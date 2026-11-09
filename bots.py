@@ -143,11 +143,22 @@ def can_enter_position(
         if not filter_row:
             return False, 0.0, "market_regime_filter table row id=1 not found"
 
-        risk_alert = bool(filter_row["risk_alert"])
+        # 듀얼 AI 최종 교차 검증 값 우선 참조 (하위 호환성 완벽 유지)
+        if "final_risk_alert" in filter_row and filter_row["final_risk_alert"] is not None:
+            risk_alert = bool(filter_row["final_risk_alert"])
+        else:
+            risk_alert = bool(filter_row["risk_alert"])
+
         rec_action = str(filter_row["recommended_action"]).upper()
-        multiplier = float(filter_row["position_size_multiplier"] or 1.0)
-        bot_overrides = json.loads(filter_row["bot_overrides_json"] or "{}")
-        blacklist = json.loads(filter_row["blacklist_tickers_json"] or "[]")
+
+        if "final_position_multiplier" in filter_row and filter_row["final_position_multiplier"] is not None:
+            multiplier = float(filter_row["final_position_multiplier"])
+        else:
+            multiplier = float(filter_row["position_size_multiplier"] or 1.0)
+
+        overrides_raw = filter_row.get("final_bot_overrides_json") or filter_row.get("bot_overrides_json") or "{}"
+        bot_overrides = json.loads(overrides_raw)
+        blacklist = json.loads(filter_row.get("blacklist_tickers_json") or "[]")
 
         # 1-1. 위험 경보 활성화
         if risk_alert:

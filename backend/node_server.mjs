@@ -209,6 +209,36 @@ async function initializeDatabase() {
       created_at TEXT NOT NULL,
       closed_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS market_regime_filter (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      sentiment_score DOUBLE PRECISION DEFAULT 0.0,
+      market_regime TEXT DEFAULT 'SIDEWAYS',
+      risk_alert INTEGER DEFAULT 0,
+      recommended_action TEXT DEFAULT 'NORMAL',
+      position_size_multiplier DOUBLE PRECISION DEFAULT 1.0,
+      bot_overrides_json TEXT DEFAULT '{"bot_vb":"ALLOW","bot_momentum":"ALLOW","bot_bb":"ALLOW"}',
+      blacklist_tickers_json TEXT DEFAULT '[]',
+      reason TEXT DEFAULT 'Initial default state',
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      flash_sentiment_score DOUBLE PRECISION DEFAULT 0.0,
+      flash_recommended_action TEXT DEFAULT 'NORMAL',
+      flash_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      pro_sentiment_score DOUBLE PRECISION DEFAULT 0.0,
+      pro_recommended_action TEXT DEFAULT 'NORMAL',
+      pro_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      final_risk_alert INTEGER DEFAULT 0,
+      final_position_multiplier DOUBLE PRECISION DEFAULT 1.0,
+      final_bot_overrides_json TEXT DEFAULT '{"bot_vb":"ALLOW","bot_momentum":"ALLOW","bot_bb":"ALLOW"}'
+    );
+    ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS flash_sentiment_score DOUBLE PRECISION DEFAULT 0.0;
+    ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS flash_recommended_action TEXT DEFAULT 'NORMAL';
+    ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS flash_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+    ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS pro_sentiment_score DOUBLE PRECISION DEFAULT 0.0;
+    ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS pro_recommended_action TEXT DEFAULT 'NORMAL';
+    ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS pro_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+    ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS final_risk_alert INTEGER DEFAULT 0;
+    ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS final_position_multiplier DOUBLE PRECISION DEFAULT 1.0;
+    ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS final_bot_overrides_json TEXT DEFAULT '{"bot_vb":"ALLOW","bot_momentum":"ALLOW","bot_bb":"ALLOW"}';
   `);
 
   // 10대 알고리즘 Arena: bots 테이블 스키마 보강 및 봇 시드
@@ -1027,27 +1057,25 @@ async function saveGeminiApiKey(key) {
 // ============================================================================
 // Gemini 무료 API 일일 쿼터 및 4시간 간격(0, 4, 8, 12, 16, 20시) 자동 분석 스케줄 관리
 // - Google Gemini Free Tier 일일 무료 호출 한도: 20회/일
-// - 4시간 간격 자동 분석 예약 건수(0시, 4시, 8시, 12시, 16시, 20시): 하루 6회 고정 제외
-// - 사용자 수동 호출 가능 무료 API 한도: 20 - 6 = 14회/일
+// - 30분 단위 Gemini Flash 빠른 분석 및 1시간 단위 Gemini Pro 심층 분석
+// - 사용자 수동 호출 가능 무료 API 한도: 20 - 6 = 14회/일 (일일 수동 안전 가이드)
 // ============================================================================
-const GEMINI_DAILY_TOTAL_FREE_LIMIT = 20;
-const AI_SCHEDULE_HOURS = [0, 4, 8, 12, 16, 20];
-const GEMINI_DAILY_AUTO_RESERVED = AI_SCHEDULE_HOURS.length; // 6회
-const GEMINI_DAILY_MANUAL_LIMIT = GEMINI_DAILY_TOTAL_FREE_LIMIT - GEMINI_DAILY_AUTO_RESERVED; // 14회
+const GEMINI_DAILY_TOTAL_FREE_LIMIT = 50;
+const AI_SCHEDULE_HOURS = Array.from({ length: 24 }, (_, i) => i);
+const GEMINI_DAILY_AUTO_RESERVED = 6;
+const GEMINI_DAILY_MANUAL_LIMIT = 30;
 
 function getNextScheduledAiAnalysisAt() {
   const now = new Date();
   const pad = (n) => String(n).padStart(2, "0");
-  const curHour = now.getHours();
-  const nextHourToday = AI_SCHEDULE_HOURS.find((h) => h > curHour);
   const target = new Date(now);
-  if (nextHourToday !== undefined) {
-    target.setHours(nextHourToday, 0, 0, 0);
+  const curMinutes = now.getMinutes();
+  if (curMinutes < 30) {
+    target.setMinutes(30, 0, 0);
   } else {
-    target.setDate(target.getDate() + 1);
-    target.setHours(AI_SCHEDULE_HOURS[0], 0, 0, 0);
+    target.setHours(target.getHours() + 1, 0, 0, 0);
   }
-  return `${target.getFullYear()}-${pad(target.getMonth() + 1)}-${pad(target.getDate())} ${pad(target.getHours())}:00:00`;
+  return `${target.getFullYear()}-${pad(target.getMonth() + 1)}-${pad(target.getDate())} ${pad(target.getHours())}:${pad(target.getMinutes())}:00`;
 }
 
 async function getGeminiQuotaStatus() {
@@ -1074,6 +1102,7 @@ async function getGeminiQuotaStatus() {
     manual_used: manualUsed,
     auto_used: autoUsed,
     remaining_calls: remainingCalls,
+    schedule_interval: "Flash 30분 / Pro 1시간",
     schedule_hours: AI_SCHEDULE_HOURS,
     next_scheduled_at: getNextScheduledAiAnalysisAt(),
     last_auto_slot: await getSetting("ai_briefing_last_auto_slot", ""),
@@ -1118,6 +1147,12 @@ async function markGeminiManualQuotaExhausted() {
 async function getLatestAiBriefing() {
   const db = getDb();
   const row = await db.prepare("SELECT * FROM ai_market_briefings ORDER BY id DESC LIMIT 1").get();
+  let regimeRow = null;
+  try {
+    regimeRow = await db.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get();
+  } catch (err) {
+    console.warn("[getLatestAiBriefing] Failed to fetch market_regime_filter:", err.message);
+  }
   const apiKey = await getGeminiApiKey();
   const maskedKey = apiKey ? `${apiKey.slice(0, 6)}...${apiKey.slice(-4)}` : "";
   const quota = await getGeminiQuotaStatus();
@@ -1126,6 +1161,7 @@ async function getLatestAiBriefing() {
     masked_key: maskedKey,
     latest: row || null,
     last_trigger_type: quota.last_trigger_type,
+    regime_filter: regimeRow || null,
     quota,
   };
 }
@@ -1288,34 +1324,43 @@ ${b.open_positions
 ---
 
 ### [작성 요청 가이드라인 및 필수 준수사항]
-반드시 다음 3개 섹션 구조와 마크다운(Markdown) 서식으로 작성하세요:
-절대로 중간에 생략하거나 끊기지 말고, 3개 섹션을 모두 끝까지 완벽하게 완결하여 작성해야 합니다.
+반드시 다음 구조와 마크다운(Markdown) 서식으로 'Flash 단기 진단'과 'Pro 심층 진단' 문단을 나누어 완벽하게 작성하세요:
+절대로 중간에 생략하거나 끊기지 말고, 모든 섹션을 끝까지 완결하여 작성해야 합니다.
 
-## 1. 📊 시장 체제(Regime) 종합 진단
-- 비트코인의 현재가와 일봉 20MA / 4시간 60MA 위치를 근거로 현재 시장이 하락/조정 장세인지, 횡보/관망 장세인지, 상승장인지 명확히 진단해주세요.
-- 왜 전 봇에 '신규 매수 차단(Hold Cash)'이 내려졌는지, 이것이 계좌 보호에 왜 중요한지 설명해주세요.
+## ⚡ Flash 단기 진단 (30분 빠른 리스크 & 수급 평가)
+- 최근 30분간의 단기 급변 사태, 돌발 악재(해킹, 급락, 거래소 장애 등) 발생 여부 신속 평가
+- 현재 호가 수급 및 단기 변동성에 따른 신규 매수 차단/비중 조절 권고 사유
 
-## 2. 🤖 봇별 행동 및 움직임 상세 분석 (3개 봇 모두 반드시 개별 서술)
-- **돌파봇-알파 (변동성 돌파)**: 현재 가동 상태, 보유 포지션 수, 왜 신규 매수를 진입하지 않고 현금을 보존하고 있는지 상세 원인 분석
-- **모멘텀봇-베타 (듀얼 모멘텀)**: 현재 가동 상태, 보유 포지션 수, 모멘텀 조건 미달 사유 및 관망 이유 상세 분석
-- **볼린저봇-감마 (볼린저 역추세)**: 현재 가동 상태, 보유 중인 종목(예: SOL, DOGE 등)의 진입가, 현재가, 평가 손익 현황과 향후 익절(+3.5%)/손절(-2.0%) 감시 대응 전략을 빠짐없이 상세 분석
+## 🧠 Pro 심층 진단 (1시간 거시 퀀트 & 봇 진입 정밀 분석)
+- 비트코인 일봉 20MA(${btcDaily20Ma ? Math.floor(btcDaily20Ma).toLocaleString("ko-KR") + "원" : "-"}) 및 4시간 60MA 기준 거시 시장 체제(Regime) 심층 분석
+- 3개 퀀트 알고리즘 봇(돌파봇-알파, 모멘텀봇-베타, 볼린저봇-감마)의 시장 적합성 및 개별 진입 허용/대기 여부 심층 진단
+- 거시적 리스크 우선 원칙 및 중단기 자산 배분 가이드
 
-## 3. 💡 향후 체크포인트 & 운용 가이드
-- 비트코인이 대략 어느 가격대(일봉 20MA 등)를 넘어서야 봇들이 다시 적극적으로 매수를 재개하는지 구체적 가격 제시
-- 사용자에게 당부하는 리스크 관리 및 심리적 조언 한마디
+## 💡 향후 체크포인트 & 운용 가이드
+- 비트코인이 넘어서야 할 주요 가격선(일봉 20MA 등)과 사용자 리스크 관리 조언
 
 이모지와 깔끔한 불릿포인트, 굵은 글씨를 활용하여 가독성을 극대화해주세요.`;
 
   // 6. Gemini API 호출 (최신 사용 가능 모델 자동 탐색 & 폴백)
-  const candidateModels = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-3.8-flash",
-    "gemini-flash-latest",
-    "gemini-flash-lite-latest",
-  ];
+  const isProTarget = options?.modelType === "pro" || options?.preferredModel === "gemini-1.5-pro";
+  const candidateModels = isProTarget
+    ? [
+        "gemini-1.5-pro",
+        "gemini-2.5-pro",
+        "gemini-pro-latest",
+        "gemini-1.5-flash",
+        "gemini-2.5-flash",
+      ]
+    : [
+        "gemini-1.5-flash",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro",
+        "gemini-3.5-flash-lite",
+        "gemini-flash-latest",
+      ];
 
-  let chosenModel = "gemini-3.5-flash-lite";
+  let chosenModel = candidateModels[0];
   let analysisText = "";
   let lastErrorMsg = "";
   let quota429Count = 0;
@@ -1580,30 +1625,30 @@ ${b.open_positions
 ---
 
 ### [작성 요청 가이드라인 및 필수 준수사항]
-반드시 다음 3개 섹션 구조와 마크다운(Markdown) 서식으로 작성하세요:
-절대로 중간에 생략하거나 끊기지 말고, 3개 섹션을 모두 끝까지 완벽하게 완결하여 작성해야 합니다.
+반드시 다음 구조와 마크다운(Markdown) 서식으로 'Flash 단기 진단'과 'Pro 심층 진단' 문단을 나누어 완벽하게 작성하세요:
+절대로 중간에 생략하거나 끊기지 말고, 모든 섹션을 끝까지 완결하여 작성해야 합니다.
 
-## 1. 📊 시장 체제(Regime) 종합 진단
-- 비트코인의 현재가와 일봉 20MA / 4시간 60MA 위치를 근거로 현재 시장이 하락/조정 장세인지, 횡보/관망 장세인지, 상승장인지 명확히 진단해주세요.
-- 왜 전 봇에 '신규 매수 차단(Hold Cash)'이 내려졌는지, 이것이 계좌 보호에 왜 중요한지 설명해주세요.
+## ⚡ Flash 단기 진단 (30분 빠른 리스크 & 수급 평가)
+- 최근 30분간의 단기 급변 사태, 돌발 악재(해킹, 급락, 거래소 장애 등) 발생 여부 신속 평가
+- 현재 호가 수급 및 단기 변동성에 따른 신규 매수 차단/비중 조절 권고 사유
 
-## 2. 🤖 봇별 행동 및 움직임 상세 분석 (3개 봇 모두 반드시 개별 서술)
-- **돌파봇-알파 (변동성 돌파)**: 현재 가동 상태, 보유 포지션 수, 왜 신규 매수를 진입하지 않고 현금을 보존하고 있는지 상세 원인 분석
-- **모멘텀봇-베타 (듀얼 모멘텀)**: 현재 가동 상태, 보유 포지션 수, 왜 진입하지 않고 대기 중인지 상세 원인 분석
-- **볼린저봇-감마 (볼린저 역추세)**: 현재 가동 상태, 보유 중인 종목(예: SOL, DOGE 등)의 진입가, 현재가, 평가 손익 현황과 향후 익절(+3.5%)/손절(-2.0%) 감시 대응 전략을 빠짐없이 상세 분석
+## 🧠 Pro 심층 진단 (1시간 거시 퀀트 & 봇 진입 정밀 분석)
+- 비트코인 일봉 20MA(${btcDaily20Ma ? Math.floor(btcDaily20Ma).toLocaleString("ko-KR") + "원" : "-"}) 및 4시간 60MA 기준 거시 시장 체제(Regime) 심층 분석
+- 3개 퀀트 알고리즘 봇(돌파봇-알파, 모멘텀봇-베타, 볼린저봇-감마)의 시장 적합성 및 개별 진입 허용/대기 여부 심층 진단
+- 거시적 리스크 우선 원칙 및 중단기 자산 배분 가이드
 
-## 3. 💡 향후 체크포인트 & 운용 가이드
-- 비트코인이 대략 어느 가격대(일봉 20MA 등)를 넘어서야 봇들이 다시 적극적으로 매수를 재개하는지 구체적 가격 제시
-- 사용자에게 당부하는 리스크 관리 및 심리적 조언 한마디
+## 💡 향후 체크포인트 & 운용 가이드
+- 비트코인이 넘어서야 할 주요 가격선(일봉 20MA 등)과 사용자 리스크 관리 조언
 
 이모지와 깔끔한 불릿포인트, 굵은 글씨를 활용하여 가독성을 극대화해주세요.`;
 
   const candidateModels = [
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
     "gemini-3.5-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-3.8-flash",
     "gemini-flash-latest",
-    "gemini-flash-lite-latest",
   ];
 
   let geminiResp = null;
@@ -1682,7 +1727,12 @@ ${b.open_positions
     "Access-Control-Allow-Origin": "*",
   });
 
-  // 메타데이터 이벤트 전송 (차감 후 남은 무료 호출 건수 포함)
+  // 메타데이터 이벤트 전송 (차감 후 남은 무료 호출 건수 및 market_regime_filter 포함)
+  let regimeRow = null;
+  try {
+    regimeRow = await db.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get();
+  } catch {}
+
   res.write(
     `data: ${JSON.stringify({
       type: "meta",
@@ -1691,8 +1741,10 @@ ${b.open_positions
       btc_4h_60ma: btc4h60Ma,
       regime_status: isHoldCash ? "HOLD_CASH" : "NORMAL",
       model: chosenModel,
+      engine: "dual",
       created_at: nowStr,
       trigger_type: "MANUAL",
+      regime_filter: regimeRow,
       quota: updatedQuota,
     })}\n\n`
   );
@@ -1763,9 +1815,11 @@ ${b.open_positions
         type: "done",
         id: info.lastInsertRowid,
         model: chosenModel,
+        engine: "dual",
         full_text: fullText,
         created_at: nowStr,
         trigger_type: "MANUAL",
+        regime_filter: regimeRow,
         quota: updatedQuota,
       })}\n\n`
     );
@@ -1884,14 +1938,14 @@ ${newsSummaryList}
 문장은 신뢰감 있고 가독성 높게, 적절한 불릿포인트와 이모지를 활용해주세요.`;
 
   const candidateModels = [
+    "gemini-1.5-flash",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
     "gemini-3.5-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-3.8-flash",
     "gemini-flash-latest",
-    "gemini-flash-lite-latest",
   ];
 
-  let chosenModel = "gemini-3.5-flash-lite";
+  let chosenModel = candidateModels[0];
   let analysisText = "";
   let lastErrorMsg = "";
   let quota429Count = 0;
@@ -2135,9 +2189,10 @@ ${newsSummaryList}
 문장은 신뢰감 있고 가독성 높게, 적절한 불릿포인트와 이모지를 활용해주세요.`;
 
   const candidateModels = [
+    "gemini-1.5-flash",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
     "gemini-3.5-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-3.8-flash",
     "gemini-flash-latest",
   ];
 
@@ -4613,12 +4668,13 @@ async function reconcileOpenPositionsWithUpbit() {
 
 // ============================================================================
 // 3. AI 실시간 시장 분석 & 봇 진단 + 뉴스 기반 AI 종합 시장 판단
-//    4시간 간격(0시, 4시, 8시, 12시, 16시, 20시) 자동 실행 스케줄러
-// - 사용자가 수동으로 분석을 요청했더라도 정해진 시각(0, 4, 8, 12, 16, 20시)에는 반드시 자동 분석 수행
+//    - 30분 단위(1800초) Gemini Flash 빠른 시장 & 뉴스 분석
+//    - 1시간 단위(3600초) Gemini Pro 심층 퀀트 분석
 // ============================================================================
 let isScheduledAiAnalysisRunning = false;
 let lastScheduledMarketAiFailureMs = 0;
 let lastScheduledNewsAiFailureMs = 0;
+let lastScheduledProAiFailureMs = 0;
 
 async function checkAndRunScheduledAiMarketAnalysis() {
   if (isScheduledAiAnalysisRunning) return;
@@ -4630,56 +4686,82 @@ async function checkAndRunScheduledAiMarketAnalysis() {
     const pad = (n) => String(n).padStart(2, "0");
     const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
     const curHour = now.getHours();
-    const slotHour = Math.floor(curHour / 4) * 4;
-    const slotKey = `${today}_${pad(slotHour)}`;
+    const curMin = now.getMinutes();
+    const slotMin = curMin >= 30 ? 30 : 0;
+    const flashSlotKey = `${today}_${pad(curHour)}:${pad(slotMin)}`;
+    const isProHour = slotMin === 0;
+    const proSlotKey = `${today}_${pad(curHour)}:00_pro`;
 
     const lastMarketAutoSlot = await getSetting("ai_briefing_last_auto_slot", "");
     const lastNewsAutoSlot = await getSetting("ai_news_briefing_last_auto_slot", "");
+    const lastProAutoSlot = await getSetting("ai_pro_briefing_last_auto_slot", "");
 
-    const needMarketAuto =
-      lastMarketAutoSlot !== slotKey &&
+    const needFlashMarket =
+      lastMarketAutoSlot !== flashSlotKey &&
       !(lastScheduledMarketAiFailureMs > 0 && Date.now() - lastScheduledMarketAiFailureMs < 5 * 60 * 1000);
-    const needNewsAuto =
-      lastNewsAutoSlot !== slotKey &&
+    const needFlashNews =
+      lastNewsAutoSlot !== flashSlotKey &&
       !(lastScheduledNewsAiFailureMs > 0 && Date.now() - lastScheduledNewsAiFailureMs < 5 * 60 * 1000);
+    const needProInDepth =
+      isProHour &&
+      lastProAutoSlot !== proSlotKey &&
+      !(lastScheduledProAiFailureMs > 0 && Date.now() - lastScheduledProAiFailureMs < 5 * 60 * 1000);
 
-    if (!needMarketAuto && !needNewsAuto) {
+    if (!needFlashMarket && !needFlashNews && !needProInDepth) {
       return;
     }
 
     isScheduledAiAnalysisRunning = true;
 
-    if (needMarketAuto) {
-      console.log(`[AI Auto Analysis] 4시간 정기 슬롯(${slotKey}) 자동 시장 분석 & 봇 진단을 시작합니다...`);
-      const marketResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey });
+    // 1. 30분 단위 Gemini Flash 시장 분석 & 봇 진단
+    if (needFlashMarket) {
+      console.log(`[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) Gemini Flash 자동 시장 분석을 시작합니다...`);
+      const marketResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: flashSlotKey, preferredModel: "gemini-1.5-flash" });
       if (marketResult.success) {
         lastScheduledMarketAiFailureMs = 0;
-        console.log(`[AI Auto Analysis] 4시간 정기 슬롯(${slotKey}) 자동 시장 분석 완료 (모델: ${marketResult.briefing?.model})`);
+        console.log(`[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) 완료 (모델: ${marketResult.briefing?.model})`);
       } else {
         lastScheduledMarketAiFailureMs = Date.now();
-        console.warn(`[AI Auto Analysis] 4시간 정기 슬롯(${slotKey}) 자동 시장 분석 실패:`, marketResult.message);
+        console.warn(`[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) 실패:`, marketResult.message);
       }
     }
 
-    if (needNewsAuto) {
-      console.log(`[AI Auto News Analysis] 4시간 정기 슬롯(${slotKey}) 뉴스 기반 AI 종합 시장 판단 자동 분석을 시작합니다...`);
+    // 2. 30분 단위 Gemini Flash 뉴스 종합 판단
+    if (needFlashNews) {
+      console.log(`[AI Auto News Analysis] 30분 정기 슬롯(${flashSlotKey}) 뉴스 종합 판단을 시작합니다...`);
       try {
         await syncNewsToDatabase(getDb());
       } catch (e) {
         console.warn("[AI Auto News Analysis] Pre-sync news warning:", e.message);
       }
-      const newsResult = await generateAiNewsAnalysis({ triggerType: "AUTO", slotKey });
+      const newsResult = await generateAiNewsAnalysis({ triggerType: "AUTO", slotKey: flashSlotKey });
       if (newsResult.success) {
         lastScheduledNewsAiFailureMs = 0;
-        console.log(`[AI Auto News Analysis] 4시간 정기 슬롯(${slotKey}) 자동 뉴스 종합 판단 완료 (모델: ${newsResult.briefing?.model})`);
+        console.log(`[AI Auto News Analysis] 30분 정기 슬롯(${flashSlotKey}) 완료 (모델: ${newsResult.briefing?.model})`);
       } else {
         lastScheduledNewsAiFailureMs = Date.now();
-        console.warn(`[AI Auto News Analysis] 4시간 정기 슬롯(${slotKey}) 자동 뉴스 종합 판단 실패:`, newsResult.message);
+        console.warn(`[AI Auto News Analysis] 30분 정기 슬롯(${flashSlotKey}) 실패:`, newsResult.message);
+      }
+    }
+
+    // 3. 1시간 정각 단위 Gemini Pro 심층 퀀트 분석
+    if (needProInDepth) {
+      console.log(`[AI Auto Pro Analysis] 1시간 정각 심층 슬롯(${proSlotKey}) Gemini Pro 심층 퀀트 분석을 시작합니다...`);
+      const proResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: proSlotKey, preferredModel: "gemini-1.5-pro", modelType: "pro" });
+      if (proResult.success) {
+        lastScheduledProAiFailureMs = 0;
+        const db = getDb();
+        await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('ai_pro_briefing_last_auto_slot', ?, ?)").run(proSlotKey, nowKSTString());
+        console.log(`[AI Auto Pro Analysis] 1시간 정각 심층 슬롯(${proSlotKey}) 완료 (모델: ${proResult.briefing?.model})`);
+      } else {
+        lastScheduledProAiFailureMs = Date.now();
+        console.warn(`[AI Auto Pro Analysis] 1시간 정각 심층 슬롯(${proSlotKey}) 실패:`, proResult.message);
       }
     }
   } catch (err) {
     lastScheduledMarketAiFailureMs = Date.now();
     lastScheduledNewsAiFailureMs = Date.now();
+    lastScheduledProAiFailureMs = Date.now();
     console.warn("[AI Auto Analysis] Scheduler error:", err.message);
   } finally {
     isScheduledAiAnalysisRunning = false;

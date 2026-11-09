@@ -203,7 +203,7 @@ def init_database(db_path: Optional[str] = None) -> None:
             """
         )
 
-        # 3. LLM 시장 체제 & 뉴스 감성 필터 테이블 (market_regime_filter - Single-row id=1)
+        # 3. LLM 시장 체제 & 뉴스 감성 필터 테이블 (market_regime_filter - Single-row id=1, 듀얼 AI 엔진 확장)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS market_regime_filter (
@@ -216,10 +216,37 @@ def init_database(db_path: Optional[str] = None) -> None:
                 bot_overrides_json TEXT DEFAULT '{"bot_vb":"ALLOW","bot_momentum":"ALLOW","bot_bb":"ALLOW"}',
                 blacklist_tickers_json TEXT DEFAULT '[]',
                 reason TEXT DEFAULT 'Initial default state',
-                updated_at TEXT NOT NULL
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                flash_sentiment_score DOUBLE PRECISION DEFAULT 0.0,
+                flash_recommended_action TEXT DEFAULT 'NORMAL',
+                flash_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                pro_sentiment_score DOUBLE PRECISION DEFAULT 0.0,
+                pro_recommended_action TEXT DEFAULT 'NORMAL',
+                pro_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                final_risk_alert INTEGER DEFAULT 0,
+                final_position_multiplier DOUBLE PRECISION DEFAULT 1.0,
+                final_bot_overrides_json TEXT DEFAULT '{"bot_vb":"ALLOW","bot_momentum":"ALLOW","bot_bb":"ALLOW"}'
             );
             """
         )
+
+        # 3-1. 듀얼 AI 엔진 (30분 Flash & 1시간 Pro) 교차 검증 컬럼 마이그레이션 (기존 데이터 보존)
+        dual_ai_columns = [
+            ("flash_sentiment_score", "DOUBLE PRECISION DEFAULT 0.0"),
+            ("flash_recommended_action", "TEXT DEFAULT 'NORMAL'"),
+            ("flash_updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("pro_sentiment_score", "DOUBLE PRECISION DEFAULT 0.0"),
+            ("pro_recommended_action", "TEXT DEFAULT 'NORMAL'"),
+            ("pro_updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("final_risk_alert", "INTEGER DEFAULT 0"),
+            ("final_position_multiplier", "DOUBLE PRECISION DEFAULT 1.0"),
+            ("final_bot_overrides_json", "TEXT DEFAULT '{\"bot_vb\":\"ALLOW\",\"bot_momentum\":\"ALLOW\",\"bot_bb\":\"ALLOW\"}'"),
+        ]
+        for col_name, col_def in dual_ai_columns:
+            try:
+                conn.execute(f"ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS {col_name} {col_def};")
+            except Exception as e:
+                logger.debug("Column %s add skipped or already exists: %s", col_name, e)
 
         # 4. market_regime_filter id=1 기본 행 초기화
         initial_overrides = json.dumps(
@@ -231,12 +258,18 @@ def init_database(db_path: Optional[str] = None) -> None:
             INSERT INTO market_regime_filter (
                 id, sentiment_score, market_regime, risk_alert, recommended_action,
                 position_size_multiplier, bot_overrides_json, blacklist_tickers_json,
-                reason, updated_at
+                reason, updated_at,
+                flash_sentiment_score, flash_recommended_action, flash_updated_at,
+                pro_sentiment_score, pro_recommended_action, pro_updated_at,
+                final_risk_alert, final_position_multiplier, final_bot_overrides_json
             ) VALUES (
-                1, 0.0, 'SIDEWAYS', 0, 'NORMAL', 1.0, %s, '[]', 'Initial default state', CURRENT_TIMESTAMP
+                1, 0.0, 'SIDEWAYS', 0, 'NORMAL', 1.0, %s, '[]', 'Initial default state', CURRENT_TIMESTAMP,
+                0.0, 'NORMAL', CURRENT_TIMESTAMP,
+                0.0, 'NORMAL', CURRENT_TIMESTAMP,
+                0, 1.0, %s
             ) ON CONFLICT (id) DO NOTHING;
             """,
-            (initial_overrides,),
+            (initial_overrides, initial_overrides),
         )
 
         conn.commit()

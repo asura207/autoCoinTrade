@@ -1343,6 +1343,7 @@ export default function App() {
                   ...prev,
                   last_trigger_type: data.trigger_type || "MANUAL",
                   quota: data.quota || prev.quota,
+                  regime_filter: data.regime_filter || capturedMeta?.regime_filter || prev.regime_filter,
                   latest: {
                     id: data.id,
                     provider: "gemini",
@@ -2775,8 +2776,9 @@ export default function App() {
                         color: "#a5b4fc",
                         border: "1px solid rgba(99, 102, 241, 0.4)",
                       }}
+                      title="30분 단위 Gemini Flash 빠른 분석과 1시간 단위 Gemini Pro 심층 퀀트 분석 듀얼 엔진"
                     >
-                      {aiBriefing?.latest?.model ? aiBriefing.latest.model.replace("models/", "") : "Gemini 3.5 Flash"}
+                      ⚡ Gemini Flash(30m) & Pro(1h) 듀얼 엔진
                     </span>
                     <span
                       style={{
@@ -2791,11 +2793,11 @@ export default function App() {
                       }}
                       title={
                         geminiQuota?.next_scheduled_at
-                          ? `매일 0시, 4시, 8시, 12시, 16시, 20시 정각 자동 분석 (다음 자동 분석: ${geminiQuota.next_scheduled_at})`
-                          : "매일 0시, 4시, 8시, 12시, 16시, 20시 4시간 간격 자동 분석"
+                          ? `Flash 30분 및 Pro 1시간 자동 교차 검증 (다음 자동 분석: ${geminiQuota.next_scheduled_at})`
+                          : "Flash 30분 / Pro 1시간 주기 자동 교차 검증"
                       }
                     >
-                      ⏰ 0·4·8·12·16·20시 자동갱신
+                      ⏰ Flash 30분 · Pro 1시간 자동 교차 검증
                     </span>
                   </div>
                   {aiBriefing?.latest && (
@@ -2804,30 +2806,99 @@ export default function App() {
                       {aiBriefing?.last_trigger_type === "AUTO" ? "자동 분석" : "수동 분석"})
                     </span>
                   )}
-                  {/* 접혀있을 때 간략 요약 뱃지 표시 */}
+                  {/* 접혀있을 때 듀얼 AI 교차검증 간략 요약 뱃지 표시 */}
                   {!isAiBriefingExpanded && aiBriefing?.latest && (
                     <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", marginLeft: "4px" }}>
-                      <span
-                        style={{
-                          fontSize: "11px",
-                          fontWeight: 700,
-                          padding: "2px 8px",
-                          borderRadius: "6px",
-                          background:
-                            aiBriefing.latest.regime_status === "HOLD_CASH"
-                              ? "rgba(239, 68, 68, 0.2)"
-                              : "rgba(34, 197, 94, 0.2)",
-                          color:
-                            aiBriefing.latest.regime_status === "HOLD_CASH" ? "#f87171" : "#4ade80",
-                          border: `1px solid ${
-                            aiBriefing.latest.regime_status === "HOLD_CASH"
-                              ? "rgba(239, 68, 68, 0.4)"
-                              : "rgba(34, 197, 94, 0.4)"
-                          }`,
-                        }}
-                      >
-                        {aiBriefing.latest.regime_status === "HOLD_CASH" ? "🔴 신규매수차단" : "🟢 정상거래 허용"}
-                      </span>
+                      {(() => {
+                        const rf = aiBriefing?.regime_filter;
+                        if (rf) {
+                          const isBlocked = rf.final_risk_alert || rf.final_position_multiplier === 0;
+                          const isReduced = !isBlocked && rf.final_position_multiplier <= 0.5;
+                          return (
+                            <>
+                              <span
+                                style={{
+                                  fontSize: "11px",
+                                  fontWeight: 700,
+                                  padding: "2px 6px",
+                                  borderRadius: "6px",
+                                  background: "rgba(56, 189, 248, 0.15)",
+                                  color: "#38bdf8",
+                                  border: "1px solid rgba(56, 189, 248, 0.35)",
+                                }}
+                                title={`Flash 30분 단기 분석: ${rf.flash_recommended_action} (점수: ${(Number(rf.flash_sentiment_score) || 0).toFixed(2)})`}
+                              >
+                                ⚡ Flash: {rf.flash_recommended_action || "NORMAL"}
+                              </span>
+                              <span
+                                style={{
+                                  fontSize: "11px",
+                                  fontWeight: 700,
+                                  padding: "2px 6px",
+                                  borderRadius: "6px",
+                                  background: "rgba(168, 85, 247, 0.15)",
+                                  color: "#c084fc",
+                                  border: "1px solid rgba(168, 85, 247, 0.35)",
+                                }}
+                                title={`Pro 1시간 심층 퀀트 분석: ${rf.pro_recommended_action} (점수: ${(Number(rf.pro_sentiment_score) || 0).toFixed(2)})`}
+                              >
+                                🧠 Pro: {rf.pro_recommended_action || "NORMAL"}
+                              </span>
+                              <span
+                                style={{
+                                  fontSize: "11px",
+                                  fontWeight: 700,
+                                  padding: "2px 8px",
+                                  borderRadius: "6px",
+                                  background: isBlocked
+                                    ? "rgba(239, 68, 68, 0.2)"
+                                    : isReduced
+                                    ? "rgba(234, 179, 8, 0.2)"
+                                    : "rgba(34, 197, 94, 0.2)",
+                                  color: isBlocked ? "#f87171" : isReduced ? "#facc15" : "#4ade80",
+                                  border: `1px solid ${
+                                    isBlocked
+                                      ? "rgba(239, 68, 68, 0.4)"
+                                      : isReduced
+                                      ? "rgba(234, 179, 8, 0.4)"
+                                      : "rgba(34, 197, 94, 0.4)"
+                                  }`,
+                                }}
+                                title={`듀얼 AI 교차검증 결론: ${rf.reason || ""}`}
+                              >
+                                {isBlocked
+                                  ? "🛡️ 최종: 신규매수차단"
+                                  : isReduced
+                                  ? `🛡️ 최종: 비중 ${(rf.final_position_multiplier * 100).toFixed(0)}%`
+                                  : "🛡️ 최종: 100% 정상거래"}
+                              </span>
+                            </>
+                          );
+                        }
+                        return (
+                          <span
+                            style={{
+                              fontSize: "11px",
+                              fontWeight: 700,
+                              padding: "2px 8px",
+                              borderRadius: "6px",
+                              background:
+                                aiBriefing.latest.regime_status === "HOLD_CASH"
+                                  ? "rgba(239, 68, 68, 0.2)"
+                                  : "rgba(34, 197, 94, 0.2)",
+                              color:
+                                aiBriefing.latest.regime_status === "HOLD_CASH" ? "#f87171" : "#4ade80",
+                              border: `1px solid ${
+                                aiBriefing.latest.regime_status === "HOLD_CASH"
+                                  ? "rgba(239, 68, 68, 0.4)"
+                                  : "rgba(34, 197, 94, 0.4)"
+                              }`,
+                            }}
+                          >
+                            {aiBriefing.latest.regime_status === "HOLD_CASH" ? "🔴 신규매수차단" : "🟢 정상거래 허용"}
+                          </span>
+                        );
+                      })()}
                       {aiBriefing.latest.btc_price && (
                         <span style={{ fontSize: "12px", color: "#cbd5e1" }}>
                           BTC {Number(aiBriefing.latest.btc_price).toLocaleString("ko-KR")}원
@@ -3115,47 +3186,168 @@ export default function App() {
                   {/* 분석 결과 리포트 표시 (스트리밍 작성 중이거나, 완료된 브리핑이 있을 때) */}
                   {(isStreaming || (!aiLoading && aiBriefing?.latest)) && (
                     <div>
-                      {/* 주요 지표 요약 바 */}
+                      {/* 주요 지표 요약 바 & 듀얼 AI 교차 검증 매트릭스 */}
                       {(() => {
                         const currentMeta = isStreaming && streamingMeta ? streamingMeta : aiBriefing?.latest;
+                        const rf = aiBriefing?.regime_filter || streamingMeta?.regime_filter;
                         if (!currentMeta) return null;
                         return (
-                          <div
-                            style={{
-                              display: "flex",
-                              flexWrap: "wrap",
-                              gap: "12px",
-                              marginBottom: "14px",
-                              padding: "10px 14px",
-                              background: "rgba(15, 23, 42, 0.5)",
-                              borderRadius: "8px",
-                              border: "1px solid rgba(255, 255, 255, 0.05)",
-                              alignItems: "center",
-                            }}
-                          >
-                            <div style={{ fontSize: "12.5px", color: "#94a3b8" }}>
-                              🪙 <strong style={{ color: "#f8fafc" }}>BTC 현재가:</strong>{" "}
-                              {currentMeta.btc_price ? Number(currentMeta.btc_price).toLocaleString("ko-KR") + "원" : "-"}
-                            </div>
-                            <div style={{ fontSize: "12.5px", color: "#94a3b8" }}>
-                              📈 <strong style={{ color: "#f8fafc" }}>일봉 20MA:</strong>{" "}
-                              {currentMeta.btc_daily_20ma ? Math.floor(Number(currentMeta.btc_daily_20ma)).toLocaleString("ko-KR") + "원" : "-"}
-                            </div>
-                            <div style={{ fontSize: "12.5px", color: "#94a3b8" }}>
-                              ⏱️ <strong style={{ color: "#f8fafc" }}>4시간 60MA:</strong>{" "}
-                              {currentMeta.btc_4h_60ma ? Math.floor(Number(currentMeta.btc_4h_60ma)).toLocaleString("ko-KR") + "원" : "-"}
-                            </div>
-                            <div style={{ fontSize: "12.5px" }}>
-                              {currentMeta.regime_status === "HOLD_CASH" ? (
-                                <span style={{ color: "#f87171", fontWeight: 700 }}>🔴 시장체제: 신규매수차단 (현금보유)</span>
-                              ) : (
-                                <span style={{ color: "#4ade80", fontWeight: 700 }}>🟢 시장체제: 정상거래 허용 (상승추세)</span>
+                          <div>
+                            {/* 1. 기본 시장 지표 요약 바 */}
+                            <div
+                              style={{
+                                display: "flex",
+                                flexWrap: "wrap",
+                                gap: "12px",
+                                marginBottom: "10px",
+                                padding: "10px 14px",
+                                background: "rgba(15, 23, 42, 0.5)",
+                                borderRadius: "8px",
+                                border: "1px solid rgba(255, 255, 255, 0.05)",
+                                alignItems: "center",
+                              }}
+                            >
+                              <div style={{ fontSize: "12.5px", color: "#94a3b8" }}>
+                                🪙 <strong style={{ color: "#f8fafc" }}>BTC 현재가:</strong>{" "}
+                                {currentMeta.btc_price ? Number(currentMeta.btc_price).toLocaleString("ko-KR") + "원" : "-"}
+                              </div>
+                              <div style={{ fontSize: "12.5px", color: "#94a3b8" }}>
+                                📈 <strong style={{ color: "#f8fafc" }}>일봉 20MA:</strong>{" "}
+                                {currentMeta.btc_daily_20ma ? Math.floor(Number(currentMeta.btc_daily_20ma)).toLocaleString("ko-KR") + "원" : "-"}
+                              </div>
+                              <div style={{ fontSize: "12.5px", color: "#94a3b8" }}>
+                                ⏱️ <strong style={{ color: "#f8fafc" }}>4시간 60MA:</strong>{" "}
+                                {currentMeta.btc_4h_60ma ? Math.floor(Number(currentMeta.btc_4h_60ma)).toLocaleString("ko-KR") + "원" : "-"}
+                              </div>
+                              <div style={{ fontSize: "12.5px" }}>
+                                {currentMeta.regime_status === "HOLD_CASH" ? (
+                                  <span style={{ color: "#f87171", fontWeight: 700 }}>🔴 기술 체제: 신규매수차단 (현금보유)</span>
+                                ) : (
+                                  <span style={{ color: "#4ade80", fontWeight: 700 }}>🟢 기술 체제: 정상거래 허용 (상승추세)</span>
+                                )}
+                              </div>
+                              {isStreaming && (
+                                <div style={{ fontSize: "12px", color: "#38bdf8", marginLeft: "auto", display: "flex", alignItems: "center", gap: "6px" }}>
+                                  <span className="spinner" style={{ width: "12px", height: "12px" }} />
+                                  한 자씩 실시간 타이핑 중...
+                                </div>
                               )}
                             </div>
-                            {isStreaming && (
-                              <div style={{ fontSize: "12px", color: "#38bdf8", marginLeft: "auto", display: "flex", alignItems: "center", gap: "6px" }}>
-                                <span className="spinner" style={{ width: "12px", height: "12px" }} />
-                                한 자씩 실시간 타이핑 중...
+
+                            {/* 2. 듀얼 AI 엔진 (30분 Flash & 1시간 Pro) 교차 검증 매트릭스 카드 */}
+                            {rf && (
+                              <div
+                                style={{
+                                  display: "grid",
+                                  gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
+                                  gap: "10px",
+                                  marginBottom: "14px",
+                                  padding: "12px 14px",
+                                  background: "linear-gradient(135deg, rgba(30, 27, 75, 0.45) 0%, rgba(15, 23, 42, 0.7) 100%)",
+                                  borderRadius: "8px",
+                                  border: "1px solid rgba(99, 102, 241, 0.28)",
+                                }}
+                              >
+                                {/* Flash 30분 단기 분석 */}
+                                <div style={{ padding: "8px 12px", background: "rgba(15, 23, 42, 0.6)", borderRadius: "6px", border: "1px solid rgba(56, 189, 248, 0.25)" }}>
+                                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                                    <span style={{ fontSize: "12px", fontWeight: 700, color: "#38bdf8" }}>⚡ Gemini Flash (30분 단기)</span>
+                                    <span
+                                      style={{
+                                        fontSize: "11px",
+                                        fontWeight: 700,
+                                        padding: "2px 7px",
+                                        borderRadius: "4px",
+                                        background: rf.flash_recommended_action === "NORMAL" ? "rgba(34, 197, 94, 0.2)" : "rgba(239, 68, 68, 0.2)",
+                                        color: rf.flash_recommended_action === "NORMAL" ? "#4ade80" : "#f87171",
+                                        border: `1px solid ${rf.flash_recommended_action === "NORMAL" ? "rgba(34, 197, 94, 0.4)" : "rgba(239, 68, 68, 0.4)"}`,
+                                      }}
+                                    >
+                                      {rf.flash_recommended_action || "NORMAL"}
+                                    </span>
+                                  </div>
+                                  <div style={{ fontSize: "11.5px", color: "#cbd5e1" }}>
+                                    단기 투심 점수:{" "}
+                                    <strong style={{ color: (Number(rf.flash_sentiment_score) || 0) >= 0 ? "#4ade80" : "#f87171" }}>
+                                      {(Number(rf.flash_sentiment_score) || 0) > 0 ? "+" : ""}{(Number(rf.flash_sentiment_score) || 0).toFixed(2)}
+                                    </strong>
+                                  </div>
+                                  <div style={{ fontSize: "11px", color: "#94a3b8", marginTop: "3px" }}>
+                                    최근 갱신: {rf.flash_updated_at ? String(rf.flash_updated_at).replace("T", " ").slice(0, 19) : "-"}
+                                  </div>
+                                </div>
+
+                                {/* Pro 1시간 심층 퀀트 분석 */}
+                                <div style={{ padding: "8px 12px", background: "rgba(15, 23, 42, 0.6)", borderRadius: "6px", border: "1px solid rgba(168, 85, 247, 0.25)" }}>
+                                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                                    <span style={{ fontSize: "12px", fontWeight: 700, color: "#c084fc" }}>🧠 Gemini Pro (1시간 심층)</span>
+                                    <span
+                                      style={{
+                                        fontSize: "11px",
+                                        fontWeight: 700,
+                                        padding: "2px 7px",
+                                        borderRadius: "4px",
+                                        background: rf.pro_recommended_action === "NORMAL" ? "rgba(34, 197, 94, 0.2)" : "rgba(239, 68, 68, 0.2)",
+                                        color: rf.pro_recommended_action === "NORMAL" ? "#4ade80" : "#f87171",
+                                        border: `1px solid ${rf.pro_recommended_action === "NORMAL" ? "rgba(34, 197, 94, 0.4)" : "rgba(239, 68, 68, 0.4)"}`,
+                                      }}
+                                    >
+                                      {rf.pro_recommended_action || "NORMAL"}
+                                    </span>
+                                  </div>
+                                  <div style={{ fontSize: "11.5px", color: "#cbd5e1" }}>
+                                    거시 체제 점수:{" "}
+                                    <strong style={{ color: (Number(rf.pro_sentiment_score) || 0) >= 0 ? "#4ade80" : "#f87171" }}>
+                                      {(Number(rf.pro_sentiment_score) || 0) > 0 ? "+" : ""}{(Number(rf.pro_sentiment_score) || 0).toFixed(2)}
+                                    </strong>
+                                  </div>
+                                  <div style={{ fontSize: "11px", color: "#94a3b8", marginTop: "3px" }}>
+                                    최근 갱신: {rf.pro_updated_at ? String(rf.pro_updated_at).replace("T", " ").slice(0, 19) : "-"}
+                                  </div>
+                                </div>
+
+                                {/* 교차 검증 최종 종합 판정 */}
+                                <div style={{ padding: "8px 12px", background: "rgba(15, 23, 42, 0.6)", borderRadius: "6px", border: "1px solid rgba(99, 102, 241, 0.35)" }}>
+                                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                                    <span style={{ fontSize: "12px", fontWeight: 700, color: "#a5b4fc" }}>🛡️ 다중 모델 교차검증 결론</span>
+                                    <span
+                                      style={{
+                                        fontSize: "11px",
+                                        fontWeight: 700,
+                                        padding: "2px 7px",
+                                        borderRadius: "4px",
+                                        background:
+                                          rf.final_risk_alert || Number(rf.final_position_multiplier) === 0
+                                            ? "rgba(239, 68, 68, 0.2)"
+                                            : Number(rf.final_position_multiplier) <= 0.5
+                                            ? "rgba(234, 179, 8, 0.2)"
+                                            : "rgba(34, 197, 94, 0.2)",
+                                        color:
+                                          rf.final_risk_alert || Number(rf.final_position_multiplier) === 0
+                                            ? "#f87171"
+                                            : Number(rf.final_position_multiplier) <= 0.5
+                                            ? "#facc15"
+                                            : "#4ade80",
+                                        border: `1px solid ${
+                                          rf.final_risk_alert || Number(rf.final_position_multiplier) === 0
+                                            ? "rgba(239, 68, 68, 0.4)"
+                                            : Number(rf.final_position_multiplier) <= 0.5
+                                            ? "rgba(234, 179, 8, 0.4)"
+                                            : "rgba(34, 197, 94, 0.4)"
+                                        }`,
+                                      }}
+                                    >
+                                      {rf.final_risk_alert || Number(rf.final_position_multiplier) === 0
+                                        ? "신규 매수 전면 차단"
+                                        : Number(rf.final_position_multiplier) <= 0.5
+                                        ? `비중 ${(Number(rf.final_position_multiplier) * 100).toFixed(0)}% 축소 운용`
+                                        : "100% 정상 진입 허용"}
+                                    </span>
+                                  </div>
+                                  <div style={{ fontSize: "11px", color: "#cbd5e1", lineHeight: "1.4" }} title={rf.reason || ""}>
+                                    {rf.reason ? (rf.reason.length > 60 ? rf.reason.slice(0, 60) + "..." : rf.reason) : "보수적 리스크 우선 원칙 및 단기 쇼크 방어 적용"}
+                                  </div>
+                                </div>
                               </div>
                             )}
                           </div>
