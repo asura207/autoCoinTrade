@@ -1,0 +1,9 @@
+{
+  "access_key": "YOUR_UPBIT_ACCESS_KEY",
+  "secret_key": "YOUR_UPBIT_SECRET_KEY",
+  "trade_mode": "paper",
+  "request_timeout_sec": 5.0,
+  "delay_threshold_ms": 800,
+  "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE"
+}
+
