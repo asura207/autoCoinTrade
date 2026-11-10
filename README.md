@@ -1,6 +1,8 @@
 # Upbit AutoCoinTrade (업비트 다중 전략 자동매매 & 실시간 AI 퀀트 시스템)
 
-> 업비트(Upbit) Open API를 기반으로 3대 퀀트 전략 봇을 동시에 운용하고, 6대 알고리즘 가상 경쟁소(Algo Lab)와 실시간 뉴스 인텔리전스, 그리고 Google Gemini AI 스트리밍 시황 분석을 결합한 통합 가상자산 퀀트 트레이딩 플랫폼입니다.
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
+> 업비트(Upbit) Open API를 기반으로 3대 퀀트 전략 봇을 동시에 운용하고, 10대 알고리즘 가상 경쟁(Always-On Arena)과 실시간 뉴스 인텔리전스, 그리고 Google Gemini AI 스트리밍 시황 분석(Flash 30분 / Pro 1시간 교차 검증)을 결합한 통합 가상자산 퀀트 트레이딩 플랫폼입니다.
 
 ---
 
@@ -155,14 +157,16 @@
 ```text
 autoCoinTrade/
 ├── backend/
-│   ├── node_server.mjs          # [메인 백엔드] Node.js 22 SQLite + Upbit API + Gemini AI + REST API + SSE
-│   ├── main.py                  # (선택) 레거시 FastAPI 백엔드
+│   ├── node_server.mjs          # [메인 백엔드] Node.js + PostgreSQL/SQLite + Upbit API + Gemini AI + REST API + SSE
 │   └── common/
-│       ├── algo_lab_service.mjs # 6대 알고리즘 검증소(Algo Lab) 시뮬레이션 및 실시간 랭킹 엔진
+│       ├── algo_lab_service.mjs # 10대 알고리즘 가상 경쟁(Arena) 시뮬레이션 및 실시간 랭킹 엔진
 │       ├── news_service.mjs     # 구글 뉴스 & 토큰포스트 RSS 파싱, 감성 분석, 태그 추출
-│       ├── pg_sync.mjs          # PostgreSQL 16 실시간 데이터 동기화 매니저
-│       ├── database.py          # Python DB 어댑터
-│       └── upbit_client.py      # Python 업비트 연동 클라이언트
+│       ├── pg_db.mjs            # PostgreSQL 비동기 풀 및 SQL 변환 레이어
+│       └── pg_sync.mjs          # PostgreSQL 16 실시간 데이터 동기화 매니저
+├── bots.py                      # [Python CLI] 3대 실전 트레이딩 봇 전략 (슈퍼트렌드, 볼린저 스퀴즈, DCA)
+├── llm_filter_worker.py         # [Python CLI] 듀얼 AI (Flash 30분 / Pro 1시간) 시장 분석 워커
+├── main_orchestrator.py         # [Python CLI] 멀티프로세싱 슈퍼바이저 오케스트레이터
+├── init_db.py                   # DB 스키마 및 마켓 체제 필터 테이블 초기화
 ├── config/
 │   ├── upbit_config.json        # 업비트 및 Gemini API 키 설정 파일 (Git 추적 제외)
 │   └── upbit_config.example.json# 설정 파일 템플릿
