@@ -2916,28 +2916,28 @@ export default function App() {
                       padding: "5px 10px",
                       borderRadius: "8px",
                       background:
-                        Number(geminiQuota?.remaining_calls ?? 14) <= 0
+                        Number(geminiQuota?.remaining_calls ?? 30) <= 0
                           ? "rgba(239, 68, 68, 0.18)"
-                          : Number(geminiQuota?.remaining_calls ?? 14) <= 3
+                          : Number(geminiQuota?.remaining_calls ?? 30) <= 3
                           ? "rgba(234, 179, 8, 0.18)"
                           : "rgba(16, 185, 129, 0.16)",
                       color:
-                        Number(geminiQuota?.remaining_calls ?? 14) <= 0
+                        Number(geminiQuota?.remaining_calls ?? 30) <= 0
                           ? "#f87171"
-                          : Number(geminiQuota?.remaining_calls ?? 14) <= 3
+                          : Number(geminiQuota?.remaining_calls ?? 30) <= 3
                           ? "#facc15"
                           : "#34d399",
                       border: `1px solid ${
-                        Number(geminiQuota?.remaining_calls ?? 14) <= 0
+                        Number(geminiQuota?.remaining_calls ?? 30) <= 0
                           ? "rgba(239, 68, 68, 0.4)"
-                          : Number(geminiQuota?.remaining_calls ?? 14) <= 3
+                          : Number(geminiQuota?.remaining_calls ?? 30) <= 3
                           ? "rgba(234, 179, 8, 0.4)"
                           : "rgba(16, 185, 129, 0.35)"
                       }`,
                     }}
-                    title={`일일 무료 한도 총 ${geminiQuota?.daily_total_limit ?? 20}건 중 4시간 간격 자동 분석 예약 ${geminiQuota?.auto_reserved_count ?? 6}건을 제외한 수동 호출 잔여 건수`}
+                    title={`일일 무료 한도 총 ${geminiQuota?.daily_total_limit ?? 50}건 중 자동 분석 예약(${geminiQuota?.auto_reserved_count ?? 6}건)을 제외한 수동 호출 잔여 건수`}
                   >
-                    무료 API 잔여: {geminiQuota?.remaining_calls ?? 14}/{geminiQuota?.manual_limit ?? 14}건 (자동예약{" "}
+                    무료 API 잔여: {geminiQuota?.remaining_calls ?? 30}/{geminiQuota?.manual_limit ?? 30}건 (자동예약{" "}
                     {geminiQuota?.auto_reserved_count ?? 6}건 제외)
                   </span>
 
@@ -2973,7 +2973,7 @@ export default function App() {
                         Gemini 연결 중...
                       </>
                     ) : (
-                      <>⚡ AI 시황 분석 요청 ({geminiQuota?.remaining_calls ?? 14}건 남음)</>
+                      <>⚡ AI 시황 분석 요청 ({geminiQuota?.remaining_calls ?? 30}건 남음)</>
                     )}
                   </button>
 
@@ -3105,7 +3105,7 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* Gemini 무료 API 호출 잔여 건수 & 4시간 간격 자동 분석 스케줄 안내 바 */}
+                  {/* Gemini 무료 API 호출 잔여 건수 & 듀얼 AI(Flash 30분 / Pro 1시간) 자동 분석 스케줄 안내 바 */}
                   <div
                     style={{
                       display: "flex",
@@ -3126,11 +3126,11 @@ export default function App() {
                       📊{" "}
                       <strong style={{ color: "#38bdf8" }}>
                         {geminiQuotaNotice ||
-                          `금일 자동 분석 예약(${geminiQuota?.auto_reserved_count ?? 6}건) 제외 남은 무료 API 호출 건수: ${geminiQuota?.remaining_calls ?? 14}건 / ${geminiQuota?.manual_limit ?? 14}건`}
+                          `금일 자동 분석 예약(${geminiQuota?.auto_reserved_count ?? 6}건) 제외 남은 무료 API 호출 건수: ${geminiQuota?.remaining_calls ?? 30}건 / ${geminiQuota?.manual_limit ?? 30}건`}
                       </strong>
                     </div>
                     <div style={{ color: "#94a3b8", fontSize: "11.5px" }}>
-                      매일 0시 · 4시 · 8시 · 12시 · 16시 · 20시 자동 분석 실행
+                      Flash 30분(단기 감지) · Pro 1시간(심층 퀀트) 자동 교차 검증 실행
                       {geminiQuota?.next_scheduled_at ? ` (다음 예약: ${geminiQuota.next_scheduled_at})` : ""}
                     </div>
                   </div>
@@ -4650,7 +4650,7 @@ export default function App() {
             </div>
 
             {/* ============================================================
-                요구사항: 뉴스를 기반으로 한 AI 판단 설명 (접을 수 있는 영역 & 한 글자씩 스트리밍 타이핑 & 4시간 주기 자동 분석)
+                요구사항: 뉴스를 기반으로 한 AI 판단 설명 (접을 수 있는 영역 & 한 글자씩 스트리밍 타이핑 & 30분 주기 자동 분석)
                ============================================================ */}
             <div className="news-ai-box">
               <div className="news-ai-header">
@@ -4688,11 +4688,11 @@ export default function App() {
                         }}
                         title={
                           geminiQuota?.next_scheduled_at
-                            ? `매일 0시, 4시, 8시, 12시, 16시, 20시 정각 자동 분석 (다음 자동 분석: ${geminiQuota.next_scheduled_at})`
-                            : "매일 0시, 4시, 8시, 12시, 16시, 20시 4시간 간격 자동 분석"
+                            ? `30분 단위 뉴스 감성 & 시장 영향 종합 자동 분석 (다음 자동 분석: ${geminiQuota.next_scheduled_at})`
+                            : "30분 주기 뉴스 감성 및 시장 영향 종합 자동 갱신 (매시 00분·30분)"
                         }
                       >
-                        ⏰ 0·4·8·12·16·20시 자동갱신
+                        ⏰ 30분 단위 자동갱신
                       </span>
                       {!isNewsAiExpanded && newsAiBriefing.latest && (
                         <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", marginLeft: "4px" }}>
@@ -4726,28 +4726,28 @@ export default function App() {
                       padding: "6px 10px",
                       borderRadius: "8px",
                       background:
-                        Number(geminiQuota?.remaining_calls ?? 14) <= 0
+                        Number(geminiQuota?.remaining_calls ?? 30) <= 0
                           ? "rgba(239, 68, 68, 0.18)"
-                          : Number(geminiQuota?.remaining_calls ?? 14) <= 3
+                          : Number(geminiQuota?.remaining_calls ?? 30) <= 3
                           ? "rgba(234, 179, 8, 0.18)"
                           : "rgba(16, 185, 129, 0.16)",
                       color:
-                        Number(geminiQuota?.remaining_calls ?? 14) <= 0
+                        Number(geminiQuota?.remaining_calls ?? 30) <= 0
                           ? "#f87171"
-                          : Number(geminiQuota?.remaining_calls ?? 14) <= 3
+                          : Number(geminiQuota?.remaining_calls ?? 30) <= 3
                           ? "#facc15"
                           : "#34d399",
                       border: `1px solid ${
-                        Number(geminiQuota?.remaining_calls ?? 14) <= 0
+                        Number(geminiQuota?.remaining_calls ?? 30) <= 0
                           ? "rgba(239, 68, 68, 0.4)"
-                          : Number(geminiQuota?.remaining_calls ?? 14) <= 3
+                          : Number(geminiQuota?.remaining_calls ?? 30) <= 3
                           ? "rgba(234, 179, 8, 0.4)"
                           : "rgba(16, 185, 129, 0.35)"
                       }`,
                     }}
-                    title={`일일 무료 한도 총 ${geminiQuota?.daily_total_limit ?? 20}건 중 4시간 간격 자동 분석 예약 ${geminiQuota?.auto_reserved_count ?? 6}건을 제외한 수동 호출 잔여 건수`}
+                    title={`일일 무료 한도 총 ${geminiQuota?.daily_total_limit ?? 50}건 중 자동 분석 예약(${geminiQuota?.auto_reserved_count ?? 6}건)을 제외한 수동 호출 잔여 건수`}
                   >
-                    무료 API 잔여: {geminiQuota?.remaining_calls ?? 14}/{geminiQuota?.manual_limit ?? 14}건 (자동예약{" "}
+                    무료 API 잔여: {geminiQuota?.remaining_calls ?? 30}/{geminiQuota?.manual_limit ?? 30}건 (자동예약{" "}
                     {geminiQuota?.auto_reserved_count ?? 6}건 제외)
                   </span>
 
@@ -4774,7 +4774,7 @@ export default function App() {
                         ? "AI 분석 스트리밍 중..."
                         : newsAiLoading
                         ? "AI 분석 준비 중..."
-                        : `AI 분석하기 (${geminiQuota?.remaining_calls ?? 14}건 남음)`}
+                        : `AI 분석하기 (${geminiQuota?.remaining_calls ?? 30}건 남음)`}
                     </span>
                   </button>
 
@@ -4792,7 +4792,7 @@ export default function App() {
               {/* 접을 수 있는 본문 영역 */}
               {isNewsAiExpanded && (
                 <div className="news-ai-body">
-                  {/* Gemini 무료 API 호출 잔여 건수 & 4시간 간격 자동 분석 스케줄 안내 바 */}
+                  {/* Gemini 무료 API 호출 잔여 건수 & 듀얼 AI(Flash 30분 / Pro 1시간) 자동 분석 스케줄 안내 바 */}
                   <div
                     style={{
                       display: "flex",
@@ -4813,11 +4813,11 @@ export default function App() {
                       📊{" "}
                       <strong style={{ color: "#38bdf8" }}>
                         {geminiQuotaNotice ||
-                          `금일 자동 분석 예약(${geminiQuota?.auto_reserved_count ?? 6}건) 제외 남은 무료 API 호출 건수: ${geminiQuota?.remaining_calls ?? 14}건 / ${geminiQuota?.manual_limit ?? 14}건`}
+                          `금일 자동 분석 예약(${geminiQuota?.auto_reserved_count ?? 6}건) 제외 남은 무료 API 호출 건수: ${geminiQuota?.remaining_calls ?? 30}건 / ${geminiQuota?.manual_limit ?? 30}건`}
                       </strong>
                     </div>
                     <div style={{ color: "#94a3b8", fontSize: "11.5px" }}>
-                      매일 0시 · 4시 · 8시 · 12시 · 16시 · 20시 자동 분석 실행
+                      매 30분 단위(매시 00분·30분) 실시간 뉴스 종합 감성 자동 분석 실행
                       {geminiQuota?.next_scheduled_at ? ` (다음 예약: ${geminiQuota.next_scheduled_at})` : ""}
                     </div>
                   </div>
