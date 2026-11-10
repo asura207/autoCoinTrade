@@ -104,19 +104,19 @@ PRO_SYSTEM_PROMPT = """당신은 암호화폐 거시경제 및 심층 퀀트 분
 
 # 모델 후보군 정의 (요구 명세 1.5-flash / 1.5-pro 우선 시도 후 최신/경량 모델 자동 폴백)
 FLASH_MODELS = [
-    "gemini-1.5-flash",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
-    "gemini-2.5-flash",
+    "gemini-3.8-flash",
     "gemini-flash-latest",
+    "gemini-1.5-flash",
 ]
 PRO_MODELS = [
-    "gemini-1.5-pro",
     "gemini-3.1-pro-preview",
     "gemini-pro-latest",
-    "gemini-2.5-pro",
     "gemini-3.5-flash",
-    "gemini-1.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-1.5-pro",
 ]
 
 

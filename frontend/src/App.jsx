@@ -27,6 +27,34 @@ function parseNumericInput(val) {
   return Number.isNaN(num) ? "" : Math.floor(num);
 }
 
+function formatDateTimeKST(val) {
+  if (!val) return "-";
+  try {
+    const raw = String(val).trim();
+    if (!raw.includes("Z") && !raw.includes("+") && raw.includes(" ") && raw.length >= 19) {
+      return raw.slice(0, 19);
+    }
+    const d = new Date(raw);
+    if (!isNaN(d.getTime())) {
+      const formatter = new Intl.DateTimeFormat("ko-KR", {
+        timeZone: "Asia/Seoul",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      });
+      const parts = formatter.formatToParts(d);
+      const map = {};
+      for (const p of parts) map[p.type] = p.value;
+      return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}:${map.second}`;
+    }
+  } catch {}
+  return String(val).replace("T", " ").slice(0, 19);
+}
+
 function computeAllocationPreview(rawTotalCapital, botsList, ratiosMap) {
   const flooredTotal = Math.max(0, Math.floor(Number(rawTotalCapital || 0)));
   const items = (botsList || []).map((b) => {
@@ -3273,7 +3301,7 @@ export default function App() {
                                     </strong>
                                   </div>
                                   <div style={{ fontSize: "11px", color: "#94a3b8", marginTop: "3px" }}>
-                                    최근 갱신: {rf.flash_updated_at ? String(rf.flash_updated_at).replace("T", " ").slice(0, 19) : "-"}
+                                    최근 갱신: {formatDateTimeKST(rf.flash_updated_at)}
                                   </div>
                                 </div>
 
@@ -3302,7 +3330,7 @@ export default function App() {
                                     </strong>
                                   </div>
                                   <div style={{ fontSize: "11px", color: "#94a3b8", marginTop: "3px" }}>
-                                    최근 갱신: {rf.pro_updated_at ? String(rf.pro_updated_at).replace("T", " ").slice(0, 19) : "-"}
+                                    최근 갱신: {formatDateTimeKST(rf.pro_updated_at)}
                                   </div>
                                 </div>
 

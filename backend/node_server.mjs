@@ -1182,6 +1182,122 @@ async function getLatestAiNewsBriefing() {
   };
 }
 
+async function updateMarketRegimeFilterFromAnalysis({
+  isPro = false,
+  btcPrice = 0,
+  btcDaily20Ma = 0,
+  btc4h60Ma = 0,
+  isHoldCash = false,
+  regimeReason = "",
+  analysisText = "",
+}) {
+  const db = getDb();
+  const now = nowKSTString();
+  try {
+    let curRow = await db.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get();
+    if (!curRow) {
+      await db.prepare("INSERT INTO market_regime_filter (id) VALUES (1) ON CONFLICT (id) DO NOTHING").run();
+      curRow = await db.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get();
+    }
+
+    const disparity = btcDaily20Ma > 0 ? ((btcPrice - btcDaily20Ma) / btcDaily20Ma) * 100 : 0;
+    let score = Math.max(-0.95, Math.min(0.95, Number((disparity / 10).toFixed(2))));
+    if (isHoldCash && score > -0.2) score = -0.25;
+
+    let action = isHoldCash ? "REDUCE_SIZE" : (score > 0.1 ? "NORMAL" : "REDUCE_SIZE");
+    if (isHoldCash && disparity < -5.0) action = "HALT_NEW_BUYS";
+
+    let flashScore = curRow ? Number(curRow.flash_sentiment_score || 0) : score;
+    let flashAction = curRow ? String(curRow.flash_recommended_action || "NORMAL") : action;
+    let flashUpdated = curRow ? curRow.flash_updated_at : now;
+
+    let proScore = curRow ? Number(curRow.pro_sentiment_score || 0) : score;
+    let proAction = curRow ? String(curRow.pro_recommended_action || "NORMAL") : action;
+    let proUpdated = curRow ? curRow.pro_updated_at : now;
+
+    if (isPro) {
+      proScore = score;
+      proAction = action;
+      proUpdated = now;
+    } else {
+      flashScore = score;
+      flashAction = action;
+      flashUpdated = now;
+    }
+
+    // 듀얼 AI 교차 검증 종합 판단 (보수적 리스크 우선 원칙)
+    let finalAlert = 0;
+    let finalMult = 1.0;
+    let finalAction = "NORMAL";
+    let synthMode = "DUAL_NORMAL_ALLOW";
+
+    if (isHoldCash || flashAction === "HALT_NEW_BUYS" || proAction === "HALT_NEW_BUYS") {
+      finalAlert = 1;
+      finalMult = isHoldCash ? 0.0 : 0.5;
+      finalAction = "HALT_NEW_BUYS";
+      synthMode = "PRO_RISK_PRIORITY (보수적 리스크 우선 원칙: 신규 매수 차단)";
+    } else if (flashAction === "REDUCE_SIZE" || proAction === "REDUCE_SIZE" || score < 0) {
+      finalAlert = 0;
+      finalMult = 0.5;
+      finalAction = "REDUCE_SIZE";
+      synthMode = "CONSERVATIVE_REDUCE (보수적 50% 비중 축소 운용)";
+    }
+
+    const botOverrides = {
+      bot_vb: finalMult >= 1.0 ? "ALLOW" : "BLOCK",
+      bot_momentum: finalMult >= 1.0 ? "ALLOW" : "BLOCK",
+      bot_bb: "ALLOW",
+    };
+
+    const synthReason = `[듀얼 AI 교차검증: ${synthMode}] Flash(30분): ${flashAction}(점수 ${flashScore.toFixed(2)}) | Pro(1시간): ${proAction}(점수 ${proScore.toFixed(2)}) => 최종 ${finalAction} (투자 비중 ${(finalMult * 100).toFixed(0)}%)`;
+
+    await db.prepare(`
+      UPDATE market_regime_filter
+      SET sentiment_score = ?,
+          market_regime = ?,
+          risk_alert = ?,
+          recommended_action = ?,
+          position_size_multiplier = ?,
+          bot_overrides_json = ?,
+          reason = ?,
+          updated_at = CURRENT_TIMESTAMP,
+          flash_sentiment_score = ?,
+          flash_recommended_action = ?,
+          flash_updated_at = ?,
+          pro_sentiment_score = ?,
+          pro_recommended_action = ?,
+          pro_updated_at = ?,
+          final_risk_alert = ?,
+          final_position_multiplier = ?,
+          final_bot_overrides_json = ?
+      WHERE id = 1
+    `).run(
+      score,
+      isHoldCash ? "BEAR" : (score > 0.1 ? "BULL" : "SIDEWAYS"),
+      finalAlert,
+      finalAction,
+      finalMult,
+      JSON.stringify(botOverrides),
+      synthReason,
+      flashScore,
+      flashAction,
+      flashUpdated,
+      proScore,
+      proAction,
+      proUpdated,
+      finalAlert,
+      finalMult,
+      JSON.stringify(botOverrides)
+    );
+
+    console.log(`[Dual AI Update] market_regime_filter updated: Flash=${flashAction}(${flashScore}) at ${flashUpdated}, Pro=${proAction}(${proScore}) at ${proUpdated}`);
+    return await db.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get();
+  } catch (err) {
+    console.error("[updateMarketRegimeFilterFromAnalysis] Error:", err.message);
+    return null;
+  }
+}
+
 async function generateAiMarketAnalysis(options = {}) {
   const triggerType = options?.triggerType === "AUTO" ? "AUTO" : "MANUAL";
   const slotKey = options?.slotKey || null;
@@ -1342,22 +1458,21 @@ ${b.open_positions
 이모지와 깔끔한 불릿포인트, 굵은 글씨를 활용하여 가독성을 극대화해주세요.`;
 
   // 6. Gemini API 호출 (최신 사용 가능 모델 자동 탐색 & 폴백)
-  const isProTarget = options?.modelType === "pro" || options?.preferredModel === "gemini-1.5-pro";
+  const isProTarget = options?.modelType === "pro" || String(options?.preferredModel || "").includes("pro");
   const candidateModels = isProTarget
     ? [
-        "gemini-1.5-pro",
-        "gemini-2.5-pro",
+        "gemini-3.1-pro-preview",
         "gemini-pro-latest",
-        "gemini-1.5-flash",
-        "gemini-2.5-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.8-flash",
       ]
     : [
-        "gemini-1.5-flash",
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-pro",
+        "gemini-3.5-flash",
         "gemini-3.5-flash-lite",
+        "gemini-3.8-flash",
         "gemini-flash-latest",
+        "gemini-flash-lite-latest",
       ];
 
   let chosenModel = candidateModels[0];
@@ -1458,10 +1573,22 @@ ${b.open_positions
   }
   const updatedQuota = await consumeGeminiQuota(triggerType);
 
+  // 듀얼 AI 필터 테이블(market_regime_filter) 원자적 갱신
+  const updatedRegime = await updateMarketRegimeFilterFromAnalysis({
+    isPro: isProTarget,
+    btcPrice,
+    btcDaily20Ma,
+    btc4h60Ma,
+    isHoldCash,
+    regimeReason,
+    analysisText,
+  });
+
   return {
     success: true,
     trigger_type: triggerType,
     quota: updatedQuota,
+    regime_filter: updatedRegime,
     briefing: {
       id: info.lastInsertRowid,
       provider: "gemini",
@@ -1643,12 +1770,11 @@ ${b.open_positions
 이모지와 깔끔한 불릿포인트, 굵은 글씨를 활용하여 가독성을 극대화해주세요.`;
 
   const candidateModels = [
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
+    "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
     "gemini-flash-latest",
+    "gemini-flash-lite-latest",
   ];
 
   let geminiResp = null;
@@ -1810,6 +1936,20 @@ ${b.open_positions
       nowStr
     );
 
+    // 듀얼 AI 필터 테이블(market_regime_filter) 원자적 갱신
+    let updatedRegime = null;
+    try {
+      updatedRegime = await updateMarketRegimeFilterFromAnalysis({
+        isPro: false,
+        btcPrice,
+        btcDaily20Ma,
+        btc4h60Ma,
+        isHoldCash,
+        regimeReason,
+        analysisText: fullText,
+      });
+    } catch {}
+
     res.write(
       `data: ${JSON.stringify({
         type: "done",
@@ -1819,7 +1959,7 @@ ${b.open_positions
         full_text: fullText,
         created_at: nowStr,
         trigger_type: "MANUAL",
-        regime_filter: regimeRow,
+        regime_filter: updatedRegime || regimeRow,
         quota: updatedQuota,
       })}\n\n`
     );
@@ -1938,11 +2078,11 @@ ${newsSummaryList}
 문장은 신뢰감 있고 가독성 높게, 적절한 불릿포인트와 이모지를 활용해주세요.`;
 
   const candidateModels = [
-    "gemini-1.5-flash",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
+    "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
     "gemini-flash-latest",
+    "gemini-flash-lite-latest",
   ];
 
   let chosenModel = candidateModels[0];
@@ -2189,11 +2329,11 @@ ${newsSummaryList}
 문장은 신뢰감 있고 가독성 높게, 적절한 불릿포인트와 이모지를 활용해주세요.`;
 
   const candidateModels = [
-    "gemini-1.5-flash",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
+    "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
     "gemini-flash-latest",
+    "gemini-flash-lite-latest",
   ];
 
   let geminiResp = null;
@@ -4716,7 +4856,7 @@ async function checkAndRunScheduledAiMarketAnalysis() {
     // 1. 30분 단위 Gemini Flash 시장 분석 & 봇 진단
     if (needFlashMarket) {
       console.log(`[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) Gemini Flash 자동 시장 분석을 시작합니다...`);
-      const marketResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: flashSlotKey, preferredModel: "gemini-1.5-flash" });
+      const marketResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: flashSlotKey, preferredModel: "gemini-3.5-flash" });
       if (marketResult.success) {
         lastScheduledMarketAiFailureMs = 0;
         console.log(`[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) 완료 (모델: ${marketResult.briefing?.model})`);
@@ -4747,7 +4887,7 @@ async function checkAndRunScheduledAiMarketAnalysis() {
     // 3. 1시간 정각 단위 Gemini Pro 심층 퀀트 분석
     if (needProInDepth) {
       console.log(`[AI Auto Pro Analysis] 1시간 정각 심층 슬롯(${proSlotKey}) Gemini Pro 심층 퀀트 분석을 시작합니다...`);
-      const proResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: proSlotKey, preferredModel: "gemini-1.5-pro", modelType: "pro" });
+      const proResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: proSlotKey, preferredModel: "gemini-3.1-pro-preview", modelType: "pro" });
       if (proResult.success) {
         lastScheduledProAiFailureMs = 0;
         const db = getDb();
