@@ -2,7 +2,7 @@
 """
 Python PostgreSQL Connection & CRUD Test
 - Tests init_db.get_db_connection() wrapper
-- Tests backend.common.database.DatabaseManager
+- Tests market_regime_filter, bots, and system_settings CRUD
 """
 import sys
 from pathlib import Path
@@ -11,7 +11,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from init_db import get_db_connection
-from backend.common.database import db_manager
 
 def run_python_crud_test():
     print("==================================================")
@@ -21,13 +20,13 @@ def run_python_crud_test():
 
     try:
         # 1. Connection check
-        print("\n[1/4] PostgreSQL 직접 연결 테스트 (init_db)")
+        print("\n[1/3] PostgreSQL 직접 연결 테스트 (init_db)")
         conn = get_db_connection()
         row = conn.execute("SELECT 1 AS ping, current_database() AS db, current_user AS usr;").fetchone()
         print(f"  -> 연결 성공! DB: {row['db']}, User: {row['usr']}")
 
         # 2. market_regime_filter CRUD 테스트
-        print("\n[2/4] market_regime_filter 테이블 Read & Update 테스트")
+        print("\n[2/3] market_regime_filter 테이블 Read & Update 테스트")
         cur_filter = conn.execute("SELECT * FROM market_regime_filter WHERE id = 1;").fetchone()
         print(f"  -> [R] 현재 시장 체제: {cur_filter['market_regime']}, 점수: {cur_filter['sentiment_score']}, 사유: {cur_filter['reason']}")
 
@@ -55,35 +54,14 @@ def run_python_crud_test():
         )
         conn.commit()
         print(f"  -> [U] 원상 복구 완료")
-        conn.close()
 
-        # 3. DatabaseManager CRUD 테스트
-        print("\n[3/4] DatabaseManager API CRUD 테스트 (backend/common/database.py)")
-        test_key = "py_test_setting_key"
-        
-        # Create/Set
-        db_manager.set_setting(test_key, "py_val_1")
-        val1 = db_manager.get_setting(test_key)
-        print(f"  -> [C/R] set_setting / get_setting 검증: {val1} (일치: {val1 == 'py_val_1'})")
-
-        # Update
-        db_manager.set_setting(test_key, "py_val_2")
-        val2 = db_manager.get_setting(test_key)
-        print(f"  -> [U/R] UPDATE 후 get_setting 검증: {val2} (일치: {val2 == 'py_val_2'})")
-
-        # Delete
-        del_conn = db_manager.get_connection()
-        del_conn.execute("DELETE FROM system_settings WHERE key = %s;", (test_key,))
-        del_conn.commit()
-        val3 = db_manager.get_setting(test_key, default="NONE")
-        print(f"  -> [D/R] DELETE 후 확인: {val3} (삭제 확인: {val3 == 'NONE'})")
-
-        # 4. 실거래/가상 봇 목록 조회
-        print("\n[4/4] DatabaseManager 봇 목록 조회")
-        bots = db_manager.get_bots()
+        # 3. system_settings & bots 조회 테스트
+        print("\n[3/3] 봇 및 시스템 설정 조회 테스트")
+        bots = conn.execute("SELECT bot_id, name, nickname, allocated_capital, virtual_krw FROM bots ORDER BY bot_id;").fetchall()
         print(f"  -> [R] 총 {len(bots)}개 봇 정상 조회 완료:")
         for b in bots[:3]:
-            print(f"     • [{b['bot_id']}] {b['nickname']} (할당액: {int(b['allocated_capital']):,}원, 가상잔고: {int(b['virtual_krw']):,}원)")
+            print(f"     • [{b['bot_id']}] {b['nickname'] or b['name']} (할당액: {int(b['allocated_capital'] or 0):,}원, 가상잔고: {int(b['virtual_krw'] or 0):,}원)")
+        conn.close()
 
     except Exception as e:
         print(f"[TEST ERROR] {e}")

@@ -5837,7 +5837,7 @@ export default function App() {
             {/* 요구사항 15: 봇 수정 및 각 봇별 별명(Nickname) 설정 */}
             <div className="card">
               <h3 style={{ fontSize: "16px", fontWeight: 700, marginBottom: "14px" }}>
-                2. 봇별 별명(Nickname) 및 전략 파라미터 수정 (agentBot 패키지 연동)
+                2. 봇별 별명(Nickname) 및 전략 파라미터 수정 (10대 알고리즘 엔진 연동)
               </h3>
               <div className="settings-grid">
                 {bots.map((b) => {
@@ -5886,7 +5886,7 @@ export default function App() {
                         {b.name}
                       </div>
                       <div style={{ fontSize: "12px", color: "#94a3b8", marginBottom: "12px" }}>
-                        패키지 모듈: <code>agentBot/{b.bot_id}.py</code>
+                        알고리즘 소스: <code>backend/common/algo_lab_service.mjs (STRATEGIES.{b.bot_id})</code>
                       </div>
 
                       <div className="form-row">
