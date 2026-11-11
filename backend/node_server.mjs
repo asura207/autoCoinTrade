@@ -2542,6 +2542,364 @@ async function resetPaperArenaAndNotify(db) {
   };
 }
 
+// ============================================================================
+// [실전 담당 봇(1~3개) 동적 투자금 배분 및 미매도 포지션 안전 승계 함수]
+// ============================================================================
+async function applyLiveBotsSelection(selected, handoverMap = [], forcedCapital = null) {
+  const db = getDb();
+  const allBots = await getBots("live");
+  const ids = (selected || []).map((it) => normalizeBotId(String(it?.bot_id || "")));
+  if (ids.length < 1 || ids.length > 3) {
+    throw new Error(`실제 거래 담당 봇은 최소 1개 ~ 최대 3개까지 선택할 수 있습니다. (현재 ${ids.length}개)`);
+  }
+  if (new Set(ids).size !== ids.length) {
+    throw new Error("중복 선택된 봇이 있습니다.");
+  }
+  const unknown = ids.filter((id) => !allBots.some((b) => b.bot_id === id));
+  if (unknown.length > 0) {
+    throw new Error(`존재하지 않는 봇입니다: ${unknown.join(", ")}`);
+  }
+  const ratios = selected.map((it) => Number(it?.allocation_ratio));
+  if (ratios.some((r) => !Number.isFinite(r) || r < 0 || r > 1)) {
+    throw new Error("봇별 투자 비율(allocation_ratio)은 0 ~ 1 사이 값이어야 합니다.");
+  }
+  const ratioSum = Number(ratios.reduce((a, b) => a + b, 0).toFixed(4));
+  if (Math.abs(ratioSum - 1.0) > 0.001) {
+    throw new Error(`선택된 봇들의 투자 비율 합계는 정확히 100%(1.0)여야 합니다. (현재 ${(ratioSum * 100).toFixed(2)}%)`);
+  }
+
+  // 요구사항 보존: 총 실전 운영 원금은 실제 Upbit 실계좌 잔고 90%를 자동 설정하고 10%는 버퍼로 남김
+  const accountInfo = await fetchUpbitAccountBalance();
+  let flooredTotal = 0;
+  if (accountInfo?.success) {
+    const rawAsset = Number(accountInfo.total_asset_krw ?? accountInfo.krw_total ?? accountInfo.krw_balance ?? 0);
+    flooredTotal = Math.floor(rawAsset * 0.9);
+  }
+  if (!(flooredTotal > 0)) {
+    flooredTotal = Math.floor(Number(forcedCapital || (await getSetting("total_capital", "0"))));
+  }
+  if (!(flooredTotal > 0)) {
+    throw new Error("업비트 실계좌 잔고를 확인할 수 없거나 잔고가 0원 이하입니다.");
+  }
+
+  const selectedIdSet = new Set(ids);
+  const currentLiveBots = allBots.filter((b) => Number(b.is_selected_for_live) === 1);
+  const removedBots = currentLiveBots.filter((b) => !selectedIdSet.has(b.bot_id));
+  const addedIds = ids.filter((id) => !currentLiveBots.some((b) => b.bot_id === id));
+
+  const handoverPairs = [];
+  const usedFrom = new Set();
+  const usedTo = new Set();
+  if (Array.isArray(handoverMap)) {
+    for (const m of handoverMap) {
+      const from = normalizeBotId(String(m?.from_bot_id || ""));
+      const to = normalizeBotId(String(m?.to_bot_id || ""));
+      const fromBot = removedBots.find((b) => b.bot_id === from);
+      if (fromBot && addedIds.includes(to) && !usedFrom.has(from) && !usedTo.has(to)) {
+        usedFrom.add(from);
+        usedTo.add(to);
+        handoverPairs.push({ from: fromBot, to });
+      }
+    }
+  }
+
+  // 자동 핸드오버 매칭 (명시되지 않은 경우 남은 해제 봇 -> 신규 투입 봇 또는 기존 유지 봇으로 1:1 매칭)
+  const pendingRemoved = removedBots.filter((b) => !usedFrom.has(b.bot_id));
+  const pendingAdded = addedIds.filter((id) => !usedTo.has(id));
+  pendingRemoved.forEach((b, i) => {
+    if (i < pendingAdded.length) {
+      usedFrom.add(b.bot_id);
+      usedTo.add(pendingAdded[i]);
+      handoverPairs.push({ from: b, to: pendingAdded[i] });
+    } else if (ids.length > 0) {
+      handoverPairs.push({ from: b, to: ids[0] });
+    }
+  });
+
+  const handedFromIds = new Set(handoverPairs.map((h) => h.from.bot_id));
+  for (const b of removedBots) {
+    if (!handedFromIds.has(b.bot_id) && Number(b.used_capital || 0) > 0) {
+      throw new Error(
+        `[${b.nickname || b.name}] 봇이 실전 미청산 포지션(${Math.floor(b.used_capital).toLocaleString("ko-KR")}원)을 보유 중이지만 승계할 신규 봇이 없습니다.`
+      );
+    }
+  }
+
+  const inheritedByTo = {};
+  for (const h of handoverPairs) inheritedByTo[h.to] = h.from;
+
+  const plan = selected.map((it, idx) => {
+    const bot = allBots.find((b) => b.bot_id === ids[idx]);
+    const allocated = Math.floor(flooredTotal * Number(it.allocation_ratio));
+    const inheritedUsed = inheritedByTo[bot.bot_id] ? Math.floor(Number(inheritedByTo[bot.bot_id].used_capital || 0)) : 0;
+    return {
+      bot,
+      ratio: Number(it.allocation_ratio),
+      allocated,
+      used: Math.floor(Number(bot.used_capital || 0)) + inheritedUsed,
+      inheritedFrom: inheritedByTo[bot.bot_id] || null,
+    };
+  });
+
+  const now = nowKSTString();
+  try {
+    await db.exec("BEGIN");
+    for (const h of handoverPairs) {
+      await db.prepare("UPDATE bot_positions SET bot_id = ? WHERE bot_id = ? AND status = 'OPEN'").run(h.to, h.from.bot_id);
+      await db.prepare("UPDATE trades SET bot_id = ? WHERE bot_id = ? AND status = 'HOLDING'").run(h.to, h.from.bot_id);
+    }
+    await db.prepare(`
+      UPDATE bots
+      SET is_selected_for_live = 0, is_running = 0, allocation_ratio = 0,
+          allocated_capital = 0, virtual_krw = 0, updated_at = ?
+      WHERE bot_id NOT IN (${ids.map(() => "?").join(",")})
+    `).run(now, ...ids);
+    for (const pl of plan) {
+      await db.prepare(`
+        UPDATE bots
+        SET is_selected_for_live = 1, is_running = 1, allocation_ratio = ?, allocated_capital = ?, virtual_krw = ?, updated_at = ?
+        WHERE bot_id = ?
+      `).run(Number((pl.ratio * 100).toFixed(2)), pl.allocated, Math.max(0, pl.allocated - pl.used), now, pl.bot.bot_id);
+    }
+    await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('total_capital', ?, ?)").run(String(flooredTotal), now);
+    await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('capital_configured', '1', ?)").run(now);
+    await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('zero_balance_halted', '0', ?)").run(now);
+    await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('zero_balance_reason', '', ?)").run(now);
+    await db.exec("COMMIT");
+  } catch (err) {
+    try {
+      await db.exec("ROLLBACK");
+    } catch {}
+    throw new Error(`실전 봇 설정 저장 실패: ${err.message}`);
+  }
+
+  const liveBots = await getBots("live");
+  return {
+    success: true,
+    total_capital: flooredTotal,
+    handover: handoverPairs.map((h) => ({ from_bot_id: h.from.bot_id, to_bot_id: h.to })),
+    selected_bots: plan.map((pl) => ({
+      bot_id: pl.bot.bot_id,
+      nickname: pl.bot.nickname,
+      allocation_ratio: pl.ratio,
+      allocated_capital: pl.allocated,
+      virtual_krw: Math.max(0, pl.allocated - pl.used),
+    })),
+    bots: liveBots,
+  };
+}
+
+// ============================================================================
+// [LLM 1주일 단위 실전 봇 1,2,3위 자동 평가 및 편성 엔진]
+// ============================================================================
+async function getLlmWeeklyBotSelectionStatus() {
+  const lastRun = await getSetting("llm_weekly_bot_selection_last_run", "");
+  const resultJson = await getSetting("llm_weekly_bot_selection_result", "null");
+  let parsedResult = null;
+  try {
+    parsedResult = JSON.parse(resultJson);
+  } catch {}
+
+  const nowMs = Date.now();
+  const lastRunMs = lastRun ? new Date(lastRun).getTime() : 0;
+  const ONE_WEEK_MS = 7 * 24 * 3600 * 1000;
+  const nextRunMs = lastRunMs > 0 ? lastRunMs + ONE_WEEK_MS : nowMs;
+  const daysRemaining = Math.max(0, Math.ceil((nextRunMs - nowMs) / (24 * 3600 * 1000)));
+
+  return {
+    success: true,
+    has_selection: !!parsedResult,
+    last_run: lastRun || null,
+    next_scheduled_run: lastRunMs > 0 ? new Date(nextRunMs).toISOString().replace("T", " ").slice(0, 19) : null,
+    days_remaining: daysRemaining,
+    selection: parsedResult || null,
+  };
+}
+
+let isWeeklyBotSelectionRunning = false;
+async function runLlmWeeklyBotSelection(force = false) {
+  if (isWeeklyBotSelectionRunning) {
+    return { success: false, message: "AI 주간 봇 평가가 이미 실행 중입니다." };
+  }
+  isWeeklyBotSelectionRunning = true;
+  try {
+    const db = getDb();
+    const nowMs = Date.now();
+    const nowStr = nowKSTString();
+
+    const lastRunStr = await getSetting("llm_weekly_bot_selection_last_run", "");
+    const lastRunMs = lastRunStr ? new Date(lastRunStr).getTime() : 0;
+    const ONE_WEEK_MS = 7 * 24 * 3600 * 1000;
+
+    if (!force && lastRunMs > 0 && nowMs - lastRunMs < ONE_WEEK_MS) {
+      const cachedResultStr = await getSetting("llm_weekly_bot_selection_result", "null");
+      try {
+        const cached = JSON.parse(cachedResultStr);
+        if (cached) return { success: true, cached: true, ...cached };
+      } catch {}
+    }
+
+    console.log(`[LLM Weekly Bot Selection] 1주일 주기 최적 실전 봇(1,2,3위) AI 정밀 평가를 시작합니다...`);
+
+    const arenaLeaderboard = await getArenaLeaderboard(db);
+    const regimeFilter = await checkMarketRegimeFilter();
+    const btcPrice = Number(regimeFilter.btcPrice || 0);
+    const btcDaily20Ma = Number(regimeFilter.ma20Day || 0);
+    const btc4h60Ma = Number(regimeFilter.ma60_4h || 0);
+    const isBearish = regimeFilter.allowBuy === false;
+
+    const botSummary = arenaLeaderboard
+      .map(
+        (b, idx) =>
+          `${idx + 1}. [${b.bot_id}] ${b.nickname} (${b.name}) | 전략: ${b.strategy_type}\n` +
+          `   - 모의투자 누적손익: ${Number(b.cumulative_profit_krw || 0).toLocaleString("ko-KR")}원 (${b.profit_rate_pct}%)\n` +
+          `   - 최대낙폭(MDD): ${b.mdd_pct}% | 승률: ${b.win_rate_pct}% (총 ${b.total_trades}전 ${b.win_trades}승 ${b.lose_trades}패)\n` +
+          `   - 전략 상세: ${b.description}`
+      )
+      .join("\n\n");
+
+    const prompt = `당신은 대한민국 최고 수준의 암호화폐 퀀트 헤지펀드 수석 AI 포트폴리오 매니저입니다.
+현재 코인 시장 체제(비트코인 20일 이평선, 변동성 등)와 지난 10대 알고리즘 봇의 실시간 모의투자(Arena) 성적표를 심층 분석하여,
+향후 1주일간 실전매매(Live Trading)를 전담할 가장 적합한 최적의 봇 1위, 2위, 3위를 엄정하게 선정하십시오.
+
+### [실시간 시장 체제 지표]
+- 비트코인(BTC) 현재가: ${btcPrice ? btcPrice.toLocaleString("ko-KR") + "원" : "데이터 수신 중"}
+- 일봉 20일 이동평균선(20 MA): ${btcDaily20Ma ? Math.floor(btcDaily20Ma).toLocaleString("ko-KR") + "원" : "-"}
+- 4시간봉 60선: ${btc4h60Ma ? Math.floor(btc4h60Ma).toLocaleString("ko-KR") + "원" : "-"}
+- 시장 상태: ${isBearish ? "하락/약세장 (비트코인이 일봉 20MA 밑에 위치, 휩쏘 주의 및 자산 보존 최우선)" : "상승/추세장"}
+
+### [10대 알고리즘 봇 Arena 모의투자 실시간 성적표]
+${botSummary}
+
+---
+
+### [필수 평가 및 배분 원칙]
+1. 하락장/횡보장(BTC 일봉 20MA 하회 시):
+   - 휩쏘 손실 위험이 큰 공격적 돌파봇(변동성 돌파, 볼린저 역추세 등)을 피하고,
+   - 손실 방어력이 입증된 봇(MDD가 낮고 승률이 높은 봇, 정배열 20일선 눌림목봇, 트레일링 스탑봇, 과매도 반등 스캘퍼 등)을 최우선으로 선정하십시오.
+2. 상승장(BTC 일봉 20MA 상회 시):
+   - 추세 추종 및 모멘텀 전략 봇을 적극 배치하십시오.
+3. 선정된 1위, 2위, 3위 봇의 투자 배분 비율(allocation_ratio)은 합계가 반드시 정확히 1.0 (예: 1위 0.34, 2위 0.33, 3위 0.33)이어야 합니다.
+4. 반드시 다른 부가 텍스트 없이 오직 유효한 순수 JSON 형식 하나만 출력하십시오 (마크다운 따옴표 포함 금지):
+{
+  "market_assessment": "현재 시장 상황과 거시 체제에 대한 2~3줄 요약 평가",
+  "portfolio_strategy": "선정된 3개 봇 조합의 자산 배분 운용 전략 설명",
+  "selected_bots": [
+    { "rank": 1, "bot_id": "bot_XX", "allocation_ratio": 0.34, "reason": "1위 선정 사유" },
+    { "rank": 2, "bot_id": "bot_YY", "allocation_ratio": 0.33, "reason": "2위 선정 사유" },
+    { "rank": 3, "bot_id": "bot_ZZ", "allocation_ratio": 0.33, "reason": "3위 선정 사유" }
+  ]
+}`;
+
+    let parsed = null;
+    const apiKey = await getGeminiApiKey();
+
+    if (apiKey) {
+      const candidateModels = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash"];
+      for (const model of candidateModels) {
+        try {
+          const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+          const resp = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+              generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
+            }),
+          });
+          if (resp.ok) {
+            const resJson = await resp.json();
+            let text = resJson.candidates?.[0]?.content?.parts?.[0]?.text || "";
+            text = text.replace(/```json/gi, "").replace(/```/g, "").trim();
+            const p = JSON.parse(text);
+            if (Array.isArray(p.selected_bots) && p.selected_bots.length === 3) {
+              parsed = p;
+              console.log(`[LLM Weekly Bot Selection] Gemini(${model}) 봇 평가 성공!`);
+              break;
+            }
+          }
+        } catch (err) {
+          console.warn(`[LLM Weekly Bot Selection] 모델 ${model} 호출 에러:`, err.message);
+        }
+      }
+    }
+
+    if (!parsed) {
+      console.warn(`[LLM Weekly Bot Selection] Gemini 호출 실패로 퀀트 룰베이스 알고리즘 폴백 적용`);
+      const sorted = [...arenaLeaderboard].sort((a, b) => {
+        if (isBearish) {
+          return (Number(a.mdd_pct) - Number(b.mdd_pct)) || (Number(b.profit_rate_pct) - Number(a.profit_rate_pct));
+        }
+        return (Number(b.profit_rate_pct) - Number(a.profit_rate_pct)) || (Number(a.mdd_pct) - Number(b.mdd_pct));
+      });
+
+      const top3 = sorted.slice(0, 3);
+      parsed = {
+        market_assessment: isBearish
+          ? "비트코인이 일봉 20일선 및 4시간 60선을 하회하는 약세장 국면으로, 최대 낙폭(MDD) 방어력이 입증된 봇을 최우선 배치합니다."
+          : "비트코인이 추세선 상단에 위치한 정상 국면으로, 수익률 및 모멘텀이 우수한 봇을 선별 배치합니다.",
+        portfolio_strategy: "자산 보존 및 리스크 최소화를 위한 상위 3대 봇 분할 자본 배분 전략",
+        selected_bots: [
+          { rank: 1, bot_id: top3[0].bot_id, allocation_ratio: 0.34, reason: `모의투자 검증상 손실 방어력 1위 (MDD ${top3[0].mdd_pct}%, 누적손익 ${top3[0].profit_rate_pct}%)` },
+          { rank: 2, bot_id: top3[1].bot_id, allocation_ratio: 0.33, reason: `트레이딩 안정성 2위 (MDD ${top3[1].mdd_pct}%, 누적손익 ${top3[1].profit_rate_pct}%)` },
+          { rank: 3, bot_id: top3[2].bot_id, allocation_ratio: 0.33, reason: `단기 과매도 반등 특화 3위 (MDD ${top3[2].mdd_pct}%, 누적손익 ${top3[2].profit_rate_pct}%)` },
+        ],
+      };
+    }
+
+    // 실전 봇 라인업 자동 적용 (계좌 유지 로직: 90% 원금 배분, 10% 안전 버퍼 엄격 보존)
+    const applyRes = await applyLiveBotsSelection(
+      parsed.selected_bots.map((b) => ({ bot_id: b.bot_id, allocation_ratio: b.allocation_ratio }))
+    );
+
+    const fullResult = {
+      evaluated_at: nowStr,
+      last_run: nowStr,
+      next_scheduled_run: new Date(nowMs + ONE_WEEK_MS).toISOString().replace("T", " ").slice(0, 19),
+      market_assessment: parsed.market_assessment,
+      portfolio_strategy: parsed.portfolio_strategy,
+      selected_bots: parsed.selected_bots.map((b) => {
+        const botInfo = arenaLeaderboard.find((a) => a.bot_id === b.bot_id);
+        return {
+          rank: b.rank,
+          bot_id: b.bot_id,
+          name: botInfo?.name || b.bot_id,
+          nickname: botInfo?.nickname || b.bot_id,
+          strategy_type: botInfo?.strategy_type || "",
+          allocation_ratio: b.allocation_ratio,
+          reason: b.reason,
+        };
+      }),
+      apply_result: applyRes,
+    };
+
+    await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('llm_weekly_bot_selection_last_run', ?, ?)").run(nowStr, nowStr);
+    await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('llm_weekly_bot_selection_result', ?, ?)").run(JSON.stringify(fullResult), nowStr);
+
+    console.log(`[LLM Weekly Bot Selection] 1주일 주기 최적 봇 자동 세팅 완료: ${fullResult.selected_bots.map((b) => `${b.rank}위 ${b.nickname}(${(b.allocation_ratio * 100).toFixed(0)}%)`).join(", ")}`);
+    return { success: true, ...fullResult };
+  } catch (err) {
+    console.error(`[LLM Weekly Bot Selection] 에러:`, err.message);
+    return { success: false, error: err.message };
+  } finally {
+    isWeeklyBotSelectionRunning = false;
+  }
+}
+
+async function checkAndRunScheduledLlmWeeklyBotSelection() {
+  try {
+    const lastRunStr = await getSetting("llm_weekly_bot_selection_last_run", "");
+    const lastRunMs = lastRunStr ? new Date(lastRunStr).getTime() : 0;
+    const ONE_WEEK_MS = 7 * 24 * 3600 * 1000;
+    if (!lastRunMs || Date.now() - lastRunMs >= ONE_WEEK_MS) {
+      console.log("[Weekly Bot Scheduler] 1주일 주기 도래로 AI 최적 봇 자동 선정을 실행합니다.");
+      await runLlmWeeklyBotSelection(false);
+    }
+  } catch (err) {
+    console.warn("[Weekly Bot Scheduler] 스케줄러 실행 오류:", err.message);
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(200, {
@@ -2666,6 +3024,17 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/ai/stream-news-analyze" && (req.method === "POST" || req.method === "GET")) {
       return generateAiNewsAnalysisStream(req, res);
+    }
+
+    // [AI 1주일 단위 실전 봇 1,2,3위 자동 평가 및 편성 API]
+    if (pathname === "/api/ai/weekly-bot-selection" && req.method === "GET") {
+      const data = await getLlmWeeklyBotSelectionStatus();
+      return sendJson(res, 200, data);
+    }
+
+    if (pathname === "/api/ai/weekly-bot-selection/run" && req.method === "POST") {
+      const result = await runLlmWeeklyBotSelection(true);
+      return sendJson(res, result.success ? 200 : 500, result);
     }
 
     if (pathname === "/api/push/vapid-public-key" && req.method === "GET") {
@@ -3258,184 +3627,21 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/settings/live-bots" && req.method === "PUT") {
       const body = await readJsonBody(req);
       const selected = Array.isArray(body.selected_bots) ? body.selected_bots : [];
-      if (selected.length < 1 || selected.length > 3) {
-        return sendJson(res, 400, {
-          success: false,
-          detail: `실제 거래 담당 봇은 최소 1개 ~ 최대 3개까지 선택할 수 있습니다. (현재 ${selected.length}개)`,
-        });
-      }
-      const ids = selected.map((it) => normalizeBotId(String(it?.bot_id || "")));
-      if (new Set(ids).size !== ids.length) {
-        return sendJson(res, 400, { success: false, detail: "중복 선택된 봇이 있습니다." });
-      }
-      const allBots = await getBots("live");
-      const unknown = ids.filter((id) => !allBots.some((b) => b.bot_id === id));
-      if (unknown.length > 0) {
-        return sendJson(res, 400, { success: false, detail: `존재하지 않는 봇입니다: ${unknown.join(", ")}` });
-      }
-      const ratios = selected.map((it) => Number(it?.allocation_ratio));
-      if (ratios.some((r) => !Number.isFinite(r) || r < 0 || r > 1)) {
-        return sendJson(res, 400, { success: false, detail: "봇별 투자 비율(allocation_ratio)은 0 ~ 1 사이 값이어야 합니다." });
-      }
-      const ratioSum = Number(ratios.reduce((a, b) => a + b, 0).toFixed(4));
-      if (Math.abs(ratioSum - 1.0) > 0.001) {
-        return sendJson(res, 400, {
-          success: false,
-          detail: `선택된 봇들의 투자 비율 합계는 정확히 100%(1.0)여야 합니다. (현재 ${(ratioSum * 100).toFixed(2)}%)`,
-        });
-      }
-      // 요구사항: 총 실전 운영 원금은 사용자가 입력하는 것이 아닌 실제 upbit 실계좌 잔고 90%를 자동 설정
-      const accountInfo = await fetchUpbitAccountBalance();
-      let flooredTotal = 0;
-      if (accountInfo?.success) {
-        const rawAsset = Number(accountInfo.total_asset_krw ?? accountInfo.krw_total ?? accountInfo.krw_balance ?? 0);
-        flooredTotal = Math.floor(rawAsset * 0.9);
-      }
-      if (!(flooredTotal > 0)) {
-        flooredTotal = Math.floor(Number(body.total_capital || (await getSetting("total_capital", "0"))));
-      }
-      if (!(flooredTotal > 0)) {
-        return sendJson(res, 400, {
-          success: false,
-          detail: "업비트 실계좌 잔고를 확인할 수 없거나 잔고가 0원 이하입니다.",
-        });
-      }
-
-      // [미매도 포지션 승계] 실전 봇 교체 시 해제되는 봇의 미매도(OPEN) 포지션/거래를 신규 투입 봇이 이어받는다.
-      //  - 유지되는 봇의 거래정보는 그대로 유지
-      //  - 해제 봇 ↔ 신규 봇은 handover_map(명시) 또는 순서대로 1:1 매칭
-      //  - 승계 대상이 없는 해제 봇(봇 수 축소)이 미청산 포지션을 가진 경우에는 기존처럼 차단
-      const selectedIdSet = new Set(ids);
-      const currentLiveBots = allBots.filter((b) => Number(b.is_selected_for_live) === 1);
-      const removedBots = currentLiveBots.filter((b) => !selectedIdSet.has(b.bot_id));
-      const addedIds = ids.filter((id) => !currentLiveBots.some((b) => b.bot_id === id));
-
-      const handoverPairs = []; // { from: botObj, to: botId }
-      const usedFrom = new Set();
-      const usedTo = new Set();
-      if (Array.isArray(body.handover_map)) {
-        for (const m of body.handover_map) {
-          const from = normalizeBotId(String(m?.from_bot_id || ""));
-          const to = normalizeBotId(String(m?.to_bot_id || ""));
-          const fromBot = removedBots.find((b) => b.bot_id === from);
-          if (!fromBot || !addedIds.includes(to) || usedFrom.has(from) || usedTo.has(to)) {
-            return sendJson(res, 400, {
-              success: false,
-              detail: `승계 매핑이 올바르지 않습니다. (${from} → ${to}) 해제되는 봇 → 신규 투입 봇 1:1 로만 지정할 수 있습니다.`,
-            });
-          }
-          usedFrom.add(from);
-          usedTo.add(to);
-          handoverPairs.push({ from: fromBot, to });
-        }
-      }
-      const pendingRemoved = removedBots.filter((b) => !usedFrom.has(b.bot_id));
-      const pendingAdded = addedIds.filter((id) => !usedTo.has(id));
-      pendingRemoved.forEach((b, i) => {
-        if (i < pendingAdded.length) handoverPairs.push({ from: b, to: pendingAdded[i] });
-      });
-
-      const handedFromIds = new Set(handoverPairs.map((h) => h.from.bot_id));
-      for (const b of removedBots) {
-        if (!handedFromIds.has(b.bot_id) && Number(b.used_capital || 0) > 0) {
-          return sendJson(res, 400, {
-            success: false,
-            detail: `[${b.nickname || b.name}] 봇이 실전 미청산 포지션(${Math.floor(b.used_capital).toLocaleString("ko-KR")}원)을 보유 중이지만 승계할 신규 봇이 없습니다. 교체 투입할 봇을 선택하거나 먼저 포지션을 청산해주세요.`,
-          });
-        }
-      }
-      const inheritedByTo = {};
-      for (const h of handoverPairs) inheritedByTo[h.to] = h.from;
-
-      const plan = selected.map((it, idx) => {
-        const bot = allBots.find((b) => b.bot_id === ids[idx]);
-        const allocated = Math.floor(flooredTotal * Number(it.allocation_ratio));
-        const inheritedUsed = inheritedByTo[bot.bot_id] ? Math.floor(Number(inheritedByTo[bot.bot_id].used_capital || 0)) : 0;
-        return {
-          bot,
-          ratio: Number(it.allocation_ratio),
-          allocated,
-          used: Math.floor(Number(bot.used_capital || 0)) + inheritedUsed,
-          inheritedFrom: inheritedByTo[bot.bot_id] || null,
-        };
-      });
-      const tooSmall = plan.find((pl) => pl.allocated < pl.used);
-      if (tooSmall) {
-        return sendJson(res, 400, {
-          success: false,
-          detail: `[${tooSmall.bot.nickname || tooSmall.bot.name}] 배정 투자금(${tooSmall.allocated.toLocaleString("ko-KR")}원)이 이미 사용된(승계 포지션 포함) 투자금(${tooSmall.used.toLocaleString("ko-KR")}원)보다 작습니다.`,
-        });
-      }
-
-      // 업비트 총 보유 자산 한도 검증 (조회 가능한 경우에 한함)
-      if (accountInfo?.success && accountInfo.total_asset_krw !== null && accountInfo.total_asset_krw !== undefined) {
-        const maxAssetLimit = Number(accountInfo.total_asset_krw);
-        if (flooredTotal > maxAssetLimit) {
-          return sendJson(res, 400, {
-            success: false,
-            detail: `설정하려는 총 실전 운용 원금(${flooredTotal.toLocaleString("ko-KR")}원)이 업비트 총 보유 자산(${maxAssetLimit.toLocaleString("ko-KR")}원)의 한도를 초과합니다.`,
-          });
-        }
-      }
-
-      const now = nowKSTString();
       try {
-        await db.exec("BEGIN");
-        // 해제되는 봇의 미매도 포지션/거래를 신규 투입 봇으로 승계 (체결 완료 이력은 기존 봇에 유지)
-        for (const h of handoverPairs) {
-          await db.prepare("UPDATE bot_positions SET bot_id = ? WHERE bot_id = ? AND status = 'OPEN'").run(h.to, h.from.bot_id);
-          await db.prepare("UPDATE trades SET bot_id = ? WHERE bot_id = ? AND status = 'HOLDING'").run(h.to, h.from.bot_id);
-        }
-        await db.prepare(`
-          UPDATE bots
-          SET is_selected_for_live = 0, is_running = 0, allocation_ratio = 0,
-              allocated_capital = 0, virtual_krw = 0, updated_at = ?
-          WHERE bot_id NOT IN (${ids.map(() => "?").join(",")})
-        `).run(now, ...ids);
-        for (const pl of plan) {
-          // 소수점 이하 버림(Math.floor) 배정 원금 및 가용 잔고(virtual_krw) 반영 (allocation_ratio 는 % 단위로 저장)
-          await db.prepare(`
-            UPDATE bots
-            SET is_selected_for_live = 1, allocation_ratio = ?, allocated_capital = ?, virtual_krw = ?, updated_at = ?
-            WHERE bot_id = ?
-          `).run(Number((pl.ratio * 100).toFixed(2)), pl.allocated, Math.max(0, pl.allocated - pl.used), now, pl.bot.bot_id);
-          // 승계 봇은 기존 봇의 가동 상태를 이어받아 승계 포지션의 익절/손절 감시가 끊기지 않게 한다
-          if (pl.inheritedFrom) {
-            await db.prepare("UPDATE bots SET is_running = ? WHERE bot_id = ?").run(Number(pl.inheritedFrom.is_running) === 1 ? 1 : 0, pl.bot.bot_id);
-          }
-        }
-        await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('total_capital', ?, ?)").run(String(flooredTotal), now);
-        await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('capital_configured', '1', ?)").run(now);
-        await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('zero_balance_halted', '0', ?)").run(now);
-        await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('zero_balance_reason', '', ?)").run(now);
-        await db.exec("COMMIT");
+        const result = await applyLiveBotsSelection(selected, body.handover_map, body.total_capital);
+        return sendJson(res, 200, {
+          success: true,
+          message:
+            `실제 거래 담당 봇 ${result.selected_bots.length}개와 투자금 배분(소수점 버림)이 저장되었습니다.` +
+            (result.handover.length > 0
+              ? "\n[미매도 포지션 승계] " +
+                result.handover.map((h) => `${h.from_bot_id} → ${h.to_bot_id}`).join(", ")
+              : ""),
+          ...result,
+        });
       } catch (err) {
-        try {
-          await db.exec("ROLLBACK");
-        } catch {}
-        return sendJson(res, 500, { success: false, detail: `실전 봇 설정 저장 실패: ${err.message}` });
+        return sendJson(res, 400, { success: false, detail: err.message });
       }
-
-      const liveBots = await getBots("live");
-      return sendJson(res, 200, {
-        success: true,
-        message:
-          `실제 거래 담당 봇 ${plan.length}개와 투자금 배분(소수점 버림)이 저장되었습니다.` +
-          (handoverPairs.length > 0
-            ? "\n[미매도 포지션 승계] " +
-              handoverPairs.map((h) => `${h.from.nickname || h.from.bot_id} → ${allBots.find((b) => b.bot_id === h.to)?.nickname || h.to}`).join(", ")
-            : ""),
-        handover: handoverPairs.map((h) => ({ from_bot_id: h.from.bot_id, to_bot_id: h.to })),
-        total_capital: flooredTotal,
-        selected_bots: plan.map((pl) => ({
-          bot_id: pl.bot.bot_id,
-          nickname: pl.bot.nickname,
-          allocation_ratio: pl.ratio,
-          allocated_capital: pl.allocated,
-          virtual_krw: Math.max(0, pl.allocated - pl.used),
-        })),
-        bots: liveBots,
-      });
     }
 
     if (pathname === "/api/settings/allocation" && req.method === "PUT") {
@@ -3864,16 +4070,19 @@ function computeRsi(closes, period = 7) {
 
 function getSafeOrderKrw(bot, ratio = 0.35) {
   const virtualKrw = Math.floor(Number(bot.virtual_krw || 0));
-  if (virtualKrw < 5000) return 0;
+  // [방어로직 1] 업비트 5,000원 최소 주문 금액 규정으로 인해 손절 시 5,000원 미만 매도 불가(데드락) 방지를 위해
+  // 최소 진입 주문 금액을 6,500원(안전마진 약 23%)으로 설정하여 -20% 손절 시에도 5,200원 > 5,000원 유지
+  const SAFE_MIN_ORDER_KRW = 6500;
+  if (virtualKrw < SAFE_MIN_ORDER_KRW) return 0;
   const cfgOrderKrw = Number(bot.config?.order_krw || 0);
   const rawRatio = Number(bot.config?.order_ratio ?? ratio ?? 0.35);
   const normRatio = Math.min(1.0, Math.max(0.05, rawRatio > 1 ? rawRatio / 100.0 : rawRatio));
   const baseCapital = Math.max(virtualKrw, Math.floor(Number(bot.allocated_capital || 0)));
-  const targetKrw = cfgOrderKrw >= 5000 ? cfgOrderKrw : Math.floor(baseCapital * normRatio);
+  const targetKrw = cfgOrderKrw >= SAFE_MIN_ORDER_KRW ? cfgOrderKrw : Math.floor(baseCapital * normRatio);
   const maxAffordable = Math.floor(virtualKrw / 1.0005);
   let safeKrw = Math.min(targetKrw, maxAffordable);
-  if (safeKrw < 5000) {
-    safeKrw = maxAffordable >= 5000 ? 5000 : 0;
+  if (safeKrw < SAFE_MIN_ORDER_KRW) {
+    safeKrw = maxAffordable >= SAFE_MIN_ORDER_KRW ? SAFE_MIN_ORDER_KRW : 0;
   }
   return safeKrw;
 }
@@ -4396,6 +4605,7 @@ async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel) {
   // 업비트 실계좌 보유 수량 조회 (소수점 8자리 미세 오차로 인한 insufficient_funds_ask 방지)
   const currency = String(currentPos.market || "").split("-")[1] || "";
   let sellVolumeStr = dbSumVolume.toFixed(8);
+  let actualCoinBalance = 0;
 
   try {
     await new Promise((r) => setTimeout(r, 120));
@@ -4411,7 +4621,7 @@ async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel) {
       const coinAcct = Array.isArray(accounts)
         ? accounts.find((a) => String(a.currency || "").toUpperCase() === currency.toUpperCase())
         : null;
-      const actualCoinBalance = Number(coinAcct?.balance || 0);
+      actualCoinBalance = Number(coinAcct?.balance || 0);
       if (actualCoinBalance > 0) {
         const otherBotsRow = await db
           .prepare(
@@ -4433,9 +4643,95 @@ async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel) {
     }
   } catch {}
 
+  // [방어로직 1] 업비트 실계좌에 코인이 이미 0(소액정리/수동매도 등)이면 DB 포지션을 즉시 CLOSED 처리하여 데드락 해제
+  if (actualCoinBalance <= 0.000001) {
+    console.log(`[Smart Cleanse] ${currentPos.market} 업비트 실계좌 보유 수량이 0이므로 포지션을 정상 청산(CLOSED) 동기화합니다.`);
+    const nowSync = nowKSTString();
+    for (const p of targetPositions) {
+      await db.prepare("UPDATE bot_positions SET status = 'CLOSED', closed_at = ? WHERE id = ? AND bot_id = ?").run(
+        nowSync,
+        p.id,
+        bot.bot_id
+      );
+      if (p.trade_id) {
+        await db.prepare(`
+          UPDATE trades
+          SET sell_order_uuid = 'manual-sync', sell_price = ?, sell_volume = ?, sell_amount = 0, sell_date = ?, profit_krw = ?, profit_pct = -100.0, status = 'COMPLETED'
+          WHERE id = ? AND bot_id = ?
+        `).run(sellPrice, p.volume, nowSync, -Number(p.buy_amount || 0), p.trade_id, bot.bot_id);
+      }
+    }
+    await syncDynamicLiveCapitalFromUpbit(true);
+    return true;
+  }
+
   let sellUuid = "";
   let actualTotalFunds = Math.floor(Number(sellVolumeStr) * Number(sellPrice));
   let actualTotalFee = Math.floor(actualTotalFunds * 0.0005);
+
+  // [방어로직 2] 평가금액이 업비트 최소주문금액(5,000원) 미만인 경우의 데드락 방어:
+  // 업비트 계좌에 가용 현금이 있으면 5,500원치 보충 시장가 매수 후 즉시 합산 전량 시장가 매도(Buy-to-Cleanse)를 실행하여 포지션 정상 청산
+  if (actualTotalFunds < 5000) {
+    console.warn(`[Smart Cleanse] ${currentPos.market} 평가액(${actualTotalFunds}원)이 업비트 최소주문(5,000원) 미만입니다. 청산용 보충 매수(Buy-to-Cleanse)를 시도합니다.`);
+    try {
+      const acctInfo = await fetchUpbitAccountBalance();
+      const orderableKrw = Number(acctInfo.orderable_krw || 0);
+      if (orderableKrw >= 6000) {
+        const topupKrw = 5500;
+        const buyParams = {
+          market: currentPos.market,
+          side: "bid",
+          price: String(topupKrw),
+          ord_type: "price",
+        };
+        const buyToken = createUpbitJwt(String(cfg.access_key).trim(), String(cfg.secret_key).trim(), buyParams);
+        const buyResp = await fetch("https://api.upbit.com/v1/orders", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${buyToken}`,
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          body: JSON.stringify(buyParams),
+        });
+
+        if (buyResp.status === 200 || buyResp.status === 201) {
+          console.log(`[Smart Cleanse] ${currentPos.market} ${topupKrw}원 보충 매수 성공. 600ms 대기 후 전량 시장가 매도 진행...`);
+          await new Promise((r) => setTimeout(r, 600));
+
+          // 갱신된 실계좌 잔고 재조회
+          const acctToken2 = createUpbitJwt(String(cfg.access_key).trim(), String(cfg.secret_key).trim());
+          const acctResp2 = await fetch("https://api.upbit.com/v1/accounts", {
+            headers: { Authorization: `Bearer ${acctToken2}`, Accept: "application/json" },
+          });
+          if (acctResp2.status === 200) {
+            const accs = await acctResp2.json();
+            const cAcc = accs.find((a) => String(a.currency || "").toUpperCase() === currency.toUpperCase());
+            const newBal = Number(cAcc?.balance || 0);
+            if (newBal > 0) {
+              sellVolumeStr = String(cAcc.balance);
+              actualTotalFunds = Math.floor(newBal * Number(sellPrice));
+              console.log(`[Smart Cleanse] 새 청산 수량: ${sellVolumeStr} (평가액: ${actualTotalFunds}원 >= 5,000원)`);
+            }
+          }
+        }
+      }
+    } catch (cleanseErr) {
+      console.warn(`[Smart Cleanse] 보충 청산 시도 중 오류:`, cleanseErr.message);
+    }
+  }
+
+  // 여전히 5,000원 미만이면 업비트 API가 거절하므로 에러 상태 기록 후 안전 종료
+  if (actualTotalFunds < 5000) {
+    const errMsg = `평가금액(${actualTotalFunds.toLocaleString("ko-KR")}원)이 업비트 최소주문(5,000원) 미만입니다. 업비트 앱의 '소액 코인 정리' 기능으로 정리하시면 봇이 자동 감지하여 청산 완료합니다.`;
+    console.warn(`[ExecuteSell] ${currentPos.market} 매도 보류: ${errMsg}`);
+    await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
+      `[청산 대기] ${errMsg}`,
+      nowKSTString(),
+      bot.bot_id
+    );
+    return false;
+  }
 
   try {
     await new Promise((r) => setTimeout(r, 120));
@@ -4926,11 +5222,13 @@ setTimeout(async () => {
   await runAlwaysOnPaperArenaCycle();
   await runLiveTradingBotsCycle();
   await checkAndRunScheduledAiMarketAnalysis();
+  await checkAndRunScheduledLlmWeeklyBotSelection();
 }, 1000);
 
 setInterval(runAlwaysOnPaperArenaCycle, 9000);
 setInterval(runLiveTradingBotsCycle, 10000);
 setInterval(checkAndRunScheduledAiMarketAnalysis, 10000);
+setInterval(checkAndRunScheduledLlmWeeklyBotSelection, 60000);
 
 // 30분 간격 암호화폐 뉴스 백그라운드 자동 수집
 setInterval(() => {

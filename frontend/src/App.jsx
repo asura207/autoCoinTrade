@@ -585,6 +585,17 @@ export default function App() {
   const isStreamDoneRef = useRef(false);
   const isAiBusyRef = useRef(false);
 
+  // 7-1) AI 주간 봇 자동 추천 & 편성 상태 (1주일 주기)
+  const [weeklyBotSelection, setWeeklyBotSelection] = useState({
+    has_selection: false,
+    last_run: null,
+    next_scheduled_run: null,
+    days_remaining: 7,
+    selection: null,
+  });
+  const [weeklyBotLoading, setWeeklyBotLoading] = useState(false);
+  const [isWeeklyBotExpanded, setIsWeeklyBotExpanded] = useState(true);
+
   // 8) 뉴스 피드 상태 (요구사항: 50건 페이지네이션, 날짜/키워드 검색)
   const [newsList, setNewsList] = useState([]);
   const [newsTotal, setNewsTotal] = useState(0);
@@ -1268,6 +1279,45 @@ export default function App() {
     }
   };
 
+  const fetchWeeklyBotSelection = async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/ai/weekly-bot-selection`);
+      if (resp.ok) {
+        const data = await resp.json();
+        setWeeklyBotSelection(data);
+      }
+    } catch (err) {
+      console.warn("Failed to fetch weekly bot selection:", err);
+    }
+  };
+
+  const triggerWeeklyBotSelection = async () => {
+    setWeeklyBotLoading(true);
+    try {
+      const resp = await fetch(`${API_BASE}/api/ai/weekly-bot-selection/run`, { method: "POST" });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        setWeeklyBotSelection(data);
+        await fetchOverviewAndBots(true);
+        showModal(
+          "AI 주간 봇 자동 편성 완료",
+          `1주일 주기 최적 봇이 실전 매매 담당으로 자동 세팅되었습니다.\n\n` +
+          `🥇 1위: ${data.selected_bots?.[0]?.nickname || ""} (${(Number(data.selected_bots?.[0]?.allocation_ratio || 0.34) * 100).toFixed(0)}%)\n` +
+          `🥈 2위: ${data.selected_bots?.[1]?.nickname || ""} (${(Number(data.selected_bots?.[1]?.allocation_ratio || 0.33) * 100).toFixed(0)}%)\n` +
+          `🥉 3위: ${data.selected_bots?.[2]?.nickname || ""} (${(Number(data.selected_bots?.[2]?.allocation_ratio || 0.33) * 100).toFixed(0)}%)\n\n` +
+          `전략: ${data.portfolio_strategy || "방어형 포트폴리오"}`,
+          "success"
+        );
+      } else {
+        showModal("AI 주간 봇 평가 실패", data.error || data.message || "평가 실행 중 오류가 발생했습니다.", "danger");
+      }
+    } catch (err) {
+      showModal("통신 오류", `AI 주간 봇 평가 실행 실패: ${err.message}`, "danger");
+    } finally {
+      setWeeklyBotLoading(false);
+    }
+  };
+
   const triggerAiAnalysis = async () => {
     if (geminiQuota && Number(geminiQuota.remaining_calls) <= 0) {
       showModal(
@@ -1777,6 +1827,7 @@ export default function App() {
     fetchStatsTrades(1);
     fetchAiBriefing();
     fetchNewsAiBriefing();
+    fetchWeeklyBotSelection();
     fetchTradeMode();
     fetchAlgoLabModels();
     fetchEntryCode();
@@ -2739,6 +2790,114 @@ export default function App() {
                   </span>
                 </div>
               </div>
+            </div>
+
+            {/* AI 주간 최적 봇 자동 편성 카드 (1주일 주기) */}
+            <div
+              className="card"
+              style={{
+                marginBottom: "18px",
+                background: "linear-gradient(135deg, rgba(30, 27, 75, 0.55) 0%, rgba(15, 23, 42, 0.85) 100%)",
+                border: "1px solid rgba(168, 85, 247, 0.35)",
+                boxShadow: "0 8px 24px -4px rgba(168, 85, 247, 0.12)",
+                borderRadius: "12px",
+                padding: "16px 20px",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: isWeeklyBotExpanded ? "14px" : "0" }}>
+                <div
+                  style={{ display: "flex", alignItems: "center", gap: "10px", cursor: "pointer" }}
+                  onClick={() => setIsWeeklyBotExpanded((prev) => !prev)}
+                >
+                  <span style={{ fontSize: "16px", fontWeight: 700, color: "#f8fafc" }}>
+                    🤖 AI 주간 봇 자동 추천 & 편성 (1주일 주기)
+                  </span>
+                  <span
+                    style={{
+                      fontSize: "11px",
+                      fontWeight: 700,
+                      padding: "2px 8px",
+                      borderRadius: "10px",
+                      background: "rgba(168, 85, 247, 0.2)",
+                      color: "#c084fc",
+                      border: "1px solid rgba(168, 85, 247, 0.4)",
+                    }}
+                  >
+                    {weeklyBotSelection?.days_remaining !== undefined ? `다음 평가까지 D-${weeklyBotSelection.days_remaining}일` : "1주일 주기 자동"}
+                  </span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <button
+                    className="btn btn-secondary"
+                    style={{ fontSize: "11.5px", padding: "4px 10px", borderColor: "rgba(168, 85, 247, 0.4)", color: "#c084fc" }}
+                    onClick={triggerWeeklyBotSelection}
+                    disabled={weeklyBotLoading}
+                  >
+                    {weeklyBotLoading ? "AI 평가 중..." : "⚡ 지금 AI 평가 실행"}
+                  </button>
+                  <button
+                    style={{ background: "transparent", border: "none", color: "#94a3b8", cursor: "pointer", fontSize: "16px" }}
+                    onClick={() => setIsWeeklyBotExpanded((prev) => !prev)}
+                  >
+                    {isWeeklyBotExpanded ? "▲" : "▼"}
+                  </button>
+                </div>
+              </div>
+
+              {isWeeklyBotExpanded && (
+                <div style={{ fontSize: "13px", color: "#e2e8f0" }}>
+                  {weeklyBotSelection?.selection?.market_assessment && (
+                    <div style={{ marginBottom: "12px", padding: "10px 14px", background: "rgba(15, 23, 42, 0.6)", borderRadius: "8px", border: "1px solid rgba(255, 255, 255, 0.08)" }}>
+                      <div style={{ fontSize: "11.5px", fontWeight: 700, color: "#94a3b8", marginBottom: "4px" }}>
+                        📊 AI 시장 체제 진단 & 포트폴리오 전략:
+                      </div>
+                      <div style={{ color: "#cbd5e1", lineHeight: 1.5 }}>
+                        {weeklyBotSelection.selection.market_assessment}
+                      </div>
+                      {weeklyBotSelection.selection.portfolio_strategy && (
+                        <div style={{ fontSize: "12px", color: "#a5b4fc", marginTop: "4px" }}>
+                          💡 운용 방향: {weeklyBotSelection.selection.portfolio_strategy}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* 1, 2, 3위 봇 리스트 */}
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: "10px" }}>
+                    {(weeklyBotSelection?.selection?.selected_bots || []).map((b) => (
+                      <div
+                        key={b.bot_id}
+                        style={{
+                          padding: "10px 14px",
+                          background: "rgba(15, 23, 42, 0.7)",
+                          borderRadius: "8px",
+                          border: `1px solid ${b.rank === 1 ? "rgba(251, 191, 36, 0.4)" : b.rank === 2 ? "rgba(148, 163, 184, 0.3)" : "rgba(180, 83, 9, 0.3)"}`,
+                        }}
+                      >
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
+                          <span style={{ fontSize: "13px", fontWeight: 800, color: b.rank === 1 ? "#fbbf24" : b.rank === 2 ? "#e2e8f0" : "#d97706" }}>
+                            {b.rank === 1 ? "🥇 1위" : b.rank === 2 ? "🥈 2위" : "🥉 3위"} {b.nickname}
+                          </span>
+                          <span style={{ fontSize: "11px", fontWeight: 700, padding: "2px 6px", borderRadius: "4px", background: "rgba(99, 102, 241, 0.2)", color: "#a5b4fc" }}>
+                            비중 {(Number(b.allocation_ratio) * 100).toFixed(0)}%
+                          </span>
+                        </div>
+                        <div style={{ fontSize: "11px", color: "#94a3b8", marginBottom: "4px" }}>
+                          전략: {b.strategy_type || b.name}
+                        </div>
+                        <div style={{ fontSize: "11.5px", color: "#cbd5e1", lineHeight: 1.4 }}>
+                          {b.reason}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: "11px", color: "#64748b", marginTop: "10px" }}>
+                    <span>최근 편성 일시: {formatDateTimeKST(weeklyBotSelection?.last_run)}</span>
+                    <span>차기 자동 갱신: {formatDateTimeKST(weeklyBotSelection?.next_scheduled_run)}</span>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* AI 실시간 시장 분석 및 봇 진단 카드 (Gemini 3.5 Flash) */}
