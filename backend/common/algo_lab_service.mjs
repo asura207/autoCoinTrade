@@ -1164,7 +1164,7 @@ async function computeBotArenaStats(db, bot) {
     cash_krw: cash,
     eval_assets_krw: evalAssets,
     cumulative_profit_krw: profitKrw,
-    profit_rate_pct: Number(((profitKrw / initial) * 100).toFixed(2)),
+    profit_rate_pct: initial > 0 ? Number(((profitKrw / initial) * 100).toFixed(2)) : 0.0,
     realized_profit_krw: realized,
     unrealized_profit_krw: openEval - openCost,
     win_trades: wins,

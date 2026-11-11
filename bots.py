@@ -36,6 +36,7 @@ logger = logging.getLogger("bots")
 
 UPBIT_FEE_RATE = 0.0005  # 업비트 원화 마켓 수수료 0.05%
 MIN_ORDER_KRW = 5000.0   # 업비트 최소 주문 금액 5,000원
+SAFE_MIN_ORDER_KRW = 6500.0  # -20% 손절 시에도 5,200원 유지 (업비트 5,000원 최소 매도 제한 데드락 방지)
 
 
 # =====================================================================
@@ -200,10 +201,11 @@ def can_enter_position(
         raw_available_buffered = available_krw * fee_buffer
         invest_krw = raw_available_buffered * multiplier
 
-        # 4. 최소 주문 금액(5,000원) 검증
-        if invest_krw < MIN_ORDER_KRW:
-            if raw_available_buffered >= MIN_ORDER_KRW and multiplier > 0:
-                # 가용액이 5000원 이상이면 최소 주문이 가능하도록 5,050원으로 보정
+        # 4. 최소 주문 금액 검증 (안전 버퍼 6,500원 적용, 가용 잔고 허용 시 보정)
+        if invest_krw < SAFE_MIN_ORDER_KRW:
+            if raw_available_buffered >= SAFE_MIN_ORDER_KRW and multiplier > 0:
+                invest_krw = min(raw_available_buffered, SAFE_MIN_ORDER_KRW)
+            elif raw_available_buffered >= MIN_ORDER_KRW and multiplier > 0:
                 invest_krw = min(raw_available_buffered, 5050.0)
             else:
                 return (

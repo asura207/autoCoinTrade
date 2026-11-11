@@ -4080,7 +4080,8 @@ async function fetchUpbitTickersMap(markets) {
   try {
     await new Promise((r) => setTimeout(r, 120));
     const resp = await fetch(
-      `https://api.upbit.com/v1/ticker?markets=${encodeURIComponent(markets.join(","))}`
+      `https://api.upbit.com/v1/ticker?markets=${encodeURIComponent(markets.join(","))}`,
+      { signal: AbortSignal.timeout(5000) }
     );
     if (resp.status === 200) {
       const data = await resp.json();
@@ -4098,7 +4099,8 @@ async function fetchUpbitCandlesSorted(market, unit = "days", count = 8) {
   try {
     await new Promise((r) => setTimeout(r, 120));
     const resp = await fetch(
-      `https://api.upbit.com/v1/candles/${unit}?market=${encodeURIComponent(market)}&count=${Math.max(count, 8)}`
+      `https://api.upbit.com/v1/candles/${unit}?market=${encodeURIComponent(market)}&count=${Math.max(count, 8)}`,
+      { signal: AbortSignal.timeout(5000) }
     );
     if (resp.status === 200) {
       const rows = await resp.json();
@@ -4158,6 +4160,8 @@ let cachedRegimeState = {
   ma20Day: 0,
   ma60_4h: 0,
   reason: "BTC 시장 체제 확인 중",
+  multiplier: 1.0,
+  botOverrides: {},
 };
 
 async function checkMarketRegimeFilter(tickerMap = null) {
@@ -4185,10 +4189,30 @@ async function checkMarketRegimeFilter(tickerMap = null) {
     const belowMa20Day = btcPrice < ma20Day;
     const belowMa60_4h = btcPrice < ma60_4h;
 
-    if (belowMa20Day || belowMa60_4h) {
+    // 듀얼 AI 필터(market_regime_filter) 교차 검증 상태 동시 확인
+    const db = getDb();
+    let regimeRow = null;
+    try {
+      regimeRow = await db.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get();
+    } catch {}
+
+    const dualAlert =
+      regimeRow &&
+      (Number(regimeRow.final_risk_alert) === 1 ||
+        String(regimeRow.recommended_action || "").toUpperCase() === "HALT_NEW_BUYS");
+    const multiplier = regimeRow
+      ? Math.max(0.0, Math.min(1.0, Number(regimeRow.final_position_multiplier ?? regimeRow.position_size_multiplier ?? 1.0)))
+      : 1.0;
+    let botOverrides = {};
+    try {
+      botOverrides = JSON.parse(regimeRow?.final_bot_overrides_json || regimeRow?.bot_overrides_json || "{}");
+    } catch {}
+
+    if (belowMa20Day || belowMa60_4h || dualAlert) {
       const reasons = [];
       if (belowMa20Day) reasons.push(`일봉20MA(${Math.floor(ma20Day).toLocaleString("ko-KR")}) 하회`);
       if (belowMa60_4h) reasons.push(`4시간60MA(${Math.floor(ma60_4h).toLocaleString("ko-KR")}) 하회`);
+      if (dualAlert) reasons.push(`듀얼 AI 리스크 차단(HALT_NEW_BUYS)`);
       cachedRegimeState = {
         checkedAtMs: nowMs,
         allowBuy: false,
@@ -4198,6 +4222,8 @@ async function checkMarketRegimeFilter(tickerMap = null) {
         reason: `[시장체제 필터: 현금보유(Hold Cash)] BTC 현재가(${Math.floor(btcPrice).toLocaleString(
           "ko-KR"
         )}원)가 ${reasons.join(" · ")} 중으로 신규 매수 중단`,
+        multiplier: 0.0,
+        botOverrides,
       };
       return cachedRegimeState;
     }
@@ -4211,6 +4237,8 @@ async function checkMarketRegimeFilter(tickerMap = null) {
       reason: `상승 체제 확인 (BTC ${Math.floor(btcPrice).toLocaleString("ko-KR")}원 >= 일봉20MA ${Math.floor(
         ma20Day
       ).toLocaleString("ko-KR")}원 & 4시간60MA ${Math.floor(ma60_4h).toLocaleString("ko-KR")}원)`,
+      multiplier,
+      botOverrides,
     };
     return cachedRegimeState;
   } catch {
@@ -5014,6 +5042,22 @@ async function runLiveTradingBotsCycle() {
         continue;
       }
 
+      // 듀얼 AI 필터 개별 봇 진입 차단 오버라이드 확인
+      const botOverrides = regimeInfo.botOverrides || {};
+      const isBotBlocked =
+        botOverrides[bot.bot_id] === "BLOCK" ||
+        (bot.bot_id === "bot_01" && botOverrides.bot_vb === "BLOCK") ||
+        (bot.bot_id === "bot_03" && botOverrides.bot_momentum === "BLOCK") ||
+        (bot.bot_id === "bot_05" && botOverrides.bot_bb === "BLOCK");
+      if (isBotBlocked) {
+        await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
+          `[듀얼 AI 봇 차단] 리스크 관리 필터에 의해 ${bot.nickname} 신규 매수 일시 차단`,
+          now,
+          bot.bot_id
+        );
+        continue;
+      }
+
       // 2) 신규 매수 시그널 탐색
       let candidates = allMarkets.filter((m) => {
         const tk = tickerMap.get(m);
@@ -5037,7 +5081,8 @@ async function runLiveTradingBotsCycle() {
         });
 
         if (sig.signal === "BUY") {
-          const orderKrw = getSafeOrderKrw(refreshedBot, Number(cfg.order_ratio || 0.3));
+          const appliedRatio = Number(cfg.order_ratio || 0.3) * (regimeInfo.multiplier ?? 1.0);
+          const orderKrw = getSafeOrderKrw(refreshedBot, appliedRatio);
           if (orderKrw >= 5000) {
             const ok = await executeBotBuyOrder(refreshedBot, mkt, orderKrw, md.price);
             if (ok) {

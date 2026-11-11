@@ -584,6 +584,7 @@ export default function App() {
   const typingTimerRef = useRef(null);
   const isStreamDoneRef = useRef(false);
   const isAiBusyRef = useRef(false);
+  const activeStreamAbortControllerRef = useRef(null);
 
   // 7-1) AI 주간 봇 자동 추천 & 편성 상태 (1주일 주기)
   const [weeklyBotSelection, setWeeklyBotSelection] = useState({
@@ -624,6 +625,7 @@ export default function App() {
   const newsTypingTimerRef = useRef(null);
   const isNewsStreamDoneRef = useRef(false);
   const isNewsAiBusyRef = useRef(false);
+  const activeNewsStreamAbortControllerRef = useRef(null);
 
   // 10) 웹푸시(Web Push) 알림 상태
   const [notificationPermission, setNotificationPermission] = useState(
@@ -684,6 +686,18 @@ export default function App() {
       if (typingTimerRef.current) clearInterval(typingTimerRef.current);
     };
   }, [isStreaming]);
+
+  // 컴포넌트 언마운트 시 활성 스트리밍 요청 정리
+  useEffect(() => {
+    return () => {
+      if (activeStreamAbortControllerRef.current) {
+        activeStreamAbortControllerRef.current.abort();
+      }
+      if (activeNewsStreamAbortControllerRef.current) {
+        activeNewsStreamAbortControllerRef.current.abort();
+      }
+    };
+  }, []);
 
   const showModal = (title, message, type = "info") => {
     setModalInfo({ open: true, title, message, type });
@@ -1337,9 +1351,16 @@ export default function App() {
     typewriterQueueRef.current = "";
     isStreamDoneRef.current = false;
 
+    if (activeStreamAbortControllerRef.current) {
+      activeStreamAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    activeStreamAbortControllerRef.current = controller;
+
     try {
       const resp = await fetch(`${API_BASE}/api/ai/stream-analyze`, {
         method: "POST",
+        signal: controller.signal,
       });
 
       if (!resp.ok) {
@@ -1608,7 +1629,7 @@ export default function App() {
         status: "red",
         label: "통신불가",
         latency_ms: 0,
-        reason: `백엔드 서버(Port 8000) 연결 불가: ${err.message}`,
+        reason: `백엔드 API 서버(Port 8001) 연결 불가: ${err.message}`,
         checked_at: new Date().toLocaleTimeString(),
       });
     }
@@ -1930,9 +1951,16 @@ export default function App() {
       registerAndSubscribePush(true);
     }
 
+    if (activeNewsStreamAbortControllerRef.current) {
+      activeNewsStreamAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    activeNewsStreamAbortControllerRef.current = controller;
+
     try {
       const resp = await fetch(`${API_BASE}/api/ai/stream-news-analyze`, {
         method: "POST",
+        signal: controller.signal,
       });
 
       if (!resp.ok) {

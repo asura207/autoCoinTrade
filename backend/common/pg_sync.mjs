@@ -98,10 +98,10 @@ export class PgSyncManager {
       try {
         await this.pool.query(`
           ALTER TABLE bots ADD COLUMN IF NOT EXISTS is_selected_for_live INT NOT NULL DEFAULT 0;
-          ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_initial_capital BIGINT NOT NULL DEFAULT 10000000;
-          ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_virtual_krw BIGINT NOT NULL DEFAULT 10000000;
+          ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_initial_capital BIGINT NOT NULL DEFAULT 1000000;
+          ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_virtual_krw BIGINT NOT NULL DEFAULT 1000000;
           ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_is_running INT NOT NULL DEFAULT 1;
-          ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_peak_equity BIGINT NOT NULL DEFAULT 10000000;
+          ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_peak_equity BIGINT NOT NULL DEFAULT 1000000;
           ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_mdd_pct NUMERIC(8,2) NOT NULL DEFAULT 0.0;
           ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_status_msg TEXT NOT NULL DEFAULT '시그널 대기 중';
           ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS buy_reason TEXT;
@@ -150,10 +150,10 @@ export class PgSyncManager {
             Number(b.take_profit_pct || 0), b.config_json || "{}",
             b.last_status_msg || "", b.updated_at,
             Number(b.is_selected_for_live || 0),
-            Math.floor(Number(b.paper_initial_capital || 10000000)),
-            Math.floor(Number(b.paper_virtual_krw || 10000000)),
+            Math.floor(Number(b.paper_initial_capital || 1000000)),
+            Math.floor(Number(b.paper_virtual_krw || 1000000)),
             Number(b.paper_is_running || 1),
-            Math.floor(Number(b.paper_peak_equity || 10000000)),
+            Math.floor(Number(b.paper_peak_equity || 1000000)),
             Number(b.paper_mdd_pct || 0),
             b.paper_status_msg || "시그널 대기 중"
           ]
@@ -416,7 +416,9 @@ export class PgSyncManager {
             sell_date TIMESTAMP,
             profit_krw BIGINT,
             profit_pct NUMERIC(8,2),
-            status VARCHAR(16) NOT NULL DEFAULT 'HOLDING'
+            status VARCHAR(16) NOT NULL DEFAULT 'HOLDING',
+            buy_reason TEXT,
+            sell_reason TEXT
           );
 
           CREATE TABLE IF NOT EXISTS paper_bot_positions (
@@ -442,8 +444,8 @@ export class PgSyncManager {
                id, bot_id, market, buy_order_uuid, sell_order_uuid,
                buy_price, buy_volume, buy_amount, buy_date,
                sell_price, sell_volume, sell_amount, sell_date,
-               profit_krw, profit_pct, status
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+               profit_krw, profit_pct, status, buy_reason, sell_reason
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
              ON CONFLICT (id) DO UPDATE SET
                sell_order_uuid = EXCLUDED.sell_order_uuid,
                sell_price = EXCLUDED.sell_price,
@@ -452,7 +454,9 @@ export class PgSyncManager {
                sell_date = EXCLUDED.sell_date,
                profit_krw = EXCLUDED.profit_krw,
                profit_pct = EXCLUDED.profit_pct,
-               status = EXCLUDED.status`,
+               status = EXCLUDED.status,
+               buy_reason = EXCLUDED.buy_reason,
+               sell_reason = EXCLUDED.sell_reason`,
             [
               t.id, t.bot_id, t.market, t.buy_order_uuid, t.sell_order_uuid ?? null,
               Number(t.buy_price), String(t.buy_volume), Math.floor(Number(t.buy_amount)), t.buy_date,
@@ -462,7 +466,9 @@ export class PgSyncManager {
               t.sell_date ?? null,
               t.profit_krw !== null && t.profit_krw !== undefined ? Math.floor(Number(t.profit_krw)) : null,
               t.profit_pct !== null && t.profit_pct !== undefined ? Number(t.profit_pct) : null,
-              t.status || "HOLDING"
+              t.status || "HOLDING",
+              t.buy_reason ?? null,
+              t.sell_reason ?? null
             ]
           );
         }
