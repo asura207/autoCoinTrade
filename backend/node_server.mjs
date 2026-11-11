@@ -2691,27 +2691,71 @@ async function applyLiveBotsSelection(selected, handoverMap = [], forcedCapital 
 
 // ============================================================================
 // [LLM 1주일 단위 실전 봇 1,2,3위 자동 평가 및 편성 엔진]
+// 기점: 매주 일요일 오전 09:00 (KST)
 // ============================================================================
+function getWeeklySundaySlotInfo(targetDate = new Date()) {
+  const d = new Date(targetDate);
+  const day = d.getDay(); // 0: Sun, 1: Mon, ..., 6: Sat
+  const hour = d.getHours();
+
+  // 매주 일요일 오전 9시(09:00:00)가 기점
+  // 오늘이 일요일(day === 0)인데 아직 9시 이전이면, 현재 슬롯은 '지난주 일요일 09:00'임
+  // 오늘이 월~토(day > 0)이면, 현재 슬롯은 '이번 주 지난 일요일 09:00'임
+  let daysSinceSundaySlot = day;
+  if (day === 0 && hour < 9) {
+    daysSinceSundaySlot = 7;
+  }
+
+  const lastSundaySlot = new Date(d);
+  lastSundaySlot.setDate(d.getDate() - daysSinceSundaySlot);
+  lastSundaySlot.setHours(9, 0, 0, 0);
+
+  // 차기 일요일 오전 9시 슬롯
+  const nextSundaySlot = new Date(lastSundaySlot);
+  nextSundaySlot.setDate(lastSundaySlot.getDate() + 7);
+
+  const pad = (n) => String(n).padStart(2, "0");
+  const fmt = (dt) =>
+    `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())} ${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+  const slotKey = `${lastSundaySlot.getFullYear()}-${pad(lastSundaySlot.getMonth() + 1)}-${pad(lastSundaySlot.getDate())}_09:00`;
+
+  const msRemaining = Math.max(0, nextSundaySlot.getTime() - d.getTime());
+  const daysRemaining = Math.max(0, Math.ceil(msRemaining / (24 * 3600 * 1000)));
+
+  return {
+    lastSundaySlot: fmt(lastSundaySlot),
+    nextSundaySlot: fmt(nextSundaySlot),
+    slotKey,
+    daysRemaining,
+    msRemaining,
+  };
+}
+
 async function getLlmWeeklyBotSelectionStatus() {
+  const slotInfo = getWeeklySundaySlotInfo();
+  const lastSlotKey = await getSetting("llm_weekly_bot_selection_last_slot", "");
   const lastRun = await getSetting("llm_weekly_bot_selection_last_run", "");
   const resultJson = await getSetting("llm_weekly_bot_selection_result", "null");
   let parsedResult = null;
   try {
     parsedResult = JSON.parse(resultJson);
+    if (parsedResult) {
+      parsedResult.schedule_rule = "매주 일요일 오전 09:00 KST";
+      parsedResult.next_scheduled_run = slotInfo.nextSundaySlot;
+      parsedResult.days_remaining = slotInfo.daysRemaining;
+      parsedResult.slot_key = lastSlotKey || slotInfo.slotKey;
+    }
   } catch {}
-
-  const nowMs = Date.now();
-  const lastRunMs = lastRun ? new Date(lastRun).getTime() : 0;
-  const ONE_WEEK_MS = 7 * 24 * 3600 * 1000;
-  const nextRunMs = lastRunMs > 0 ? lastRunMs + ONE_WEEK_MS : nowMs;
-  const daysRemaining = Math.max(0, Math.ceil((nextRunMs - nowMs) / (24 * 3600 * 1000)));
 
   return {
     success: true,
     has_selection: !!parsedResult,
+    schedule_rule: "매주 일요일 오전 09:00 KST",
+    current_slot: slotInfo.slotKey,
+    last_slot: lastSlotKey || slotInfo.slotKey,
     last_run: lastRun || null,
-    next_scheduled_run: lastRunMs > 0 ? new Date(nextRunMs).toISOString().replace("T", " ").slice(0, 19) : null,
-    days_remaining: daysRemaining,
+    next_scheduled_run: slotInfo.nextSundaySlot,
+    days_remaining: slotInfo.daysRemaining,
     selection: parsedResult || null,
   };
 }
@@ -2724,14 +2768,12 @@ async function runLlmWeeklyBotSelection(force = false) {
   isWeeklyBotSelectionRunning = true;
   try {
     const db = getDb();
-    const nowMs = Date.now();
     const nowStr = nowKSTString();
+    const slotInfo = getWeeklySundaySlotInfo();
 
-    const lastRunStr = await getSetting("llm_weekly_bot_selection_last_run", "");
-    const lastRunMs = lastRunStr ? new Date(lastRunStr).getTime() : 0;
-    const ONE_WEEK_MS = 7 * 24 * 3600 * 1000;
-
-    if (!force && lastRunMs > 0 && nowMs - lastRunMs < ONE_WEEK_MS) {
+    const lastSlotKey = await getSetting("llm_weekly_bot_selection_last_slot", "");
+    // force가 아니고 현재 슬롯(해당 주차 일요일 09:00)의 평가 결과가 이미 존재하면 캐시 반환
+    if (!force && lastSlotKey === slotInfo.slotKey) {
       const cachedResultStr = await getSetting("llm_weekly_bot_selection_result", "null");
       try {
         const cached = JSON.parse(cachedResultStr);
@@ -2739,7 +2781,7 @@ async function runLlmWeeklyBotSelection(force = false) {
       } catch {}
     }
 
-    console.log(`[LLM Weekly Bot Selection] 1주일 주기 최적 실전 봇(1,2,3위) AI 정밀 평가를 시작합니다...`);
+    console.log(`[LLM Weekly Bot Selection] 매주 일요일 09:00 기점 주간 봇 평가 시작 (슬롯: ${slotInfo.slotKey})...`);
 
     const arenaLeaderboard = await getArenaLeaderboard(db);
     const regimeFilter = await checkMarketRegimeFilter();
@@ -2760,7 +2802,7 @@ async function runLlmWeeklyBotSelection(force = false) {
 
     const prompt = `당신은 대한민국 최고 수준의 암호화폐 퀀트 헤지펀드 수석 AI 포트폴리오 매니저입니다.
 현재 코인 시장 체제(비트코인 20일 이평선, 변동성 등)와 지난 10대 알고리즘 봇의 실시간 모의투자(Arena) 성적표를 심층 분석하여,
-향후 1주일간 실전매매(Live Trading)를 전담할 가장 적합한 최적의 봇 1위, 2위, 3위를 엄정하게 선정하십시오.
+매주 일요일 오전 9시부터 1주일간 실전매매(Live Trading)를 전담할 가장 적합한 최적의 봇 1위, 2위, 3위를 엄정하게 선정하십시오.
 
 ### [실시간 시장 체제 지표]
 - 비트코인(BTC) 현재가: ${btcPrice ? btcPrice.toLocaleString("ko-KR") + "원" : "데이터 수신 중"}
@@ -2795,22 +2837,33 @@ ${botSummary}
     const apiKey = await getGeminiApiKey();
 
     if (apiKey) {
-      const candidateModels = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash"];
+      const candidateModels = ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"];
       for (const model of candidateModels) {
+        let timer = null;
         try {
           const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+          const controller = new AbortController();
+          timer = setTimeout(() => controller.abort(), 12000);
           const resp = await fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
+            signal: controller.signal,
             body: JSON.stringify({
               contents: [{ parts: [{ text: prompt }] }],
-              generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
+              generationConfig: {
+                temperature: 0.2,
+                maxOutputTokens: 4096,
+                responseMimeType: "application/json",
+              },
             }),
           });
+          clearTimeout(timer);
           if (resp.ok) {
             const resJson = await resp.json();
             let text = resJson.candidates?.[0]?.content?.parts?.[0]?.text || "";
             text = text.replace(/```json/gi, "").replace(/```/g, "").trim();
+            const jsonMatch = text.match(/\{[\s\S]*\}/);
+            if (jsonMatch) text = jsonMatch[0];
             const p = JSON.parse(text);
             if (Array.isArray(p.selected_bots) && p.selected_bots.length === 3) {
               parsed = p;
@@ -2819,6 +2872,7 @@ ${botSummary}
             }
           }
         } catch (err) {
+          if (timer) clearTimeout(timer);
           console.warn(`[LLM Weekly Bot Selection] 모델 ${model} 호출 에러:`, err.message);
         }
       }
@@ -2855,7 +2909,10 @@ ${botSummary}
     const fullResult = {
       evaluated_at: nowStr,
       last_run: nowStr,
-      next_scheduled_run: new Date(nowMs + ONE_WEEK_MS).toISOString().replace("T", " ").slice(0, 19),
+      slot_key: slotInfo.slotKey,
+      schedule_rule: "매주 일요일 오전 09:00 KST",
+      next_scheduled_run: slotInfo.nextSundaySlot,
+      days_remaining: slotInfo.daysRemaining,
       market_assessment: parsed.market_assessment,
       portfolio_strategy: parsed.portfolio_strategy,
       selected_bots: parsed.selected_bots.map((b) => {
@@ -2873,10 +2930,11 @@ ${botSummary}
       apply_result: applyRes,
     };
 
+    await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('llm_weekly_bot_selection_last_slot', ?, ?)").run(slotInfo.slotKey, nowStr);
     await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('llm_weekly_bot_selection_last_run', ?, ?)").run(nowStr, nowStr);
     await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('llm_weekly_bot_selection_result', ?, ?)").run(JSON.stringify(fullResult), nowStr);
 
-    console.log(`[LLM Weekly Bot Selection] 1주일 주기 최적 봇 자동 세팅 완료: ${fullResult.selected_bots.map((b) => `${b.rank}위 ${b.nickname}(${(b.allocation_ratio * 100).toFixed(0)}%)`).join(", ")}`);
+    console.log(`[LLM Weekly Bot Selection] 매주 일요일 09:00 기점 최적 봇 자동 세팅 완료 (슬롯: ${slotInfo.slotKey}): ${fullResult.selected_bots.map((b) => `${b.rank}위 ${b.nickname}(${(b.allocation_ratio * 100).toFixed(0)}%)`).join(", ")}`);
     return { success: true, ...fullResult };
   } catch (err) {
     console.error(`[LLM Weekly Bot Selection] 에러:`, err.message);
@@ -2887,12 +2945,13 @@ ${botSummary}
 }
 
 async function checkAndRunScheduledLlmWeeklyBotSelection() {
+  if (isWeeklyBotSelectionRunning) return;
   try {
-    const lastRunStr = await getSetting("llm_weekly_bot_selection_last_run", "");
-    const lastRunMs = lastRunStr ? new Date(lastRunStr).getTime() : 0;
-    const ONE_WEEK_MS = 7 * 24 * 3600 * 1000;
-    if (!lastRunMs || Date.now() - lastRunMs >= ONE_WEEK_MS) {
-      console.log("[Weekly Bot Scheduler] 1주일 주기 도래로 AI 최적 봇 자동 선정을 실행합니다.");
+    const slotInfo = getWeeklySundaySlotInfo();
+    const lastSlotKey = await getSetting("llm_weekly_bot_selection_last_slot", "");
+    // 현재 일요일 09:00 슬롯에 대한 자동 선정이 아직 실행되지 않았으면 실행
+    if (lastSlotKey !== slotInfo.slotKey) {
+      console.log(`[Weekly Bot Scheduler] 일요일 09:00 기점 주간 슬롯(${slotInfo.slotKey}) 도래로 AI 최적 봇 자동 선정을 실행합니다.`);
       await runLlmWeeklyBotSelection(false);
     }
   } catch (err) {

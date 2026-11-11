@@ -1301,7 +1301,7 @@ export default function App() {
         await fetchOverviewAndBots(true);
         showModal(
           "AI 주간 봇 자동 편성 완료",
-          `1주일 주기 최적 봇이 실전 매매 담당으로 자동 세팅되었습니다.\n\n` +
+          `매주 일요일 09:00 기점 최적 봇이 실전 매매 담당으로 자동 세팅되었습니다.\n\n` +
           `🥇 1위: ${data.selected_bots?.[0]?.nickname || ""} (${(Number(data.selected_bots?.[0]?.allocation_ratio || 0.34) * 100).toFixed(0)}%)\n` +
           `🥈 2위: ${data.selected_bots?.[1]?.nickname || ""} (${(Number(data.selected_bots?.[1]?.allocation_ratio || 0.33) * 100).toFixed(0)}%)\n` +
           `🥉 3위: ${data.selected_bots?.[2]?.nickname || ""} (${(Number(data.selected_bots?.[2]?.allocation_ratio || 0.33) * 100).toFixed(0)}%)\n\n` +
@@ -2810,7 +2810,7 @@ export default function App() {
                   onClick={() => setIsWeeklyBotExpanded((prev) => !prev)}
                 >
                   <span style={{ fontSize: "16px", fontWeight: 700, color: "#f8fafc" }}>
-                    🤖 AI 주간 봇 자동 추천 & 편성 (1주일 주기)
+                    🤖 AI 주간 봇 자동 추천 & 편성 (매주 일요일 09:00)
                   </span>
                   <span
                     style={{
@@ -2823,7 +2823,7 @@ export default function App() {
                       border: "1px solid rgba(168, 85, 247, 0.4)",
                     }}
                   >
-                    {weeklyBotSelection?.days_remaining !== undefined ? `다음 평가까지 D-${weeklyBotSelection.days_remaining}일` : "1주일 주기 자동"}
+                    {weeklyBotSelection?.days_remaining !== undefined ? `차기 갱신 D-${weeklyBotSelection.days_remaining}일` : "매주 일요일 09:00"}
                   </span>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
@@ -2894,7 +2894,7 @@ export default function App() {
 
                   <div style={{ display: "flex", justifyContent: "space-between", fontSize: "11px", color: "#64748b", marginTop: "10px" }}>
                     <span>최근 편성 일시: {formatDateTimeKST(weeklyBotSelection?.last_run)}</span>
-                    <span>차기 자동 갱신: {formatDateTimeKST(weeklyBotSelection?.next_scheduled_run)}</span>
+                    <span>차기 자동 갱신: {weeklyBotSelection?.next_scheduled_run ? `${formatDateTimeKST(weeklyBotSelection.next_scheduled_run)} (매주 일요일 09:00)` : "매주 일요일 09:00"}</span>
                   </div>
                 </div>
               )}
