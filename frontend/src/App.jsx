@@ -468,6 +468,190 @@ export default function App() {
   const [entryCodeInput, setEntryCodeInput] = useState("");
   const [gateError, setGateError] = useState("");
 
+  // 1-1) 초기 설정 마법사 (Setup Wizard) 상태
+  const [setupConfigured, setSetupConfigured] = useState(true);
+  const [setupChecking, setSetupChecking] = useState(true);
+  const [showSetupWizard, setShowSetupWizard] = useState(false);
+  const [wizardStep, setWizardStep] = useState(1);
+
+  // 마법사 폼 데이터
+  const [wizardForm, setWizardForm] = useState({
+    entryCode: "stock",
+    tradeMode: "paper",
+    initialCapital: 10000000,
+    dbType: "sqlite",
+    dbConfig: {
+      host: "127.0.0.1",
+      port: 5432,
+      database: "coin_trader",
+      user: "coin_trader",
+      password: "",
+    },
+    upbitAccessKey: "",
+    upbitSecretKey: "",
+    skipUpbit: false,
+    geminiApiKey: "",
+  });
+
+  const [dbTestState, setDbTestState] = useState({ loading: false, result: null, error: null });
+  const [keysTestState, setKeysTestState] = useState({ loading: false, result: null, error: null });
+  const [installState, setInstallState] = useState({
+    installing: false,
+    progress: 0,
+    currentStepIndex: 0,
+    error: null,
+  });
+
+  const fetchSetupStatus = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/setup/status`);
+      if (resp.ok) {
+        const data = await resp.json();
+        setSetupConfigured(data.is_configured);
+        if (data.is_configured) {
+          setShowSetupWizard(false);
+        }
+        if (data.current_env) {
+          setWizardForm((prev) => ({
+            ...prev,
+            tradeMode: data.current_env.trade_mode || "paper",
+            initialCapital: data.current_env.initial_capital || 10000000,
+            dbType: data.current_env.db_mode === "postgres_hybrid" ? "server" : "sqlite",
+            dbConfig: {
+              ...prev.dbConfig,
+              ...(data.current_env.db_config || {}),
+            },
+          }));
+        }
+      }
+    } catch (err) {
+      console.warn("Setup status fetch error:", err.message);
+    } finally {
+      setSetupChecking(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchSetupStatus();
+  }, [fetchSetupStatus]);
+
+  const handleTestDbConnection = async () => {
+    setDbTestState({ loading: true, result: null, error: null });
+    try {
+      const resp = await fetch(`${API_BASE}/api/setup/test-db`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(wizardForm.dbConfig),
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        setDbTestState({ loading: false, result: data.message, error: null });
+      } else {
+        setDbTestState({ loading: false, result: null, error: data.error || "DB 서버에 연결할 수 없습니다." });
+      }
+    } catch (err) {
+      setDbTestState({ loading: false, result: null, error: `네트워크 오류: ${err.message}` });
+    }
+  };
+
+  const handleTestApiKeys = async () => {
+    setKeysTestState({ loading: true, result: null, error: null });
+    try {
+      const resp = await fetch(`${API_BASE}/api/setup/test-keys`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          upbit_access_key: wizardForm.upbitAccessKey,
+          upbit_secret_key: wizardForm.upbitSecretKey,
+          gemini_api_key: wizardForm.geminiApiKey,
+          skip_upbit: wizardForm.skipUpbit,
+        }),
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        setKeysTestState({
+          loading: false,
+          result: `${data.upbit?.message || "업비트 검증 통과"} | ${data.gemini?.message || "Gemini 검증 통과"}`,
+          error: null,
+        });
+      } else {
+        const errors = [];
+        if (!data.upbit?.ok) errors.push(`[업비트] ${data.upbit?.error || "검증 실패"}`);
+        if (!data.gemini?.ok) errors.push(`[Gemini] ${data.gemini?.error || "검증 실패"}`);
+        setKeysTestState({
+          loading: false,
+          result: null,
+          error: errors.join(" / ") || "API 키 검증에 실패했습니다.",
+        });
+      }
+    } catch (err) {
+      setKeysTestState({ loading: false, result: null, error: `네트워크 오류: ${err.message}` });
+    }
+  };
+
+  const handleCompleteSetup = async () => {
+    setInstallState({ installing: true, progress: 15, currentStepIndex: 0, error: null });
+
+    try {
+      await new Promise((r) => setTimeout(r, 400));
+      setInstallState((prev) => ({ ...prev, progress: 35, currentStepIndex: 1 }));
+
+      const resp = await fetch(`${API_BASE}/api/setup/complete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          entry_code: wizardForm.entryCode,
+          trade_mode: wizardForm.tradeMode,
+          initial_capital: wizardForm.initialCapital,
+          db_type: wizardForm.dbType,
+          db_config: wizardForm.dbConfig,
+          upbit_access_key: wizardForm.upbitAccessKey,
+          upbit_secret_key: wizardForm.upbitSecretKey,
+          gemini_api_key: wizardForm.geminiApiKey,
+          skip_upbit: wizardForm.skipUpbit,
+        }),
+      });
+
+      setInstallState((prev) => ({ ...prev, progress: 65, currentStepIndex: 2 }));
+      await new Promise((r) => setTimeout(r, 400));
+      setInstallState((prev) => ({ ...prev, progress: 85, currentStepIndex: 3 }));
+
+      const data = await resp.json();
+      if (resp.ok && data.ok) {
+        setInstallState((prev) => ({ ...prev, progress: 100, currentStepIndex: 4 }));
+        await new Promise((r) => setTimeout(r, 500));
+
+        const today = new Date().toISOString().slice(0, 10);
+        sessionStorage.setItem("autoCoinTrade_auth", "true");
+        localStorage.setItem("autoCoinTrade_auth", "true");
+        sessionStorage.setItem("autoCoinTrade_auth_date", today);
+        localStorage.setItem("autoCoinTrade_auth_date", today);
+
+        setAuthenticated(true);
+        setSetupConfigured(true);
+        setShowSetupWizard(false);
+        setInstallState({ installing: false, progress: 0, currentStepIndex: 0, error: null });
+
+        fetchOverviewAndBots(true);
+        fetchUpbitStatus();
+        fetchTradeMode();
+        fetchEntryCode();
+      } else {
+        setInstallState((prev) => ({
+          ...prev,
+          installing: false,
+          error: data.message || "설치 진행 중 오류가 발생했습니다.",
+        }));
+      }
+    } catch (err) {
+      setInstallState((prev) => ({
+        ...prev,
+        installing: false,
+        error: `서버 통신 오류: ${err.message}`,
+      }));
+    }
+  };
+
   // 2) 좌측 메뉴 상태 (실제거래 현황 | 가상거래 경쟁 | 통계 | 뉴스 | 설정)
   const [activeMenu, setActiveMenu] = useState(() => {
     const saved =
@@ -2423,6 +2607,569 @@ export default function App() {
     () => bots.find((b) => b.bot_id === selectedBotId) || bots[0] || null,
     [bots, selectedBotId]
   );
+
+  // ------------------------------------------------------------------
+  // 초기 설정 마법사 화면 (Step-by-Step Onboarding Setup Wizard)
+  // ------------------------------------------------------------------
+  if (showSetupWizard) {
+    return (
+      <div className="wizard-wrapper">
+        <div className="wizard-card">
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "10px" }}>
+            <div>
+              <span className="wizard-top-badge">🚀 AUTO COIN TRADE ONBOARDING</span>
+              <h1 className="wizard-title">초기 환경 설정 마법사</h1>
+              <p className="wizard-desc">
+                비개발자도 클릭 몇 번으로 바로 구동할 수 있도록 시스템 환경과 데이터베이스를 자동으로 구성합니다.
+              </p>
+            </div>
+            {setupConfigured && (
+              <button
+                type="button"
+                onClick={() => setShowSetupWizard(false)}
+                className="btn btn-outline"
+                style={{ padding: "6px 14px", fontSize: "12.5px" }}
+              >
+                ✕ 대시보드로 돌아가기
+              </button>
+            )}
+          </div>
+
+          {/* Stepper Header */}
+          <div className="wizard-stepper">
+            {[
+              { num: 1, title: "기본 & 보안" },
+              { num: 2, title: "데이터베이스(DB)" },
+              { num: 3, title: "거래소 & AI 키" },
+              { num: 4, title: "설치 및 구동" },
+            ].map((step) => {
+              const isActive = wizardStep === step.num;
+              const isDone = wizardStep > step.num;
+              return (
+                <button
+                  key={step.num}
+                  type="button"
+                  className={`wizard-step-node ${isActive ? "active" : ""} ${isDone ? "completed" : ""}`}
+                  onClick={() => !installState.installing && setWizardStep(step.num)}
+                  disabled={installState.installing}
+                >
+                  <div className="wizard-step-circle">
+                    {isDone ? "✔" : step.num}
+                  </div>
+                  <span className="wizard-step-label">{step.title}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Step 1: 기본 및 보안 설정 */}
+          {wizardStep === 1 && (
+            <div>
+              <div className="wizard-form-group">
+                <label className="wizard-label">🔒 웹 대시보드 입장 코드 (비밀번호)</label>
+                <input
+                  type="text"
+                  className="wizard-input"
+                  value={wizardForm.entryCode}
+                  onChange={(e) => setWizardForm({ ...wizardForm, entryCode: e.target.value })}
+                  placeholder="기본값: stock"
+                />
+                <p className="wizard-hint">
+                  웹 화면에 접속할 때 요구되는 보안 입장 코드입니다. (기본값: <code>stock</code>)
+                </p>
+              </div>
+
+              <div className="wizard-form-group">
+                <label className="wizard-label">⚡ 시작 거래 모드 선택</label>
+                <div className="wizard-choice-grid" style={{ marginBottom: "10px" }}>
+                  <div
+                    className={`wizard-choice-card ${wizardForm.tradeMode === "paper" ? "selected" : ""}`}
+                    onClick={() => setWizardForm({ ...wizardForm, tradeMode: "paper" })}
+                  >
+                    <div className="wizard-choice-header">
+                      <div className="wizard-choice-title">
+                        <span>🟢 안전 가상거래(모의투자)</span>
+                      </div>
+                      <span className="wizard-choice-badge">권장</span>
+                    </div>
+                    <p className="wizard-choice-desc">
+                      실제 자금 소모 없이 실시간 호가/시세 기반 10대 알고리즘 봇 경쟁 및 전략을 안전하게 테스트합니다.
+                    </p>
+                  </div>
+
+                  <div
+                    className={`wizard-choice-card ${wizardForm.tradeMode === "live" ? "selected" : ""}`}
+                    onClick={() => setWizardForm({ ...wizardForm, tradeMode: "live" })}
+                  >
+                    <div className="wizard-choice-header">
+                      <div className="wizard-choice-title">
+                        <span>⚡ 업비트 실거래 모드</span>
+                      </div>
+                      <span className="wizard-choice-badge" style={{ background: "rgba(239, 68, 68, 0.2)", color: "#fca5a5", borderColor: "rgba(239, 68, 68, 0.4)" }}>
+                        실전
+                      </span>
+                    </div>
+                    <p className="wizard-choice-desc">
+                      실제 업비트 계좌의 원화 잔고와 연동하여 1~3개 선정 봇이 실제 매수/매도 주문을 집행합니다.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="wizard-form-group">
+                <label className="wizard-label">💰 초기 운용 시드 (KRW)</label>
+                <input
+                  type="number"
+                  className="wizard-input"
+                  value={wizardForm.initialCapital}
+                  step={100000}
+                  onChange={(e) => setWizardForm({ ...wizardForm, initialCapital: Math.max(100000, Number(e.target.value) || 0) })}
+                  placeholder="10000000"
+                />
+                <p className="wizard-hint">
+                  설정 금액: <strong>{Number(wizardForm.initialCapital).toLocaleString("ko-KR")}원</strong> (가상거래 기준 총 운영자본 또는 실전 운영기준치)
+                </p>
+              </div>
+
+              <div className="wizard-footer">
+                <div></div>
+                <button
+                  type="button"
+                  className="wizard-btn-next"
+                  onClick={() => setWizardStep(2)}
+                  disabled={!wizardForm.entryCode.trim()}
+                >
+                  다음 단계 (데이터베이스 설정) ➔
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Step 2: 데이터베이스(DB) 환경 선택 */}
+          {wizardStep === 2 && (
+            <div>
+              <div style={{ marginBottom: "18px" }}>
+                <h3 style={{ fontSize: "16px", fontWeight: 700, color: "#f8fafc", marginBottom: "6px" }}>
+                  데이터베이스(DB) 방식을 선택하세요
+                </h3>
+                <p style={{ fontSize: "13px", color: "#94a3b8" }}>
+                  별도의 데이터베이스 서버가 없어도 프로그램 자체 내장 초고속 파일 DB(SQLite WAL)로 모든 기능을 100% 동일하게 사용할 수 있습니다.
+                </p>
+              </div>
+
+              <div className="wizard-choice-grid">
+                <div
+                  className={`wizard-choice-card ${wizardForm.dbType === "sqlite" ? "selected" : ""}`}
+                  onClick={() => setWizardForm({ ...wizardForm, dbType: "sqlite" })}
+                >
+                  <div className="wizard-choice-header">
+                    <div className="wizard-choice-title">
+                      <span>📂 DB 없음 (내장 SQLite 자동 사용)</span>
+                    </div>
+                    <span className="wizard-choice-badge">일반 사용자 권장</span>
+                  </div>
+                  <p className="wizard-choice-desc">
+                    별도의 DB 서버 설치 없이 프로그램 내장 파일 DB(<code>data/auto_coin_trade.db</code>, SQLite WAL 고속 모드)를 자동으로 생성하고 단독으로 사용합니다. 에러나 복잡한 설정 없이 원클릭 구동이 가능합니다.
+                  </p>
+                </div>
+
+                <div
+                  className={`wizard-choice-card ${wizardForm.dbType === "server" ? "selected" : ""}`}
+                  onClick={() => setWizardForm({ ...wizardForm, dbType: "server" })}
+                >
+                  <div className="wizard-choice-header">
+                    <div className="wizard-choice-title">
+                      <span>🗄️ DB 서버 있음 (PostgreSQL 직접 연결)</span>
+                    </div>
+                    <span className="wizard-choice-badge" style={{ background: "rgba(59, 130, 246, 0.2)", color: "#93c5fd", borderColor: "rgba(59, 130, 246, 0.4)" }}>
+                      고급 사용자
+                    </span>
+                  </div>
+                  <p className="wizard-choice-desc">
+                    외부 또는 로컬에 구동 중인 PostgreSQL 서버에 접속하여 14개 필수 테이블을 자동 설치(`CREATE TABLE IF NOT EXISTS`)하고 실시간 동기화(`pg_sync.mjs`)를 가동합니다.
+                  </p>
+                </div>
+              </div>
+
+              {wizardForm.dbType === "server" && (
+                <div style={{ background: "#0e1526", border: "1px solid #23314f", borderRadius: "12px", padding: "20px", marginBottom: "20px" }}>
+                  <h4 style={{ fontSize: "14px", fontWeight: 700, color: "#93c5fd", marginBottom: "14px" }}>
+                    🔌 PostgreSQL 서버 접속 정보 입력
+                  </h4>
+                  <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: "12px", marginBottom: "12px" }}>
+                    <div>
+                      <label className="wizard-label">호스트 IP / 도메인</label>
+                      <input
+                        type="text"
+                        className="wizard-input"
+                        value={wizardForm.dbConfig.host}
+                        onChange={(e) => setWizardForm({
+                          ...wizardForm,
+                          dbConfig: { ...wizardForm.dbConfig, host: e.target.value }
+                        })}
+                        placeholder="127.0.0.1"
+                      />
+                    </div>
+                    <div>
+                      <label className="wizard-label">포트 (기본 5432)</label>
+                      <input
+                        type="number"
+                        className="wizard-input"
+                        value={wizardForm.dbConfig.port}
+                        onChange={(e) => setWizardForm({
+                          ...wizardForm,
+                          dbConfig: { ...wizardForm.dbConfig, port: Number(e.target.value) || 5432 }
+                        })}
+                        placeholder="5432"
+                      />
+                    </div>
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "12px", marginBottom: "14px" }}>
+                    <div>
+                      <label className="wizard-label">데이터베이스명</label>
+                      <input
+                        type="text"
+                        className="wizard-input"
+                        value={wizardForm.dbConfig.database}
+                        onChange={(e) => setWizardForm({
+                          ...wizardForm,
+                          dbConfig: { ...wizardForm.dbConfig, database: e.target.value }
+                        })}
+                        placeholder="coin_trader"
+                      />
+                    </div>
+                    <div>
+                      <label className="wizard-label">계정 ID</label>
+                      <input
+                        type="text"
+                        className="wizard-input"
+                        value={wizardForm.dbConfig.user}
+                        onChange={(e) => setWizardForm({
+                          ...wizardForm,
+                          dbConfig: { ...wizardForm.dbConfig, user: e.target.value }
+                        })}
+                        placeholder="coin_trader"
+                      />
+                    </div>
+                    <div>
+                      <label className="wizard-label">비밀번호</label>
+                      <input
+                        type="password"
+                        className="wizard-input"
+                        value={wizardForm.dbConfig.password}
+                        onChange={(e) => setWizardForm({
+                          ...wizardForm,
+                          dbConfig: { ...wizardForm.dbConfig, password: e.target.value }
+                        })}
+                        placeholder="비밀번호"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="wizard-test-box">
+                    <button
+                      type="button"
+                      className="wizard-btn-test"
+                      onClick={handleTestDbConnection}
+                      disabled={dbTestState.loading}
+                    >
+                      {dbTestState.loading ? "연결 확인 중..." : "🔌 DB 서버 연결 테스트"}
+                    </button>
+                    {dbTestState.result && (
+                      <span style={{ fontSize: "12.5px", color: "#34d399", fontWeight: 600 }}>
+                        ✔ {dbTestState.result}
+                      </span>
+                    )}
+                    {dbTestState.error && (
+                      <span style={{ fontSize: "12.5px", color: "#f87171", fontWeight: 600 }}>
+                        ✕ {dbTestState.error}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              <div className="wizard-footer">
+                <button
+                  type="button"
+                  className="wizard-btn-prev"
+                  onClick={() => setWizardStep(1)}
+                >
+                  ◀ 이전 단계
+                </button>
+                <button
+                  type="button"
+                  className="wizard-btn-next"
+                  onClick={() => setWizardStep(3)}
+                >
+                  다음 단계 (API 키 입력) ➔
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Step 3: 업비트 및 Gemini API 키 설정 */}
+          {wizardStep === 3 && (
+            <div>
+              <div style={{ marginBottom: "18px" }}>
+                <h3 style={{ fontSize: "16px", fontWeight: 700, color: "#f8fafc", marginBottom: "6px" }}>
+                  거래소 및 AI API 키 연동
+                </h3>
+                <p style={{ fontSize: "13px", color: "#94a3b8" }}>
+                  업비트 실거래 또는 안전 가상거래, 그리고 Gemini AI 시황/뉴스 분석을 위한 키를 입력합니다.
+                </p>
+              </div>
+
+              {/* Upbit Key Group */}
+              <div style={{ background: "#151d30", border: "1px solid #24304d", borderRadius: "12px", padding: "18px", marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px", flexWrap: "wrap", gap: "8px" }}>
+                  <label className="wizard-label" style={{ margin: 0 }}>
+                    🪙 업비트(Upbit) Open API 키
+                  </label>
+                  <label style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "12px", color: "#94a3b8", cursor: "pointer" }}>
+                    <input
+                      type="checkbox"
+                      checked={wizardForm.skipUpbit}
+                      onChange={(e) => setWizardForm({ ...wizardForm, skipUpbit: e.target.checked })}
+                    />
+                    <span>가상거래만 먼저 사용할 경우 나중에 입력하기 (건너뛰기)</span>
+                  </label>
+                </div>
+
+                {!wizardForm.skipUpbit ? (
+                  <>
+                    <div style={{ marginBottom: "10px" }}>
+                      <input
+                        type="text"
+                        className="wizard-input"
+                        value={wizardForm.upbitAccessKey}
+                        onChange={(e) => setWizardForm({ ...wizardForm, upbitAccessKey: e.target.value })}
+                        placeholder="Upbit Access Key 입력"
+                      />
+                    </div>
+                    <div>
+                      <input
+                        type="password"
+                        className="wizard-input"
+                        value={wizardForm.upbitSecretKey}
+                        onChange={(e) => setWizardForm({ ...wizardForm, upbitSecretKey: e.target.value })}
+                        placeholder="Upbit Secret Key 입력"
+                      />
+                    </div>
+                    <p className="wizard-hint">
+                      * 업비트 고객센터 ➔ Open API 관리에서 발급받은 키를 입력하세요. (자산조회, 주문 권한 필수)
+                    </p>
+                  </>
+                ) : (
+                  <p style={{ margin: 0, fontSize: "12.5px", color: "#60a5fa" }}>
+                    ℹ️ 업비트 키 입력을 건너뜁니다. 언제든 가상거래 모드로 10대 봇 경쟁을 즐길 수 있으며, 추후 [설정] 메뉴에서 실제 키를 등록할 수 있습니다.
+                  </p>
+                )}
+              </div>
+
+              {/* Gemini Key Group */}
+              <div style={{ background: "#151d30", border: "1px solid #24304d", borderRadius: "12px", padding: "18px", marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px", flexWrap: "wrap", gap: "8px" }}>
+                  <label className="wizard-label" style={{ margin: 0 }}>
+                    🤖 Google Gemini AI API 키 (선택/권장)
+                  </label>
+                  <a
+                    href="https://aistudio.google.com/app/apikey"
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{ fontSize: "12px", color: "#818cf8", textDecoration: "none", fontWeight: 600 }}
+                  >
+                    Google AI Studio에서 무료 발급 ➔
+                  </a>
+                </div>
+                <input
+                  type="password"
+                  className="wizard-input"
+                  value={wizardForm.geminiApiKey}
+                  onChange={(e) => setWizardForm({ ...wizardForm, geminiApiKey: e.target.value })}
+                  placeholder="AI Studio에서 발급받은 Gemini API Key 입력 (미입력 시 룰베이스 분석 동작)"
+                />
+                <p className="wizard-hint">
+                  30분 주기 Flash 시황·뉴스 분석 및 1시간 주기 Pro 심층 퀀트 교차검증에 사용됩니다. (무료 발급 가능)
+                </p>
+              </div>
+
+              {/* Test Action */}
+              <div className="wizard-test-box">
+                <button
+                  type="button"
+                  className="wizard-btn-test"
+                  onClick={handleTestApiKeys}
+                  disabled={keysTestState.loading || (wizardForm.skipUpbit && !wizardForm.geminiApiKey)}
+                >
+                  {keysTestState.loading ? "API 키 검증 중..." : "🔑 API 키 연동 테스트"}
+                </button>
+                {keysTestState.result && (
+                  <span style={{ fontSize: "12.5px", color: "#34d399", fontWeight: 600 }}>
+                    ✔ {keysTestState.result}
+                  </span>
+                )}
+                {keysTestState.error && (
+                  <span style={{ fontSize: "12.5px", color: "#f87171", fontWeight: 600 }}>
+                    ✕ {keysTestState.error}
+                  </span>
+                )}
+              </div>
+
+              <div className="wizard-footer">
+                <button
+                  type="button"
+                  className="wizard-btn-prev"
+                  onClick={() => setWizardStep(2)}
+                >
+                  ◀ 이전 단계
+                </button>
+                <button
+                  type="button"
+                  className="wizard-btn-next"
+                  onClick={() => setWizardStep(4)}
+                >
+                  다음 단계 (최종 확인 및 자동 설치) ➔
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Step 4: 요약 확인 및 원클릭 자동 설치 & 서비스 시작 */}
+          {wizardStep === 4 && (
+            <div>
+              <div style={{ marginBottom: "18px" }}>
+                <h3 style={{ fontSize: "16px", fontWeight: 700, color: "#f8fafc", marginBottom: "6px" }}>
+                  설정 내용 최종 확인 & 원클릭 자동 설치
+                </h3>
+                <p style={{ fontSize: "13px", color: "#94a3b8" }}>
+                  입력하신 구성을 확인하고 [설정 저장 및 프로그램 자동 설치·구동] 버튼을 누르면 모든 환경 구성이 완료됩니다.
+                </p>
+              </div>
+
+              {/* Summary Card */}
+              <div style={{ background: "#151d30", border: "1px solid #24304d", borderRadius: "12px", padding: "18px", marginBottom: "20px" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: "14px" }}>
+                  <div>
+                    <span style={{ fontSize: "11.5px", color: "#64748b", display: "block" }}>보안 입장 코드</span>
+                    <strong style={{ fontSize: "14px", color: "#f8fafc" }}>{wizardForm.entryCode}</strong>
+                  </div>
+                  <div>
+                    <span style={{ fontSize: "11.5px", color: "#64748b", display: "block" }}>시작 거래 모드</span>
+                    <strong style={{ fontSize: "14px", color: wizardForm.tradeMode === "paper" ? "#34d399" : "#f87171" }}>
+                      {wizardForm.tradeMode === "paper" ? "🟢 안전 가상거래(모의투자)" : "⚡ 업비트 실거래"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span style={{ fontSize: "11.5px", color: "#64748b", display: "block" }}>운용 원금(KRW)</span>
+                    <strong style={{ fontSize: "14px", color: "#f8fafc" }}>{Number(wizardForm.initialCapital).toLocaleString("ko-KR")}원</strong>
+                  </div>
+                  <div>
+                    <span style={{ fontSize: "11.5px", color: "#64748b", display: "block" }}>데이터베이스(DB) 모드</span>
+                    <strong style={{ fontSize: "14px", color: "#93c5fd" }}>
+                      {wizardForm.dbType === "sqlite" ? "📂 내장 SQLite 파일 DB (WAL 고속)" : `🗄️ PostgreSQL (${wizardForm.dbConfig.host}:${wizardForm.dbConfig.port})`}
+                    </strong>
+                  </div>
+                  <div>
+                    <span style={{ fontSize: "11.5px", color: "#64748b", display: "block" }}>업비트 거래소 연동</span>
+                    <strong style={{ fontSize: "14px", color: wizardForm.skipUpbit ? "#94a3b8" : "#34d399" }}>
+                      {wizardForm.skipUpbit ? "건너뜀 (가상거래 모드 전용)" : "등록됨 (API 키 연동)"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span style={{ fontSize: "11.5px", color: "#64748b", display: "block" }}>Gemini AI 분석</span>
+                    <strong style={{ fontSize: "14px", color: wizardForm.geminiApiKey ? "#818cf8" : "#94a3b8" }}>
+                      {wizardForm.geminiApiKey ? "등록됨 (듀얼 AI 엔진 가동)" : "미등록 (기본 룰 분석)"}
+                    </strong>
+                  </div>
+                </div>
+              </div>
+
+              {/* Installation Progress & Checklist */}
+              {installState.installing ? (
+                <div>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                    <span style={{ fontSize: "13.5px", fontWeight: 700, color: "#818cf8" }}>
+                      ⚙️ 시스템 자동 설치 및 백그라운드 엔진 기동 중...
+                    </span>
+                    <span style={{ fontSize: "13px", fontWeight: 700, color: "#cbd5e1" }}>
+                      {installState.progress}%
+                    </span>
+                  </div>
+                  <div className="wizard-progress-track">
+                    <div className="wizard-progress-bar" style={{ width: `${installState.progress}%` }}></div>
+                  </div>
+
+                  <div className="wizard-checklist">
+                    {[
+                      "설정 파일 생성 완료 (.env 및 config/upbit_config.json)",
+                      "데이터베이스 스키마 및 인덱스 자동 설치 완료",
+                      "10대 알고리즘 봇 계좌 및 전략 엔진 초기화 완료",
+                      "백그라운드 AI 브리핑 및 실시간 시세 워커 기동 완료",
+                      "웹 대시보드 화면 진입 준비 완료",
+                    ].map((stepText, idx) => {
+                      const isDone = installState.currentStepIndex > idx;
+                      const isCur = installState.currentStepIndex === idx;
+                      return (
+                        <div
+                          key={idx}
+                          className={`wizard-check-item ${isDone ? "done" : ""} ${isCur ? "active" : ""}`}
+                        >
+                          <span>{isDone ? "✔" : isCur ? "⏳" : "○"}</span>
+                          <span>{stepText}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {installState.error && (
+                    <div style={{ padding: "12px", background: "rgba(239, 68, 68, 0.15)", border: "1px solid #ef4444", borderRadius: "8px", color: "#fca5a5", fontSize: "13px", marginTop: "12px" }}>
+                      ✕ {installState.error}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div style={{ textAlign: "center", padding: "10px 0" }}>
+                  <button
+                    type="button"
+                    className="wizard-btn-next"
+                    style={{
+                      width: "100%",
+                      justifyContent: "center",
+                      padding: "16px 24px",
+                      fontSize: "16px",
+                      background: "linear-gradient(135deg, #4f46e5, #059669)",
+                      borderColor: "#34d399",
+                      boxShadow: "0 8px 24px rgba(16, 185, 129, 0.35)",
+                    }}
+                    onClick={handleCompleteSetup}
+                  >
+                    <span>🚀 설정 저장 및 프로그램 자동 설치·구동 시작</span>
+                  </button>
+                  <p style={{ fontSize: "12px", color: "#64748b", marginTop: "10px" }}>
+                    클릭 시 설정이 저장되고 DB가 즉시 초기화되며 백그라운드 엔진이 가동됩니다.
+                  </p>
+                </div>
+              )}
+
+              <div className="wizard-footer">
+                <button
+                  type="button"
+                  className="wizard-btn-prev"
+                  onClick={() => setWizardStep(3)}
+                  disabled={installState.installing}
+                >
+                  ◀ 이전 단계
+                </button>
+                <div></div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   // ------------------------------------------------------------------
   // 입장 코드 화면 (기본: stock)
@@ -5450,13 +6197,36 @@ export default function App() {
            ============================================================ */}
         {activeMenu === "settings" && (
           <div>
-            <div className="page-header">
+            <div className="page-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "12px" }}>
               <div>
                 <h2 className="page-title">설정</h2>
                 <p className="page-desc">
                   거래 실행 모드(가상거래/실거래), 봇별 자금 분배 비율, 봇 별명 및 전략 파라미터 수정, 데이터 마이그레이션을 관리합니다.
                 </p>
               </div>
+              <button
+                type="button"
+                className="btn btn-outline"
+                onClick={() => {
+                  setWizardStep(1);
+                  setShowSetupWizard(true);
+                }}
+                style={{
+                  padding: "9px 16px",
+                  fontSize: "13px",
+                  fontWeight: 700,
+                  background: "linear-gradient(135deg, rgba(99, 102, 241, 0.25), rgba(30, 41, 70, 0.5))",
+                  borderColor: "#6366f1",
+                  color: "#c7d2fe",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  borderRadius: "8px",
+                }}
+              >
+                <span>🛠️</span>
+                <span>초기 설정 마법사 다시 열기</span>
+              </button>
             </div>
 
             {/* 거래 실행 모드 설정 (가상거래 모의투자 ↔ 업비트 실거래) */}
@@ -6527,6 +7297,23 @@ export default function App() {
             </div>
           </div>
         )}
+        {/* 법적 면책 조항 (Legal Disclaimer Footer) */}
+        <footer
+          style={{
+            marginTop: "40px",
+            padding: "20px 16px",
+            borderTop: "1px solid rgba(255, 255, 255, 0.08)",
+            textAlign: "center",
+            color: "#64748b",
+            fontSize: "12px",
+            lineHeight: "1.6",
+          }}
+        >
+          <div style={{ maxWidth: "800px", margin: "0 auto" }}>
+            <span style={{ fontWeight: 600, color: "#94a3b8" }}>⚖️ 법적 면책 조항 (Disclaimer):</span><br />
+            본 프로그램은 오픈소스 소프트웨어 및 알고리즘 연구 목적의 도구일 뿐, 수익을 보장하거나 특정 종목의 매수를 권유하지 않습니다. 모든 실전 투자의 책임은 사용자 본인에게 있습니다.
+          </div>
+        </footer>
       </main>
 
       {/* 인앱 웹푸시 토스트 팝업 */}

@@ -6,6 +6,31 @@
 
 ---
 
+## ⚡ 비개발자(일반인)를 위한 원클릭 초간편 설치 (`/install` 독립 패키지)
+
+> **복잡한 개발 도구, 터미널 명령어, Git 구조를 전혀 몰라도 괜찮습니다!**  
+> 프로젝트 내 생성된 **`/install` 폴더 하나만 가져가면 Windows와 Linux 양쪽에서 더블클릭 한 번으로 설치부터 웹 대시보드 실행까지 자동 완료**됩니다.
+
+### 🌟 원클릭 실행 방법 (Windows / Linux)
+1. **Windows 사용자**:
+   - `install/AutoCoinTrade_Windows_Start.bat` 더블 클릭!
+   - 런타임 점검 ➔ 필수 패키지 자동 설치 ➔ 웹 브라우저(`http://localhost:9000`) 자동 실행.
+   - 종료 시: `install/AutoCoinTrade_Windows_Stop.bat` 더블 클릭.
+2. **Linux 사용자**:
+   - 터미널에서 `cd install && ./AutoCoinTrade_Linux_Start.sh` 실행.
+   - 종료 시: `./AutoCoinTrade_Linux_Stop.sh` 실행.
+
+### 🧙 최초 실행 시 Step-by-Step 설정 마법사 자동 실행
+브라우저가 열리면 화면 안내에 따라 4단계를 완료합니다:
+- **Step 1 (기본&보안)**: 입장 코드(기본: `stock`, 원하는 코드로 설정 가능), 시작 거래 모드(안전 가상거래 권장), 운용 시드 설정
+- **Step 2 (데이터베이스)**: **`[📂 DB 없음 (내장 SQLite 자동 사용 — 일반인 권장)]`** 클릭 (별도 DB 설치 필요 없음!)
+- **Step 3 (API 키 연동)**: 업비트 및 Gemini 키 입력 (가상거래만 이용할 경우 건너뛰기 가능)
+- **Step 4 (원클릭 자동 설치)**: `[🚀 설정 저장 및 프로그램 자동 설치·구동]` 클릭 ➔ 3초 후 메인 대시보드 자동 진입!
+
+👉 자세한 사전 준비 가이드(업비트 키 발급, 구글 Gemini 무료 키 발급 등)는 **[install/README.md](install/README.md)** 를 참조하세요.
+
+---
+
 ## 🚀 빠른 시작 (Quick Start for Developers & AI Agents)
 
 새로운 환경이나 다른 PC에서 프로젝트를 처음 실행할 때는 **[SETUP_GUIDE.md](SETUP_GUIDE.md)** 를 참조하세요.
@@ -246,3 +271,9 @@ autoCoinTrade/
 - **Exchange API**: Upbit Open API v1.0 (JWT SHA-512 비대칭 서명 인증, Rate Limit 방어)
 - **Network Tunnel**: Cloudflare Quick Tunnel (`cloudflared --no-autoupdate`)
 - **Deployment**: Linux Shell Scripts & Windows Batch / VBScript 무음 백그라운드 자동화
+
+---
+
+## ⚖️ 법적 면책 조항 (Legal Disclaimer)
+
+> **[필독]** 본 프로그램은 오픈소스 소프트웨어 및 알고리즘 연구 목적의 도구일 뿐, 수익을 보장하거나 특정 종목의 매수를 권유하지 않습니다. 모든 실전 투자의 책임은 사용자 본인에게 있습니다.

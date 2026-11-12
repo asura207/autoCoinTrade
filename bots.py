@@ -24,6 +24,7 @@ import requests
 from dotenv import load_dotenv
 
 from init_db import DEFAULT_DB_PATH, get_db_connection
+from market_hub import get_cached_current_price, get_cached_ohlcv, get_cached_tickers
 
 load_dotenv()
 
@@ -89,25 +90,17 @@ def retry_with_backoff(func, *args, max_retries: int = 3, **kwargs):
 
 def get_safe_current_price(ticker: str) -> float:
     """
-    현재가를 안전하게 조회합니다. pyupbit 실패 시 REST API로 폴백합니다.
+    현재가를 안전하게 조회합니다. 중앙 인메모리 캐시(market_hub)를 우선 활용하여 Rate Limit을 방어합니다.
     """
+    p = get_cached_current_price(ticker)
+    if p > 0:
+        return p
     try:
-        time.sleep(0.08)
-        p = pyupbit.get_current_price(ticker)
-        if p and float(p) > 0:
-            return float(p)
+        raw = pyupbit.get_current_price(ticker)
+        if raw and float(raw) > 0:
+            return float(raw)
     except Exception:
         pass
-
-    try:
-        resp = requests.get(f"https://api.upbit.com/v1/ticker?markets={ticker}", timeout=4.0)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data and "trade_price" in data[0]:
-                return float(data[0]["trade_price"])
-    except Exception as exc:
-        logger.error("Failed to fetch price for %s: %s", ticker, exc)
-
     return 0.0
 
 
@@ -120,23 +113,29 @@ def can_enter_position(
     ticker: str,
     available_krw: float,
     db_path: Optional[str] = None,
+    is_paper: bool = False,
 ) -> Tuple[bool, float, str]:
     """
     3개 봇이 매수 직전에 통과해야 하는 공통 리스크 체크 및 투입 금액 계산 게이트웨이:
-    1. market_regime_filter 상태 체크:
-       - risk_alert == 1
-       - recommended_action in ('HALT_NEW_BUYS', 'EMERGENCY_CLOSE_ALL')
-       - bot_overrides[bot_id] == 'BLOCK'
-       - ticker in blacklist_tickers
-       위 조건 중 하나라도 해당 시 (False, 0.0, "LLM Filter Blocked")
-    2. 기술적 대장주 필터 (하락장 방어):
-       - KRW-BTC 현재가가 일봉 20MA 아래면 신규 매수를 보수적으로 제한/차단
-    3. 투입 금액 산출:
-       - invest_krw = available_krw * position_size_multiplier * (1 - 0.0005)
-    4. 최소 주문 금액(5,000원) 검증:
-       - invest_krw < 5000 이더라도 가용액 원금이 5000원 이상이면 5,050원으로 보정
-       - 가용액 자체가 부족하면 Insufficient KRW 거부
+    - 가상거래(Arena/Paper) 모드: 100% 순수 알고리즘 시그널 작동을 위해 LLM 및 거시 하락장 필터 완전 우회(Bypass)
+    - 실전거래(Live) 모드: 듀얼 AI 및 BTC 20MA 거시 리스크 필터 엄격 적용
     """
+    # 0. 가상거래/시뮬레이션 모드일 경우 LLM 및 거시 리스크 필터 완전 우회 (Bypass)
+    if is_paper or is_dry_run():
+        fee_buffer = 1.0 - UPBIT_FEE_RATE
+        raw_available_buffered = available_krw * fee_buffer
+        invest_krw = raw_available_buffered
+        if invest_krw < SAFE_MIN_ORDER_KRW:
+            if raw_available_buffered >= MIN_ORDER_KRW:
+                invest_krw = min(raw_available_buffered, 5050.0)
+            else:
+                return (
+                    False,
+                    0.0,
+                    f"Insufficient KRW (<5000): Available={available_krw:,.0f}원",
+                )
+        return True, float(math.floor(invest_krw)), "PAPER_BYPASS_OK"
+
     conn = get_db_connection(db_path)
     try:
         # 1. LLM 필터 테이블 조회
@@ -228,6 +227,82 @@ def can_enter_position(
 # 3. Step 3: 슬리피지 방어형 주문 래퍼 함수 (매수 / 분할 매도)
 # =====================================================================
 
+def execute_limit_order_with_polling(
+    upbit: pyupbit.Upbit,
+    side: str,  # "bid" or "ask"
+    ticker: str,
+    price: float,
+    volume: float,
+    timeout_sec: int = 40,
+) -> Optional[Dict[str, Any]]:
+    """
+    시장가 슬리피지 방어를 위한 최유리 지정가 주문 및 최대 40초 폴링 래퍼.
+    미체결 시 주문 취소(cancel_order) 및 체결 수량/수수료 확인.
+    """
+    vol_rounded = round(float(volume), 8)
+    price_val = float(price)
+    try:
+        if side == "bid":
+            res = retry_with_backoff(upbit.buy_limit_order, ticker, price_val, vol_rounded)
+        else:
+            res = retry_with_backoff(upbit.sell_limit_order, ticker, price_val, vol_rounded)
+        if not res or "uuid" not in res:
+            logger.warning("[%s %s] Limit order placement failed or returned no uuid: %s", side, ticker, res)
+            return None
+        order_uuid = res["uuid"]
+    except Exception as exc:
+        logger.warning("[%s %s] Limit order error: %s", side, ticker, exc)
+        return None
+
+    poll_start = time.time()
+    filled_vol = 0.0
+    exec_price = price_val
+    paid_fee = 0.0
+    is_done = False
+
+    while time.time() - poll_start < timeout_sec:
+        time.sleep(3.0)
+        detail = retry_with_backoff(upbit.get_order, order_uuid)
+        if not detail:
+            continue
+        state = detail.get("state", "")
+        filled_vol = float(detail.get("executed_volume", 0.0) or 0.0)
+        if state in ("done", "cancel"):
+            is_done = True
+            trades = detail.get("trades", [])
+            total_funds = sum(float(t.get("funds", 0.0)) for t in trades)
+            if total_funds > 0 and filled_vol > 0:
+                exec_price = total_funds / filled_vol
+            paid_fee = float(detail.get("paid_fee", 0.0) or 0.0)
+            break
+
+    # 미체결 잔여분 취소 (cancel_order)
+    if not is_done:
+        try:
+            logger.info("Limit order %s timeout (%ds); canceling remainder...", order_uuid, timeout_sec)
+            retry_with_backoff(upbit.cancel_order, order_uuid)
+            time.sleep(1.0)
+            detail = retry_with_backoff(upbit.get_order, order_uuid)
+            if detail:
+                filled_vol = float(detail.get("executed_volume", 0.0) or 0.0)
+                trades = detail.get("trades", [])
+                total_funds = sum(float(t.get("funds", 0.0)) for t in trades)
+                if total_funds > 0 and filled_vol > 0:
+                    exec_price = total_funds / filled_vol
+                paid_fee = float(detail.get("paid_fee", 0.0) or 0.0)
+        except Exception as c_exc:
+            logger.warning("Order cancel exception: %s", c_exc)
+
+    if filled_vol > 0:
+        return {
+            "uuid": order_uuid,
+            "executed_price": exec_price,
+            "executed_volume": filled_vol,
+            "paid_fee": paid_fee,
+        }
+    return None
+
+
 def execute_buy_order(
     bot_id: str,
     ticker: str,
@@ -238,7 +313,7 @@ def execute_buy_order(
     """
     매수 주문 실행 및 SQLite 가상 원장(bot_positions, bot_accounts) 원자적 업데이트:
     - DRY_RUN 모드: 실시간 시세 기준 가상 주문 생성
-    - LIVE 모드: 업비트 시장가 매수 주문 (지수 백오프 적용)
+    - LIVE 모드: 최유리 지정가 주문 우선(미체결 폴링 취소) 후 필요 시 시장가 폴백
     - bot_accounts의 virtual_krw 차감 및 bot_positions 행 추가
     """
     conn = get_db_connection(db_path)
@@ -253,23 +328,39 @@ def execute_buy_order(
 
     buy_fee = invest_krw * UPBIT_FEE_RATE
     net_invest = invest_krw - buy_fee
-    volume = net_invest / current_price
+    volume = round(net_invest / current_price, 8)
     order_uuid = f"sim-buy-{uuid.uuid4().hex[:12]}"
     executed_price = current_price
 
     if not dry and upbit:
-        res = retry_with_backoff(upbit.buy_market_order, ticker, invest_krw)
-        if not res or "uuid" not in res:
-            logger.error("[%s] Live market buy order failed for %s", bot_id, ticker)
-            conn.close()
-            return None
-        order_uuid = res["uuid"]
-        time.sleep(0.5)
-        order_detail = retry_with_backoff(upbit.get_order, order_uuid)
-        if order_detail:
-            executed_price = float(order_detail.get("price", current_price))
-            volume = float(order_detail.get("executed_volume", volume))
-            buy_fee = float(order_detail.get("paid_fee", buy_fee))
+        # 1. 슬리피지 방어를 위한 최유리 지정가 주문 우선 시도 (35초 폴링)
+        limit_res = execute_limit_order_with_polling(upbit, "bid", ticker, current_price, volume, timeout_sec=35)
+        if limit_res:
+            order_uuid = limit_res["uuid"]
+            executed_price = limit_res["executed_price"]
+            volume = round(limit_res["executed_volume"], 8)
+            buy_fee = limit_res["paid_fee"]
+            invest_krw = math.floor(volume * executed_price + buy_fee)
+        else:
+            # 2. 지정가 미체결/실패 시 안전 시장가 매수 폴백
+            logger.info("[%s] Limit buy not filled; falling back to market buy for %s", bot_id, ticker)
+            res = retry_with_backoff(upbit.buy_market_order, ticker, invest_krw)
+            if not res or "uuid" not in res:
+                logger.error("[%s] Live market buy order failed for %s", bot_id, ticker)
+                conn.close()
+                return None
+            order_uuid = res["uuid"]
+            time.sleep(0.5)
+            order_detail = retry_with_backoff(upbit.get_order, order_uuid)
+            if order_detail:
+                executed_price = float(order_detail.get("price", current_price))
+                volume = round(float(order_detail.get("executed_volume", volume)), 8)
+                buy_fee = float(order_detail.get("paid_fee", buy_fee))
+                trades = order_detail.get("trades", [])
+                total_funds = sum(float(t.get("funds", 0.0)) for t in trades)
+                if total_funds > 0 and volume > 0:
+                    executed_price = total_funds / volume
+                    invest_krw = math.floor(total_funds + buy_fee)
 
     try:
         conn.execute("BEGIN IMMEDIATE;")
@@ -309,7 +400,7 @@ def execute_buy_order(
         conn.execute("COMMIT;")
         logger.info(
             f"[{bot_id}] BUY Executed ({'DRY_RUN' if dry else 'LIVE'}): {ticker} | "
-            f"Amount={invest_krw:,.0f}원 | Price={executed_price:,.0f}원 | Vol={volume:.6f} | UUID={order_uuid}"
+            f"Amount={invest_krw:,.0f}원 | Price={executed_price:,.0f}원 | Vol={volume:.8f} | UUID={order_uuid}"
         )
         return {
             "bot_id": bot_id,
@@ -350,7 +441,7 @@ def execute_sell_order(
 
     bot_id = pos["bot_id"]
     ticker = pos["ticker"]
-    volume = float(pos["volume"])
+    volume = round(float(pos["volume"]), 8)
     buy_amount = float(pos["buy_amount"])
     avg_buy_price = float(pos["avg_buy_price"])
 
@@ -369,22 +460,41 @@ def execute_sell_order(
     executed_sell_price = current_price
 
     if not dry and upbit:
-        res = retry_with_backoff(upbit.sell_market_order, ticker, volume)
-        if not res or "uuid" not in res:
-            logger.error("[%s] Live market sell failed for pos %d (%s, vol=%.6f)", bot_id, position_id, ticker, volume)
-            conn.close()
-            return None
-        sell_order_uuid = res["uuid"]
-        time.sleep(0.5)
-        order_detail = retry_with_backoff(upbit.get_order, sell_order_uuid)
-        if order_detail:
-            executed_sell_price = float(order_detail.get("price", current_price))
-            volume = float(order_detail.get("executed_volume", volume))
-            sell_fee = float(order_detail.get("paid_fee", sell_fee))
+        # 엄격하게 본인 bot_positions에 기록된 volume 수량만 지정하여 최유리 지정가 매도 우선 시도
+        limit_res = execute_limit_order_with_polling(upbit, "ask", ticker, current_price, volume, timeout_sec=35)
+        if limit_res:
+            sell_order_uuid = limit_res["uuid"]
+            executed_sell_price = limit_res["executed_price"]
+            volume = round(limit_res["executed_volume"], 8)
+            sell_fee = limit_res["paid_fee"]
             gross_amount = volume * executed_sell_price
             net_sell_amount = gross_amount - sell_fee
             realized_pnl = net_sell_amount - buy_amount
             pnl_pct = (realized_pnl / buy_amount) * 100.0 if buy_amount > 0 else 0.0
+        else:
+            logger.info("[%s] Limit sell not filled; falling back to market sell for pos %d (%s, vol=%.8f)", bot_id, position_id, ticker, volume)
+            res = retry_with_backoff(upbit.sell_market_order, ticker, volume)
+            if not res or "uuid" not in res:
+                logger.error("[%s] Live market sell failed for pos %d (%s, vol=%.8f)", bot_id, position_id, ticker, volume)
+                conn.close()
+                return None
+            sell_order_uuid = res["uuid"]
+            time.sleep(0.5)
+            order_detail = retry_with_backoff(upbit.get_order, sell_order_uuid)
+            if order_detail:
+                executed_sell_price = float(order_detail.get("price", current_price))
+                volume = round(float(order_detail.get("executed_volume", volume)), 8)
+                sell_fee = float(order_detail.get("paid_fee", sell_fee))
+                trades = order_detail.get("trades", [])
+                total_funds = sum(float(t.get("funds", 0.0)) for t in trades)
+                if total_funds > 0 and volume > 0:
+                    executed_sell_price = total_funds / volume
+                    gross_amount = total_funds
+                else:
+                    gross_amount = volume * executed_sell_price
+                net_sell_amount = gross_amount - sell_fee
+                realized_pnl = net_sell_amount - buy_amount
+                pnl_pct = (realized_pnl / buy_amount) * 100.0 if buy_amount > 0 else 0.0
 
     try:
         conn.execute("BEGIN IMMEDIATE;")
@@ -818,7 +928,7 @@ def run_bot_bb(stop_event, bot_id: str = "bot_bb", db_path: Optional[str] = None
 
                 # Case A: 1차 신규 진입 (볼린저 하단 이탈 + RSI < 30)
                 if len(ticker_positions) == 0 and available_krw >= MIN_ORDER_KRW:
-                    if current_price <= lower_val and rsi_val < 30.0:
+                    if current_price <= lower_val and rsi_val <= 40.0:
                         logger.info(
                             f"[{bot_id}] Oversold dip on {ticker}: Price={current_price:,.0f} "
                             f"<= Lower={lower_val:,.0f}, RSI={rsi_val:.1f}"

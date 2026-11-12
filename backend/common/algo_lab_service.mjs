@@ -343,11 +343,11 @@ export const ARENA_BOT_DEFS = [
     name: "필터 결합형 변동성 돌파 봇",
     nickname: "돌파봇-알파",
     strategy_type: "VOLATILITY_BREAKOUT",
-    description: "장중 단타 / 1일 보유 | 변동성 돌파(K=0.4) + 20일 이평선 추세 필터 전략",
+    description: "장중 단타 / 1일 보유 | 변동성 돌파(K=0.3) + 20일 이평선 추세 필터 전략",
     min_volume_krw: 10000000000,
     stop_loss_pct: 2.5,
     take_profit_pct: 4.5,
-    config: { k_value: 0.4, ma_period: 20, volume_multiplier: 1.2, order_ratio: 0.3, max_positions: 2 },
+    config: { k_value: 0.3, ma_period: 20, volume_multiplier: 1.2, order_ratio: 0.3, max_positions: 2 },
   },
   {
     bot_id: "bot_02",
@@ -403,11 +403,11 @@ export const ARENA_BOT_DEFS = [
     name: "다단계 분할 매수 그리드 (Dynamic Grid Reversion)",
     nickname: "그리드봇-엡실론",
     strategy_type: "DYNAMIC_GRID",
-    description: "단기 과매도 진입 후 -2.5%/-5.0% 추가 하락 시 최대 3분할 매수(order_uuid 개별 관리) | 개별 포지션 +1.8% 도달 시 개별 익절",
+    description: "단기 과매도(RSI≤40) 진입 후 -2.5%/-5.0% 추가 하락 시 최대 3분할 매수(order_uuid 개별 관리) | 개별 포지션 +1.8% 도달 시 개별 익절",
     min_volume_krw: 5000000000,
     stop_loss_pct: 9.0,
     take_profit_pct: 1.8,
-    config: { rsi_entry: 35, grid_step_1_pct: 2.5, grid_step_2_pct: 5.0, max_splits: 3, order_ratio: 0.45, max_positions: 2 },
+    config: { rsi_entry: 40, grid_step_1_pct: 2.5, grid_step_2_pct: 5.0, max_splits: 3, order_ratio: 0.45, max_positions: 2 },
   },
   {
     bot_id: "bot_07",
@@ -439,11 +439,11 @@ export const ARENA_BOT_DEFS = [
     name: "거래량 폭발 모멘텀 스캘퍼 (Volume Spike Breakout)",
     nickname: "스파이크봇-세타",
     strategy_type: "VOLUME_SPIKE_BREAKOUT",
-    description: "15분봉 거래량이 직전 20봉 평균 대비 300% 이상 폭발하며 양봉 마감 시 진입 | 고점 대비 -1.5% 트레일링 스탑",
+    description: "15분봉 거래량이 직전 20봉 평균 대비 150% 이상 폭발하며 양봉 마감 시 진입 | 고점 대비 -1.5% 트레일링 스탑",
     min_volume_krw: 5000000000,
     stop_loss_pct: 2.0,
     take_profit_pct: 8.0,
-    config: { volume_spike_multiplier: 3.0, trailing_stop_pct: 1.5, order_ratio: 0.3, max_positions: 3 },
+    config: { volume_spike_multiplier: 1.5, trailing_stop_pct: 1.5, order_ratio: 0.3, max_positions: 3 },
   },
   {
     bot_id: "bot_10",
@@ -451,11 +451,11 @@ export const ARENA_BOT_DEFS = [
     name: "RSI 극단 과매도 & VWAP 회귀 (RSI VWAP Scalper)",
     nickname: "VWAP봇-이오타",
     strategy_type: "RSI_VWAP_SCALPER",
-    description: "15분봉 RSI ≤ 25 패닉셀 & 당일 VWAP 대비 -3% 이상 이격 후 매수세 유입 시 진입 | VWAP 회귀 또는 RSI 50 도달 시 즉시 청산",
+    description: "15분봉 RSI ≤ 40 패닉셀 & 당일 VWAP 대비 -3% 이상 이격 후 매수세 유입 시 진입 | VWAP 회귀 또는 RSI 50 도달 시 즉시 청산",
     min_volume_krw: 5000000000,
     stop_loss_pct: 3.0,
     take_profit_pct: 4.0,
-    config: { rsi_threshold: 25, vwap_gap_pct: 3.0, exit_rsi: 50, order_ratio: 0.3, max_positions: 3 },
+    config: { rsi_threshold: 40, vwap_gap_pct: 3.0, exit_rsi: 50, order_ratio: 0.3, max_positions: 3 },
   },
 ];
 
@@ -570,7 +570,7 @@ const STRATEGIES = {
     if (!m || !m.bb) return hold("15분봉 데이터 부족");
     if (held.length > 0) return hold("보유 중 (+3.5% 익절 / -2.0% 손절 감시)");
     const touched = m.minLow2 <= m.bb.lower;
-    if (touched && m.curBullish && price > m.bb.lower && m.rsiMin3 <= 30) {
+    if (touched && m.curBullish && price > m.bb.lower && m.rsiMin3 <= 40) {
       return buy(`BB 하단 터치 후 양봉 복귀 · RSI ${fmt(m.rsiMin3, 1)} 과매도 반등`);
     }
     return hold(`BB 하단 ${ko(m.bb.lower)} / RSI ${fmt(m.rsi, 1)}`);
@@ -597,7 +597,7 @@ const STRATEGIES = {
       return hold(`그리드 보유 ${held.length}분할`);
     }
     if (!m || !m.bb) return hold("15분봉 데이터 부족");
-    const rsiEntry = Number(params.rsi_entry ?? 35);
+    const rsiEntry = Number(params.rsi_entry ?? 40);
     if (m.rsi <= rsiEntry && price <= m.bb.lower * 1.005) {
       return buy(`단기 과매도 그리드 1차 진입 (RSI ${fmt(m.rsi, 1)}, BB 하단 부근)`, { splitIndex: 1 });
     }
@@ -659,7 +659,7 @@ const STRATEGIES = {
     }
     const m = ind.m15;
     if (!m) return hold("15분봉 데이터 부족");
-    const spike = Number(params.volume_spike_multiplier ?? 3.0);
+    const spike = Number(params.volume_spike_multiplier ?? 1.5);
     const closedClose = Number(m.closed.trade_price);
     if (m.closedVolRatio >= spike && m.closedBullish && price >= closedClose && pctChange(price, closedClose) <= 1.5) {
       return buy(`15분봉 거래량 ${fmt(m.closedVolRatio, 1)}배 폭발 양봉 마감`);
@@ -678,7 +678,7 @@ const STRATEGIES = {
       return hold("보유 중 (VWAP 회귀/RSI 50 대기)");
     }
     if (!m.vwap) return hold("VWAP 산출 대기");
-    const rsiTh = Number(params.rsi_threshold ?? 25);
+    const rsiTh = Number(params.rsi_threshold ?? 40);
     const gapNeed = Number(params.vwap_gap_pct ?? 3.0);
     const gap = pctChange(price, m.vwap);
     const buyersIn = m.curBullish || price > Number(m.closed.trade_price);
@@ -997,7 +997,7 @@ function normalizedOrderRatio(cfg, fallback = 0.3) {
   return Math.min(1, raw > 1 ? raw / 100 : raw);
 }
 
-const COOLDOWN_MS = 10 * 60 * 1000;
+const COOLDOWN_MS = 3 * 60 * 1000;
 
 async function runPaperBot(db, bot, ctx) {
   const { mdMap, universe, rankMap, tickerMap } = ctx;

@@ -56,6 +56,13 @@ export class PgSyncManager {
   }
 
   async connect() {
+    loadEnv();
+    if (process.env.PG_SYNC_ENABLED === "false" || process.env.DB_MODE === "sqlite") {
+      console.log(`[PgSync] SQLite 단독 모드 활성화됨 (PG_SYNC_ENABLED=${process.env.PG_SYNC_ENABLED}, DB_MODE=${process.env.DB_MODE}). PostgreSQL 동기화를 건너뜁니다.`);
+      this.isConnected = false;
+      return false;
+    }
+
     try {
       this.pool = new Pool({
         host: this.host,
@@ -93,6 +100,52 @@ export class PgSyncManager {
           [s.key, String(s.value), s.updated_at]
         );
       }
+
+      // 1-1. market_regime_filter
+      try {
+        const regime = sqliteDb.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get();
+        if (regime) {
+          await this.pool.query(
+            `INSERT INTO market_regime_filter (
+               id, sentiment_score, market_regime, risk_alert, recommended_action,
+               position_size_multiplier, bot_overrides_json, blacklist_tickers_json,
+               reason, updated_at, flash_sentiment_score, flash_recommended_action,
+               flash_updated_at, pro_sentiment_score, pro_recommended_action,
+               pro_updated_at, final_risk_alert, final_position_multiplier, final_bot_overrides_json
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+             ON CONFLICT (id) DO UPDATE SET
+               sentiment_score = EXCLUDED.sentiment_score,
+               market_regime = EXCLUDED.market_regime,
+               risk_alert = EXCLUDED.risk_alert,
+               recommended_action = EXCLUDED.recommended_action,
+               position_size_multiplier = EXCLUDED.position_size_multiplier,
+               bot_overrides_json = EXCLUDED.bot_overrides_json,
+               blacklist_tickers_json = EXCLUDED.blacklist_tickers_json,
+               reason = EXCLUDED.reason,
+               updated_at = EXCLUDED.updated_at,
+               flash_sentiment_score = EXCLUDED.flash_sentiment_score,
+               flash_recommended_action = EXCLUDED.flash_recommended_action,
+               flash_updated_at = EXCLUDED.flash_updated_at,
+               pro_sentiment_score = EXCLUDED.pro_sentiment_score,
+               pro_recommended_action = EXCLUDED.pro_recommended_action,
+               pro_updated_at = EXCLUDED.pro_updated_at,
+               final_risk_alert = EXCLUDED.final_risk_alert,
+               final_position_multiplier = EXCLUDED.final_position_multiplier,
+               final_bot_overrides_json = EXCLUDED.final_bot_overrides_json`,
+            [
+              1, Number(regime.sentiment_score || 0), regime.market_regime || "SIDEWAYS",
+              Number(regime.risk_alert || 0), regime.recommended_action || "NORMAL",
+              Number(regime.position_size_multiplier || 1.0), regime.bot_overrides_json || "{}",
+              regime.blacklist_tickers_json || "[]", regime.reason || "", regime.updated_at || new Date().toISOString(),
+              Number(regime.flash_sentiment_score || 0), regime.flash_recommended_action || "NORMAL",
+              regime.flash_updated_at || null, Number(regime.pro_sentiment_score || 0),
+              regime.pro_recommended_action || "NORMAL", regime.pro_updated_at || null,
+              Number(regime.final_risk_alert || 0), Number(regime.final_position_multiplier || 1.0),
+              regime.final_bot_overrides_json || "{}"
+            ]
+          );
+        }
+      } catch (rErr) {}
 
       // 2. bots
       try {

@@ -16,6 +16,9 @@ frontend/dist/
 data/*.db
 data/*.db-shm
 data/*.db-wal
+install/app/data/*.db
+install/app/data/*.db-shm
+install/app/data/*.db-wal
 *.db
 *.db-shm
 *.db-wal
@@ -25,10 +28,15 @@ trading_ledger.db
 logs/
 *.log
 *.pid
+install/app/logs/*.log
+install/app/logs/.backend.pid
+install/app/logs/.frontend.pid
 
 # Environment & Secrets
 .env
 .env.*
 !.env.example
 config/upbit_config.json
+install/app/.env
+install/app/config/upbit_config.json
 .aider*
