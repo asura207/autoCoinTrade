@@ -51,6 +51,15 @@ if (fs.existsSync(ENV_PATH)) {
 const HOST = process.env.BACKEND_HOST || "0.0.0.0";
 const PORT = Number(process.env.BACKEND_PORT || process.env.PORT || 8001);
 
+let APP_VERSION = "0.0.14";
+try {
+  const pkgJsonPath = path.join(BASE_DIR, "package.json");
+  if (fs.existsSync(pkgJsonPath)) {
+    const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8"));
+    if (pkg.version) APP_VERSION = pkg.version;
+  }
+} catch {}
+
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
@@ -3085,6 +3094,37 @@ const server = http.createServer(async (req, res) => {
 
   try {
     // ============================================================
+    // [시스템 버전 및 히스토리 API]
+    // ============================================================
+    if (pathname === "/api/version" && req.method === "GET") {
+      const historyPath = path.join(BASE_DIR, "history.md");
+      const hasHistory = fs.existsSync(historyPath);
+      return sendJson(res, 200, {
+        ok: true,
+        version: APP_VERSION,
+        name: "auto-coin-trade",
+        history_available: hasHistory,
+      });
+    }
+
+    if (pathname === "/api/version/history" && req.method === "GET") {
+      const historyPath = path.join(BASE_DIR, "history.md");
+      if (!fs.existsSync(historyPath)) {
+        return sendJson(res, 404, { ok: false, error: "history.md 파일이 존재하지 않습니다." });
+      }
+      try {
+        const historyText = fs.readFileSync(historyPath, "utf-8");
+        return sendJson(res, 200, {
+          ok: true,
+          version: APP_VERSION,
+          history: historyText,
+        });
+      } catch (err) {
+        return sendJson(res, 500, { ok: false, error: `히스토리 읽기 실패: ${err.message}` });
+      }
+    }
+
+    // ============================================================
     // [설치 마법사 API] 초기 설정 확인, DB 연결 테스트, 키 검증, 최종 설치 완료
     // ============================================================
     if (pathname === "/api/setup/status" && req.method === "GET") {
@@ -3102,6 +3142,8 @@ const server = http.createServer(async (req, res) => {
       } catch {}
 
       return sendJson(res, 200, {
+        ok: true,
+        version: APP_VERSION,
         is_configured: configured,
         current_env: {
           db_mode: dbMode,
@@ -3389,8 +3431,8 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/auth/verify" && req.method === "POST") {
       const body = await readJsonBody(req);
-      const defaultEntry = process.env.ENTRY_CODE || "stock";
-      const expected = await getSetting("entry_code", defaultEntry);
+      const defaultEntry = process.env.GATE_CODE || process.env.ENTRY_CODE || "stock";
+      const expected = (await getSetting("gate_code")) || (await getSetting("entry_code", defaultEntry));
       const inputCode = String(body.code || "").trim();
       const isKoreanMatch = (expected.toLowerCase() === "stock" && (inputCode === "ㄴ새차" || inputCode.toLowerCase() === "stock")) ||
                             inputCode === "ㄴ새차";

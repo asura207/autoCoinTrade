@@ -64,6 +64,10 @@ cp "$PROJECT_ROOT/llm_filter_worker.py" "$APP_DIR/"
 cp "$PROJECT_ROOT/main_orchestrator.py" "$APP_DIR/"
 cp "$PROJECT_ROOT/package.json" "$APP_DIR/"
 cp "$PROJECT_ROOT/requirements.txt" "$APP_DIR/"
+if [ -f "$PROJECT_ROOT/history.md" ]; then
+    cp "$PROJECT_ROOT/history.md" "$APP_DIR/"
+    cp "$PROJECT_ROOT/history.md" "$INSTALL_DIR/"
+fi
 
 # 6. 폴더 유지용 .gitkeep
 touch "$APP_DIR/data/.gitkeep"

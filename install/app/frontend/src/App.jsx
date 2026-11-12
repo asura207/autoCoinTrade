@@ -462,11 +462,103 @@ function isDailyGateAuthValid() {
   return true;
 }
 
+function renderSimpleMarkdown(md) {
+  if (!md) return "";
+  const lines = md.split(/\r?\n/);
+  const out = [];
+  let inTable = false;
+  let tableHeader = [];
+  let tableRows = [];
+
+  const flushTable = () => {
+    if (inTable) {
+      out.push(
+        `<table class="history-table"><thead><tr>${tableHeader
+          .map((th) => `<th>${th}</th>`)
+          .join("")}</tr></thead><tbody>${tableRows
+          .map((row) => `<tr>${row.map((td) => `<td>${td}</td>`).join("")}</tr>`)
+          .join("")}</tbody></table>`
+      );
+      inTable = false;
+      tableHeader = [];
+      tableRows = [];
+    }
+  };
+
+  const inlineFormat = (text) => {
+    return text
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/\*([^*]+)\*/g, "<em>$1</em>");
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
+    const trimmed = rawLine.trim();
+
+    if (trimmed.startsWith("|") && trimmed.endsWith("|")) {
+      const cells = trimmed
+        .slice(1, -1)
+        .split("|")
+        .map((c) => inlineFormat(c.trim()));
+      if (cells.every((c) => /^:?-+:?$/.test(c.replace(/&lt;|&gt;/g, "")))) {
+        continue;
+      }
+      if (!inTable) {
+        inTable = true;
+        tableHeader = cells;
+      } else {
+        tableRows.push(cells);
+      }
+      continue;
+    } else {
+      flushTable();
+    }
+
+    if (!trimmed) {
+      out.push("<div style='height: 8px;'></div>");
+      continue;
+    }
+
+    if (trimmed.startsWith("### ")) {
+      out.push(`<h3>${inlineFormat(trimmed.slice(4))}</h3>`);
+    } else if (trimmed.startsWith("## ")) {
+      out.push(`<h2>${inlineFormat(trimmed.slice(3))}</h2>`);
+    } else if (trimmed.startsWith("# ")) {
+      out.push(`<h1>${inlineFormat(trimmed.slice(2))}</h1>`);
+    } else if (trimmed.startsWith("> ")) {
+      out.push(`<blockquote>${inlineFormat(trimmed.slice(2))}</blockquote>`);
+    } else if (trimmed.startsWith("---")) {
+      out.push("<hr style='border:none; border-top:1px solid rgba(255,255,255,0.1); margin:16px 0;' />");
+    } else if (trimmed.startsWith("- ")) {
+      out.push(`<div style='padding-left:16px; margin:3px 0;'>• ${inlineFormat(trimmed.slice(2))}</div>`);
+    } else if (trimmed.startsWith("  - ")) {
+      out.push(`<div style='padding-left:32px; margin:2px 0; color:#94a3b8;'>◦ ${inlineFormat(trimmed.slice(4))}</div>`);
+    } else if (trimmed.startsWith("    - ")) {
+      out.push(`<div style='padding-left:48px; margin:2px 0; color:#64748b;'>▪ ${inlineFormat(trimmed.slice(6))}</div>`);
+    } else {
+      out.push(`<p style='margin: 4px 0;'>${inlineFormat(trimmed)}</p>`);
+    }
+  }
+  flushTable();
+
+  return out.join("\n");
+}
+
 export default function App() {
   // 1) 입장 코드 인증 상태 (날짜 변경 시 자동 만료 및 재인증 요구)
   const [authenticated, setAuthenticated] = useState(() => isDailyGateAuthValid());
   const [entryCodeInput, setEntryCodeInput] = useState("");
   const [gateError, setGateError] = useState("");
+
+  // 프로젝트 버전 및 히스토리 모달 상태
+  const [appVersion, setAppVersion] = useState("0.0.14");
+  const [historyModalOpen, setHistoryModalOpen] = useState(false);
+  const [historyContent, setHistoryContent] = useState("");
+  const [historyLoading, setHistoryLoading] = useState(false);
 
   // 1-1) 초기 설정 마법사 (Setup Wizard) 상태
   const [setupConfigured, setSetupConfigured] = useState(true);
@@ -511,6 +603,9 @@ export default function App() {
         if (data.is_configured) {
           setShowSetupWizard(false);
         }
+        if (data.version) {
+          setAppVersion(data.version);
+        }
         if (data.current_env) {
           setWizardForm((prev) => ({
             ...prev,
@@ -531,8 +626,36 @@ export default function App() {
     }
   }, []);
 
+  const openHistoryModal = useCallback(async () => {
+    setHistoryModalOpen(true);
+    if (!historyContent) {
+      setHistoryLoading(true);
+      try {
+        const resp = await fetch(`${API_BASE}/api/version/history`);
+        const data = await resp.json();
+        if (data && data.history) {
+          setHistoryContent(data.history);
+        } else {
+          setHistoryContent("버전 변경 이력(history.md)을 불러올 수 없습니다.");
+        }
+      } catch (err) {
+        setHistoryContent(`버전 변경 이력 로드 오류: ${err.message}`);
+      } finally {
+        setHistoryLoading(false);
+      }
+    }
+  }, [historyContent]);
+
   useEffect(() => {
     fetchSetupStatus();
+    fetch(`${API_BASE}/api/version`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (data && data.version) {
+          setAppVersion(data.version);
+        }
+      })
+      .catch(() => {});
   }, [fetchSetupStatus]);
 
   const handleTestDbConnection = async () => {
@@ -889,6 +1012,77 @@ export default function App() {
 
   const closeModal = () => {
     setModalInfo((prev) => ({ ...prev, open: false }));
+  };
+
+  const renderHistoryModal = () => {
+    if (!historyModalOpen) return null;
+    return (
+      <div className="modal-backdrop" onClick={() => setHistoryModalOpen(false)}>
+        <div className="history-modal-box" onClick={(e) => e.stopPropagation()}>
+          <div className="history-modal-header">
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <span style={{ fontSize: "20px" }}>📜</span>
+              <div>
+                <strong style={{ fontSize: "16px", color: "#f8fafc" }}>
+                  autoCoinTrade 프로젝트 변경 이력 (History)
+                </strong>
+                <span
+                  className="version-pill-badge"
+                  style={{ marginLeft: "10px", fontSize: "11px" }}
+                >
+                  현재 v{appVersion}
+                </span>
+              </div>
+            </div>
+            <button
+              type="button"
+              className="btn btn-outline"
+              style={{ padding: "4px 10px", fontSize: "12px" }}
+              onClick={() => setHistoryModalOpen(false)}
+            >
+              닫기 ✕
+            </button>
+          </div>
+          <div className="history-modal-body">
+            {historyLoading ? (
+              <div style={{ padding: "40px", textAlign: "center", color: "#94a3b8" }}>
+                ⏳ 버전 변경 내역(history.md)을 불러오는 중입니다...
+              </div>
+            ) : (
+              <div
+                dangerouslySetInnerHTML={{
+                  __html: renderSimpleMarkdown(historyContent),
+                }}
+              />
+            )}
+          </div>
+          <div
+            style={{
+              padding: "12px 24px",
+              borderTop: "1px solid rgba(255, 255, 255, 0.08)",
+              background: "rgba(15, 23, 42, 0.95)",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              fontSize: "12px",
+              color: "#64748b",
+              flexWrap: "wrap",
+              gap: "10px",
+            }}
+          >
+            <span>* 별다른 언급이 없다면 git commit 1건당 0.0.X 증가 규칙이 유지됩니다.</span>
+            <button
+              type="button"
+              className="btn btn-primary"
+              style={{ padding: "6px 16px", fontSize: "12.5px" }}
+              onClick={() => setHistoryModalOpen(false)}
+            >
+              확인 완료
+            </button>
+          </div>
+        </div>
+      </div>
+    );
   };
 
   // Web Audio 소리 알림 (신호음)
@@ -3178,7 +3372,17 @@ export default function App() {
     return (
       <div className="gate-wrapper">
         <div className="gate-card">
-          <span className="gate-badge">UPBIT QUANT AUTO TRADER</span>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+            <span className="gate-badge" style={{ margin: 0 }}>UPBIT QUANT AUTO TRADER</span>
+            <button
+              type="button"
+              className="version-pill-badge"
+              onClick={openHistoryModal}
+              title="클릭하여 버전별 수정내역(history.md) 확인"
+            >
+              v{appVersion}
+            </button>
+          </div>
           <h1 className="gate-title">코인 자동매매 시스템</h1>
           <p className="gate-subtitle">
             개인 전용 보안 화면입니다. 진입을 위해 입장 코드를 입력해주세요.
@@ -3197,7 +3401,24 @@ export default function App() {
               입장하기
             </button>
           </form>
+          <div style={{ marginTop: "16px", textAlign: "center" }}>
+            <button
+              type="button"
+              onClick={openHistoryModal}
+              style={{
+                background: "none",
+                border: "none",
+                color: "#64748b",
+                fontSize: "12px",
+                cursor: "pointer",
+                textDecoration: "underline",
+              }}
+            >
+              📜 버전 변경 이력 (history.md v{appVersion}) 확인
+            </button>
+          </div>
         </div>
+        {renderHistoryModal()}
       </div>
     );
   }
@@ -3220,7 +3441,28 @@ export default function App() {
       {/* 좌측 메뉴 영역 (20%) */}
       <aside className="left-sidebar">
         <div className="sidebar-top-section">
-          <div className="brand-header">Upbit AutoTrade</div>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              padding: "0 4px 14px 4px",
+              borderBottom: "1px solid var(--border-color)",
+              marginBottom: "16px",
+            }}
+          >
+            <div className="brand-header" style={{ margin: 0, padding: 0, border: "none" }}>
+              Upbit AutoTrade
+            </div>
+            <button
+              type="button"
+              className="version-pill-badge"
+              onClick={openHistoryModal}
+              title="클릭하여 프로젝트 버전별 상세 변경이력(history.md) 확인"
+            >
+              v{appVersion}
+            </button>
+          </div>
 
           {/* 요구사항 19: 메뉴 상단 업비트 통신 상태 식별 영역 (초록/노랑/빨강 + 마우스 오버 사유 표기) */}
           <div className="upbit-status-box">
@@ -3322,6 +3564,16 @@ export default function App() {
               title="클릭하여 모드 전환"
             >
               {tradeMode.mode === "paper" ? "🧪 가상거래(모의)" : "⚡ 업비트 실거래"}
+            </span>
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
+            <span>시스템 버전:</span>
+            <span
+              style={{ color: "#38bdf8", fontWeight: 700, cursor: "pointer", textDecoration: "underline" }}
+              onClick={openHistoryModal}
+              title="클릭하여 상세 변경이력(history.md) 확인"
+            >
+              v{appVersion}
             </span>
           </div>
           <div>DB: SQLite (WAL / 자동 재접속)</div>
@@ -7295,6 +7547,39 @@ export default function App() {
                 </button>
               </div>
             </div>
+
+            {/* 요구사항: 프로젝트 버전 및 변경 이력 (History) 정보 카드 */}
+            <div className="card" style={{ marginTop: "20px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px", flexWrap: "wrap", gap: "10px" }}>
+                <div>
+                  <h3 style={{ fontSize: "16px", fontWeight: 700, margin: 0, color: "#f8fafc" }}>
+                    6. 시스템 버전 및 변경 이력 관리 (Version & History)
+                  </h3>
+                  <p style={{ margin: "4px 0 0 0", fontSize: "12.5px", color: "#94a3b8" }}>
+                    autoCoinTrade는 <code>0.0.1</code>부터 시작하여 커밋 1건당 1씩 증가하는 <code>0.0.X</code> 버전 규칙을 엄격하게 유지합니다.
+                  </p>
+                </div>
+                <span className="version-pill-badge" style={{ padding: "6px 14px", fontSize: "12.5px" }}>
+                  현재 버전: v{appVersion}
+                </span>
+              </div>
+              <div style={{ background: "rgba(15, 23, 42, 0.6)", padding: "14px 18px", borderRadius: "10px", border: "1px solid rgba(255, 255, 255, 0.06)", marginBottom: "14px", fontSize: "13px", color: "#cbd5e1" }}>
+                <div>• <strong>현재 프로젝트 버전</strong>: <span style={{ color: "#38bdf8", fontWeight: 700 }}>v{appVersion}</span></div>
+                <div style={{ marginTop: "4px" }}>• <strong>버전 정책</strong>: 별다른 지침이 없을 경우 <code>0.0.숫자</code> 증가 형태 유지 (Git Commit 1건당 1씩 증가)</div>
+                <div style={{ marginTop: "4px" }}>• <strong>형상 관리 문서</strong>: <code>history.md</code>, <code>package.json</code> 및 웹 UI 동기화 완료</div>
+              </div>
+              <div className="btn-group">
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={openHistoryModal}
+                  style={{ display: "inline-flex", alignItems: "center", gap: "8px" }}
+                >
+                  <span>📜</span>
+                  <span>버전별 전체 수정내역(history.md) 열람</span>
+                </button>
+              </div>
+            </div>
           </div>
         )}
         {/* 법적 면책 조항 (Legal Disclaimer Footer) */}
@@ -7310,6 +7595,16 @@ export default function App() {
           }}
         >
           <div style={{ maxWidth: "800px", margin: "0 auto" }}>
+            <div style={{ marginBottom: "6px" }}>
+              <span style={{ fontWeight: 700, color: "#94a3b8" }}>autoCoinTrade v{appVersion}</span>
+              {" · "}
+              <span
+                style={{ color: "#38bdf8", cursor: "pointer", textDecoration: "underline" }}
+                onClick={openHistoryModal}
+              >
+                📜 버전별 수정내역(history.md) 확인
+              </span>
+            </div>
             <span style={{ fontWeight: 600, color: "#94a3b8" }}>⚖️ 법적 면책 조항 (Disclaimer):</span><br />
             본 프로그램은 오픈소스 소프트웨어 및 알고리즘 연구 목적의 도구일 뿐, 수익을 보장하거나 특정 종목의 매수를 권유하지 않습니다. 모든 실전 투자의 책임은 사용자 본인에게 있습니다.
           </div>
@@ -7399,6 +7694,9 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* 버전별 변경 이력 (history.md) Modal Popup */}
+      {renderHistoryModal()}
     </div>
   );
 }
