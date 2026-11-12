@@ -3389,8 +3389,8 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/auth/verify" && req.method === "POST") {
       const body = await readJsonBody(req);
-      const defaultEntry = process.env.ENTRY_CODE || "stock";
-      const expected = await getSetting("entry_code", defaultEntry);
+      const defaultEntry = process.env.GATE_CODE || process.env.ENTRY_CODE || "stock";
+      const expected = (await getSetting("gate_code")) || (await getSetting("entry_code", defaultEntry));
       const inputCode = String(body.code || "").trim();
       const isKoreanMatch = (expected.toLowerCase() === "stock" && (inputCode === "ㄴ새차" || inputCode.toLowerCase() === "stock")) ||
                             inputCode === "ㄴ새차";
