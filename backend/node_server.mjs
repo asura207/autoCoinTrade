@@ -51,7 +51,7 @@ if (fs.existsSync(ENV_PATH)) {
 const HOST = process.env.BACKEND_HOST || "0.0.0.0";
 const PORT = Number(process.env.BACKEND_PORT || process.env.PORT || 8001);
 
-let APP_VERSION = "0.0.16";
+let APP_VERSION = "0.0.17";
 try {
   const pkgJsonPath = path.join(BASE_DIR, "package.json");
   if (fs.existsSync(pkgJsonPath)) {
@@ -3951,101 +3951,202 @@ const server = http.createServer(async (req, res) => {
       }
 
       let baseFromSql = "";
-      if (mode === "live") {
-        baseFromSql = `
-          SELECT 
-            'live' AS trade_mode, 
-            id, 
-            bot_id, 
-            market, 
-            buy_order_uuid, 
-            sell_order_uuid, 
-            buy_price::numeric AS buy_price, 
-            buy_volume, 
-            buy_amount, 
-            buy_date, 
-            sell_price::numeric AS sell_price, 
-            sell_volume, 
-            sell_amount, 
-            sell_date, 
-            profit_krw, 
-            profit_pct::numeric AS profit_pct, 
-            status, 
-            NULL::text AS buy_reason, 
-            NULL::text AS sell_reason 
-          FROM trades
-        `;
-      } else if (mode === "paper") {
-        baseFromSql = `
-          SELECT 
-            'paper' AS trade_mode, 
-            id, 
-            bot_id, 
-            market, 
-            buy_order_uuid, 
-            sell_order_uuid, 
-            buy_price::numeric AS buy_price, 
-            buy_volume, 
-            buy_amount, 
-            to_char(buy_date, 'YYYY-MM-DD HH24:MI:SS') AS buy_date, 
-            sell_price::numeric AS sell_price, 
-            sell_volume, 
-            sell_amount, 
-            to_char(sell_date, 'YYYY-MM-DD HH24:MI:SS') AS sell_date, 
-            profit_krw, 
-            profit_pct::numeric AS profit_pct, 
-            status, 
-            buy_reason, 
-            sell_reason 
-          FROM paper_trades
-        `;
+      const isSqlite = (process.env.DB_MODE || "sqlite").trim().toLowerCase() === "sqlite";
+
+      if (isSqlite) {
+        if (mode === "live") {
+          baseFromSql = `
+            SELECT 
+              'live' AS trade_mode, 
+              id, 
+              bot_id, 
+              market, 
+              buy_order_uuid, 
+              sell_order_uuid, 
+              buy_price, 
+              buy_volume, 
+              buy_amount, 
+              buy_date, 
+              sell_price, 
+              sell_volume, 
+              sell_amount, 
+              sell_date, 
+              profit_krw, 
+              profit_pct, 
+              status, 
+              NULL AS buy_reason, 
+              NULL AS sell_reason 
+            FROM trades
+          `;
+        } else if (mode === "paper") {
+          baseFromSql = `
+            SELECT 
+              'paper' AS trade_mode, 
+              id, 
+              bot_id, 
+              market, 
+              buy_order_uuid, 
+              sell_order_uuid, 
+              buy_price, 
+              buy_volume, 
+              buy_amount, 
+              buy_date, 
+              sell_price, 
+              sell_volume, 
+              sell_amount, 
+              sell_date, 
+              profit_krw, 
+              profit_pct, 
+              status, 
+              buy_reason, 
+              sell_reason 
+            FROM paper_trades
+          `;
+        } else {
+          // mode === "all" (실거래 + 가상거래 전체)
+          baseFromSql = `
+            SELECT 
+              'live' AS trade_mode, 
+              id, 
+              bot_id, 
+              market, 
+              buy_order_uuid, 
+              sell_order_uuid, 
+              buy_price, 
+              buy_volume, 
+              buy_amount, 
+              buy_date, 
+              sell_price, 
+              sell_volume, 
+              sell_amount, 
+              sell_date, 
+              profit_krw, 
+              profit_pct, 
+              status, 
+              NULL AS buy_reason, 
+              NULL AS sell_reason 
+            FROM trades
+            UNION ALL
+            SELECT 
+              'paper' AS trade_mode, 
+              id, 
+              bot_id, 
+              market, 
+              buy_order_uuid, 
+              sell_order_uuid, 
+              buy_price, 
+              buy_volume, 
+              buy_amount, 
+              buy_date, 
+              sell_price, 
+              sell_volume, 
+              sell_amount, 
+              sell_date, 
+              profit_krw, 
+              profit_pct, 
+              status, 
+              buy_reason, 
+              sell_reason 
+            FROM paper_trades
+          `;
+        }
       } else {
-        // mode === "all" (실거래 + 가상거래 전체)
-        baseFromSql = `
-          SELECT 
-            'live' AS trade_mode, 
-            id, 
-            bot_id, 
-            market, 
-            buy_order_uuid, 
-            sell_order_uuid, 
-            buy_price::numeric AS buy_price, 
-            buy_volume, 
-            buy_amount, 
-            buy_date, 
-            sell_price::numeric AS sell_price, 
-            sell_volume, 
-            sell_amount, 
-            sell_date, 
-            profit_krw, 
-            profit_pct::numeric AS profit_pct, 
-            status, 
-            NULL::text AS buy_reason, 
-            NULL::text AS sell_reason 
-          FROM trades
-          UNION ALL
-          SELECT 
-            'paper' AS trade_mode, 
-            id, 
-            bot_id, 
-            market, 
-            buy_order_uuid, 
-            sell_order_uuid, 
-            buy_price::numeric AS buy_price, 
-            buy_volume, 
-            buy_amount, 
-            to_char(buy_date, 'YYYY-MM-DD HH24:MI:SS') AS buy_date, 
-            sell_price::numeric AS sell_price, 
-            sell_volume, 
-            sell_amount, 
-            to_char(sell_date, 'YYYY-MM-DD HH24:MI:SS') AS sell_date, 
-            profit_krw, 
-            profit_pct::numeric AS profit_pct, 
-            status, 
-            buy_reason, 
-            sell_reason 
-          FROM paper_trades
-        `;
+        if (mode === "live") {
+          baseFromSql = `
+            SELECT 
+              'live' AS trade_mode, 
+              id, 
+              bot_id, 
+              market, 
+              buy_order_uuid, 
+              sell_order_uuid, 
+              buy_price::numeric AS buy_price, 
+              buy_volume, 
+              buy_amount, 
+              buy_date, 
+              sell_price::numeric AS sell_price, 
+              sell_volume, 
+              sell_amount, 
+              sell_date, 
+              profit_krw, 
+              profit_pct::numeric AS profit_pct, 
+              status, 
+              NULL::text AS buy_reason, 
+              NULL::text AS sell_reason 
+            FROM trades
+          `;
+        } else if (mode === "paper") {
+          baseFromSql = `
+            SELECT 
+              'paper' AS trade_mode, 
+              id, 
+              bot_id, 
+              market, 
+              buy_order_uuid, 
+              sell_order_uuid, 
+              buy_price::numeric AS buy_price, 
+              buy_volume, 
+              buy_amount, 
+              to_char(buy_date, 'YYYY-MM-DD HH24:MI:SS') AS buy_date, 
+              sell_price::numeric AS sell_price, 
+              sell_volume, 
+              sell_amount, 
+              to_char(sell_date, 'YYYY-MM-DD HH24:MI:SS') AS sell_date, 
+              profit_krw, 
+              profit_pct::numeric AS profit_pct, 
+              status, 
+              buy_reason, 
+              sell_reason 
+            FROM paper_trades
+          `;
+        } else {
+          // mode === "all" (실거래 + 가상거래 전체)
+          baseFromSql = `
+            SELECT 
+              'live' AS trade_mode, 
+              id, 
+              bot_id, 
+              market, 
+              buy_order_uuid, 
+              sell_order_uuid, 
+              buy_price::numeric AS buy_price, 
+              buy_volume, 
+              buy_amount, 
+              buy_date, 
+              sell_price::numeric AS sell_price, 
+              sell_volume, 
+              sell_amount, 
+              sell_date, 
+              profit_krw, 
+              profit_pct::numeric AS profit_pct, 
+              status, 
+              NULL::text AS buy_reason, 
+              NULL::text AS sell_reason 
+            FROM trades
+            UNION ALL
+            SELECT 
+              'paper' AS trade_mode, 
+              id, 
+              bot_id, 
+              market, 
+              buy_order_uuid, 
+              sell_order_uuid, 
+              buy_price::numeric AS buy_price, 
+              buy_volume, 
+              buy_amount, 
+              to_char(buy_date, 'YYYY-MM-DD HH24:MI:SS') AS buy_date, 
+              sell_price::numeric AS sell_price, 
+              sell_volume, 
+              sell_amount, 
+              to_char(sell_date, 'YYYY-MM-DD HH24:MI:SS') AS sell_date, 
+              profit_krw, 
+              profit_pct::numeric AS profit_pct, 
+              status, 
+              buy_reason, 
+              sell_reason 
+            FROM paper_trades
+          `;
+        }
       }
 
       const whereClauses = [];

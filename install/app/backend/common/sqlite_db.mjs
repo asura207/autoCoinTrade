@@ -33,7 +33,13 @@ export function translateSqlite(sql) {
   // 4. NOW() -> CURRENT_TIMESTAMP
   s = s.replace(/\bNOW\(\)/gi, "CURRENT_TIMESTAMP");
 
-  // 5. Postgres $1, $2 파라미터를 ? 로 변환
+  // 5. Postgres ::type 캐스팅 제거 (e.g. ::numeric, ::text, ::bigint)
+  s = s.replace(/::[a-zA-Z0-9_]+/g, "");
+
+  // 6. to_char(col, 'fmt') -> col
+  s = s.replace(/to_char\(([^,]+),\s*'[^']*'\)/gi, "$1");
+
+  // 7. Postgres $1, $2 파라미터를 ? 로 변환
   s = s.replace(/\$(\d+)/g, "?");
 
   return s;

@@ -966,7 +966,7 @@ export default function App() {
   const [gateError, setGateError] = useState("");
 
   // 프로젝트 버전 및 히스토리 모달 상태
-  const [appVersion, setAppVersion] = useState("0.0.16");
+  const [appVersion, setAppVersion] = useState("0.0.17");
   const [historyModalOpen, setHistoryModalOpen] = useState(false);
   const [historyContent, setHistoryContent] = useState("");
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -2524,16 +2524,17 @@ export default function App() {
     }
   };
 
-  // 통계 메뉴 최하단 실제 거래내역 조회 (페이지당 50건, 실거래 전용)
+  // 통계 메뉴 최하단 거래내역 조회 (페이지당 50건, 실거래/가상거래 모드 연동)
   const fetchStatsTrades = useCallback(
-    async (page = 1, botId = null) => {
+    async (page = 1, botId = null, targetMode = null) => {
       setStatsTradeLoading(true);
       try {
         const targetBot = botId !== null ? botId : statsTradeFilterBot;
+        const currentMode = targetMode !== null ? targetMode : statsModeTab;
         const params = new URLSearchParams();
         params.append("page", String(page));
         params.append("limit", "50");
-        params.append("mode", "live"); // 실제 거래(Live)만 조회
+        params.append("mode", currentMode); // 통계 상단 선택 탭(live / paper)과 자동 연동
         if (targetBot && targetBot !== "all") {
           params.append("bot_id", targetBot);
         }
@@ -2551,7 +2552,7 @@ export default function App() {
         setStatsTradeLoading(false);
       }
     },
-    [statsTradeFilterBot]
+    [statsTradeFilterBot, statsModeTab]
   );
 
   const fetchUpbitAccount = async () => {
@@ -5267,6 +5268,7 @@ export default function App() {
                   onClick={() => {
                     setStatsModeTab("live");
                     fetchStatistics("live");
+                    fetchStatsTrades(1, statsTradeFilterBot, "live");
                   }}
                   style={{ padding: "8px 14px", fontSize: "12.5px" }}
                 >
@@ -5278,6 +5280,7 @@ export default function App() {
                   onClick={() => {
                     setStatsModeTab("paper");
                     fetchStatistics("paper");
+                    fetchStatsTrades(1, statsTradeFilterBot, "paper");
                   }}
                   style={{ padding: "8px 14px", fontSize: "12.5px" }}
                 >
@@ -5673,7 +5676,7 @@ export default function App() {
             )}
 
             {/* ============================================================
-                [통계 최하단] 실제 거래 내역 및 50건 페이징 게시판 (실거래 전용)
+                [통계 최하단] 거래 내역 및 50건 페이징 게시판 (실거래 / 가상거래 자동 연동)
                ============================================================ */}
             <div className="card" style={{ marginTop: "20px" }}>
               <div
@@ -5689,30 +5692,32 @@ export default function App() {
                 <div>
                   <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                     <h3 style={{ fontSize: "16px", fontWeight: 700, margin: 0, color: "#f8fafc" }}>
-                      ⚡ 실제 거래 내역 (Live Trade History)
+                      {statsModeTab === "live" ? "⚡ 실제 거래 내역 (Live Trade History)" : "🏆 가상 거래 내역 (Arena Trade History)"}
                     </h3>
                     <span
                       style={{
                         fontSize: "11px",
                         padding: "2px 8px",
                         borderRadius: "12px",
-                        background: "rgba(239, 68, 68, 0.2)",
-                        color: "#fca5a5",
-                        border: "1px solid rgba(239, 68, 68, 0.4)",
+                        background: statsModeTab === "live" ? "rgba(239, 68, 68, 0.2)" : "rgba(16, 185, 129, 0.2)",
+                        color: statsModeTab === "live" ? "#fca5a5" : "#6ee7b7",
+                        border: `1px solid ${statsModeTab === "live" ? "rgba(239, 68, 68, 0.4)" : "rgba(16, 185, 129, 0.4)"}`,
                         fontWeight: 700,
                       }}
                     >
-                      실계좌 체결 전용 · 50건 페이징
+                      {statsModeTab === "live" ? "실계좌 체결 전용 · 50건 페이징" : "10대 봇 아레나 체결 전용 · 50건 페이징"}
                     </span>
                   </div>
                   <p style={{ fontSize: "12.5px", color: "#94a3b8", marginTop: "4px", margin: "4px 0 0 0" }}>
-                    업비트 실계좌로 체결된 실제 거래 내역(trades)만 페이지당 50건씩 최신순으로 제공합니다.
+                    {statsModeTab === "live"
+                      ? "업비트 실계좌로 체결된 실제 거래 내역(trades)을 페이지당 50건씩 최신순으로 제공합니다."
+                      : "10대 봇 아레나 가상 경쟁 체결 내역(paper_trades)을 페이지당 50건씩 최신순으로 제공합니다."}
                   </p>
                 </div>
 
                 {/* 필터 및 컨트롤 바 */}
                 <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
-                  {/* 실거래 전용 표시 배지 */}
+                  {/* 원장 건수 표시 배지 */}
                   <div
                     style={{
                       display: "inline-flex",
@@ -5720,14 +5725,14 @@ export default function App() {
                       gap: "6px",
                       padding: "5px 12px",
                       borderRadius: "6px",
-                      background: "rgba(239, 68, 68, 0.15)",
-                      border: "1px solid rgba(239, 68, 68, 0.35)",
+                      background: statsModeTab === "live" ? "rgba(239, 68, 68, 0.15)" : "rgba(16, 185, 129, 0.15)",
+                      border: `1px solid ${statsModeTab === "live" ? "rgba(239, 68, 68, 0.35)" : "rgba(16, 185, 129, 0.35)"}`,
                       fontSize: "12px",
                       fontWeight: 600,
-                      color: "#fca5a5",
+                      color: statsModeTab === "live" ? "#fca5a5" : "#6ee7b7",
                     }}
                   >
-                    <span>⚡ 실계좌 원장(trades)</span>
+                    <span>{statsModeTab === "live" ? "⚡ 실계좌 원장(trades)" : "🏆 가상 원장(paper_trades)"}</span>
                     <span style={{ color: "#ffffff", fontWeight: 700 }}>({statsTradeTotal}건)</span>
                   </div>
 
@@ -5820,13 +5825,13 @@ export default function App() {
                     {statsTradeLoading && statsTrades.length === 0 ? (
                       <tr>
                         <td colSpan={7} style={{ textAlign: "center", padding: "36px", color: "#94a3b8" }}>
-                          실제 거래 내역을 불러오는 중입니다...
+                          거래 내역을 불러오는 중입니다...
                         </td>
                       </tr>
                     ) : statsTrades.length === 0 ? (
                       <tr>
                         <td colSpan={7} style={{ textAlign: "center", padding: "36px", color: "#94a3b8" }}>
-                          체결된 실제 거래 내역이 없습니다.
+                          {statsModeTab === "live" ? "체결된 실제 거래 내역이 없습니다." : "체결된 가상 거래 내역이 없습니다."}
                         </td>
                       </tr>
                     ) : (
