@@ -966,7 +966,7 @@ export default function App() {
   const [gateError, setGateError] = useState("");
 
   // 프로젝트 버전 및 히스토리 모달 상태
-  const [appVersion, setAppVersion] = useState("0.0.17");
+  const [appVersion, setAppVersion] = useState("0.0.18");
   const [historyModalOpen, setHistoryModalOpen] = useState(false);
   const [historyContent, setHistoryContent] = useState("");
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -6114,8 +6114,13 @@ export default function App() {
                       )}
                     </div>
 
-                    <div style={{ fontSize: "17px", fontWeight: 800, color: "#f8fafc", marginBottom: "4px" }}>
-                      {m.nickname || m.name}
+                    <div style={{ fontSize: "17px", fontWeight: 800, color: "#f8fafc", marginBottom: "4px", display: "flex", alignItems: "center", gap: "6px" }}>
+                      <span>{m.nickname || m.name}</span>
+                      {m.bot_id === "bot_10" && (
+                        <span style={{ fontSize: "11px", padding: "1px 6px", borderRadius: "4px", background: "rgba(168, 85, 247, 0.25)", color: "#c084fc", fontWeight: 700 }}>
+                          VWAP & LRC
+                        </span>
+                      )}
                     </div>
                     <div style={{ fontSize: "12px", color: "#94a3b8", marginBottom: "14px", minHeight: "34px", lineHeight: "1.4" }}>
                       {m.description}
@@ -6251,8 +6256,13 @@ export default function App() {
                               {m.rank === 1 ? "🥇 1위" : m.rank === 2 ? "🥈 2위" : m.rank === 3 ? "🥉 3위" : `${m.rank}위`}
                             </td>
                             <td>
-                              <div style={{ fontWeight: 700, fontSize: "14px", color: "#f8fafc" }}>
-                                {m.nickname || m.name}
+                              <div style={{ fontWeight: 700, fontSize: "14px", color: "#f8fafc", display: "flex", alignItems: "center", gap: "6px" }}>
+                                <span>{m.nickname || m.name}</span>
+                                {m.bot_id === "bot_10" && (
+                                  <span style={{ fontSize: "10.5px", padding: "1px 6px", borderRadius: "4px", background: "rgba(168, 85, 247, 0.25)", color: "#c084fc", fontWeight: 700 }}>
+                                    VWAP & LRC
+                                  </span>
+                                )}
                               </div>
                               <div style={{ fontSize: "11.5px", color: "#94a3b8" }}>{m.name}</div>
                             </td>
@@ -7371,8 +7381,13 @@ export default function App() {
                               readOnly
                               style={{ width: "16px", height: "16px", cursor: "pointer", accentColor: "#3b82f6", pointerEvents: "none" }}
                             />
-                            <span style={{ fontWeight: 800, fontSize: "14px", color: isSelected ? "#93c5fd" : "#f1f5f9" }}>
-                              {bot.nickname || bot.name}
+                            <span style={{ fontWeight: 800, fontSize: "14px", color: isSelected ? "#93c5fd" : "#f1f5f9", display: "inline-flex", alignItems: "center", gap: "5px" }}>
+                              <span>{bot.nickname || bot.name}</span>
+                              {bot.bot_id === "bot_10" && (
+                                <span style={{ fontSize: "10px", padding: "1px 5px", borderRadius: "4px", background: "rgba(168, 85, 247, 0.25)", color: "#c084fc", fontWeight: 700 }}>
+                                  VWAP & LRC
+                                </span>
+                              )}
                             </span>
                           </div>
                           <span
@@ -7390,7 +7405,7 @@ export default function App() {
                         </div>
 
                         <div style={{ fontSize: "11.5px", color: "#94a3b8", marginBottom: "8px", lineHeight: "1.4" }}>
-                          {bot.strategy_desc || bot.strategy || bot.bot_id}
+                          {bot.description || bot.strategy_desc || bot.strategy || bot.bot_id}
                         </div>
 
                         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "12px", borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: "8px" }}>

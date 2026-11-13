@@ -590,7 +590,7 @@ def init_database(db_path: Optional[str] = None) -> None:
             ("bot_07", "돌파-눌림목 매매봇", 0.0, 0),
             ("bot_08", "거래량 급증 추종봇", 0.0, 0),
             ("bot_09", "단기 스캘핑봇", 0.0, 0),
-            ("bot_10", "AI 딥러닝 앙상블봇", 0.0, 0),
+            ("bot_10", "잭 켈로그 프라이스액션", 0.0, 0),
         ]
         for b_id, b_name, b_ratio, b_live in initial_bots:
             conn.execute(
@@ -601,6 +601,7 @@ def init_database(db_path: Optional[str] = None) -> None:
                 """,
                 (b_id, b_name, b_ratio, b_live),
             )
+        conn.execute("UPDATE bot_accounts SET name = '잭 켈로그 프라이스액션' WHERE bot_id = 'bot_10';")
 
         conn.commit()
         db_mode_str = "SQLite (" + (db_path or DEFAULT_SQLITE_PATH) + ")" if sqlite_mode else "PostgreSQL"

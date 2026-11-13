@@ -62,6 +62,9 @@ cp "$PROJECT_ROOT/bots.py" "$APP_DIR/"
 cp "$PROJECT_ROOT/market_hub.py" "$APP_DIR/"
 cp "$PROJECT_ROOT/llm_filter_worker.py" "$APP_DIR/"
 cp "$PROJECT_ROOT/main_orchestrator.py" "$APP_DIR/"
+if [ -d "$PROJECT_ROOT/agentBot" ]; then
+    cp -r "$PROJECT_ROOT/agentBot" "$APP_DIR/"
+fi
 cp "$PROJECT_ROOT/package.json" "$APP_DIR/"
 cp "$PROJECT_ROOT/requirements.txt" "$APP_DIR/"
 if [ -f "$PROJECT_ROOT/history.md" ]; then

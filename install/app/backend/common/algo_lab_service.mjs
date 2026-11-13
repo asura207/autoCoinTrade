@@ -205,6 +205,150 @@ function candleKstKey(c) {
   return String(c?.candle_date_time_kst || "").replace("T", " ").slice(0, 19);
 }
 
+/**
+ * 20봉 선형 회귀 채널 (Linear Regression Channel, N = 20)
+ * 최소자승법(OLS)으로 기울기 m, 절편 b, 현재 시점 중심값 ŷ_19, 잔차 표준편차 σ(±2σ) 계산
+ */
+export function computeLinearRegressionChannel(closes, period = 20) {
+  if (!closes || closes.length < period) return null;
+  const win = closes.slice(-period);
+  const n = period;
+  const xMean = (n - 1) / 2.0; // 9.5 for n=20
+  let ySum = 0;
+  for (let i = 0; i < n; i++) ySum += win[i];
+  const yMean = ySum / n;
+
+  let numerator = 0;
+  let denominator = 0; // (n * (n^2 - 1)) / 12 = 665 for n=20
+  for (let i = 0; i < n; i++) {
+    const xDiff = i - xMean;
+    numerator += xDiff * win[i];
+    denominator += xDiff * xDiff;
+  }
+  const slope = denominator !== 0 ? numerator / denominator : 0;
+  const intercept = yMean - slope * xMean;
+  const mid = slope * (n - 1) + intercept; // ŷ_(n-1)
+
+  let sumSqErr = 0;
+  for (let i = 0; i < n; i++) {
+    const fitted = slope * i + intercept;
+    const err = win[i] - fitted;
+    sumSqErr += err * err;
+  }
+  const sigma = Math.sqrt(Math.max(0, sumSqErr / n));
+  const upper = mid + 2.0 * sigma;
+  const lower = mid - 2.0 * sigma;
+
+  return {
+    slope,
+    intercept,
+    mid,
+    upper,
+    lower,
+    sigma,
+  };
+}
+
+/**
+ * 잭 켈로그(Jack Kellogg) 4대 핵심 지표 패키지 계산
+ * ① 당일/롤링 VWAP (TP = (H+L+C)/3) 및 이격도
+ * ② 20봉 선형 회귀 채널 (LRC ±2σ)
+ * ③ 상대 거래량 폭발 배수 (RVOL)
+ * ④ 3대 핵심 기준 가격선 (당일 09시 시가, 전일 종가, 전일 고가, 전일 저가)
+ */
+export function calculateKelloggIndicators(m15Candles, dayCandles, currentPrice) {
+  if (!m15Candles || m15Candles.length < 20) return null;
+  const price = Number(currentPrice || m15Candles[m15Candles.length - 1]?.trade_price || 0);
+
+  // 1. 기준 가격선 (당일 시가, 전일 종가, 전일 고가, 전일 저가)
+  let today_open = 0;
+  let prev_close = 0;
+  let prev_high = 0;
+  let prev_low = 0;
+  if (Array.isArray(dayCandles) && dayCandles.length > 0) {
+    const curDay = dayCandles[dayCandles.length - 1];
+    today_open = Number(curDay.opening_price || 0);
+    if (dayCandles.length >= 2) {
+      const prevDay = dayCandles[dayCandles.length - 2];
+      prev_close = Number(prevDay.trade_price || curDay.prev_closing_price || today_open);
+      prev_high = Number(prevDay.high_price || today_open);
+      prev_low = Number(prevDay.low_price || today_open);
+    } else {
+      prev_close = Number(curDay.prev_closing_price || today_open);
+      prev_high = Number(curDay.high_price || today_open);
+      prev_low = Number(curDay.low_price || today_open);
+    }
+  }
+
+  // 2. 당일(09:00 KST) 및 롤링 24시간 VWAP (TP = (H+L+C)/3)
+  const tradingDate = tradingDateKST(nowKSTString());
+  const dayStartKey = `${tradingDate} 09:00:00`;
+  let dayVwapSum = 0;
+  let dayVolSum = 0;
+  let rollVwapSum = 0;
+  let rollVolSum = 0;
+  const rollCandles = m15Candles.slice(-96);
+
+  for (const c of rollCandles) {
+    const h = Number(c.high_price || 0);
+    const l = Number(c.low_price || 0);
+    const cl = Number(c.trade_price || 0);
+    const v = Number(c.candle_acc_trade_volume || 0);
+    const tp = (h + l + cl) / 3.0;
+    rollVwapSum += tp * v;
+    rollVolSum += v;
+    if (candleKstKey(c) >= dayStartKey) {
+      dayVwapSum += tp * v;
+      dayVolSum += v;
+    }
+  }
+
+  const vwap = (dayVolSum > 0 && dayVwapSum > 0)
+    ? (dayVwapSum / dayVolSum)
+    : (rollVolSum > 0 ? rollVwapSum / rollVolSum : price);
+  const vwap_disparity_pct = vwap > 0 ? ((price - vwap) / vwap) * 100.0 : 0;
+
+  // 3. 20봉 선형 회귀 채널 (LRC)
+  const closes = m15Candles.map((c) => Number(c.trade_price));
+  const lrc = computeLinearRegressionChannel(closes, 20);
+
+  // 4. 상대 거래량 (RVOL)
+  const n = m15Candles.length;
+  const cur = m15Candles[n - 1];
+  const closed = m15Candles[n - 2] || cur;
+  const avg20 = avgVolume(m15Candles, 1, 20); // 직전 20개 완료 캔들 평균 거래량
+  const curVol = Number(cur.candle_acc_trade_volume || 0);
+  const closedVol = Number(closed.candle_acc_trade_volume || 0);
+  const rvol = avg20 > 0 ? Math.max(curVol, closedVol) / avg20 : 1.0;
+  const curRvol = avg20 > 0 ? curVol / avg20 : 1.0;
+  const closedRvol = avg20 > 0 ? closedVol / avg20 : 1.0;
+
+  // 최근 20봉 최고가/최저가
+  const win20 = m15Candles.slice(-20);
+  const recent_high_20 = Math.max(...win20.map((c) => Number(c.high_price || 0)));
+  const recent_low_20 = Math.min(...win20.map((c) => Number(c.low_price || 0)));
+
+  return {
+    today_open,
+    prev_close,
+    prev_high,
+    prev_low,
+    vwap,
+    vwap_disparity_pct,
+    lrc,
+    rvol,
+    curRvol,
+    closedRvol,
+    avg_volume_20: avg20,
+    recent_high_20,
+    recent_low_20,
+    cur,
+    closed,
+    curBullish: Number(cur.trade_price) > Number(cur.opening_price),
+    closedBullish: Number(closed.trade_price) > Number(closed.opening_price),
+  };
+}
+
 // ============================================================================
 // 2. 지표 패키지 빌더 (한 번 계산해 10개 봇이 공유)
 // ============================================================================
@@ -311,6 +455,9 @@ export function buildIndicators(marketData) {
       vwap: vwapVol > 0 ? vwapAmt / vwapVol : null,
       minLow2: Math.min(Number(cur.low_price), Number(closed.low_price)),
     };
+    const kellogg = calculateKelloggIndicators(m15, day, price);
+    ind.kellogg = kellogg;
+    ind.m15.kellogg = kellogg;
   }
   return ind;
 }
@@ -448,14 +595,22 @@ export const ARENA_BOT_DEFS = [
   {
     bot_id: "bot_10",
     legacy_ids: [],
-    name: "RSI 극단 과매도 & VWAP 회귀 (RSI VWAP Scalper)",
-    nickname: "VWAP봇-이오타",
-    strategy_type: "RSI_VWAP_SCALPER",
-    description: "15분봉 RSI ≤ 40 패닉셀 & 당일 VWAP 대비 -3% 이상 이격 후 매수세 유입 시 진입 | VWAP 회귀 또는 RSI 50 도달 시 즉시 청산",
-    min_volume_krw: 5000000000,
-    stop_loss_pct: 3.0,
-    take_profit_pct: 4.0,
-    config: { rsi_threshold: 40, vwap_gap_pct: 3.0, exit_rsi: 50, order_ratio: 0.3, max_positions: 3 },
+    name: "잭 켈로그 프라이스액션 (Jack Kellogg Price Action)",
+    nickname: "잭 켈로그 프라이스액션",
+    strategy_type: "JACK_KELLOGG_PRICE_ACTION",
+    description: "4대 핵심 지표(VWAP, 20봉 선형회귀 채널 LRC ±2σ, 거래량 폭발 RVOL, 당일시가/전일고저) 기반 돌파 및 과매도 2분할 반등 매매",
+    min_volume_krw: 10000000000,
+    stop_loss_pct: 2.5,
+    take_profit_pct: 5.0,
+    config: {
+      rvol_breakout_arena: 1.5,
+      rvol_breakout_live: 2.0,
+      rvol_dip: 1.3,
+      vwap_gap_arena: 2.2,
+      vwap_gap_live: 3.0,
+      order_ratio: 0.3,
+      max_positions: 3,
+    },
   },
 ];
 
@@ -667,25 +822,133 @@ const STRATEGIES = {
     return hold(`거래량 ${fmt(m.closedVolRatio, 1)}배 (기준 ${spike}배)`);
   },
 
-  // bot_10: RSI 극단 과매도 & VWAP 회귀
-  bot_10({ price, ind, held, params }) {
-    const m = ind.m15;
-    if (!m) return hold("15분봉 데이터 부족");
-    const exitRsi = Number(params.exit_rsi ?? 50);
+  // bot_10: 잭 켈로그(Jack Kellogg) 프라이스 액션 & VWAP/선형회귀 모멘텀
+  bot_10({ price, ind, held, params, options = {} }) {
+    const k = ind.kellogg || ind.m15?.kellogg;
+    if (!k || !k.lrc || !k.vwap) return hold("잭 켈로그 4대 지표(VWAP/LRC) 데이터 산출 대기");
+
+    const isLive = Boolean(options.isLive);
+    const rvolBreakoutTh = Number(params.rvol_breakout ?? (isLive ? (params.rvol_breakout_live ?? 2.0) : (params.rvol_breakout_arena ?? 1.5)));
+    const rvolDipTh = Number(params.rvol_dip ?? 1.3);
+    const dipGapTh = Number(params.vwap_gap ?? (isLive ? -(params.vwap_gap_live ?? 3.0) : -(params.vwap_gap_arena ?? 2.2)));
+    const trailingPct = Number(params.trailing_stop_pct ?? 1.5);
+
+    // ==========================================
+    // 1. 보유 포지션 매도 / 익절 / 손절 평가
+    // ==========================================
     if (held.length > 0) {
-      if (m.vwap && price >= m.vwap) return sell("VWAP 회귀 청산");
-      if (m.rsi >= exitRsi) return sell(`RSI ${fmt(m.rsi, 1)} ≥ ${exitRsi} 도달 청산`);
-      return hold("보유 중 (VWAP 회귀/RSI 50 대기)");
+      const totalCost = held.reduce((acc, p) => acc + Number(p.buy_amount || Number(p.volume) * Number(p.avg_buy_price)), 0);
+      const totalVol = held.reduce((acc, p) => acc + Number(p.volume), 0);
+      const avgBuyPrice = totalVol > 0 ? totalCost / totalVol : Number(held[0].avg_buy_price);
+      const totalPnlPct = pctChange(price, avgBuyPrice);
+
+      const isBreakout = held.some((p) => String(p.buy_reason || "").includes("돌파") || String(p.buy_reason || "").includes("Setup A"));
+      const isDip = held.some((p) => String(p.buy_reason || "").includes("반등") || String(p.buy_reason || "").includes("Setup B"));
+
+      // (1) 기계적 기준선 손절 (Key Level Hard Stop)
+      if (isBreakout) {
+        if ((k.today_open > 0 && price < k.today_open && price < k.vwap) || totalPnlPct <= -2.0) {
+          return sell(`[Setup A 손절] 당일시가(${ko(k.today_open)}) 및 VWAP(${ko(k.vwap)}) 동시 이탈 / 손절(-2.0%) 청산 (수익률 ${fmt(totalPnlPct)}%)`);
+        }
+      }
+
+      if (isDip) {
+        if (k.prev_low > 0 && price < k.prev_low) {
+          return sell(`[Setup B 손절] 전일 저가(${ko(k.prev_low)}) 하향 이탈 손절 (수익률 ${fmt(totalPnlPct)}%)`);
+        }
+        if (held.length >= 2 && totalPnlPct <= -2.5) {
+          return sell(`[Setup B 손절] 2차 분할 후 평단가 대비 -2.5% 손절 (수익률 ${fmt(totalPnlPct)}%)`);
+        }
+      }
+
+      if (!isBreakout && !isDip) {
+        if ((k.today_open > 0 && price < k.today_open && price < k.vwap) || totalPnlPct <= -2.5) {
+          return sell(`[기계적 기준선 손절] 당일시가/VWAP 이탈 또는 -2.5% 손절 (수익률 ${fmt(totalPnlPct)}%)`);
+        }
+      }
+
+      // (2) 선형 회귀 채널 익절 (Take Profit)
+      if (totalPnlPct >= 1.5 && price >= k.lrc.upper) {
+        return sell(`[LRC 상단 익절] +2σ 채널 상단(${ko(k.lrc.upper)}) 도달 전량 익절 (수익률 +${fmt(totalPnlPct)}%)`);
+      }
+      if (isDip && totalPnlPct >= 1.5 && price >= k.lrc.mid) {
+        return sell(`[LRC 중심선 회귀 익절] LRC 중심선(${ko(k.lrc.mid)}) 도달 익절 (수익률 +${fmt(totalPnlPct)}%)`);
+      }
+
+      // (3) 대량 거래량 폭발 + 윗꼬리 음봉 (Volume Climax Exhaustion) 청산
+      const cur = k.cur;
+      const isBearishUpperWick = Number(cur.trade_price) < Number(cur.opening_price) &&
+        (Number(cur.high_price) - Number(cur.opening_price)) > Math.abs(Number(cur.opening_price) - Number(cur.trade_price)) * 0.5;
+      if (totalPnlPct >= 1.0 && k.rvol >= 2.5 && isBearishUpperWick) {
+        return sell(`[거래량 클라이맥스 엑시트] RVOL ${fmt(k.rvol, 1)}배 윗꼬리 음봉 출현 익절 (수익률 +${fmt(totalPnlPct)}%)`);
+      }
+
+      // (4) 최고가 대비 -1.5% 트레일링 스탑
+      const peak = Math.max(Number(options.peakPrice || 0), price);
+      const peakPnl = pctChange(peak, avgBuyPrice);
+      if (peakPnl >= 1.5 && price <= peak * (1 - trailingPct / 100)) {
+        return sell(`[트레일링 스탑] 고점 대비 -${trailingPct}% 반락 익절 (수익률 +${fmt(totalPnlPct)}%)`);
+      }
+
+      // (5) Setup B 2차 분할 매수 (Scaling-In) 평가
+      if (isDip && held.length === 1) {
+        const firstBuyPrice = Number(held[0].avg_buy_price);
+        const dropPct = pctChange(price, firstBuyPrice);
+        if (dropPct <= -2.5 && (k.prev_low === 0 || price >= k.prev_low)) {
+          return buy(`[Setup B 2차 분할 매수] 1차 진입가 대비 ${fmt(dropPct)}% 추가 하락 분할 매수 (Scaling-In)`, {
+            setup: "B",
+            splitIndex: 2,
+            order_ratio: 0.15,
+          });
+        }
+      }
+
+      return hold(`잭 켈로그 포지션 감시 중 (수익률 ${fmt(totalPnlPct)}%, LRC ${ko(k.lrc.lower)} ~ ${ko(k.lrc.upper)})`);
     }
-    if (!m.vwap) return hold("VWAP 산출 대기");
-    const rsiTh = Number(params.rsi_threshold ?? 40);
-    const gapNeed = Number(params.vwap_gap_pct ?? 3.0);
-    const gap = pctChange(price, m.vwap);
-    const buyersIn = m.curBullish || price > Number(m.closed.trade_price);
-    if (m.rsiMin3 <= rsiTh && gap <= -gapNeed && buyersIn) {
-      return buy(`RSI ${fmt(m.rsiMin3, 1)} 패닉셀 · VWAP 대비 ${fmt(gap)}% 이격 후 매수세 유입`);
+
+    // ==========================================
+    // 2. 신규 매수 진입 평가 (Setup A & Setup B)
+    // ==========================================
+
+    // Setup A [Breakout Long - 추세 돌파 진입]
+    const setupA_trend = (k.today_open > 0 ? price > k.today_open : true) && price > k.vwap;
+    const setupA_slope = k.lrc.slope > 0 && price < k.lrc.upper;
+    const setupA_break = (k.recent_high_20 > 0 && price >= k.recent_high_20 * 0.998) ||
+                         (k.prev_high > 0 && price >= k.prev_high * 0.998);
+    const setupA_vol = k.rvol >= rvolBreakoutTh;
+
+    if (setupA_trend && setupA_slope && setupA_break && setupA_vol) {
+      return buy(
+        `[Setup A 돌파] VWAP 지지(${ko(k.vwap)}) & 전고점 돌파 · RVOL ${fmt(k.rvol, 1)}배 · LRC 기울기 +${fmt(k.lrc.slope, 2)}`,
+        {
+          setup: "A",
+          splitIndex: 1,
+          order_ratio: 0.3,
+        }
+      );
     }
-    return hold(`RSI ${fmt(m.rsi, 1)} / VWAP 이격 ${fmt(gap)}%`);
+
+    // Setup B [Dip Reversion Long - 과매도 이격 반등 1차 진입]
+    const minLow = Math.min(Number(k.cur.low_price || price), Number(k.closed.low_price || price));
+    const setupB_dip = k.vwap_disparity_pct <= dipGapTh;
+    const setupB_lrc = minLow <= k.lrc.lower * 1.002;
+    const setupB_rebound = k.curBullish || price > Number(k.closed.trade_price);
+    const setupB_vol = k.rvol >= rvolDipTh;
+
+    if (setupB_dip && setupB_lrc && setupB_rebound && setupB_vol) {
+      return buy(
+        `[Setup B 반등 1차] LRC 하단(-2σ ${ko(k.lrc.lower)}) 터치 반등 · VWAP 이격 ${fmt(k.vwap_disparity_pct)}% · RVOL ${fmt(k.rvol, 1)}배`,
+        {
+          setup: "B",
+          splitIndex: 1,
+          order_ratio: 0.15,
+        }
+      );
+    }
+
+    return hold(
+      `잭 켈로그 시그널 대기 (VWAP 이격 ${fmt(k.vwap_disparity_pct)}%, LRC 기울기 ${fmt(k.lrc.slope, 2)}, RVOL ${fmt(k.rvol, 1)}배)`
+    );
   },
 };
 
@@ -907,6 +1170,16 @@ export async function seedArenaBots(db, { hadSelectionColumn = true } = {}) {
   // 가상거래 상시 가동(항상 1) 보장
   await db.prepare("UPDATE bots SET paper_is_running = 1").run();
 
+  // bot_10 잭 켈로그 전략명/별명 마이그레이션 적용
+  await db.prepare(`
+    UPDATE bots
+    SET nickname = '잭 켈로그 프라이스액션',
+        name = '잭 켈로그 프라이스액션 (Jack Kellogg Price Action)',
+        strategy_type = 'JACK_KELLOGG_PRICE_ACTION',
+        min_volume_krw = 10000000000
+    WHERE bot_id = 'bot_10' AND (nickname = 'VWAP봇-이오타' OR nickname = '' OR nickname LIKE '%이오타%' OR name LIKE '%RSI%')
+  `).run();
+
   // 실전 담당 봇 초기 선택 (기존 실전 3대 봇: 돌파봇-알파 40%, 모멘텀봇-베타 40%, 볼린저봇-감마 20%)
   const selectedCountRow = await db.prepare("SELECT COUNT(*) AS cnt FROM bots WHERE is_selected_for_live = 1").get();
   const selectedCount = Number(selectedCountRow?.cnt || 0);
@@ -1082,10 +1355,11 @@ async function runPaperBot(db, bot, ctx) {
     candidates = candidates.sort((a, b) => (rankMap[a]?.rank || 99) - (rankMap[b]?.rank || 99));
   }
 
-  const isGrid = bot.bot_id === "bot_06";
+  const canScaleIn = bot.bot_id === "bot_06" || bot.bot_id === "bot_10";
   for (const market of candidates) {
     const held = heldByMarket.get(market) || [];
-    if (held.length > 0 && !isGrid) continue;
+    if (held.length > 0 && !canScaleIn) continue;
+    if (bot.bot_id === "bot_10" && held.length >= 2) continue;
     if (held.length === 0 && heldByMarket.size >= maxMarkets) continue;
     const cdAt = cooldownMap.get(`${bot.bot_id}|${market}`) || 0;
     if (held.length === 0 && Date.now() - cdAt < COOLDOWN_MS) continue;
@@ -1095,12 +1369,17 @@ async function runPaperBot(db, bot, ctx) {
       params,
       momentumRank: rankMap,
       market,
+      isLive: false,
     });
     if (!firstNote && sig.signal === "HOLD") firstNote = `${market.replace("KRW-", "")}: ${sig.reason}`;
     if (sig.signal !== "BUY") continue;
 
     let ratio = normalizedOrderRatio(cfg, 0.3);
-    if (isGrid) ratio = ratio / Math.max(1, Number(cfg.max_splits || 3));
+    if (bot.bot_id === "bot_06") {
+      ratio = ratio / Math.max(1, Number(cfg.max_splits || 3));
+    } else if (bot.bot_id === "bot_10" && sig.order_ratio) {
+      ratio = Number(sig.order_ratio);
+    }
     const budget = Math.min(Math.floor(initial * ratio), Math.floor(cash / (1 + PAPER_FEE_RATE)));
     if (budget < PAPER_MIN_ORDER_KRW) break;
     const filled = await paperBuy(db, bot, market, md.price, budget, sig.reason);

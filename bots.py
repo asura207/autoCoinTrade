@@ -973,3 +973,18 @@ def run_bot_bb(stop_event, bot_id: str = "bot_bb", db_path: Optional[str] = None
             break
 
     logger.info("Bot process [%s] gracefully stopped.", bot_id)
+
+
+# =====================================================================
+# 8. Step 5: 봇 10 (`bot_10`) - 잭 켈로그(Jack Kellogg) 프라이스 액션
+#    VWAP & 20봉 선형 회귀 채널(LRC ±2σ) 돌파/반등 2분할 매매
+# =====================================================================
+
+from agentBot.bot_10_jack_kellogg import (
+    calculate_kellogg_indicators,
+    compute_linear_regression_channel,
+    compute_vwap,
+    evaluate_jack_kellogg_strategy,
+    run_bot_jack_kellogg,
+)
+

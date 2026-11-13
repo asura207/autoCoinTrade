@@ -51,7 +51,7 @@ if (fs.existsSync(ENV_PATH)) {
 const HOST = process.env.BACKEND_HOST || "0.0.0.0";
 const PORT = Number(process.env.BACKEND_PORT || process.env.PORT || 8001);
 
-let APP_VERSION = "0.0.17";
+let APP_VERSION = "0.0.18";
 try {
   const pkgJsonPath = path.join(BASE_DIR, "package.json");
   if (fs.existsSync(pkgJsonPath)) {
@@ -5758,6 +5758,7 @@ async function runLiveTradingBotsCycle() {
             peakPrice: curPeak,
             momentumRank: rankMap,
             market: pos.market,
+            isLive: true,
           });
           if (sig.signal === "SELL") {
             await executeBotSellOrder(bot, pos, curPrice, sig.reason);
@@ -5815,19 +5816,23 @@ async function runLiveTradingBotsCycle() {
 
       let actionMsg = "";
       for (const mkt of candidates) {
-        if (heldSet.has(mkt) && bot.bot_id !== "bot_06") continue;
+        if (heldSet.has(mkt) && bot.bot_id !== "bot_06" && bot.bot_id !== "bot_10") continue;
         if (!heldSet.has(mkt) && heldSet.size >= maxPositions) continue;
 
         const md = mdMap.get(mkt);
         const held = (refreshedBot.open_positions || []).filter((p) => p.market === mkt);
+        if (bot.bot_id === "bot_10" && held.length >= 2) continue;
+
         const sig = evaluateStrategy(bot.bot_id, md, md.indicators, held, {
           params,
           momentumRank: rankMap,
           market: mkt,
+          isLive: true,
         });
 
         if (sig.signal === "BUY") {
-          const appliedRatio = Number(cfg.order_ratio || 0.3) * (regimeInfo.multiplier ?? 1.0);
+          const baseRatio = Number(sig.order_ratio || cfg.order_ratio || 0.3);
+          const appliedRatio = baseRatio * (regimeInfo.multiplier ?? 1.0);
           const orderKrw = getSafeOrderKrw(refreshedBot, appliedRatio);
           if (orderKrw >= 5000) {
             const ok = await executeBotBuyOrder(refreshedBot, mkt, orderKrw, md.price);
