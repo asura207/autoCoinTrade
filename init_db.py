@@ -537,6 +537,23 @@ def init_database(db_path: Optional[str] = None) -> None:
             );
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS monthly_asset_snapshots (
+                year_month TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'live',
+                month_start_balance REAL NOT NULL,
+                current_balance REAL NOT NULL,
+                krw_balance REAL NOT NULL DEFAULT 0,
+                coin_eval_balance REAL NOT NULL DEFAULT 0,
+                diff_amount REAL NOT NULL DEFAULT 0,
+                diff_rate REAL NOT NULL DEFAULT 0,
+                snapshot_date TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (year_month, mode)
+            );
+            """
+        )
 
         # 10. market_regime_filter id=1 기본 행 초기화
         initial_overrides = json.dumps(

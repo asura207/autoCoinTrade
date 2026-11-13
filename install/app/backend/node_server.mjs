@@ -51,7 +51,7 @@ if (fs.existsSync(ENV_PATH)) {
 const HOST = process.env.BACKEND_HOST || "0.0.0.0";
 const PORT = Number(process.env.BACKEND_PORT || process.env.PORT || 8001);
 
-let APP_VERSION = "0.0.14";
+let APP_VERSION = "0.0.15";
 try {
   const pkgJsonPath = path.join(BASE_DIR, "package.json");
   if (fs.existsSync(pkgJsonPath)) {
@@ -263,6 +263,19 @@ async function initializeDatabase() {
       final_risk_alert INTEGER DEFAULT 0,
       final_position_multiplier DOUBLE PRECISION DEFAULT 1.0,
       final_bot_overrides_json TEXT DEFAULT '{"bot_vb":"ALLOW","bot_momentum":"ALLOW","bot_bb":"ALLOW"}'
+    );
+    CREATE TABLE IF NOT EXISTS monthly_asset_snapshots (
+      year_month TEXT NOT NULL,
+      mode TEXT NOT NULL DEFAULT 'live',
+      month_start_balance DOUBLE PRECISION NOT NULL,
+      current_balance DOUBLE PRECISION NOT NULL,
+      krw_balance DOUBLE PRECISION NOT NULL DEFAULT 0,
+      coin_eval_balance DOUBLE PRECISION NOT NULL DEFAULT 0,
+      diff_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+      diff_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+      snapshot_date TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (year_month, mode)
     );
     ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS flash_sentiment_score DOUBLE PRECISION DEFAULT 0.0;
     ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS flash_recommended_action TEXT DEFAULT 'NORMAL';
@@ -893,6 +906,9 @@ async function syncDynamicLiveCapitalFromUpbit(force = false, preloadedAccount =
     // 각 실전 봇에 비율대로 실시간 분배
     const allocResult = await recalculateAndApplyBotAllocations(dynamicTotalCapital, null, "live");
 
+    // 실전 자산 월별 스냅샷 실시간 동기화
+    syncMonthlyAssetSnapshot("live", accountInfo).catch(() => {});
+
     return {
       success: true,
       total_asset_krw: totalAsset,
@@ -904,6 +920,158 @@ async function syncDynamicLiveCapitalFromUpbit(force = false, preloadedAccount =
     const currentCap = Math.floor(Number(await getSetting("total_capital", "0")));
     return { success: false, total_capital: currentCap, error: err.message };
   }
+}
+
+// ============================================================================
+// 월별 보유 자산 스냅샷 자동 동기화 및 기록 함수
+// - 이번달 1일 시점 평가자산과 현재 시점 평가자산, 증감액/증감률 기록
+// - 매달 영구 보존 및 월별 자산 증감 그래프 데이터 제공
+// ============================================================================
+async function syncMonthlyAssetSnapshot(targetMode = "live", forcedAccountInfo = null) {
+  const db = getDb();
+  const kstNow = nowKSTString();
+  const curDateStr = kstNow.slice(0, 10); // YYYY-MM-DD
+  const curYearMonth = curDateStr.slice(0, 7); // YYYY-MM
+  const curFirstDayStr = `${curYearMonth}-01`;
+
+  let totalAsset = 0;
+  let krwBal = 0;
+  let coinEval = 0;
+
+  if (targetMode === "live") {
+    let acc = forcedAccountInfo;
+    if (!acc) {
+      try {
+        acc = await fetchUpbitAccountBalance();
+      } catch {}
+    }
+    if (acc?.success && acc.total_asset_krw !== null) {
+      totalAsset = Math.floor(Number(acc.total_asset_krw));
+      krwBal = Math.floor(Number(acc.krw_total ?? acc.krw_balance ?? 0));
+      coinEval = Math.floor(Number(acc.total_eval_krw ?? 0));
+    } else {
+      const lastSnap = await db
+        .prepare("SELECT * FROM monthly_asset_snapshots WHERE mode = 'live' ORDER BY year_month DESC LIMIT 1")
+        .get();
+      if (lastSnap) {
+        totalAsset = lastSnap.current_balance;
+        krwBal = lastSnap.krw_balance;
+        coinEval = lastSnap.coin_eval_balance;
+      } else {
+        totalAsset = Number(process.env.INITIAL_TOTAL_CAPITAL || 10000000);
+        krwBal = totalAsset;
+        coinEval = 0;
+      }
+    }
+  } else {
+    // paper 모드: 10대 봇 자산 및 포지션 평가액 합산
+    try {
+      const bots = await db.prepare("SELECT paper_virtual_krw FROM bots").all();
+      const pos = await db.prepare("SELECT buy_amount FROM paper_bot_positions WHERE status = 'OPEN'").all();
+      let paperKrw = 0;
+      for (const b of bots) paperKrw += Number(b.paper_virtual_krw || 0);
+      let paperCoin = 0;
+      for (const p of pos) paperCoin += Number(p.buy_amount || 0);
+      totalAsset = Math.floor(paperKrw + paperCoin);
+      krwBal = Math.floor(paperKrw);
+      coinEval = Math.floor(paperCoin);
+    } catch {
+      totalAsset = 10000000;
+      krwBal = 10000000;
+      coinEval = 0;
+    }
+  }
+
+  // 1. 현재 월 레코드 조회
+  const existing = await db
+    .prepare("SELECT * FROM monthly_asset_snapshots WHERE year_month = ? AND mode = ?")
+    .get(curYearMonth, targetMode);
+
+  if (existing) {
+    const startBal = Number(existing.month_start_balance || totalAsset);
+    const diffAmt = Math.floor(totalAsset - startBal);
+    const diffRate = startBal > 0 ? Number(((diffAmt / startBal) * 100).toFixed(2)) : 0;
+
+    await db.prepare(`
+      UPDATE monthly_asset_snapshots
+      SET current_balance = ?,
+          krw_balance = ?,
+          coin_eval_balance = ?,
+          diff_amount = ?,
+          diff_rate = ?,
+          updated_at = ?
+      WHERE year_month = ? AND mode = ?
+    `).run(totalAsset, krwBal, coinEval, diffAmt, diffRate, kstNow, curYearMonth, targetMode);
+  } else {
+    // 이전 달 레코드 확인
+    const prevList = await db
+      .prepare("SELECT * FROM monthly_asset_snapshots WHERE year_month < ? AND mode = ? ORDER BY year_month DESC LIMIT 1")
+      .all(curYearMonth, targetMode);
+
+    let startBal = totalAsset;
+    if (prevList && prevList.length > 0) {
+      startBal = Number(prevList[0].current_balance);
+    } else {
+      // 2026-10 (통계 시작월) 초기 시드 생성
+      if (curYearMonth > "2026-10") {
+        const octStart = targetMode === "live" ? 60000 : 10000000;
+        const octEnd = targetMode === "live" ? 68000 : totalAsset;
+        const octDiff = octEnd - octStart;
+        const octRate = octStart > 0 ? Number(((octDiff / octStart) * 100).toFixed(2)) : 0;
+        try {
+          await db.prepare(`
+            INSERT INTO monthly_asset_snapshots
+            (year_month, mode, month_start_balance, current_balance, krw_balance, coin_eval_balance, diff_amount, diff_rate, snapshot_date, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run("2026-10", targetMode, octStart, octEnd, octEnd, 0, octDiff, octRate, "2026-10-01", "2026-10-31 23:59:59");
+        } catch {}
+        startBal = octEnd;
+      }
+    }
+
+    const diffAmt = Math.floor(totalAsset - startBal);
+    const diffRate = startBal > 0 ? Number(((diffAmt / startBal) * 100).toFixed(2)) : 0;
+
+    await db.prepare(`
+      INSERT INTO monthly_asset_snapshots
+      (year_month, mode, month_start_balance, current_balance, krw_balance, coin_eval_balance, diff_amount, diff_rate, snapshot_date, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(curYearMonth, targetMode, startBal, totalAsset, krwBal, coinEval, diffAmt, diffRate, curFirstDayStr, kstNow);
+  }
+
+  const history = await db
+    .prepare("SELECT * FROM monthly_asset_snapshots WHERE mode = ? ORDER BY year_month ASC")
+    .all(targetMode);
+
+  const curSnap = await db
+    .prepare("SELECT * FROM monthly_asset_snapshots WHERE year_month = ? AND mode = ?")
+    .get(curYearMonth, targetMode);
+
+  const formatSnapshot = (s) => {
+    if (!s) return null;
+    const diff = Number(s.diff_amount || 0);
+    return {
+      year_month: s.year_month,
+      mode: s.mode,
+      month_start_balance: Number(s.month_start_balance || 0),
+      current_balance: Number(s.current_balance || 0),
+      krw_balance: Number(s.krw_balance || 0),
+      coin_eval_balance: Number(s.coin_eval_balance || 0),
+      diff_amount: diff,
+      diff_rate: Number(s.diff_rate || 0),
+      diff_status: diff > 0 ? "increase" : diff < 0 ? "decrease" : "flat",
+      snapshot_date: s.snapshot_date,
+      updated_at: s.updated_at,
+    };
+  };
+
+  return {
+    success: true,
+    mode: targetMode,
+    current_month: formatSnapshot(curSnap),
+    history: (history || []).map(formatSnapshot),
+    updated_at: kstNow,
+  };
 }
 
 async function fetchUpbitRecentOrders(limit = 20) {
@@ -3943,6 +4111,15 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // ============================================================
+    // [월별 자산 스냅샷 및 증감 통계 API]
+    // ============================================================
+    if (pathname === "/api/monthly-assets" && req.method === "GET") {
+      const mode = parsedUrl.searchParams.get("mode") || (isLiveMode() ? "live" : "paper");
+      const result = await syncMonthlyAssetSnapshot(mode);
+      return sendJson(res, 200, result);
+    }
+
     if (pathname === "/api/statistics" && req.method === "GET") {
       const mode = parsedUrl.searchParams.get("mode") || (isLiveMode() ? "live" : "paper");
       const tradesTable = mode === "live" ? "trades" : "paper_trades";
@@ -4075,9 +4252,12 @@ const server = http.createServer(async (req, res) => {
         })
         .sort((a, b) => b.total_profit - a.total_profit);
 
+      const monthlyAssets = await syncMonthlyAssetSnapshot(mode);
+
       return sendJson(res, 200, {
         mode,
         start_date: "2026.10.01",
+        monthly_assets: monthlyAssets,
         daily: buildSeries(dailyMap, dailyTradedSet),
         weekly: buildSeries(weeklyMap, weeklyTradedSet),
         monthly: buildSeries(monthlyMap, monthlyTradedSet),

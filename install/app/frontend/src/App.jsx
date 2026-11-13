@@ -350,6 +350,414 @@ function ProfitLineChart({ series, periodLabel }) {
   );
 }
 
+/**
+ * 월별 보유 자산 및 증감 추이 인터랙티브 차트 컴포넌트
+ * - 매달 1일 시점 평가자산 vs 현재/말일 시점 평가자산 막대 그래프 비교
+ * - 상단 월간 순증감 뱃지 및 마우스 툴팁 지원
+ * - 월별 변동 내역 테이블 표출
+ */
+function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) {
+  const scrollRef = useRef(null);
+  const [hoveredMonth, setHoveredMonth] = useState(null);
+
+  const dataList = useMemo(() => {
+    if (!history || history.length === 0) {
+      if (currentMonth) return [currentMonth];
+      return [];
+    }
+    return history;
+  }, [history, currentMonth]);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollLeft = scrollRef.current.scrollWidth;
+    }
+  }, [dataList]);
+
+  if (!dataList || dataList.length === 0) {
+    return (
+      <div style={{ padding: "30px", textAlign: "center", color: "#94a3b8" }}>
+        기록된 월별 보유 자산 데이터가 없습니다.
+      </div>
+    );
+  }
+
+  const padLeft = 85;
+  const padRight = 40;
+  const padTop = 45;
+  const padBottom = 45;
+  const groupWidth = 140;
+  const barWidth = 36;
+  const barGap = 8;
+  const width = Math.max(780, padLeft + padRight + dataList.length * groupWidth);
+  const height = 280;
+
+  const allBalances = dataList.flatMap((d) => [
+    Number(d.month_start_balance || 0),
+    Number(d.current_balance || 0),
+  ]);
+  const rawMax = Math.max(...allBalances, 10000);
+  const maxVal = Math.ceil(rawMax * 1.15);
+  const plotH = height - padTop - padBottom;
+
+  const getY = (val) => {
+    const ratio = Math.max(0, Math.min(1, val / maxVal));
+    return padTop + plotH - ratio * plotH;
+  };
+
+  const formatShortKRW = (num) => {
+    if (num >= 100000000) return `${(num / 100000000).toFixed(1)}억`;
+    if (num >= 10000) return `${Math.floor(num / 10000).toLocaleString()}만`;
+    return `${Math.floor(num).toLocaleString()}원`;
+  };
+
+  const yTicks = [0, maxVal * 0.33, maxVal * 0.66, maxVal];
+
+  return (
+    <div style={{ marginTop: "10px" }}>
+      <div
+        ref={scrollRef}
+        style={{
+          width: "100%",
+          overflowX: "auto",
+          paddingBottom: "8px",
+          background: "rgba(11, 15, 25, 0.4)",
+          borderRadius: "12px",
+          border: "1px solid rgba(255, 255, 255, 0.05)",
+        }}
+      >
+        <svg
+          viewBox={`0 0 ${width} ${height}`}
+          style={{
+            width: dataList.length > 5 ? `${width}px` : "100%",
+            height: "auto",
+            minWidth: "600px",
+            display: "block",
+          }}
+        >
+          {/* Y축 그리드 및 레이블 */}
+          {yTicks.map((tick, idx) => {
+            const yPos = getY(tick);
+            return (
+              <g key={`ytick-${idx}`}>
+                <line
+                  x1={padLeft}
+                  y1={yPos}
+                  x2={width - padRight}
+                  y2={yPos}
+                  stroke={idx === 0 ? "rgba(255, 255, 255, 0.15)" : "rgba(255, 255, 255, 0.05)"}
+                  strokeDasharray={idx === 0 ? "none" : "3,3"}
+                  strokeWidth="1"
+                />
+                <text
+                  x={padLeft - 10}
+                  y={yPos + 4}
+                  textAnchor="end"
+                  fill="#94a3b8"
+                  fontSize="11"
+                  fontFamily="sans-serif"
+                >
+                  {formatShortKRW(tick)}
+                </text>
+              </g>
+            );
+          })}
+
+          {/* 월별 막대 그룹 */}
+          {dataList.map((item, idx) => {
+            const groupCenterX = padLeft + idx * groupWidth + groupWidth / 2;
+            const startBal = Number(item.month_start_balance || 0);
+            const curBal = Number(item.current_balance || 0);
+            const diffAmt = Number(item.diff_amount || curBal - startBal);
+            const diffRate = Number(item.diff_rate || 0);
+            const isInc = diffAmt > 0;
+            const isDec = diffAmt < 0;
+
+            const startBarX = groupCenterX - barWidth - barGap / 2;
+            const startBarY = getY(startBal);
+            const startBarH = padTop + plotH - startBarY;
+
+            const curBarX = groupCenterX + barGap / 2;
+            const curBarY = getY(curBal);
+            const curBarH = padTop + plotH - curBarY;
+
+            const badgeY = Math.min(startBarY, curBarY) - 18;
+            const isHovered = hoveredMonth === item.year_month;
+
+            return (
+              <g
+                key={item.year_month}
+                onMouseEnter={() => setHoveredMonth(item.year_month)}
+                onMouseLeave={() => setHoveredMonth(null)}
+                style={{ cursor: "pointer" }}
+              >
+                {/* 배경 호버 하이라이트 영역 */}
+                {isHovered && (
+                  <rect
+                    x={groupCenterX - groupWidth / 2 + 6}
+                    y={padTop - 25}
+                    width={groupWidth - 12}
+                    height={plotH + 40}
+                    rx="8"
+                    fill="rgba(56, 189, 248, 0.06)"
+                    stroke="rgba(56, 189, 248, 0.25)"
+                    strokeWidth="1"
+                  />
+                )}
+
+                {/* 1일 시작 자산 막대 (슬레이트 블루) */}
+                <rect
+                  x={startBarX}
+                  y={startBarY}
+                  width={barWidth}
+                  height={Math.max(2, startBarH)}
+                  rx="4"
+                  fill="url(#startBalGrad)"
+                  opacity={isHovered ? 1 : 0.85}
+                />
+                <text
+                  x={startBarX + barWidth / 2}
+                  y={startBarY - 6}
+                  textAnchor="middle"
+                  fill="#94a3b8"
+                  fontSize="10"
+                  fontWeight="600"
+                >
+                  {formatShortKRW(startBal)}
+                </text>
+
+                {/* 현재/말일 자산 막대 (증가: 에메랄드/그린, 감소: 레드) */}
+                <rect
+                  x={curBarX}
+                  y={curBarY}
+                  width={barWidth}
+                  height={Math.max(2, curBarH)}
+                  rx="4"
+                  fill={isInc ? "url(#curBalIncGrad)" : isDec ? "url(#curBalDecGrad)" : "url(#curBalFlatGrad)"}
+                  opacity={isHovered ? 1 : 0.95}
+                />
+                <text
+                  x={curBarX + barWidth / 2}
+                  y={curBarY - 6}
+                  textAnchor="middle"
+                  fill={isInc ? "#4ade80" : isDec ? "#f87171" : "#e2e8f0"}
+                  fontSize="10.5"
+                  fontWeight="700"
+                >
+                  {formatShortKRW(curBal)}
+                </text>
+
+                {/* 상단 증감 뱃지 태그 */}
+                <g transform={`translate(${groupCenterX}, ${badgeY})`}>
+                  <rect
+                    x="-44"
+                    y="-12"
+                    width="88"
+                    height="18"
+                    rx="9"
+                    fill={isInc ? "rgba(34, 197, 94, 0.2)" : isDec ? "rgba(239, 68, 68, 0.2)" : "rgba(148, 163, 184, 0.2)"}
+                    stroke={isInc ? "#22c55e" : isDec ? "#ef4444" : "#94a3b8"}
+                    strokeWidth="1"
+                  />
+                  <text
+                    x="0"
+                    y="1"
+                    textAnchor="middle"
+                    dominantBaseline="middle"
+                    fill={isInc ? "#4ade80" : isDec ? "#fca5a5" : "#cbd5e1"}
+                    fontSize="9.5"
+                    fontWeight="700"
+                  >
+                    {isInc ? `▲ +${diffRate.toFixed(1)}%` : isDec ? `▼ ${diffRate.toFixed(1)}%` : "- 0.0%"}
+                  </text>
+                </g>
+
+                {/* X축 연월 라벨 */}
+                <text
+                  x={groupCenterX}
+                  y={height - 18}
+                  textAnchor="middle"
+                  fill={isHovered ? "#38bdf8" : "#cbd5e1"}
+                  fontSize="12"
+                  fontWeight={isHovered ? "800" : "600"}
+                >
+                  {item.year_month}
+                </text>
+                <text
+                  x={groupCenterX}
+                  y={height - 4}
+                  textAnchor="middle"
+                  fill="#64748b"
+                  fontSize="10"
+                >
+                  {item.year_month === currentMonth?.year_month ? "(진행중)" : "(마감)"}
+                </text>
+              </g>
+            );
+          })}
+
+          {/* 그라데이션 정의 */}
+          <defs>
+            <linearGradient id="startBalGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#64748b" />
+              <stop offset="100%" stopColor="#334155" />
+            </linearGradient>
+            <linearGradient id="curBalIncGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#10b981" />
+              <stop offset="100%" stopColor="#047857" />
+            </linearGradient>
+            <linearGradient id="curBalDecGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#ef4444" />
+              <stop offset="100%" stopColor="#b91c1c" />
+            </linearGradient>
+            <linearGradient id="curBalFlatGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#94a3b8" />
+              <stop offset="100%" stopColor="#475569" />
+            </linearGradient>
+          </defs>
+        </svg>
+      </div>
+
+      {/* 범례 (Legend) */}
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          flexWrap: "wrap",
+          gap: "10px",
+          marginTop: "12px",
+          padding: "8px 12px",
+          background: "rgba(15, 23, 42, 0.5)",
+          borderRadius: "8px",
+          fontSize: "12px",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: "16px", flexWrap: "wrap" }}>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+            <span style={{ width: "12px", height: "12px", background: "#64748b", borderRadius: "3px", display: "inline-block" }} />
+            <span style={{ color: "#cbd5e1" }}>1일 시점 평가자산</span>
+          </span>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+            <span style={{ width: "12px", height: "12px", background: "#10b981", borderRadius: "3px", display: "inline-block" }} />
+            <span style={{ color: "#cbd5e1" }}>현재/말일 자산 (자산 증가)</span>
+          </span>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+            <span style={{ width: "12px", height: "12px", background: "#ef4444", borderRadius: "3px", display: "inline-block" }} />
+            <span style={{ color: "#cbd5e1" }}>현재/말일 자산 (자산 감소)</span>
+          </span>
+        </div>
+        {onRefresh && (
+          <button
+            type="button"
+            className="btn btn-outline"
+            onClick={onRefresh}
+            disabled={loading}
+            style={{ padding: "4px 10px", fontSize: "11.5px" }}
+          >
+            {loading ? "동기화 중..." : "🔄 자산 스냅샷 동기화"}
+          </button>
+        )}
+      </div>
+
+      {/* 월별 보유 자산 변동 원장 테이블 */}
+      <div style={{ marginTop: "14px", overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12.5px" }}>
+          <thead>
+            <tr style={{ background: "rgba(30, 41, 59, 0.8)", borderBottom: "1px solid rgba(255, 255, 255, 0.1)" }}>
+              <th style={{ padding: "8px 10px", textAlign: "left", color: "#94a3b8" }}>기준 연월</th>
+              <th style={{ padding: "8px 10px", textAlign: "right", color: "#94a3b8" }}>1일 시점 자산</th>
+              <th style={{ padding: "8px 10px", textAlign: "right", color: "#94a3b8" }}>현재/말일 자산</th>
+              <th style={{ padding: "8px 10px", textAlign: "right", color: "#94a3b8" }}>원화 잔고</th>
+              <th style={{ padding: "8px 10px", textAlign: "right", color: "#94a3b8" }}>코인 평가액</th>
+              <th style={{ padding: "8px 10px", textAlign: "right", color: "#94a3b8" }}>월간 증감액</th>
+              <th style={{ padding: "8px 10px", textAlign: "right", color: "#94a3b8" }}>증감률</th>
+              <th style={{ padding: "8px 10px", textAlign: "center", color: "#94a3b8" }}>증감 상태</th>
+            </tr>
+          </thead>
+          <tbody>
+            {dataList.map((row) => {
+              const diff = Number(row.diff_amount || 0);
+              const rate = Number(row.diff_rate || 0);
+              const isInc = diff > 0;
+              const isDec = diff < 0;
+              return (
+                <tr
+                  key={row.year_month}
+                  style={{
+                    borderBottom: "1px solid rgba(255, 255, 255, 0.05)",
+                    background: row.year_month === currentMonth?.year_month ? "rgba(56, 189, 248, 0.05)" : "transparent",
+                  }}
+                >
+                  <td style={{ padding: "8px 10px", fontWeight: "700", color: "#f8fafc" }}>
+                    {row.year_month}
+                    {row.year_month === currentMonth?.year_month && (
+                      <span style={{ marginLeft: "6px", fontSize: "11px", color: "#38bdf8" }}>(이번달)</span>
+                    )}
+                  </td>
+                  <td style={{ padding: "8px 10px", textAlign: "right", color: "#cbd5e1" }}>
+                    {Math.floor(Number(row.month_start_balance || 0)).toLocaleString("ko-KR")}원
+                  </td>
+                  <td style={{ padding: "8px 10px", textAlign: "right", fontWeight: "700", color: "#f8fafc" }}>
+                    {Math.floor(Number(row.current_balance || 0)).toLocaleString("ko-KR")}원
+                  </td>
+                  <td style={{ padding: "8px 10px", textAlign: "right", color: "#94a3b8" }}>
+                    {Math.floor(Number(row.krw_balance || 0)).toLocaleString("ko-KR")}원
+                  </td>
+                  <td style={{ padding: "8px 10px", textAlign: "right", color: "#94a3b8" }}>
+                    {Math.floor(Number(row.coin_eval_balance || 0)).toLocaleString("ko-KR")}원
+                  </td>
+                  <td
+                    style={{
+                      padding: "8px 10px",
+                      textAlign: "right",
+                      fontWeight: "700",
+                      color: isInc ? "#4ade80" : isDec ? "#f87171" : "#cbd5e1",
+                    }}
+                  >
+                    {isInc ? "+" : ""}
+                    {Math.floor(diff).toLocaleString("ko-KR")}원
+                  </td>
+                  <td
+                    style={{
+                      padding: "8px 10px",
+                      textAlign: "right",
+                      fontWeight: "700",
+                      color: isInc ? "#4ade80" : isDec ? "#f87171" : "#cbd5e1",
+                    }}
+                  >
+                    {isInc ? "+" : ""}
+                    {rate.toFixed(2)}%
+                  </td>
+                  <td style={{ padding: "8px 10px", textAlign: "center" }}>
+                    <span
+                      style={{
+                        padding: "2px 8px",
+                        borderRadius: "6px",
+                        fontSize: "11px",
+                        fontWeight: "700",
+                        background: isInc
+                          ? "rgba(34, 197, 94, 0.15)"
+                          : isDec
+                          ? "rgba(239, 68, 68, 0.15)"
+                          : "rgba(148, 163, 184, 0.15)",
+                        color: isInc ? "#4ade80" : isDec ? "#f87171" : "#cbd5e1",
+                        border: `1px solid ${isInc ? "rgba(34, 197, 94, 0.3)" : isDec ? "rgba(239, 68, 68, 0.3)" : "rgba(148, 163, 184, 0.3)"}`,
+                      }}
+                    >
+                      {isInc ? "▲ 금액 증가" : isDec ? "▼ 금액 감소" : "- 보합 유지"}
+                    </span>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function MarkdownViewer({ content, isStreaming = false }) {
   if (!content) return null;
   const lines = content.split("\n");
@@ -555,7 +963,7 @@ export default function App() {
   const [gateError, setGateError] = useState("");
 
   // 프로젝트 버전 및 히스토리 모달 상태
-  const [appVersion, setAppVersion] = useState("0.0.14");
+  const [appVersion, setAppVersion] = useState("0.0.15");
   const [historyModalOpen, setHistoryModalOpen] = useState(false);
   const [historyContent, setHistoryContent] = useState("");
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -812,6 +1220,7 @@ export default function App() {
     weekly: [],
     monthly: [],
     coin_ranking: [],
+    monthly_assets: null,
   });
   const [statsPeriodTab, setStatsPeriodTab] = useState(() => {
     return (
@@ -4904,6 +5313,227 @@ export default function App() {
                       : "가상거래 전용 원장(paper_trades)에 기록된 10대 알고리즘 모의 체결 통계입니다."}
                   </div>
                 </div>
+              </div>
+            </div>
+
+            {/* ============================================================
+                [요구사항] 실전 수익 통계 상단: 이번달 1일 시점 평가자산, 현재 시점 평가자산, 금액 증감 및 월별 보유 자산 증감 그래프
+               ============================================================ */}
+            <div
+              className="card"
+              style={{
+                marginBottom: "20px",
+                border: "1px solid rgba(56, 189, 248, 0.35)",
+                background: "linear-gradient(135deg, rgba(15, 23, 42, 0.95), rgba(30, 41, 59, 0.85))",
+                boxShadow: "0 10px 30px -10px rgba(0, 0, 0, 0.6)",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  gap: "10px",
+                  marginBottom: "16px",
+                  borderBottom: "1px solid rgba(255, 255, 255, 0.08)",
+                  paddingBottom: "12px",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <span style={{ fontSize: "22px" }}>💰</span>
+                  <div>
+                    <h3 style={{ margin: 0, fontSize: "17px", fontWeight: "800", color: "#f8fafc" }}>
+                      {statsModeTab === "live" ? "실전 실계좌 자산 평가 및 월간 증감 현황" : "가상거래(10대 봇) 자산 평가 및 월간 증감 현황"}
+                    </h3>
+                    <div style={{ fontSize: "12px", color: "#94a3b8", marginTop: "2px" }}>
+                      매달 1일 시점의 평가자산을 자동으로 기록하고, 현재 평가자산과 비교하여 자산 증감(수익/손실)을 실시간 추적합니다.
+                    </div>
+                  </div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <span style={{ fontSize: "11.5px", color: "#94a3b8" }}>
+                    최근 기록: {stats?.monthly_assets?.updated_at || "-"}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn btn-outline"
+                    onClick={() => fetchStatistics(statsModeTab)}
+                    style={{ padding: "4px 10px", fontSize: "12px" }}
+                    title="자산 스냅샷 및 통계를 새로고침합니다"
+                  >
+                    🔄 새로고침
+                  </button>
+                </div>
+              </div>
+
+              {/* 3대 핵심 자산 지표 카드 그리드 */}
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                  gap: "12px",
+                  marginBottom: "20px",
+                }}
+              >
+                {/* 1) 이번달 1일 시점의 평가자산 */}
+                <div
+                  style={{
+                    background: "rgba(15, 23, 42, 0.7)",
+                    border: "1px solid rgba(255, 255, 255, 0.08)",
+                    borderRadius: "12px",
+                    padding: "16px",
+                  }}
+                >
+                  <div
+                    style={{
+                      fontSize: "12.5px",
+                      color: "#94a3b8",
+                      marginBottom: "6px",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "6px",
+                    }}
+                  >
+                    <span>📅</span>
+                    <span>이번달 1일 시점 평가자산</span>
+                  </div>
+                  <div style={{ fontSize: "22px", fontWeight: "800", color: "#e2e8f0" }}>
+                    {stats?.monthly_assets?.current_month?.month_start_balance !== undefined
+                      ? `${Math.floor(stats.monthly_assets.current_month.month_start_balance).toLocaleString("ko-KR")}원`
+                      : statsModeTab === "live" && upbitAccount?.total_asset_krw !== null
+                      ? `${Math.floor(Number(upbitAccount.total_asset_krw)).toLocaleString("ko-KR")}원`
+                      : "-"}
+                  </div>
+                  <div style={{ fontSize: "11.5px", color: "#64748b", marginTop: "6px" }}>
+                    기준 시점: {stats?.monthly_assets?.current_month?.snapshot_date || "매월 1일 00:00 KST"}
+                  </div>
+                </div>
+
+                {/* 2) 현재 시점의 평가자산 */}
+                <div
+                  style={{
+                    background: "rgba(15, 23, 42, 0.7)",
+                    border: "1px solid rgba(56, 189, 248, 0.35)",
+                    borderRadius: "12px",
+                    padding: "16px",
+                  }}
+                >
+                  <div
+                    style={{
+                      fontSize: "12.5px",
+                      color: "#38bdf8",
+                      marginBottom: "6px",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "6px",
+                    }}
+                  >
+                    <span>⚡</span>
+                    <span style={{ fontWeight: "700" }}>현재 시점 평가자산</span>
+                  </div>
+                  <div style={{ fontSize: "22px", fontWeight: "800", color: "#38bdf8" }}>
+                    {stats?.monthly_assets?.current_month?.current_balance !== undefined
+                      ? `${Math.floor(stats.monthly_assets.current_month.current_balance).toLocaleString("ko-KR")}원`
+                      : statsModeTab === "live" && upbitAccount?.total_asset_krw !== null
+                      ? `${Math.floor(Number(upbitAccount.total_asset_krw)).toLocaleString("ko-KR")}원`
+                      : "-"}
+                  </div>
+                  <div style={{ fontSize: "11.5px", color: "#94a3b8", marginTop: "6px" }}>
+                    {statsModeTab === "live"
+                      ? `원화 ${Math.floor(Number(stats?.monthly_assets?.current_month?.krw_balance ?? upbitAccount?.krw_total ?? upbitAccount?.krw_balance ?? 0)).toLocaleString("ko-KR")}원 · 코인평가 ${Math.floor(Number(stats?.monthly_assets?.current_month?.coin_eval_balance ?? upbitAccount?.total_eval_krw ?? 0)).toLocaleString("ko-KR")}원`
+                      : `가상현금 ${Math.floor(Number(stats?.monthly_assets?.current_month?.krw_balance ?? 0)).toLocaleString("ko-KR")}원 · 보유평가 ${Math.floor(Number(stats?.monthly_assets?.current_month?.coin_eval_balance ?? 0)).toLocaleString("ko-KR")}원`}
+                  </div>
+                </div>
+
+                {/* 3) 금액 증감 현황 (늘었는지 줄었는지 표기) */}
+                {(() => {
+                  const cur = stats?.monthly_assets?.current_month;
+                  const diffAmt = cur ? Number(cur.diff_amount || 0) : 0;
+                  const diffRate = cur ? Number(cur.diff_rate || 0) : 0;
+                  const isInc = diffAmt > 0;
+                  const isDec = diffAmt < 0;
+                  const statusBg = isInc
+                    ? "rgba(34, 197, 94, 0.12)"
+                    : isDec
+                    ? "rgba(239, 68, 68, 0.12)"
+                    : "rgba(148, 163, 184, 0.12)";
+                  const statusBorder = isInc
+                    ? "rgba(34, 197, 94, 0.4)"
+                    : isDec
+                    ? "rgba(239, 68, 68, 0.4)"
+                    : "rgba(148, 163, 184, 0.25)";
+                  const statusColor = isInc ? "#4ade80" : isDec ? "#f87171" : "#cbd5e1";
+
+                  return (
+                    <div
+                      style={{
+                        background: statusBg,
+                        border: `1px solid ${statusBorder}`,
+                        borderRadius: "12px",
+                        padding: "16px",
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          marginBottom: "6px",
+                        }}
+                      >
+                        <span style={{ fontSize: "12.5px", color: "#94a3b8" }}>월간 자산 증감</span>
+                        <span
+                          style={{
+                            padding: "3px 9px",
+                            borderRadius: "6px",
+                            fontSize: "11px",
+                            fontWeight: "800",
+                            background: statusColor,
+                            color: "#0f172a",
+                          }}
+                        >
+                          {isInc ? "▲ 금액 증가 (수익)" : isDec ? "▼ 금액 감소 (손실)" : "- 변동 없음 (보합)"}
+                        </span>
+                      </div>
+                      <div style={{ fontSize: "22px", fontWeight: "800", color: statusColor }}>
+                        {isInc ? "+" : ""}
+                        {Math.floor(diffAmt).toLocaleString("ko-KR")}원
+                      </div>
+                      <div style={{ fontSize: "12px", fontWeight: "700", color: statusColor, marginTop: "6px" }}>
+                        1일 대비 {isInc ? "▲ +" : isDec ? "▼ " : ""}{diffRate.toFixed(2)}% {isInc ? "증가" : isDec ? "감소" : "유지"}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+
+              {/* 월별 보유 자산 증감 그래프 섹션 */}
+              <div style={{ borderTop: "1px solid rgba(255, 255, 255, 0.08)", paddingTop: "16px" }}>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    marginBottom: "8px",
+                    flexWrap: "wrap",
+                    gap: "8px",
+                  }}
+                >
+                  <h4 style={{ margin: 0, fontSize: "15px", fontWeight: "700", color: "#f8fafc" }}>
+                    📊 월별 보유 자산 및 증감 추이 그래프 (Monthly Growth Chart)
+                  </h4>
+                  <span style={{ fontSize: "11.5px", color: "#94a3b8" }}>
+                    * 매월 1일 자산 대비 현재/말일 자산의 증감을 비교합니다.
+                  </span>
+                </div>
+
+                <MonthlyAssetGrowthChart
+                  history={stats?.monthly_assets?.history || []}
+                  currentMonth={stats?.monthly_assets?.current_month}
+                  onRefresh={() => fetchStatistics(statsModeTab)}
+                  loading={false}
+                />
               </div>
             </div>
 

@@ -550,6 +550,51 @@ export class PgSyncManager {
           );
         }
       } catch {}
+
+      // 8. monthly_asset_snapshots (월별 자산 스냅샷 테이블)
+      try {
+        await this.pool.query(`
+          CREATE TABLE IF NOT EXISTS monthly_asset_snapshots (
+            year_month VARCHAR(16) NOT NULL,
+            mode VARCHAR(16) NOT NULL DEFAULT 'live',
+            month_start_balance NUMERIC(16,4) NOT NULL,
+            current_balance NUMERIC(16,4) NOT NULL,
+            krw_balance NUMERIC(16,4) NOT NULL DEFAULT 0,
+            coin_eval_balance NUMERIC(16,4) NOT NULL DEFAULT 0,
+            diff_amount NUMERIC(16,4) NOT NULL DEFAULT 0,
+            diff_rate NUMERIC(8,2) NOT NULL DEFAULT 0,
+            snapshot_date VARCHAR(32) NOT NULL,
+            updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (year_month, mode)
+          );
+        `);
+
+        const snapshots = sqliteDb.prepare("SELECT * FROM monthly_asset_snapshots").all();
+        for (const s of snapshots) {
+          await this.pool.query(
+            `INSERT INTO monthly_asset_snapshots (
+               year_month, mode, month_start_balance, current_balance,
+               krw_balance, coin_eval_balance, diff_amount, diff_rate,
+               snapshot_date, updated_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (year_month, mode) DO UPDATE SET
+               month_start_balance = EXCLUDED.month_start_balance,
+               current_balance = EXCLUDED.current_balance,
+               krw_balance = EXCLUDED.krw_balance,
+               coin_eval_balance = EXCLUDED.coin_eval_balance,
+               diff_amount = EXCLUDED.diff_amount,
+               diff_rate = EXCLUDED.diff_rate,
+               snapshot_date = EXCLUDED.snapshot_date,
+               updated_at = EXCLUDED.updated_at`,
+            [
+              s.year_month, s.mode || "live", Number(s.month_start_balance || 0),
+              Number(s.current_balance || 0), Number(s.krw_balance || 0),
+              Number(s.coin_eval_balance || 0), Number(s.diff_amount || 0),
+              Number(s.diff_rate || 0), s.snapshot_date, s.updated_at
+            ]
+          );
+        }
+      } catch {}
     } catch (err) {
       console.warn(`[PgSync] Sync error: ${err.message}`);
     }
