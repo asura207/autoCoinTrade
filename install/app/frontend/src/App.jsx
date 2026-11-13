@@ -966,7 +966,7 @@ export default function App() {
   const [gateError, setGateError] = useState("");
 
   // 프로젝트 버전 및 히스토리 모달 상태
-  const [appVersion, setAppVersion] = useState("0.0.20");
+  const [appVersion, setAppVersion] = useState("0.0.21");
   const [historyModalOpen, setHistoryModalOpen] = useState(false);
   const [historyContent, setHistoryContent] = useState("");
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -7818,6 +7818,8 @@ export default function App() {
                         border: "1px solid #26324d",
                         borderRadius: "12px",
                         padding: "16px",
+                        boxSizing: "border-box",
+                        overflow: "hidden",
                       }}
                     >
                       <div style={{ fontWeight: 800, fontSize: "15px", marginBottom: "4px" }}>
@@ -7859,8 +7861,16 @@ export default function App() {
                         />
                       </div>
 
-                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
-                        <div className="form-row">
+                      <div
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))",
+                          gap: "10px",
+                          width: "100%",
+                          boxSizing: "border-box",
+                        }}
+                      >
+                        <div className="form-row" style={{ minWidth: 0, width: "100%", boxSizing: "border-box" }}>
                           <label>손절 기준 (%)</label>
                           <input
                             type="number"
@@ -7874,9 +7884,10 @@ export default function App() {
                                 e.target.value === "" ? "" : Number(e.target.value)
                               )
                             }
+                            style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }}
                           />
                         </div>
-                        <div className="form-row">
+                        <div className="form-row" style={{ minWidth: 0, width: "100%", boxSizing: "border-box" }}>
                           <label>익절 기준 (%)</label>
                           <input
                             type="number"
@@ -7890,6 +7901,7 @@ export default function App() {
                                 e.target.value === "" ? "" : Number(e.target.value)
                               )
                             }
+                            style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }}
                           />
                         </div>
                       </div>

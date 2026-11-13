@@ -606,6 +606,9 @@ body {
   flex-direction: column;
   gap: 6px;
   margin-bottom: 14px;
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .form-row label {
@@ -615,6 +618,10 @@ body {
 }
 
 .form-input {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   padding: 10px 12px;
   border-radius: 8px;
   border: 1px solid var(--border-color);
