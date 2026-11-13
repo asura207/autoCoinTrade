@@ -196,21 +196,22 @@ function ProfitLineChart({ series, periodLabel }) {
     );
   }
 
-  const padLeft = 75;
+  const padLeft = 85;
   const padRight = 35;
-  const padTop = 28;
+  const padTop = 45;
   const padBottom = 45;
   const minPointGap = 72;
   const width = Math.max(860, padLeft + padRight + Math.max(0, series.length - 1) * minPointGap);
-  const height = 270;
+  const height = 285;
 
   const getPointValue = (d) => (d.has_trade === false ? 0 : Number(d.cumulative_profit ?? d.profit ?? 0));
   const values = series.map(getPointValue);
   const minVal = Math.min(0, ...values);
   const maxVal = Math.max(0, ...values);
   const isAllZero = maxVal === 0 && minVal === 0;
-  const range = isAllZero ? 1 : maxVal - minVal;
-
+  const rawRange = isAllZero ? 1 : maxVal - minVal;
+  // 상하단에 15% 여유를 주어 데이터 포인트 텍스트가 SVG 경계나 축과 겹치지 않게 함
+  const range = isAllZero ? 1 : rawRange * 1.25;
   const plotW = width - padLeft - padRight;
   const plotH = height - padTop - padBottom;
 
@@ -222,16 +223,16 @@ function ProfitLineChart({ series, periodLabel }) {
         : padLeft + (idx / (series.length - 1)) * plotW;
     const y = isAllZero
       ? padTop + plotH / 2
-      : padTop + plotH - ((val - minVal) / range) * plotH;
+      : padTop + plotH - ((val - minVal) / range) * plotH - (isAllZero ? 0 : plotH * 0.1);
     return { x, y, displayValue: val, ...item };
   });
 
   const polylinePoints = points.map((p) => `${p.x},${p.y}`).join(" ");
   const zeroY = isAllZero
     ? padTop + plotH / 2
-    : padTop + plotH - ((0 - minVal) / range) * plotH;
-  const showMaxLabel = maxVal > 0 && Math.abs(zeroY - padTop) >= 18;
-  const showMinLabel = minVal < 0 && Math.abs(padTop + plotH - zeroY) >= 18;
+    : padTop + plotH - ((0 - minVal) / range) * plotH - (isAllZero ? 0 : plotH * 0.1);
+  const showMaxLabel = maxVal > 0 && Math.abs(zeroY - padTop) >= 20;
+  const showMinLabel = minVal < 0 && Math.abs(padTop + plotH - zeroY) >= 20;
 
   return (
     <div>
@@ -321,7 +322,7 @@ function ProfitLineChart({ series, periodLabel }) {
                 <circle cx={pt.x} cy={pt.y} r={dotRadius} fill={dotColor} stroke="#0b0f19" strokeWidth="2" />
                 <text
                   x={pt.x}
-                  y={pt.y - 10}
+                  y={Math.max(18, pt.y - 10)}
                   textAnchor="middle"
                   fill={textColor}
                   fontSize="11"
@@ -384,20 +385,20 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
 
   const padLeft = 85;
   const padRight = 40;
-  const padTop = 45;
-  const padBottom = 45;
-  const groupWidth = 140;
+  const padTop = 75;
+  const padBottom = 50;
+  const groupWidth = 156;
   const barWidth = 36;
-  const barGap = 8;
-  const width = Math.max(780, padLeft + padRight + dataList.length * groupWidth);
-  const height = 280;
+  const barGap = 12;
+  const width = Math.max(820, padLeft + padRight + dataList.length * groupWidth);
+  const height = 320;
 
   const allBalances = dataList.flatMap((d) => [
     Number(d.month_start_balance || 0),
     Number(d.current_balance || 0),
   ]);
   const rawMax = Math.max(...allBalances, 10000);
-  const maxVal = Math.ceil(rawMax * 1.15);
+  const maxVal = Math.ceil(rawMax * 1.35);
   const plotH = height - padTop - padBottom;
 
   const getY = (val) => {
@@ -442,8 +443,8 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
               <g key={`ytick-${idx}`}>
                 <line
                   x1={padLeft}
-                  y1={yPos}
                   x2={width - padRight}
+                  y1={yPos}
                   y2={yPos}
                   stroke={idx === 0 ? "rgba(255, 255, 255, 0.15)" : "rgba(255, 255, 255, 0.05)"}
                   strokeDasharray={idx === 0 ? "none" : "3,3"}
@@ -481,7 +482,9 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
             const curBarY = getY(curBal);
             const curBarH = padTop + plotH - curBarY;
 
-            const badgeY = Math.min(startBarY, curBarY) - 18;
+            const topBarY = Math.min(startBarY, curBarY);
+            // 막대 상단 금액 텍스트(barY - 8)와 수익 뱃지 간 최소 12px 이상의 여백을 확보하여 겹침 방지
+            const badgeY = Math.max(28, topBarY - 40);
             const isHovered = hoveredMonth === item.year_month;
 
             return (
@@ -494,10 +497,10 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
                 {/* 배경 호버 하이라이트 영역 */}
                 {isHovered && (
                   <rect
-                    x={groupCenterX - groupWidth / 2 + 6}
-                    y={padTop - 25}
-                    width={groupWidth - 12}
-                    height={plotH + 40}
+                    x={groupCenterX - groupWidth / 2 + 4}
+                    y={16}
+                    width={groupWidth - 8}
+                    height={height - 24}
                     rx="8"
                     fill="rgba(56, 189, 248, 0.06)"
                     stroke="rgba(56, 189, 248, 0.25)"
@@ -517,7 +520,7 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
                 />
                 <text
                   x={startBarX + barWidth / 2}
-                  y={startBarY - 6}
+                  y={startBarY - 8}
                   textAnchor="middle"
                   fill="#94a3b8"
                   fontSize="10"
@@ -538,7 +541,7 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
                 />
                 <text
                   x={curBarX + barWidth / 2}
-                  y={curBarY - 6}
+                  y={curBarY - 8}
                   textAnchor="middle"
                   fill={isInc ? "#4ade80" : isDec ? "#f87171" : "#e2e8f0"}
                   fontSize="10.5"
@@ -547,26 +550,26 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
                   {formatShortKRW(curBal)}
                 </text>
 
-                {/* 상단 증감 뱃지 태그 */}
+                {/* 상단 증감 뱃지 태그 (수익 표기영역 - 막대 금액 글자와 충분한 간격 유지) */}
                 <g transform={`translate(${groupCenterX}, ${badgeY})`}>
                   <rect
                     x="-44"
-                    y="-12"
+                    y="-11"
                     width="88"
-                    height="18"
-                    rx="9"
-                    fill={isInc ? "rgba(34, 197, 94, 0.2)" : isDec ? "rgba(239, 68, 68, 0.2)" : "rgba(148, 163, 184, 0.2)"}
+                    height="22"
+                    rx="11"
+                    fill={isInc ? "rgba(34, 197, 94, 0.22)" : isDec ? "rgba(239, 68, 68, 0.22)" : "rgba(148, 163, 184, 0.2)"}
                     stroke={isInc ? "#22c55e" : isDec ? "#ef4444" : "#94a3b8"}
-                    strokeWidth="1"
+                    strokeWidth="1.2"
                   />
                   <text
                     x="0"
-                    y="1"
+                    y="0"
                     textAnchor="middle"
-                    dominantBaseline="middle"
+                    dominantBaseline="central"
                     fill={isInc ? "#4ade80" : isDec ? "#fca5a5" : "#cbd5e1"}
-                    fontSize="9.5"
-                    fontWeight="700"
+                    fontSize="10"
+                    fontWeight="800"
                   >
                     {isInc ? `▲ +${diffRate.toFixed(1)}%` : isDec ? `▼ ${diffRate.toFixed(1)}%` : "- 0.0%"}
                   </text>
@@ -575,7 +578,7 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
                 {/* X축 연월 라벨 */}
                 <text
                   x={groupCenterX}
-                  y={height - 18}
+                  y={height - 20}
                   textAnchor="middle"
                   fill={isHovered ? "#38bdf8" : "#cbd5e1"}
                   fontSize="12"
@@ -585,7 +588,7 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
                 </text>
                 <text
                   x={groupCenterX}
-                  y={height - 4}
+                  y={height - 6}
                   textAnchor="middle"
                   fill="#64748b"
                   fontSize="10"
@@ -963,7 +966,7 @@ export default function App() {
   const [gateError, setGateError] = useState("");
 
   // 프로젝트 버전 및 히스토리 모달 상태
-  const [appVersion, setAppVersion] = useState("0.0.15");
+  const [appVersion, setAppVersion] = useState("0.0.16");
   const [historyModalOpen, setHistoryModalOpen] = useState(false);
   const [historyContent, setHistoryContent] = useState("");
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -5509,13 +5512,13 @@ export default function App() {
               </div>
 
               {/* 월별 보유 자산 증감 그래프 섹션 */}
-              <div style={{ borderTop: "1px solid rgba(255, 255, 255, 0.08)", paddingTop: "16px" }}>
+              <div style={{ borderTop: "1px solid rgba(255, 255, 255, 0.08)", paddingTop: "20px", marginTop: "4px" }}>
                 <div
                   style={{
                     display: "flex",
                     justifyContent: "space-between",
                     alignItems: "center",
-                    marginBottom: "8px",
+                    marginBottom: "12px",
                     flexWrap: "wrap",
                     gap: "8px",
                   }}
