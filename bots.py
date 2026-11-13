@@ -40,6 +40,56 @@ MIN_ORDER_KRW = 5000.0   # 업비트 최소 주문 금액 5,000원
 SAFE_MIN_ORDER_KRW = 6500.0  # -20% 손절 시에도 5,200원 유지 (업비트 5,000원 최소 매도 제한 데드락 방지)
 
 
+def is_backend_running(port: int = 8001) -> bool:
+    """
+    Node.js 백엔드(포트 8001)가 기동 중인지 검사합니다.
+    백엔드가 자체적으로 실전/가상 매매 루프를 실행 중인 경우,
+    Python 봇 프로세스가 동일한 주문을 중복 실행(Double Execution)하지 않도록 방어합니다.
+    """
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.25)
+            if s.connect_ex(("127.0.0.1", port)) == 0:
+                return True
+    except Exception:
+        pass
+    try:
+        pid_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", ".backend.pid")
+        if os.path.isfile(pid_path):
+            with open(pid_path, "r", encoding="utf-8") as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def normalize_bot_id(raw_id: str) -> str:
+    """구버전 봇 ID(bot_vb 등)를 최신 표준 ID(bot_01 ~ bot_10)로 정규화합니다."""
+    if not raw_id:
+        return "bot_01"
+    raw = str(raw_id).strip()
+    alias_map = {
+        "bot_vb": "bot_01",
+        "bot_volatility": "bot_01",
+        "bot_supertrend": "bot_02",
+        "bot_momentum": "bot_03",
+        "bot_dual_momentum": "bot_03",
+        "bot_bb_squeeze": "bot_04",
+        "bot_bb": "bot_05",
+        "bot_bollinger_rebound": "bot_05",
+        "bot_grid_dca": "bot_06",
+        "bot_macd": "bot_07",
+        "bot_pullback": "bot_08",
+        "bot_volume_scalp": "bot_09",
+        "bot_kellogg": "bot_10",
+        "bot_jack_kellogg": "bot_10",
+    }
+    return alias_map.get(raw, raw)
+
+
 # =====================================================================
 # 1. 업비트 클라이언트 및 공통 지수 백오프 유틸리티
 # =====================================================================
@@ -121,6 +171,16 @@ def can_enter_position(
     - 실전거래(Live) 모드: 듀얼 AI 및 BTC 20MA 거시 리스크 필터 엄격 적용
     """
     # 0. 가상거래/시뮬레이션 모드일 경우 LLM 및 거시 리스크 필터 완전 우회 (Bypass)
+    norm_id = normalize_bot_id(bot_id)
+
+    # 실전거래 모드에서 Node.js 백엔드가 실행 중이면 중복 주문(Double Execution) 방지를 위해 Python 주문 디퍼
+    if not is_paper and not is_dry_run() and is_backend_running():
+        return (
+            False,
+            0.0,
+            f"DEFERRED_TO_NODEJS_BACKEND: Active Node.js backend manages live trading for {norm_id}",
+        )
+
     if is_paper or is_dry_run():
         fee_buffer = 1.0 - UPBIT_FEE_RATE
         raw_available_buffered = available_krw * fee_buffer
@@ -169,8 +229,8 @@ def can_enter_position(
             return False, 0.0, f"LLM Filter Blocked: Recommended action is {rec_action}"
 
         # 1-3. 봇별 오버라이드 차단
-        if bot_overrides.get(bot_id) == "BLOCK":
-            return False, 0.0, f"LLM Filter Blocked: Bot override for {bot_id} is BLOCK"
+        if bot_overrides.get(bot_id) == "BLOCK" or bot_overrides.get(norm_id) == "BLOCK":
+            return False, 0.0, f"LLM Filter Blocked: Bot override for {norm_id} is BLOCK"
 
         # 1-4. 블랙리스트 티커
         if ticker in blacklist:
@@ -320,9 +380,17 @@ def execute_buy_order(
     dry = is_dry_run()
     upbit = get_upbit_client()
 
+    norm_bot_id = normalize_bot_id(bot_id)
+
+    # Node.js 백엔드가 실거래를 관장 중인 경우 Python 중복 실거래 주문 차단
+    if not dry and upbit and is_backend_running():
+        logger.info("[%s] Node.js backend is active. Deferring live buy order on Upbit to backend.", norm_bot_id)
+        conn.close()
+        return None
+
     current_price = get_safe_current_price(ticker)
     if current_price <= 0:
-        logger.error("[%s] Cannot execute buy: Invalid price for %s", bot_id, ticker)
+        logger.error("[%s] Cannot execute buy: Invalid price for %s", norm_bot_id, ticker)
         conn.close()
         return None
 
@@ -343,10 +411,10 @@ def execute_buy_order(
             invest_krw = math.floor(volume * executed_price + buy_fee)
         else:
             # 2. 지정가 미체결/실패 시 안전 시장가 매수 폴백
-            logger.info("[%s] Limit buy not filled; falling back to market buy for %s", bot_id, ticker)
+            logger.info("[%s] Limit buy not filled; falling back to market buy for %s", norm_bot_id, ticker)
             res = retry_with_backoff(upbit.buy_market_order, ticker, invest_krw)
             if not res or "uuid" not in res:
-                logger.error("[%s] Live market buy order failed for %s", bot_id, ticker)
+                logger.error("[%s] Live market buy order failed for %s", norm_bot_id, ticker)
                 conn.close()
                 return None
             order_uuid = res["uuid"]
@@ -374,7 +442,7 @@ def execute_buy_order(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', CURRENT_TIMESTAMP);
             """,
             (
-                bot_id,
+                norm_bot_id,
                 ticker,
                 order_uuid,
                 volume,
@@ -394,16 +462,16 @@ def execute_buy_order(
                 updated_at = CURRENT_TIMESTAMP
             WHERE bot_id = ?;
             """,
-            (invest_krw, bot_id),
+            (invest_krw, norm_bot_id),
         )
 
         conn.execute("COMMIT;")
         logger.info(
-            f"[{bot_id}] BUY Executed ({'DRY_RUN' if dry else 'LIVE'}): {ticker} | "
+            f"[{norm_bot_id}] BUY Executed ({'DRY_RUN' if dry else 'LIVE'}): {ticker} | "
             f"Amount={invest_krw:,.0f}원 | Price={executed_price:,.0f}원 | Vol={volume:.8f} | UUID={order_uuid}"
         )
         return {
-            "bot_id": bot_id,
+            "bot_id": norm_bot_id,
             "ticker": ticker,
             "order_uuid": order_uuid,
             "volume": volume,
@@ -440,10 +508,17 @@ def execute_sell_order(
         return None
 
     bot_id = pos["bot_id"]
+    norm_bot_id = normalize_bot_id(bot_id)
     ticker = pos["ticker"]
     volume = round(float(pos["volume"]), 8)
     buy_amount = float(pos["buy_amount"])
     avg_buy_price = float(pos["avg_buy_price"])
+
+    # Node.js 백엔드가 실거래를 관장 중인 경우 Python 중복 실거래 주문 차단
+    if not dry and upbit and is_backend_running():
+        logger.info("[%s] Node.js backend is active. Deferring live sell order on Upbit to backend.", norm_bot_id)
+        conn.close()
+        return None
 
     current_price = get_safe_current_price(ticker)
     if current_price <= 0:
@@ -533,12 +608,12 @@ def execute_sell_order(
                 updated_at = CURRENT_TIMESTAMP
             WHERE bot_id = ?;
             """,
-            (net_sell_amount, realized_pnl, bot_id),
+            (net_sell_amount, realized_pnl, norm_bot_id),
         )
 
         conn.execute("COMMIT;")
         logger.info(
-            f"[{bot_id}] SELL Executed ({'DRY_RUN' if dry else 'LIVE'}, {reason}): {ticker} | "
+            f"[{norm_bot_id}] SELL Executed ({'DRY_RUN' if dry else 'LIVE'}, {reason}): {ticker} | "
             f"SellPrice={executed_sell_price:,.0f}원 | PnL={realized_pnl:,.0f}원 ({pnl_pct:.2f}%) | UUID={sell_order_uuid}"
         )
         return {
@@ -597,7 +672,7 @@ def compute_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
 # 5. Step 4: 봇 1 (`bot_vb`) - 슈퍼트렌드 변동성 돌파 + ATR 트레일링 스탑
 # =====================================================================
 
-def run_bot_vb(stop_event, bot_id: str = "bot_vb", db_path: Optional[str] = None) -> None:
+def run_bot_vb(stop_event, bot_id: str = "bot_01", db_path: Optional[str] = None) -> None:
     """
     [Bot 1] 슈퍼트렌드 / 동적 변동성 돌파 + ATR 트레일링 스탑 (자금 비중 40%)
     - 대상: KRW-BTC, KRW-ETH
@@ -605,13 +680,22 @@ def run_bot_vb(stop_event, bot_id: str = "bot_vb", db_path: Optional[str] = None
     - 진입: 4시간봉 기준 노이즈 비율 목표가 돌파 + 현재가 > 5일선 + 거래량 20봉 평균 1.5배 이상
     - 청산: 보유 중 최고가 대비 3 * ATR(14) 하락 시 트레일링 스탑 청산
     """
-    logger.info("Bot process [%s] started.", bot_id)
+    norm_id = normalize_bot_id(bot_id)
+    logger.info("Bot process [%s (norm: %s)] started.", bot_id, norm_id)
     target_tickers = ["KRW-BTC", "KRW-ETH"]
 
     while not stop_event.is_set():
         try:
             conn = get_db_connection(db_path)
-            bot_acc = conn.execute("SELECT * FROM bot_accounts WHERE bot_id = ?;", (bot_id,)).fetchone()
+            if not is_dry_run():
+                b_row = conn.execute("SELECT is_selected_for_live, is_running FROM bots WHERE bot_id = ?;", (norm_id,)).fetchone()
+                if b_row and (not b_row["is_selected_for_live"] or not b_row["is_running"]):
+                    conn.close()
+                    if stop_event.wait(timeout=10):
+                        break
+                    continue
+
+            bot_acc = conn.execute("SELECT * FROM bot_accounts WHERE bot_id = ?;", (norm_id,)).fetchone()
             available_krw = float(bot_acc["virtual_krw"]) if bot_acc else 0.0
             conn.close()
 
@@ -637,8 +721,8 @@ def run_bot_vb(stop_event, bot_id: str = "bot_vb", db_path: Optional[str] = None
                 # 현재 해당 코인에 대해 열려 있는 bot_vb 포지션 조회
                 conn = get_db_connection(db_path)
                 open_pos = conn.execute(
-                    "SELECT * FROM bot_positions WHERE bot_id = ? AND ticker = ? AND status = 'OPEN';",
-                    (bot_id, ticker),
+                    "SELECT * FROM bot_positions WHERE (bot_id = ? OR bot_id = ?) AND ticker = ? AND status = 'OPEN';",
+                    (bot_id, norm_id, ticker),
                 ).fetchone()
                 conn.close()
 
@@ -707,7 +791,7 @@ def run_bot_vb(stop_event, bot_id: str = "bot_vb", db_path: Optional[str] = None
 # 6. Step 4: 봇 2 (`bot_momentum`) - 볼린저 밴드 스퀴즈 돌파 (VCP)
 # =====================================================================
 
-def run_bot_momentum(stop_event, bot_id: str = "bot_momentum", db_path: Optional[str] = None) -> None:
+def run_bot_momentum(stop_event, bot_id: str = "bot_03", db_path: Optional[str] = None) -> None:
     """
     [Bot 2] 볼린저 밴드 스퀴즈 돌파 (VCP) 스윙 (자금 비중 40%)
     - 기존 7일 단순 수익률 상위 추격매수 폐기
@@ -716,17 +800,26 @@ def run_bot_momentum(stop_event, bot_id: str = "bot_momentum", db_path: Optional
     - 분할: 최대 2~3종목 분할 진입 (각 5,000원 이상 보장)
     - 청산: 중심선(20선) 하향 이탈 시 청산
     """
-    logger.info("Bot process [%s] started.", bot_id)
+    norm_id = normalize_bot_id(bot_id)
+    logger.info("Bot process [%s (norm: %s)] started.", bot_id, norm_id)
     MAX_POSITIONS = 2
 
     while not stop_event.is_set():
         try:
             conn = get_db_connection(db_path)
-            bot_acc = conn.execute("SELECT * FROM bot_accounts WHERE bot_id = ?;", (bot_id,)).fetchone()
+            if not is_dry_run():
+                b_row = conn.execute("SELECT is_selected_for_live, is_running FROM bots WHERE bot_id = ?;", (norm_id,)).fetchone()
+                if b_row and (not b_row["is_selected_for_live"] or not b_row["is_running"]):
+                    conn.close()
+                    if stop_event.wait(timeout=10):
+                        break
+                    continue
+
+            bot_acc = conn.execute("SELECT * FROM bot_accounts WHERE bot_id = ?;", (norm_id,)).fetchone()
             available_krw = float(bot_acc["virtual_krw"]) if bot_acc else 0.0
             open_positions = conn.execute(
-                "SELECT * FROM bot_positions WHERE bot_id = ? AND status = 'OPEN';",
-                (bot_id,),
+                "SELECT * FROM bot_positions WHERE (bot_id = ? OR bot_id = ?) AND status = 'OPEN';",
+                (bot_id, norm_id),
             ).fetchall()
             conn.close()
 
@@ -825,7 +918,7 @@ def run_bot_momentum(stop_event, bot_id: str = "bot_momentum", db_path: Optional
 # 7. Step 4: 봇 3 (`bot_bb`) - 다단계 분할 매수 볼린저 역추세 (DCA / Grid)
 # =====================================================================
 
-def run_bot_bb(stop_event, bot_id: str = "bot_bb", db_path: Optional[str] = None) -> None:
+def run_bot_bb(stop_event, bot_id: str = "bot_05", db_path: Optional[str] = None) -> None:
     """
     [Bot 3] SQLite 원장 기반 다단계 분할 매수 (DCA/역추세) (자금 비중 20%)
     - 기존 -1.5% 기계적 칼손절 폐기
@@ -835,17 +928,26 @@ def run_bot_bb(stop_event, bot_id: str = "bot_bb", db_path: Optional[str] = None
     - 익절: 개별 포지션 +1.8% 도달 시 해당 물량만 개별 익절 또는 중심선 도달 시 전량 익절
     - 손절: -5% ~ -7% 극단적 이탈 시 최종 안전 손절
     """
-    logger.info("Bot process [%s] started.", bot_id)
+    norm_id = normalize_bot_id(bot_id)
+    logger.info("Bot process [%s (norm: %s)] started.", bot_id, norm_id)
     target_tickers = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP"]
 
     while not stop_event.is_set():
         try:
             conn = get_db_connection(db_path)
-            bot_acc = conn.execute("SELECT * FROM bot_accounts WHERE bot_id = ?;", (bot_id,)).fetchone()
+            if not is_dry_run():
+                b_row = conn.execute("SELECT is_selected_for_live, is_running FROM bots WHERE bot_id = ?;", (norm_id,)).fetchone()
+                if b_row and (not b_row["is_selected_for_live"] or not b_row["is_running"]):
+                    conn.close()
+                    if stop_event.wait(timeout=10):
+                        break
+                    continue
+
+            bot_acc = conn.execute("SELECT * FROM bot_accounts WHERE bot_id = ?;", (norm_id,)).fetchone()
             available_krw = float(bot_acc["virtual_krw"]) if bot_acc else 0.0
             open_positions = conn.execute(
-                "SELECT * FROM bot_positions WHERE bot_id = ? AND status = 'OPEN';",
-                (bot_id,),
+                "SELECT * FROM bot_positions WHERE (bot_id = ? OR bot_id = ?) AND status = 'OPEN';",
+                (bot_id, norm_id),
             ).fetchall()
             conn.close()
 
@@ -987,4 +1089,24 @@ from agentBot.bot_10_jack_kellogg import (
     evaluate_jack_kellogg_strategy,
     run_bot_jack_kellogg,
 )
+
+# 10대 알고리즘 및 레거시 봇 통합 러너 레지스트리
+BOT_RUNNERS: Dict[str, Any] = {
+    "bot_01": run_bot_vb,
+    "bot_02": run_bot_vb,
+    "bot_03": run_bot_momentum,
+    "bot_04": run_bot_momentum,
+    "bot_05": run_bot_bb,
+    "bot_06": run_bot_bb,
+    "bot_07": run_bot_momentum,
+    "bot_08": run_bot_vb,
+    "bot_09": run_bot_momentum,
+    "bot_10": run_bot_jack_kellogg,
+    # 하위 호환 별칭
+    "bot_vb": run_bot_vb,
+    "bot_momentum": run_bot_momentum,
+    "bot_bb": run_bot_bb,
+    "bot_kellogg": run_bot_jack_kellogg,
+    "bot_jack_kellogg": run_bot_jack_kellogg,
+}
 

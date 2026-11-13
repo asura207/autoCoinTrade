@@ -33,7 +33,7 @@
 
 24. 각 봇들은 API Rate Limit 방어 (time.sleep(0.12)), 유동성(거래대금) 필터 적용 (min_volume_krw), 기준 시점 인덱싱 (count=8, iloc[-8]) 규칙을 지켜야해.
 25. sqllite 의 세션이 끊기거나 날이 바뀐경우 자동으로 재접속하는 로직을 만들어줘
-26. git 주소는 https://github.com/wonsubshin/autoCoinTrade.git 이야
+26. git 주소는 https://github.com/asura207/autoCoinTrade.git 이야
 27. 작업이 끝나면 항상 git에 commit & push를 해주고 commit 문구에는 개인정보 관련 문구는 빼줘
 28. 수정 요청 사항이 있을 경우 반드시 해당 부분만 수정해야하고, 그이외의 소스가 영향을 받아선 않되
 29. 안정적인 코인 매매 프로그램을 만들기위해서 위해 이야기한 사항 외에도 추가적으로 고려해야할 사항이 있다면 프롬프트에 추가해줘

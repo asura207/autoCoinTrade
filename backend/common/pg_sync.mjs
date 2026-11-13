@@ -87,6 +87,7 @@ export class PgSyncManager {
   }
 
   async syncAll(sqliteDb) {
+    if (process.env.PG_SYNC_ENABLED === "false" || process.env.DB_MODE === "sqlite") return;
     if (!this.isConnected || !this.pool) return;
 
     try {
@@ -596,13 +597,26 @@ export class PgSyncManager {
         }
       } catch {}
     } catch (err) {
+      if (err.code === "ECONNREFUSED" || err.message?.includes("Connection terminated") || err.message?.includes("closed")) {
+        this.isConnected = false;
+      }
       console.warn(`[PgSync] Sync error: ${err.message}`);
     }
   }
 
   startAutoSync(getSqliteDbFn, intervalMs = 10000) {
+    if (process.env.PG_SYNC_ENABLED === "false" || process.env.DB_MODE === "sqlite" || !this.isConnected || !this.pool) {
+      return;
+    }
     if (this.timer) clearInterval(this.timer);
     this.timer = setInterval(async () => {
+      if (!this.isConnected || !this.pool) {
+        if (this.timer) {
+          clearInterval(this.timer);
+          this.timer = null;
+        }
+        return;
+      }
       try {
         const sqliteDb = getSqliteDbFn();
         if (sqliteDb) {

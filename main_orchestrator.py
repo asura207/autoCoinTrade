@@ -1,8 +1,9 @@
 """
 main_orchestrator.py - 멀티프로세싱 기반 슈퍼바이저 오케스트레이터
-- BOT_CONFIGS 레지스트리에 3개 퀀트 봇(bot_vb, bot_momentum, bot_bb)과 4번째 워커(bot_llm_filter) 등록
-- 실행 시 init_database() 호출로 SQLite WAL 모드 및 스키마/단일행 상태 테이블 안전 초기화
-- 4개 워커 프로세스 상시 헬스체크 및 크래시 시 자동 재기동(Auto-Restart)
+- BOT_CONFIGS 레지스트리에 10대 퀀트 봇(bot_01 ~ bot_10, bot_10 잭 켈로그 포함) 및 듀얼 AI 필터 워커(bot_llm_filter) 등록
+- 중앙 시세 허브(market_hub.py) 및 SQLite WAL 표준 경로(data/auto_coin_trade.db) 연동
+- Node.js 백엔드와 상호 조율(Coordinated Mode)로 실전 주문 중복 실행(Double Execution) 완전 방어
+- 워커 프로세스 상시 헬스체크 및 크래시 시 자동 재기동(Auto-Restart)
 - SIGINT(Ctrl+C) / SIGTERM 시그널 수신 시 stop_event 전파 및 Graceful Shutdown
 """
 
@@ -12,13 +13,22 @@ import os
 import signal
 import sys
 import time
-from typing import Dict
+from typing import Dict, List
 
 from dotenv import load_dotenv
 
-from bots import run_bot_bb, run_bot_momentum, run_bot_vb
-from init_db import init_database
+from bots import (
+    BOT_RUNNERS,
+    is_backend_running,
+    normalize_bot_id,
+    run_bot_bb,
+    run_bot_jack_kellogg,
+    run_bot_momentum,
+    run_bot_vb,
+)
+from init_db import DEFAULT_DB_PATH, get_db_connection, init_database
 from llm_filter_worker import run_llm_sentiment_worker
+from market_hub import get_cached_tickers
 
 load_dotenv()
 
@@ -29,12 +39,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger("supervisor")
 
-# 4개 워커 프로세스 레지스트리
+# 10대 알고리즘 및 AI 필터 워커 프로세스 레지스트리
 BOT_CONFIGS = {
+    "bot_01": run_bot_vb,
+    "bot_02": run_bot_vb,
+    "bot_03": run_bot_momentum,
+    "bot_04": run_bot_momentum,
+    "bot_05": run_bot_bb,
+    "bot_06": run_bot_bb,
+    "bot_07": run_bot_momentum,
+    "bot_08": run_bot_vb,
+    "bot_09": run_bot_momentum,
+    "bot_10": run_bot_jack_kellogg,
+    "bot_llm_filter": run_llm_sentiment_worker,
+    # 하위 호환 별칭
     "bot_vb": run_bot_vb,
     "bot_momentum": run_bot_momentum,
     "bot_bb": run_bot_bb,
-    "bot_llm_filter": run_llm_sentiment_worker,
+    "bot_kellogg": run_bot_jack_kellogg,
+    "bot_jack_kellogg": run_bot_jack_kellogg,
 }
 
 
@@ -148,9 +171,10 @@ def configure_multiprocessing_environment():
 
     if not sys.executable.lower().endswith(".exe"):
         candidates = [
-            "C:\\Program Files\\LibreOffice\\program\\python.exe",
             os.path.join(os.path.dirname(sys.executable), "python.exe"),
             os.path.join(sys.prefix, "python.exe"),
+            os.path.join(sys.prefix, "Scripts", "python.exe"),
+            "C:\\Program Files\\LibreOffice\\program\\python.exe",
         ]
         for cand in candidates:
             if os.path.isfile(cand):
@@ -171,10 +195,25 @@ def main():
     configure_multiprocessing_environment()
 
     # 2. SQLite 데이터베이스 및 스키마, 기본 시드 초기화
-    logger.info("[Step 1/3] Initializing SQLite database schema & ledger...")
+    logger.info("[Step 1/4] Initializing SQLite database schema & ledger...")
     init_database()
 
-    # 3. 프로세스 간 종료 시그널 제어를 위한 컨트롤러
+    # 3. 중앙 시세 허브 캐시 웜업
+    logger.info("[Step 2/4] Initializing Market Data Hub cache...")
+    try:
+        initial_tickers = get_cached_tickers()
+        logger.info("Market Data Hub initialized with %d KRW tickers.", len(initial_tickers))
+    except Exception as hub_err:
+        logger.warning("Market Data Hub initial ticker fetch error: %s", hub_err)
+
+    # Node.js 백엔드 구동 감지 및 조율 모드 확인
+    if is_backend_running():
+        logger.info(
+            "[Coordinated Execution Mode] Active Node.js backend detected on Port 8001. "
+            "Python workers will coordinate with backend to prevent double execution."
+        )
+
+    # 4. 프로세스 간 종료 시그널 제어를 위한 컨트롤러
     stop_controller = SupervisorStopController()
 
     def handle_shutdown_signal(signum, frame):
@@ -185,15 +224,39 @@ def main():
     signal.signal(signal.SIGINT, handle_shutdown_signal)
     signal.signal(signal.SIGTERM, handle_shutdown_signal)
 
-    # 4. 4개 워커 프로세스 구동
-    logger.info("[Step 2/3] Spawning 4 worker processes...")
+    # 5. 실행할 워커 목록 결정 (활성 실전 봇 및 듀얼 AI 필터 워커)
+    logger.info("[Step 3/4] Determining active trading and filter workers...")
+    active_bot_ids = []
+    try:
+        conn = get_db_connection()
+        rows = conn.execute(
+            "SELECT bot_id FROM bots WHERE is_selected_for_live = 1 ORDER BY bot_id ASC;"
+        ).fetchall()
+        conn.close()
+        active_bot_ids = [r["bot_id"] for r in rows]
+    except Exception as db_err:
+        logger.warning("Failed to query active bots from DB: %s", db_err)
+
+    if not active_bot_ids:
+        active_bot_ids = ["bot_01", "bot_03", "bot_05", "bot_10"]
+    elif "bot_10" not in active_bot_ids:
+        active_bot_ids.append("bot_10")
+
+    # AI 필터 워커 항상 포함
+    workers_to_spawn = list(dict.fromkeys(active_bot_ids + ["bot_llm_filter"]))
+
+    logger.info("[Step 4/4] Spawning %d worker processes: %s", len(workers_to_spawn), workers_to_spawn)
     workers: Dict[str, multiprocessing.Process] = {}
 
-    for bot_id, worker_func in BOT_CONFIGS.items():
-        workers[bot_id] = spawn_worker_process(bot_id, worker_func, stop_controller)
+    for bot_id in workers_to_spawn:
+        worker_func = BOT_CONFIGS.get(bot_id)
+        if worker_func:
+            workers[bot_id] = spawn_worker_process(bot_id, worker_func, stop_controller)
+        else:
+            logger.warning("No worker function mapped for bot [%s]. Skipping.", bot_id)
 
-    logger.info("[Step 3/3] All workers active. Entering supervisor monitoring loop.")
-    logger.info("Active Bots: %s", list(BOT_CONFIGS.keys()))
+    logger.info("All workers active. Entering supervisor monitoring loop.")
+    logger.info("Active Workers: %s", list(workers.keys()))
     logger.info("Press Ctrl+C to terminate all processes gracefully.\n")
 
     # 5. 슈퍼바이저 헬스체크 및 자동 재기동 루프

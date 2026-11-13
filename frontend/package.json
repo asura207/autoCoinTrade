@@ -1,6 +1,6 @@
 {
   "name": "auto-coin-trade-frontend",
-  "version": "0.0.18",
+  "version": "0.0.19",
   "description": "autoCoinTrade React 18 & Vite Frontend Dashboard",
   "keywords": [
     "react",
@@ -12,7 +12,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/wonsubshin/autoCoinTrade.git",
+    "url": "https://github.com/asura207/autoCoinTrade.git",
     "directory": "frontend"
   },
   "type": "module",

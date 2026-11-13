@@ -10,7 +10,8 @@
 
 | 버전 (Version) | 릴리즈 일시 | 커밋 해시 | 주요 수정 내용 요약 |
 | :--- | :--- | :--- | :--- |
-| **v0.0.18** | 2026-11-13 | `197ba2b` | 잭 켈로그(Jack Kellogg) 프라이스 액션 & VWAP/선형회귀 알고리즘(bot_10) 탑재, 2대 진입(돌파/반등 2분할) 및 가상·실전 매매 엔진 연동 |
+| **v0.0.19** | 2026-11-13 | `cf8bbe7` | 오케스트레이터(10대 봇·시세 허브) 동기화, 이중 주문 방어(Double Execution Guard), DB 경로 통일, pg_sync 예외 방어 및 저장소 URL(asura207) 일괄 갱신 |
+| **v0.0.18** | 2026-11-13 | `608a63c` | 잭 켈로그(Jack Kellogg) 프라이스 액션 & VWAP/선형회귀 알고리즘(bot_10) 탑재, 2대 진입(돌파/반등 2분할) 및 가상·실전 매매 엔진 연동 |
 | **v0.0.17** | 2026-11-13 | `871e2ec` | 초반 실전 및 가상 거래 내역 SQLite 동기화 복구, /api/trades SQLite 쿼리 호환성 수정, 통계 내역 탭 연동 |
 | **v0.0.16** | 2026-11-13 | `3632a14` | 통계 차트 막대 상단 텍스트 및 수익 표기 뱃지 영역 겹침 현상 해소, 레이아웃 및 여백 최적화 |
 | **v0.0.15** | 2026-11-13 | `ca74d8a` | 실전 수익 통계 상단 이번달 1일 시점 및 현재 평가자산 표기, 금액 증감 상태 표출, 매달 기록 및 월별 보유 자산 증감 차트 구현 |
@@ -32,6 +33,27 @@
 ---
 
 ## 📝 상세 버전별 변경 내역 (Detailed Changelog)
+
+### [v0.0.19] - 2026-11-13
+- **커밋 해시**: `cf8bbe7`
+- **변경 분류**: `fix` (오케스트레이터 및 실행 스크립트 최신 아키텍처 동기화, 이중 주문 방어, DB 경로 통일, 레포지토리 URL 현행화)
+- **주요 변경 사항**:
+  - **오케스트레이터(`main_orchestrator.py`) 및 봇 모듈(`bots.py`) 전면 현행화**:
+    - 레거시 3개 봇(`bot_vb`, `bot_momentum`, `bot_bb`) 하드코딩에서 최신 10대 알고리즘(`bot_01` ~ `bot_10`, `bot_10` 잭 켈로그 포함) 및 듀얼 AI 필터 워커(`bot_llm_filter`) 완벽 등록 (`BOT_RUNNERS`, `BOT_CONFIGS`).
+    - 중앙 시세 허브(`market_hub.py`) 초기 캐시 웜업 연동 및 표준 DB 경로(`data/auto_coin_trade.db`) 적용.
+    - Node.js 백엔드와 Python 오케스트레이터 간 상호 조율(Coordinated Execution Mode) 및 이중 체결 방어(Double Execution Shield) 구현: 백엔드가 8001 포트에서 가동 중일 경우 Python 실전 주문 실행을 디퍼(`DEFERRED_TO_NODEJS_BACKEND`)하여 중복 매매 완전 차단.
+    - `normalize_bot_id` 정규화 함수 탑재: 레거시 봇 ID와 최신 `bot_01` ~ `bot_10` 간의 SQLite `bot_accounts` 및 `bots` 테이블 쿼리 불일치 결함 해소.
+  - **실행 스크립트(`run_orchestrator.bat`) 가상환경 우선순위 개선**:
+    - LibreOffice 파이썬 하드코딩 대신 `.venv\Scripts\python.exe` 및 `venv` 우선 탐색으로 패키지 누락 런타임 오류 방지.
+  - **PostgreSQL 동기화(`pg_sync.mjs`) 예외 방어 및 로그 스팸 차단**:
+    - `DB_MODE=sqlite` 또는 `PG_SYNC_ENABLED=false` 환경에서 `startAutoSync` 즉시 반환 처리로 불필요한 타이머 및 로그 스팸 차단.
+    - 연결 해제 감지 시 `isConnected = false` 안전 처리.
+  - **문서 및 설정 DB 경로 통일 (`SETUP_GUIDE.md`)**:
+    - 잔존 구버전 DB명(`trading_ledger.db`)을 표준 SQLite 파일(`data/auto_coin_trade.db`)로 전면 통일.
+  - **원격 Git 저장소 주소 현행화 (`package.json`, `frontend/package.json`, `initRule.md`)**:
+    - `github.com/wonsubshin/autoCoinTrade.git`에서 `github.com/asura207/autoCoinTrade.git`로 100% 일괄 갱신.
+  - **독립 배포 패키지(`/install/app`) 최신 동기화**:
+    - 최신 소스 및 번들 빌드 반영.
 
 ### [v0.0.18] - 2026-11-13
 - **커밋 해시**: `197ba2b`

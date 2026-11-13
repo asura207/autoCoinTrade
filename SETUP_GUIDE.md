@@ -223,7 +223,7 @@ curl -s -I http://localhost:9000
 독립된 Python 멀티프로세싱 아키텍처 기반으로 3개 전략 봇(`bot_vb`, `bot_momentum`, `bot_bb`)과 4번째 워커(`bot_llm_filter`)를 실행할 때 사용합니다:
 
 ### 파일 구성
-- **`init_db.py`**: SQLite(`trading_ledger.db`, WAL 모드) 가상 원장 및 단일 행(`id=1`) `market_regime_filter` 테이블 초기화
+- **`init_db.py`**: SQLite(`data/auto_coin_trade.db`, WAL 모드) 가상 원장 및 단일 행(`id=1`) `market_regime_filter` 테이블 초기화
 - **`llm_filter_worker.py`**: 1~4시간 주기 시장 지표/뉴스 수집, LLM 분석, 룰베이스 폴백 및 DB 갱신 워커
 - **`bots.py`**: 공통 매수 게이트웨이(`can_enter_position`), 슬리피지 방어형 주문 래퍼, 3개 봇 전략(슈퍼트렌드 변동성 돌파, BB 스퀴즈 VCP 돌파, 다단계 분할 매수 DCA)
 - **`main_orchestrator.py`**: 4개 워커 프로세스 상시 헬스체크, 크래시 시 자동 재기동(Auto-Restart), Graceful Shutdown 관리
