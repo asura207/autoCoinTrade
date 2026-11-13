@@ -16,6 +16,7 @@ import {
   ensureArenaSchema,
   seedArenaBots,
   evaluateStrategy,
+  evaluateSmartExit,
   buildMarketData,
   updatePeakPrice,
   runArenaCycle,
@@ -51,7 +52,7 @@ if (fs.existsSync(ENV_PATH)) {
 const HOST = process.env.BACKEND_HOST || "0.0.0.0";
 const PORT = Number(process.env.BACKEND_PORT || process.env.PORT || 8001);
 
-let APP_VERSION = "0.0.19";
+let APP_VERSION = "0.0.20";
 try {
   const pkgJsonPath = path.join(BASE_DIR, "package.json");
   if (fs.existsSync(pkgJsonPath)) {
@@ -484,6 +485,8 @@ async function getBots(mode = null) {
   if (!db) return [];
   const rows = await db.prepare("SELECT * FROM bots ORDER BY bot_id ASC").all();
   const posTable = getPositionsTableName(mode);
+  const tradesTable = getTradesTableName(mode);
+  const todayStartKst = `${nowKSTString().split(" ")[0]} 00:00:00`;
   const result = [];
   for (const r of rows) {
     let config = {};
@@ -497,7 +500,29 @@ async function getBots(mode = null) {
       openPositions.reduce((acc, p) => acc + Number(p.buy_amount || 0), 0)
     );
     const virtualKrw = Math.max(0, Math.floor(Number(r.allocated_capital || 0) - usedCapital));
-    result.push({ ...r, virtual_krw: virtualKrw, config, open_positions: openPositions, used_capital: usedCapital });
+
+    let dailyProfit = 0;
+    try {
+      const dailyRow = await db
+        .prepare(`SELECT COALESCE(SUM(profit_krw), 0) AS daily_profit FROM ${tradesTable} WHERE bot_id = ? AND status = 'COMPLETED' AND sell_date >= ?`)
+        .get(r.bot_id, todayStartKst);
+      dailyProfit = Number(dailyRow?.daily_profit || 0);
+    } catch {}
+
+    const allocatedCap = Number(r.allocated_capital || 0);
+    const dailyLossLimit = allocatedCap > 0 ? -Math.floor(allocatedCap * 0.04) : -40000;
+    const isCircuitBreaker = Number(r.is_selected_for_live || 0) === 1 && allocatedCap > 0 && dailyProfit <= dailyLossLimit;
+
+    result.push({
+      ...r,
+      virtual_krw: virtualKrw,
+      config,
+      open_positions: openPositions,
+      used_capital: usedCapital,
+      daily_profit_krw: dailyProfit,
+      daily_loss_limit_krw: dailyLossLimit,
+      circuit_breaker_active: isCircuitBreaker,
+    });
   }
   return result;
 }
@@ -5739,6 +5764,24 @@ async function runLiveTradingBotsCycle() {
         const curPeak = Math.max(Number(liveBotPeakMap.get(peakKey) || avgBuy), curPrice);
         liveBotPeakMap.set(peakKey, curPeak);
 
+        const md = mdMap.get(pos.market);
+
+        // 3단계 스마트 청산 유틸리티 (본절 스탑, 시간 제한 청산, 동적 ATR 트레일링 스탑)
+        const smartExit = evaluateSmartExit({
+          botId: bot.bot_id,
+          position: pos,
+          currentPrice: curPrice,
+          indicators: md?.indicators,
+          peakPrice: curPeak,
+          isLive: true,
+          stopLossPct: stopLossPct,
+        });
+        if (smartExit && smartExit.signal === "SELL") {
+          await executeBotSellOrder(bot, pos, curPrice, smartExit.reason);
+          liveBotPeakMap.delete(peakKey);
+          continue;
+        }
+
         if (pnlPct <= stopLossPct) {
           await executeBotSellOrder(bot, pos, curPrice, `손절(${pnlPct.toFixed(2)}%)`);
           liveBotPeakMap.delete(peakKey);
@@ -5751,7 +5794,6 @@ async function runLiveTradingBotsCycle() {
         }
 
         // 10대 알고리즘 전략별 청산 시그널 평가
-        const md = mdMap.get(pos.market);
         if (md) {
           const sig = evaluateStrategy(bot.bot_id, md, md.indicators, pos, {
             params,
@@ -5772,6 +5814,28 @@ async function runLiveTradingBotsCycle() {
       if (!refreshedBot || Number(refreshedBot.is_running) !== 1) continue;
       const heldSet = new Set((refreshedBot.open_positions || []).map((p) => p.market));
       const maxPositions = Math.max(1, Number(cfg.max_positions || 2));
+
+      // [실전 서킷 브레이커] 당일(00:00 KST 기준) 누적 실현 손실이 배정 원금의 -4.0% 이하 시 신규 매수 차단
+      const todayStartKst = `${nowKSTString().split(" ")[0]} 00:00:00`;
+      let dailyProfit = 0;
+      try {
+        const dailyRow = await db
+          .prepare("SELECT COALESCE(SUM(profit_krw), 0) AS daily_profit FROM trades WHERE bot_id = ? AND status = 'COMPLETED' AND sell_date >= ?")
+          .get(bot.bot_id, todayStartKst);
+        dailyProfit = Number(dailyRow?.daily_profit || 0);
+      } catch {}
+
+      const allocatedCap = Number(refreshedBot.allocated_capital || 0);
+      const lossLimit = allocatedCap > 0 ? -Math.floor(allocatedCap * 0.04) : -40000;
+      if (allocatedCap > 0 && dailyProfit <= lossLimit) {
+        const cbMsg = `[서킷 브레이커 발동] 당일 실현 손실(${dailyProfit.toLocaleString("ko-KR")}원 / -4.0% 한도 도달)로 자정까지 신규 매수 일시 차단`;
+        await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
+          cbMsg,
+          now,
+          bot.bot_id
+        );
+        continue;
+      }
 
       // [실전 로직 필수 보존] 전체 봇 공통 시장 체제 필터 (BTC Regime Filter)
       // 대장주 KRW-BTC가 일봉 20MA 또는 4시간봉 60MA 하회 시 신규 매수를 전면 차단(Hold Cash)

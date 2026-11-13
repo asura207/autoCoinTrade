@@ -216,9 +216,9 @@ def evaluate_jack_kellogg_strategy(
     잭 켈로그 순수 수식 매매 시그널 판별 (가상/실전 공용)
     """
     params = params or {}
-    rvol_breakout_th = float(params.get("rvol_breakout", 2.0 if is_live else 1.5))
+    rvol_breakout_th = float(params.get("rvol_breakout", 1.8 if is_live else 1.4))
     rvol_dip_th = float(params.get("rvol_dip", 1.3))
-    dip_gap_th = float(params.get("vwap_gap", -3.0 if is_live else -2.2))
+    dip_gap_th = float(params.get("vwap_gap", -2.8 if is_live else -2.0))
     trailing_pct = float(params.get("trailing_stop_pct", 1.5))
 
     held = open_positions or []
@@ -360,7 +360,15 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
     [Bot 10] 잭 켈로그(Jack Kellogg) 프라이스 액션 & VWAP/선형회귀 모멘텀 독립 워커 프로세스
     """
     from init_db import get_db_connection
-    from bots import can_enter_position, execute_buy_order, execute_sell_order, get_safe_current_price, is_dry_run, MIN_ORDER_KRW
+    from bots import (
+        can_enter_position,
+        evaluate_smart_exit,
+        execute_buy_order,
+        execute_sell_order,
+        get_safe_current_price,
+        is_dry_run,
+        MIN_ORDER_KRW,
+    )
     from market_hub import get_cached_tickers
 
     logger.info("Bot process [%s] (Jack Kellogg Price Action) started.", bot_id)
@@ -383,14 +391,14 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
                 t = pos["ticker"]
                 pos_by_ticker.setdefault(t, []).append(dict(pos))
 
-            for ticker, pos_list in pos_by_ticker.items():
+            for ticker, pos_list in list(pos_by_ticker.items()):
                 cur_price = get_safe_current_price(ticker)
                 if cur_price <= 0:
                     continue
 
                 for p in pos_list:
                     p_id = p["id"]
-                    peak_map[p_id] = max(peak_map.get(p_id, float(p["avg_buy_price"])), cur_price)
+                    peak_map[p_id] = max(peak_map.get(p_id, float(p.get("highest_price") or p.get("avg_buy_price") or cur_price)), cur_price)
 
                 df_15m = pyupbit.get_ohlcv(ticker, interval="minute15", count=100)
                 df_day = pyupbit.get_ohlcv(ticker, interval="day", count=30)
@@ -399,6 +407,34 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
 
                 k = calculate_kellogg_indicators(df_15m, df_day, cur_price)
                 if not k:
+                    continue
+
+                # 스마트 청산(본절 스탑, 시간 제한 청산, 동적 ATR 트레일링 스탑) 우선 검토
+                tr = pd.concat([
+                    df_15m["high"] - df_15m["low"],
+                    (df_15m["high"] - df_15m["close"].shift(1)).abs(),
+                    (df_15m["low"] - df_15m["close"].shift(1)).abs()
+                ], axis=1).max(axis=1)
+                atr_val = float(tr.rolling(14).mean().iloc[-1]) if len(tr) >= 14 else 0.0
+
+                smart_exited_any = False
+                for p in list(pos_list):
+                    smart_exit = evaluate_smart_exit(
+                        bot_id,
+                        p,
+                        cur_price,
+                        atr=atr_val,
+                        rvol=k.get("rvol", 1.0),
+                        is_live=not is_dry_run(),
+                    )
+                    if smart_exit:
+                        logger.info("[%s] Smart Exit on %s: %s", bot_id, ticker, smart_exit["reason"])
+                        execute_sell_order(p["id"], reason=smart_exit["reason"], db_path=db_path)
+                        peak_map.pop(p["id"], None)
+                        pos_list.remove(p)
+                        smart_exited_any = True
+
+                if not pos_list:
                     continue
 
                 max_peak = max(peak_map.get(p["id"], cur_price) for p in pos_list)

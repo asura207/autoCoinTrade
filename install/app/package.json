@@ -1,6 +1,6 @@
 {
   "name": "auto-coin-trade",
-  "version": "0.0.19",
+  "version": "0.0.20",
   "description": "Upbit Open API & Google Gemini AI(Flash/Pro) 기반 10대 알고리즘 상시 가상 경쟁(Arena) 및 선택형(1~3개) 동적 실전 코인 자동매매 웹 플랫폼 (Windows/Linux 원클릭 설치 지원)",
   "keywords": [
     "upbit",

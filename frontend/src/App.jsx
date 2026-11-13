@@ -966,7 +966,7 @@ export default function App() {
   const [gateError, setGateError] = useState("");
 
   // 프로젝트 버전 및 히스토리 모달 상태
-  const [appVersion, setAppVersion] = useState("0.0.19");
+  const [appVersion, setAppVersion] = useState("0.0.20");
   const [historyModalOpen, setHistoryModalOpen] = useState(false);
   const [historyContent, setHistoryContent] = useState("");
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -5068,6 +5068,22 @@ export default function App() {
                       >
                         실전 {bot.allocation_ratio}%
                       </span>
+                      {bot.circuit_breaker_active && (
+                        <span
+                          style={{
+                            fontSize: "10px",
+                            marginLeft: "4px",
+                            padding: "1px 5px",
+                            borderRadius: "4px",
+                            background: "rgba(239, 68, 68, 0.35)",
+                            color: "#fca5a5",
+                            fontWeight: 700,
+                          }}
+                          title="일일 손실 방어 서킷 브레이커 발동 (-4.0% 도달, 자정까지 신규 매수 차단)"
+                        >
+                          ⚡ 서킷차단
+                        </span>
+                      )}
                     </button>
                   ))}
                 </div>
@@ -5079,11 +5095,26 @@ export default function App() {
               <div className="card">
                 <div className="bot-control-panel">
                   <div>
-                    <div style={{ fontSize: "18px", fontWeight: 800, marginBottom: "6px" }}>
-                      {currentBot.nickname || currentBot.name}{" "}
+                    <div style={{ fontSize: "18px", fontWeight: 800, marginBottom: "6px", display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                      <span>{currentBot.nickname || currentBot.name}</span>
                       <span style={{ fontSize: "13px", color: "#94a3b8", fontWeight: 500 }}>
                         ({currentBot.name})
                       </span>
+                      {currentBot.circuit_breaker_active && (
+                        <span
+                          style={{
+                            fontSize: "11px",
+                            padding: "2px 8px",
+                            borderRadius: "6px",
+                            background: "rgba(239, 68, 68, 0.2)",
+                            border: "1px solid rgba(239, 68, 68, 0.5)",
+                            color: "#f87171",
+                            fontWeight: 700,
+                          }}
+                        >
+                          ⚡ 일일 서킷 브레이커 발동 (신규 매수 차단)
+                        </span>
+                      )}
                     </div>
                     <div style={{ fontSize: "13px", color: "#94a3b8", marginBottom: "14px" }}>
                       {currentBot.description}
@@ -5106,6 +5137,23 @@ export default function App() {
                         <span className="meta-label">가용 가상잔고 (virtual_krw)</span>
                         <span className="meta-value" style={{ color: "#a5b4fc" }}>
                           {formatKRW(currentBot.virtual_krw)}
+                        </span>
+                      </div>
+                      <div className="meta-item">
+                        <span className="meta-label">일일 손익 / 서킷 브레이커 한도 (-4.0%)</span>
+                        <span
+                          className="meta-value"
+                          style={{
+                            color: currentBot.circuit_breaker_active
+                              ? "#ef4444"
+                              : (Number(currentBot.daily_profit_krw || 0) >= 0 ? "#22c55e" : "#fca5a5"),
+                            fontWeight: 700,
+                          }}
+                        >
+                          {formatKRW(currentBot.daily_profit_krw || 0)}
+                          <span style={{ fontSize: "11.5px", color: "#94a3b8", marginLeft: "6px", fontWeight: 500 }}>
+                            (한도: -{formatKRW(currentBot.daily_loss_limit_krw || Math.floor((currentBot.allocated_capital || 0) * 0.04))})
+                          </span>
                         </span>
                       </div>
                       <div className="meta-item">

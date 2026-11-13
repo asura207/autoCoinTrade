@@ -8,6 +8,7 @@ bots.py - 3개 트레이딩 봇 매매 전략 및 공통 리스크 게이트웨�
 - DRY_RUN 모드 지원: 실제 API 주문 없이 실시간 호가/시세 기반 가상 원장 체결 및 검증
 """
 
+import datetime
 import json
 import logging
 import math
@@ -88,6 +89,134 @@ def normalize_bot_id(raw_id: str) -> str:
         "bot_jack_kellogg": "bot_10",
     }
     return alias_map.get(raw, raw)
+
+
+def check_upper_wick_and_overextension(
+    df_candle: Optional[pd.DataFrame],
+    current_price: float,
+    ma20: float = 0.0,
+    vwap: float = 0.0,
+) -> Tuple[bool, str]:
+    """
+    돌파형 봇(bot_01, bot_03, bot_04, bot_09) 윗꼬리(Whipsaw) & 고점 물림 방어 필터
+    1) 캔들 전체 길이(High - Low) 중 윗꼬리 길이(High - Close)가 45% 초과하거나,
+       캔들 종가가 고가 대비 상위 35% 이내에 안착하지 못한 경우 가짜 돌파(Bull Trap) 차단
+    2) 현재가가 20MA 또는 VWAP 대비 +6.0% 이상 급등한 상태일 경우 이격도 과열 추격 매수 금지
+    """
+    if df_candle is None or df_candle.empty:
+        return True, "OK"
+
+    try:
+        last_row = df_candle.iloc[-1]
+        high = float(last_row.get("high", current_price))
+        low = float(last_row.get("low", current_price))
+        open_p = float(last_row.get("open", current_price))
+        close = float(last_row.get("close", current_price))
+        total_len = high - low
+
+        if total_len > 0:
+            upper_wick = high - max(open_p, close)
+            upper_wick_ratio = upper_wick / total_len
+            top_close_dist = (high - close) / total_len
+
+            if upper_wick_ratio > 0.45 or top_close_dist > 0.35:
+                return (
+                    False,
+                    f"Wick Filter Blocked: Upper wick {upper_wick_ratio*100:.1f}% > 45% or top 35% close missed ({top_close_dist*100:.1f}% > 35%)",
+                )
+
+        if ma20 > 0:
+            ma_gap = ((current_price - ma20) / ma20) * 100.0
+            if ma_gap >= 6.0:
+                return False, f"Overextension Cap Blocked: 20MA gap +{ma_gap:.1f}% >= +6.0%"
+
+        if vwap > 0:
+            vwap_gap = ((current_price - vwap) / vwap) * 100.0
+            if vwap_gap >= 6.0:
+                return False, f"Overextension Cap Blocked: VWAP gap +{vwap_gap:.1f}% >= +6.0%"
+
+    except Exception as exc:
+        logger.debug("check_upper_wick_and_overextension check error: %s", exc)
+
+    return True, "OK"
+
+
+def evaluate_smart_exit(
+    bot_id: str,
+    open_pos: Dict[str, Any],
+    current_price: float,
+    atr: float = 0.0,
+    rvol: float = 1.0,
+    is_live: bool = False,
+    stop_loss_pct: float = -2.5,
+) -> Optional[Dict[str, Any]]:
+    """
+    3단계 스마트 청산 유틸리티
+    1) 본절 스탑 (Breakeven Stop): 최고 수익률 +1.2% 이상 도달 후 +0.25% 이하로 하락 시 수익 반납 방지 익절
+    2) 시간 제한 청산 (Time-Stop): 단타 봇(bot_01, bot_04, bot_05, bot_09, bot_10)이 6시간(실전)/2시간(가상) 경과 후 -0.6%~+0.8% 박스권 & RVOL < 1.0 시 자금 회수
+    3) ATR 기반 동적 트레일링 스탑: 진입가 대비 -2.2*ATR 하드 손절, 최고가 대비 -1.8*ATR 트레일링 스탑
+    """
+    norm_id = normalize_bot_id(bot_id)
+    avg_buy = float(open_pos.get("avg_buy_price", 0.0) or 0.0)
+    if current_price <= 0 or avg_buy <= 0:
+        return None
+
+    pnl_pct = ((current_price - avg_buy) / avg_buy) * 100.0
+    highest_price = max(float(open_pos.get("highest_price", 0.0) or avg_buy), current_price)
+    peak_pnl_pct = ((highest_price - avg_buy) / avg_buy) * 100.0
+
+    # 1. 본절 스탑 (Breakeven Stop — 수익 반납 방지)
+    if peak_pnl_pct >= 1.2 and pnl_pct <= 0.25:
+        return {
+            "signal": "SELL",
+            "reason": f"BREAKEVEN_STOP: Peak +{peak_pnl_pct:.2f}% dropped to +{pnl_pct:.2f}%",
+        }
+
+    # 2. 시간 제한 청산 (Time-Stop)
+    time_stop_bots = {"bot_01", "bot_04", "bot_05", "bot_09", "bot_10"}
+    if norm_id in time_stop_bots:
+        created_str = open_pos.get("created_at") or open_pos.get("opened_at")
+        if created_str:
+            try:
+                dt_str = str(created_str).replace("T", " ").split(".")[0]
+                entry_dt = datetime.datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+                elapsed_hours = (datetime.datetime.now() - entry_dt).total_seconds() / 3600.0
+                max_hours = 6.0 if is_live else 2.0
+
+                in_box = (-0.6 <= pnl_pct <= 0.8)
+                if elapsed_hours >= max_hours and in_box and rvol < 1.0:
+                    return {
+                        "signal": "SELL",
+                        "reason": f"TIME_STOP: {elapsed_hours:.1f}h elapsed (box {pnl_pct:.2f}%, RVOL {rvol:.1f}x)",
+                    }
+            except Exception:
+                pass
+
+    # 3. ATR 기반 동적 트레일링 스탑
+    if atr > 0:
+        hard_stop_price = avg_buy - (2.2 * atr)
+        if current_price <= hard_stop_price:
+            return {
+                "signal": "SELL",
+                "reason": f"ATR_HARD_STOP: -2.2xATR ({hard_stop_price:,.0f} KRW) hit (PnL {pnl_pct:.2f}%)",
+            }
+
+        if highest_price > avg_buy:
+            trailing_stop_price = highest_price - (1.8 * atr)
+            if current_price <= trailing_stop_price:
+                return {
+                    "signal": "SELL",
+                    "reason": f"ATR_TRAILING_STOP: -1.8xATR from peak ({trailing_stop_price:,.0f} KRW) hit (PnL {pnl_pct:.2f}%)",
+                }
+    else:
+        fixed_stop = -abs(float(stop_loss_pct or 2.5))
+        if pnl_pct <= fixed_stop:
+            return {
+                "signal": "SELL",
+                "reason": f"FIXED_STOP_LOSS: PnL {pnl_pct:.2f}% <= {fixed_stop:.2f}%",
+            }
+
+    return None
 
 
 # =====================================================================
@@ -198,6 +327,24 @@ def can_enter_position(
 
     conn = get_db_connection(db_path)
     try:
+        # 0-1. 실전 일일 서킷 브레이커 (Daily Circuit Breaker): 당일 실현 손실이 배정원금의 -4.0% 이하 시 신규 매수 차단
+        if not is_paper and not is_dry_run():
+            today_start = datetime.datetime.now().strftime("%Y-%m-%d 00:00:00")
+            loss_row = conn.execute(
+                "SELECT COALESCE(SUM(profit_krw), 0) AS daily_profit FROM trades WHERE (bot_id = ? OR bot_id = ?) AND status = 'COMPLETED' AND sell_date >= ?;",
+                (bot_id, norm_id, today_start),
+            ).fetchone()
+            daily_profit = float(loss_row["daily_profit"]) if loss_row else 0.0
+            bot_row = conn.execute("SELECT allocated_capital FROM bots WHERE bot_id = ?;", (norm_id,)).fetchone()
+            allocated_cap = float(bot_row["allocated_capital"]) if bot_row else 0.0
+            loss_limit = -math.floor(allocated_cap * 0.04) if allocated_cap > 0 else -40000.0
+            if allocated_cap > 0 and daily_profit <= loss_limit:
+                return (
+                    False,
+                    0.0,
+                    f"CIRCUIT_BREAKER_ACTIVE: Daily loss {daily_profit:,.0f} KRW exceeded -4.0% limit ({loss_limit:,.0f} KRW)",
+                )
+
         # 1. LLM 필터 테이블 조회
         filter_row = conn.execute("SELECT * FROM market_regime_filter WHERE id = 1;").fetchone()
         if not filter_row:
@@ -726,7 +873,7 @@ def run_bot_vb(stop_event, bot_id: str = "bot_01", db_path: Optional[str] = None
                 ).fetchone()
                 conn.close()
 
-                # 2. 보유 중 포지션 관리: ATR 트레일링 스탑
+                # 2. 보유 중 포지션 관리: ATR 트레일링 스탑 및 3단계 스마트 청산
                 if open_pos:
                     pos_id = open_pos["id"]
                     highest_price = max(float(open_pos["highest_price"] or 0.0), current_price)
@@ -737,11 +884,26 @@ def run_bot_vb(stop_event, bot_id: str = "bot_01", db_path: Optional[str] = None
                         conn.execute("UPDATE bot_positions SET highest_price = ? WHERE id = ?;", (highest_price, pos_id))
                         conn.close()
 
+                    # 스마트 청산(본절 스탑, 시간 제한 청산, 동적 ATR 트레일링 스탑)
+                    rvol_val = curr_vol / vol_ma20 if vol_ma20 > 0 else 1.0
+                    smart_exit = evaluate_smart_exit(
+                        norm_id,
+                        dict(open_pos),
+                        current_price,
+                        atr=atr_val,
+                        rvol=rvol_val,
+                        is_live=not is_dry_run(),
+                    )
+                    if smart_exit:
+                        logger.info("[%s] Smart Exit on %s: %s", norm_id, ticker, smart_exit["reason"])
+                        execute_sell_order(pos_id, reason=smart_exit["reason"], db_path=db_path)
+                        continue
+
                     # 트레일링 스탑 청산 조건: 최고가 - (3 * ATR)
                     trail_stop_price = highest_price - (3.0 * atr_val)
                     if current_price <= trail_stop_price:
                         logger.info(
-                            f"[{bot_id}] Trailing Stop triggered on {ticker}: Curr={current_price:,.0f} "
+                            f"[{norm_id}] Trailing Stop triggered on {ticker}: Curr={current_price:,.0f} "
                             f"<= Stop={trail_stop_price:,.0f} (High={highest_price:,.0f}, ATR={atr_val:,.0f})"
                         )
                         execute_sell_order(pos_id, reason="ATR_TRAILING_STOP", db_path=db_path)
@@ -764,8 +926,14 @@ def run_bot_vb(stop_event, bot_id: str = "bot_01", db_path: Optional[str] = None
                     is_vol_surge = curr_vol >= (vol_ma20 * 1.5)
 
                     if is_breakout and is_above_sma5 and is_vol_surge:
+                        # 윗꼬리 및 이격도 과열 필터 검사
+                        wick_ok, wick_reason = check_upper_wick_and_overextension(df, current_price, ma20=sma5)
+                        if not wick_ok:
+                            logger.info("[%s] Entry blocked on %s: %s", norm_id, ticker, wick_reason)
+                            continue
+
                         logger.info(
-                            f"[{bot_id}] Breakout signal on {ticker}: Price={current_price:,.0f} "
+                            f"[{norm_id}] Breakout signal on {ticker}: Price={current_price:,.0f} "
                             f">= Target={breakout_target:,.0f}, Vol={curr_vol:.1f} >= 1.5xMA"
                         )
                         # 공통 매수 게이트웨이 검증
@@ -823,7 +991,7 @@ def run_bot_momentum(stop_event, bot_id: str = "bot_03", db_path: Optional[str] 
             ).fetchall()
             conn.close()
 
-            # 1. 기존 보유 포지션 중심선(20일선) 하향 이탈 청산 체크
+            # 1. 기존 보유 포지션 스마트 청산 및 중심선(20일선) 하향 이탈 청산 체크
             for pos in open_positions:
                 pos_id = pos["id"]
                 ticker = pos["ticker"]
@@ -833,6 +1001,35 @@ def run_bot_momentum(stop_event, bot_id: str = "bot_03", db_path: Optional[str] 
 
                 df = pyupbit.get_ohlcv(ticker, interval="minute240", count=25)
                 if df is not None and len(df) >= 20:
+                    highest_price = max(float(pos["highest_price"] or 0.0), current_price)
+                    if highest_price > float(pos["highest_price"] or 0.0):
+                        conn = get_db_connection(db_path)
+                        conn.execute("UPDATE bot_positions SET highest_price = ? WHERE id = ?;", (highest_price, pos_id))
+                        conn.close()
+
+                    tr = pd.concat([
+                        df["high"] - df["low"],
+                        (df["high"] - df["close"].shift(1)).abs(),
+                        (df["low"] - df["close"].shift(1)).abs()
+                    ], axis=1).max(axis=1)
+                    atr_val = float(tr.rolling(14).mean().iloc[-1]) if len(tr) >= 14 else 0.0
+                    vol_ma20 = float(df["volume"].rolling(20).mean().iloc[-1])
+                    curr_vol = float(df["volume"].iloc[-1])
+                    rvol_val = curr_vol / vol_ma20 if vol_ma20 > 0 else 1.0
+
+                    smart_exit = evaluate_smart_exit(
+                        norm_id,
+                        dict(pos),
+                        current_price,
+                        atr=atr_val,
+                        rvol=rvol_val,
+                        is_live=not is_dry_run(),
+                    )
+                    if smart_exit:
+                        logger.info("[%s] Smart Exit on %s: %s", norm_id, ticker, smart_exit["reason"])
+                        execute_sell_order(pos_id, reason=smart_exit["reason"], db_path=db_path)
+                        continue
+
                     middle_band = float(df["close"].rolling(20).mean().iloc[-1])
                     if current_price < middle_band:
                         logger.info(
@@ -885,6 +1082,10 @@ def run_bot_momentum(stop_event, bot_id: str = "bot_03", db_path: Optional[str] 
                     is_volume_up = curr_vol > (vol_ma20 * 1.3)
 
                     if is_squeezed and is_bullish and is_breakout and is_volume_up:
+                        wick_ok, wick_reason = check_upper_wick_and_overextension(df, curr_close, ma20=float(middle.iloc[-1]))
+                        if not wick_ok:
+                            logger.info("[%s] Breakout filter rejected %s: %s", norm_id, t, wick_reason)
+                            continue
                         qualifying_candidates.append(t)
                         if len(qualifying_candidates) >= remaining_slots:
                             break
@@ -951,7 +1152,7 @@ def run_bot_bb(stop_event, bot_id: str = "bot_05", db_path: Optional[str] = None
             ).fetchall()
             conn.close()
 
-            # 1. 기존 오픈 포지션별 개별 익절 / 중심선 익절 / 최종 안전 손절 점검
+            # 1. 기존 오픈 포지션별 스마트 청산 / 개별 익절 / 중심선 익절 / 최종 안전 손절 점검
             for pos in open_positions:
                 pos_id = pos["id"]
                 ticker = pos["ticker"]
@@ -960,6 +1161,42 @@ def run_bot_bb(stop_event, bot_id: str = "bot_05", db_path: Optional[str] = None
 
                 current_price = get_safe_current_price(ticker)
                 if current_price <= 0:
+                    continue
+
+                highest_price = max(float(pos["highest_price"] or 0.0), current_price)
+                if highest_price > float(pos["highest_price"] or 0.0):
+                    conn = get_db_connection(db_path)
+                    conn.execute("UPDATE bot_positions SET highest_price = ? WHERE id = ?;", (highest_price, pos_id))
+                    conn.close()
+
+                df = pyupbit.get_ohlcv(ticker, interval="minute30", count=25)
+                atr_val = 0.0
+                rvol_val = 1.0
+                middle_band = None
+                if df is not None and len(df) >= 20:
+                    tr = pd.concat([
+                        df["high"] - df["low"],
+                        (df["high"] - df["close"].shift(1)).abs(),
+                        (df["low"] - df["close"].shift(1)).abs()
+                    ], axis=1).max(axis=1)
+                    atr_val = float(tr.rolling(14).mean().iloc[-1]) if len(tr) >= 14 else 0.0
+                    vol_ma20 = float(df["volume"].rolling(20).mean().iloc[-1])
+                    curr_vol = float(df["volume"].iloc[-1])
+                    rvol_val = curr_vol / vol_ma20 if vol_ma20 > 0 else 1.0
+                    middle_band = float(df["close"].rolling(20).mean().iloc[-1])
+
+                # 스마트 청산(본절 스탑, 시간 제한 청산, 동적 ATR 트레일링 스탑)
+                smart_exit = evaluate_smart_exit(
+                    norm_id,
+                    dict(pos),
+                    current_price,
+                    atr=atr_val,
+                    rvol=rvol_val,
+                    is_live=not is_dry_run(),
+                )
+                if smart_exit:
+                    logger.info("[%s] Smart Exit on %s: %s", norm_id, ticker, smart_exit["reason"])
+                    execute_sell_order(pos_id, reason=smart_exit["reason"], db_path=db_path)
                     continue
 
                 pnl_ratio = (current_price - avg_buy_price) / avg_buy_price

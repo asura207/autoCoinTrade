@@ -436,6 +436,7 @@ export function buildIndicators(marketData) {
       }
     }
     const recentRsi = rsiSeries.slice(-3).filter((v) => v !== null && v !== undefined);
+    const atr14_15m = computeAtrSeries(m15, 14);
     ind.m15 = {
       closes,
       rsi: rsiSeries[n - 1] ?? 50,
@@ -444,6 +445,7 @@ export function buildIndicators(marketData) {
       bandwidthSeries,
       ema20: ema20[n - 1],
       ema60: ema60[n - 1],
+      atr14: atr14_15m[atr14_15m.length - 1] ?? null,
       macdSeries,
       cur,
       closed,
@@ -459,6 +461,7 @@ export function buildIndicators(marketData) {
     ind.kellogg = kellogg;
     ind.m15.kellogg = kellogg;
   }
+  ind.atr = ind.m15?.atr14 || ind.m60?.atr14 || null;
   return ind;
 }
 
@@ -478,6 +481,159 @@ export function computeMomentumRanking(marketDataMap, markets) {
     rankMap[r.market] = { rank: idx + 1, momPct: r.momPct };
   });
   return rankMap;
+}
+
+/**
+ * 돌파형 봇(bot_01, bot_03, bot_04, bot_09) 윗꼬리(Whipsaw) & 고점 물림 방어 필터
+ * 1) 캔들 전체 길이(High - Low) 중 윗꼬리 길이(High - Close)가 45% 초과하거나,
+ *    캔들 종가가 고가 대비 상위 35% 이내에 안착하지 못한 경우((High - Close) / (High - Low) > 0.35) 가짜 돌파(Bull Trap) 차단
+ * 2) 15분봉 현재가가 20MA 또는 VWAP 대비 +6.0% 이상 급등한 상태일 경우 이격도 과열 추격 매수 금지
+ */
+export function checkUpperWickAndOverextension(candle, currentPrice, ma20 = null, vwap = null) {
+  if (!candle) return { ok: true };
+  const high = Number(candle.high_price || candle.trade_price || 0);
+  const low = Number(candle.low_price || candle.trade_price || 0);
+  const open = Number(candle.opening_price || candle.trade_price || 0);
+  const close = Number(candle.trade_price || 0);
+  const curPrice = Number(currentPrice || close);
+  const totalLen = high - low;
+
+  // 1) 윗꼬리 비율 필터
+  if (totalLen > 0) {
+    const upperWick = high - Math.max(open, close);
+    const upperWickRatio = upperWick / totalLen;
+    const topCloseDist = (high - close) / totalLen; // 0이면 최고가 마감, 1이면 최저가 마감
+
+    if (upperWickRatio > 0.45 || topCloseDist > 0.35) {
+      return {
+        ok: false,
+        reason: `가짜 돌파(Bull Trap) 차단: 윗꼬리 ${fmt(upperWickRatio * 100, 1)}% > 45% 또는 상위 35% 안착 실패(${fmt(topCloseDist * 100, 1)}% > 35%)`,
+      };
+    }
+  }
+
+  // 2) 이격도 과열 추격 매수 금지 (+6.0% 초과)
+  if (ma20 && Number(ma20) > 0) {
+    const maGap = ((curPrice - Number(ma20)) / Number(ma20)) * 100.0;
+    if (maGap >= 6.0) {
+      return {
+        ok: false,
+        reason: `이격도 과열 추격매수 금지: 20MA 대비 +${fmt(maGap, 1)}% ≥ +6.0% 급등`,
+      };
+    }
+  }
+  if (vwap && Number(vwap) > 0) {
+    const vwapGap = ((curPrice - Number(vwap)) / Number(vwap)) * 100.0;
+    if (vwapGap >= 6.0) {
+      return {
+        ok: false,
+        reason: `이격도 과열 추격매수 금지: VWAP 대비 +${fmt(vwapGap, 1)}% ≥ +6.0% 급등`,
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
+/**
+ * 횡보장 자금 잠김(Position Lock) 해소를 위한 3단계 스마트 청산(Exit) 엔진
+ * 1) 본절 스탑 (Breakeven Stop): 최고 수익률 +1.2% 이상 도달 후 +0.25% 이하로 하락 시 수익 반납 방지 익절
+ * 2) 시간 제한 청산 (Time-Stop): 단타 봇(bot_01, bot_04, bot_05, bot_09, bot_10)이 6시간(실전)/2시간(가상) 경과 후 -0.6%~+0.8% 박스권 & RVOL < 1.0 시 자금 회수
+ * 3) ATR 기반 동적 트레일링 스탑: 진입가 대비 -2.2*ATR 하드 손절, 최고가 대비 -1.8*ATR 트레일링 스탑 (불가 시 고정 % 손절 Fallback)
+ */
+export function evaluateSmartExit({
+  botId,
+  position,
+  currentPrice,
+  indicators,
+  peakPrice = 0,
+  isLive = false,
+  stopLossPct = -2.5,
+}) {
+  const normId = normalizeBotId(botId);
+  const curPrice = Number(currentPrice || 0);
+  const avgBuy = Number(position.avg_buy_price || 0);
+  if (curPrice <= 0 || avgBuy <= 0) return null;
+
+  const pnlPct = pctChange(curPrice, avgBuy);
+  const curPeak = Math.max(Number(peakPrice || avgBuy), curPrice);
+  const peakPnlPct = pctChange(curPeak, avgBuy);
+
+  // 1. 본절 스탑 (Breakeven Stop — 수익 반납 방지)
+  if (peakPnlPct >= 1.2 && pnlPct <= 0.25) {
+    return {
+      signal: "SELL",
+      exitType: "BREAKEVEN_STOP",
+      reason: `본절 스탑(Breakeven-Exit): 최고 +${fmt(peakPnlPct)}% 도달 후 +${fmt(pnlPct)}% 하락 반납 방지 청산`,
+    };
+  }
+
+  // 2. 시간 제한 청산 (Time-Stop)
+  const timeStopBots = new Set(["bot_01", "bot_04", "bot_05", "bot_09", "bot_10"]);
+  if (timeStopBots.has(normId)) {
+    const timeStr = position.opened_at || position.created_at;
+    if (timeStr) {
+      const entryTs = new Date(timeStr).getTime();
+      if (!isNaN(entryTs)) {
+        const holdHours = (Date.now() - entryTs) / (3600 * 1000);
+        const maxHoldHours = isLive ? 6.0 : 2.0;
+
+        const inBox = pnlPct >= -0.6 && pnlPct <= 0.8;
+        const rvol = Number(
+          indicators?.kellogg?.rvol ??
+          indicators?.m15?.curVolRatio ??
+          indicators?.m15?.closedVolRatio ??
+          0.8
+        );
+
+        if (holdHours >= maxHoldHours && inBox && rvol < 1.0) {
+          return {
+            signal: "SELL",
+            exitType: "TIME_STOP",
+            reason: `시간 제한 청산(Time-Exit): ${fmt(holdHours, 1)}h 경과(기준 ${maxHoldHours}h) · 박스권(${fmt(pnlPct)}%) · 거래량 침체(RVOL ${fmt(rvol, 1)}배) 현금 회수`,
+          };
+        }
+      }
+    }
+  }
+
+  // 3. ATR 기반 동적 트레일링 스탑 (Dynamic ATR Trailing Stop)
+  const atr = Number(indicators?.m15?.atr14 || indicators?.m60?.atr14 || indicators?.atr || 0);
+  if (atr > 0) {
+    // 3-1. 진입가 대비 2.2 * ATR 하락 시 손절 (Hard Stop)
+    const hardStopPrice = avgBuy - 2.2 * atr;
+    if (curPrice <= hardStopPrice) {
+      return {
+        signal: "SELL",
+        exitType: "ATR_HARD_STOP",
+        reason: `동적 ATR 손절(Hard Stop): 진입가 대비 -2.2×ATR(${ko(2.2 * atr)}원) 이탈 (수익률 ${fmt(pnlPct)}%)`,
+      };
+    }
+
+    // 3-2. 최고가 대비 1.8 * ATR 하락 시 트레일링 스탑 (Dynamic Trailing Stop)
+    if (curPeak > avgBuy) {
+      const trailingStopPrice = curPeak - 1.8 * atr;
+      if (curPrice <= trailingStopPrice) {
+        return {
+          signal: "SELL",
+          exitType: "ATR_TRAILING_STOP",
+          reason: `동적 ATR 트레일링 스탑: 최고가(${ko(curPeak)}) 대비 -1.8×ATR(${ko(1.8 * atr)}원) 이탈 (수익률 ${fmt(pnlPct)}%)`,
+        };
+      }
+    }
+  } else {
+    // Fallback: ATR 산출 불가 시 기존 고정 퍼센트 손절
+    const fixedStop = -Math.abs(Number(stopLossPct || 2.5));
+    if (pnlPct <= fixedStop) {
+      return {
+        signal: "SELL",
+        exitType: "FIXED_STOP_LOSS",
+        reason: `고정 손절(Fallback Stop): ${fmt(pnlPct)}% ≤ ${fmt(fixedStop)}%`,
+      };
+    }
+  }
+
+  return null;
 }
 
 // ============================================================================
@@ -637,30 +793,35 @@ const ko = (n) => Math.floor(Number(n || 0)).toLocaleString("ko-KR");
 
 const STRATEGIES = {
   // bot_01: 변동성 돌파
-  bot_01({ price, ind, held, params }) {
+  bot_01({ price, ind, held, params, options = {} }) {
+    const isLive = Boolean(options.isLive);
     const d = ind.day;
     if (!d) return hold("일봉 데이터 부족");
     if (held.length > 0) {
       const today = tradingDateKST(nowKSTString());
-      if (held.some((p) => tradingDateKST(p.created_at) < today)) {
+      if (held.some((p) => tradingDateKST(p.created_at || p.opened_at) < today)) {
         return sell("익일 시가 청산 (1일 보유 만기)");
       }
       return hold("보유 중 (목표 수익/익일 시가 청산 대기)");
     }
-    const k = Number(params.k_value ?? 0.45);
+    const k = Number(params.k_value ?? (isLive ? 0.45 : 0.35));
     const target = d.todayOpen + (d.prevHigh - d.prevLow) * k;
-    const volMult = Number(params.volume_multiplier ?? 1.2);
+    const volMult = Number(params.volume_multiplier ?? (isLive ? 1.5 : 1.2));
     const volOk = ind.m15 ? ind.m15.volSurge5 >= volMult : true;
     if (price >= target && price > d.todayOpen && volOk) {
+      // 윗꼬리 및 이격도 과열 필터 검사
+      const filter = checkUpperWickAndOverextension(ind.m15?.cur || ind.m15?.closed, price, ind.m15?.ema20 || d.ma20, ind.m15?.vwap);
+      if (!filter.ok) return hold(filter.reason);
       return buy(`변동성 돌파(K=${k}) 목표가 ${ko(target)} 돌파 · 거래량 증가`);
     }
     return hold(`돌파목표 ${ko(target)} 대기 (현재 ${ko(price)})`);
   },
 
   // bot_02: SuperTrend + ATR 트레일링
-  bot_02({ price, ind, held, params, options }) {
+  bot_02({ price, ind, held, params, options = {} }) {
+    const isLive = Boolean(options.isLive);
     const mult = Number(params.atr_multiplier ?? 2.5);
-    const volMult = Number(params.volume_multiplier ?? 1.5);
+    const volMult = Number(params.volume_multiplier ?? (isLive ? 2.0 : 1.4));
     if (held.length > 0) {
       const atr = ind.m60?.atr14;
       const peak = Math.max(Number(options.peakPrice || 0), price);
@@ -683,23 +844,31 @@ const STRATEGIES = {
   },
 
   // bot_03: 듀얼 모멘텀
-  bot_03({ held, params, options }) {
+  bot_03({ held, params, options = {} }) {
+    const isLive = Boolean(options.isLive);
     const info = options.momentumRank?.[options.market];
     if (!info) return hold("모멘텀 순위 산출 대기");
-    const absTh = Number(params.abs_momentum_threshold_pct ?? 1.5);
+    const absTh = Number(params.abs_momentum_threshold_pct ?? (isLive ? 2.0 : 1.2));
     const topN = Number(params.top_n ?? 2);
     if (held.length > 0) {
       if (info.momPct < 0) return sell(`모멘텀 이탈 (7일 ${fmt(info.momPct)}%)`);
       return hold(`보유 중 (7일 모멘텀 ${fmt(info.momPct)}% / ${info.rank}위)`);
     }
     if (info.rank <= topN && info.momPct >= absTh) {
+      const m15 = options.indicators?.m15;
+      const curPrice = Number(options.currentPrice || options.price || 0);
+      if (m15 && curPrice > 0) {
+        const filter = checkUpperWickAndOverextension(m15.cur || m15.closed, curPrice, m15.ema20, m15.vwap);
+        if (!filter.ok) return hold(filter.reason);
+      }
       return buy(`듀얼 모멘텀 ${info.rank}위 (7일 +${fmt(info.momPct)}% ≥ +${absTh}%)`);
     }
     return hold(`7일 모멘텀 ${info.rank}위 (${fmt(info.momPct)}%)`);
   },
 
   // bot_04: 볼린저 스퀴즈 돌파
-  bot_04({ price, ind, held, params }) {
+  bot_04({ price, ind, held, params, options = {} }) {
+    const isLive = Boolean(options.isLive);
     const m = ind.m15;
     if (!m || !m.bb) return hold("15분봉 데이터 부족");
     if (held.length > 0) {
@@ -711,28 +880,33 @@ const STRATEGIES = {
     const recent6Min = Math.min(...bw.slice(-7, -1));
     const min20 = Math.min(...bw.slice(-22, -1));
     const squeezed = recent6Min <= min20 * 1.1;
-    const volMult = Number(params.volume_multiplier ?? 2.0);
+    const volMult = Number(params.volume_multiplier ?? (isLive ? 2.0 : 1.4));
     const volRatio = Math.max(m.curVolRatio, m.closedVolRatio);
     if (squeezed && volRatio >= volMult && price > m.bb.upper) {
+      const filter = checkUpperWickAndOverextension(m.cur || m.closed, price, m.bb.mid, m.vwap);
+      if (!filter.ok) return hold(filter.reason);
       return buy(`BB 스퀴즈(밴드폭 ${fmt(recent6Min * 100)}%) 후 거래량 ${fmt(volRatio, 1)}배 상단 돌파`);
     }
     return hold(`스퀴즈 ${squeezed ? "형성" : "미형성"} / 상단 ${ko(m.bb.upper)}`);
   },
 
   // bot_05: 볼린저 역추세 반등
-  bot_05({ price, ind, held }) {
+  bot_05({ price, ind, held, params, options = {} }) {
+    const isLive = Boolean(options.isLive);
     const m = ind.m15;
     if (!m || !m.bb) return hold("15분봉 데이터 부족");
     if (held.length > 0) return hold("보유 중 (+3.5% 익절 / -2.0% 손절 감시)");
+    const rsiTh = Number(params.rsi_threshold ?? (isLive ? 30 : 38));
     const touched = m.minLow2 <= m.bb.lower;
-    if (touched && m.curBullish && price > m.bb.lower && m.rsiMin3 <= 40) {
-      return buy(`BB 하단 터치 후 양봉 복귀 · RSI ${fmt(m.rsiMin3, 1)} 과매도 반등`);
+    if (touched && m.curBullish && price > m.bb.lower && m.rsiMin3 <= rsiTh) {
+      return buy(`BB 하단 터치 후 양봉 복귀 · RSI ${fmt(m.rsiMin3, 1)} ≤ ${rsiTh} 과매도 반등`);
     }
-    return hold(`BB 하단 ${ko(m.bb.lower)} / RSI ${fmt(m.rsi, 1)}`);
+    return hold(`BB 하단 ${ko(m.bb.lower)} / RSI ${fmt(m.rsi, 1)} (기준 ≤ ${rsiTh})`);
   },
 
   // bot_06: 다단계 분할 매수 그리드
-  bot_06({ price, ind, held, params }) {
+  bot_06({ price, ind, held, params, options = {} }) {
+    const isLive = Boolean(options.isLive);
     const m = ind.m15;
     const tp = Number(params.take_profit_pct ?? 1.8);
     if (held.length > 0) {
@@ -752,11 +926,11 @@ const STRATEGIES = {
       return hold(`그리드 보유 ${held.length}분할`);
     }
     if (!m || !m.bb) return hold("15분봉 데이터 부족");
-    const rsiEntry = Number(params.rsi_entry ?? 40);
+    const rsiEntry = Number(params.rsi_entry ?? (isLive ? 30 : 38));
     if (m.rsi <= rsiEntry && price <= m.bb.lower * 1.005) {
-      return buy(`단기 과매도 그리드 1차 진입 (RSI ${fmt(m.rsi, 1)}, BB 하단 부근)`, { splitIndex: 1 });
+      return buy(`단기 과매도 그리드 1차 진입 (RSI ${fmt(m.rsi, 1)} ≤ ${rsiEntry}, BB 하단 부근)`, { splitIndex: 1 });
     }
-    return hold(`과매도 대기 (RSI ${fmt(m.rsi, 1)})`);
+    return hold(`과매도 대기 (RSI ${fmt(m.rsi, 1)} / 기준 ≤ ${rsiEntry})`);
   },
 
   // bot_07: MACD + RSI 골든크로스
@@ -783,7 +957,8 @@ const STRATEGIES = {
   },
 
   // bot_08: 정배열 20일선 눌림목
-  bot_08({ price, ind, held, params }) {
+  bot_08({ price, ind, held, params, options = {} }) {
+    const isLive = Boolean(options.isLive);
     const d = ind.day;
     const h4 = ind.m240;
     if (!d || !h4 || d.ma60 === null || h4.ma60 === null) return hold("일봉/4시간봉 데이터 부족");
@@ -793,7 +968,7 @@ const STRATEGIES = {
     }
     const dayAligned = d.ma5 > d.ma20 && d.ma20 > d.ma60;
     const h4Aligned = h4.ma5 > h4.ma20 && h4.ma20 > h4.ma60;
-    const band = Number(params.pullback_band_pct ?? 1.5);
+    const band = Number(params.pullback_band_pct ?? (isLive ? 1.5 : 2.2));
     const gap = pctChange(price, d.ma20);
     const volDecline = h4.lastClosedVolRatio < 1.0;
     if (dayAligned && h4Aligned && Math.abs(gap) <= band && volDecline) {
@@ -803,7 +978,8 @@ const STRATEGIES = {
   },
 
   // bot_09: 거래량 폭발 모멘텀 스캘퍼
-  bot_09({ price, ind, held, params, options }) {
+  bot_09({ price, ind, held, params, options = {} }) {
+    const isLive = Boolean(options.isLive);
     const trailPct = Number(params.trailing_stop_pct ?? 1.5);
     if (held.length > 0) {
       const peak = Math.max(Number(options.peakPrice || 0), price);
@@ -814,9 +990,11 @@ const STRATEGIES = {
     }
     const m = ind.m15;
     if (!m) return hold("15분봉 데이터 부족");
-    const spike = Number(params.volume_spike_multiplier ?? 1.5);
+    const spike = Number(params.volume_spike_multiplier ?? (isLive ? 2.0 : 1.4));
     const closedClose = Number(m.closed.trade_price);
     if (m.closedVolRatio >= spike && m.closedBullish && price >= closedClose && pctChange(price, closedClose) <= 1.5) {
+      const filter = checkUpperWickAndOverextension(m.closed, price, m.ema20, m.vwap);
+      if (!filter.ok) return hold(filter.reason);
       return buy(`15분봉 거래량 ${fmt(m.closedVolRatio, 1)}배 폭발 양봉 마감`);
     }
     return hold(`거래량 ${fmt(m.closedVolRatio, 1)}배 (기준 ${spike}배)`);
@@ -828,9 +1006,9 @@ const STRATEGIES = {
     if (!k || !k.lrc || !k.vwap) return hold("잭 켈로그 4대 지표(VWAP/LRC) 데이터 산출 대기");
 
     const isLive = Boolean(options.isLive);
-    const rvolBreakoutTh = Number(params.rvol_breakout ?? (isLive ? (params.rvol_breakout_live ?? 2.0) : (params.rvol_breakout_arena ?? 1.5)));
+    const rvolBreakoutTh = Number(params.rvol_breakout ?? (isLive ? 1.8 : 1.4));
     const rvolDipTh = Number(params.rvol_dip ?? 1.3);
-    const dipGapTh = Number(params.vwap_gap ?? (isLive ? -(params.vwap_gap_live ?? 3.0) : -(params.vwap_gap_arena ?? 2.2)));
+    const dipGapTh = Number(params.vwap_gap ?? (isLive ? -2.8 : -2.0));
     const trailingPct = Number(params.trailing_stop_pct ?? 1.5);
 
     // ==========================================
@@ -856,8 +1034,8 @@ const STRATEGIES = {
         if (k.prev_low > 0 && price < k.prev_low) {
           return sell(`[Setup B 손절] 전일 저가(${ko(k.prev_low)}) 하향 이탈 손절 (수익률 ${fmt(totalPnlPct)}%)`);
         }
-        if (held.length >= 2 && totalPnlPct <= -2.5) {
-          return sell(`[Setup B 손절] 2차 분할 후 평단가 대비 -2.5% 손절 (수익률 ${fmt(totalPnlPct)}%)`);
+        if (totalPnlPct <= -2.5) {
+          return sell(`[Setup B 손절] 평단가 대비 -2.5% 손절 (수익률 ${fmt(totalPnlPct)}%)`);
         }
       }
 
@@ -868,10 +1046,10 @@ const STRATEGIES = {
       }
 
       // (2) 선형 회귀 채널 익절 (Take Profit)
-      if (totalPnlPct >= 1.5 && price >= k.lrc.upper) {
+      if (price >= k.lrc.upper) {
         return sell(`[LRC 상단 익절] +2σ 채널 상단(${ko(k.lrc.upper)}) 도달 전량 익절 (수익률 +${fmt(totalPnlPct)}%)`);
       }
-      if (isDip && totalPnlPct >= 1.5 && price >= k.lrc.mid) {
+      if (isDip && price >= k.lrc.mid) {
         return sell(`[LRC 중심선 회귀 익절] LRC 중심선(${ko(k.lrc.mid)}) 도달 익절 (수익률 +${fmt(totalPnlPct)}%)`);
       }
 
@@ -1308,6 +1486,22 @@ async function runPaperBot(db, bot, ctx) {
     }
     const remaining = [];
     for (const p of group) {
+      // 3단계 스마트 청산 유틸리티 (본절 스탑, 시간 제한 청산, 동적 ATR 트레일링 스탑)
+      const smartExit = evaluateSmartExit({
+        botId: bot.bot_id,
+        position: p,
+        currentPrice: price,
+        indicators: md?.indicators,
+        peakPrice: peak,
+        isLive: false,
+        stopLossPct: stopLoss,
+      });
+      if (smartExit && smartExit.signal === "SELL") {
+        const profit = await paperSell(db, bot, [p], price, smartExit.reason);
+        lastAction = `[가상매도] ${market} ${smartExit.reason} (${profit >= 0 ? "+" : ""}${ko(profit)}원)`;
+        continue;
+      }
+
       const pnl = pctChange(price, Number(p.avg_buy_price));
       if (pnl <= stopLoss) {
         const profit = await paperSell(db, bot, [p], price, `손절(${fmt(pnl)}%)`);
