@@ -9,6 +9,46 @@ const __dirname = path.dirname(__filename);
 const ROOT_DIR = path.resolve(__dirname, "../..");
 const ENV_PATH = path.join(ROOT_DIR, ".env");
 
+const ALL_BOT_IDS = Array.from({ length: 10 }, (_, idx) => `bot_${String(idx + 1).padStart(2, "0")}`);
+const LEGACY_BOT_OVERRIDE_ALIAS = {
+  bot_vb: "bot_01",
+  bot_momentum: "bot_03",
+  bot_bb: "bot_05",
+};
+const DEFAULT_BOT_OVERRIDES = Object.fromEntries(ALL_BOT_IDS.map((id) => [id, "ALLOW"]));
+const DEFAULT_BOT_OVERRIDES_JSON = JSON.stringify(DEFAULT_BOT_OVERRIDES);
+
+function normalizeBotOverridesJson(rawValue) {
+  let parsed = {};
+  if (typeof rawValue === "string" && rawValue.trim()) {
+    try {
+      const candidate = JSON.parse(rawValue);
+      if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+        parsed = candidate;
+      }
+    } catch {
+      parsed = {};
+    }
+  } else if (rawValue && typeof rawValue === "object" && !Array.isArray(rawValue)) {
+    parsed = rawValue;
+  }
+
+  const normalized = { ...DEFAULT_BOT_OVERRIDES };
+  for (const [legacyKey, modernKey] of Object.entries(LEGACY_BOT_OVERRIDE_ALIAS)) {
+    const val = String(parsed[legacyKey] || "").trim().toUpperCase();
+    if ((val === "ALLOW" || val === "BLOCK") && parsed[modernKey] === undefined) {
+      normalized[modernKey] = val;
+    }
+  }
+  for (const botId of ALL_BOT_IDS) {
+    const val = String(parsed[botId] || "").trim().toUpperCase();
+    if (val === "ALLOW" || val === "BLOCK") {
+      normalized[botId] = val;
+    }
+  }
+  return JSON.stringify(normalized);
+}
+
 function loadEnv() {
   if (fs.existsSync(ENV_PATH)) {
     const raw = fs.readFileSync(ENV_PATH, "utf-8");
@@ -104,8 +144,33 @@ export class PgSyncManager {
 
       // 1-1. market_regime_filter
       try {
+        await this.pool.query(`
+          CREATE TABLE IF NOT EXISTS market_regime_filter (
+            id INTEGER PRIMARY KEY,
+            sentiment_score NUMERIC(8,4) DEFAULT 0.0,
+            market_regime TEXT DEFAULT 'SIDEWAYS',
+            risk_alert INTEGER DEFAULT 0,
+            recommended_action TEXT DEFAULT 'NORMAL',
+            position_size_multiplier NUMERIC(8,4) DEFAULT 1.0,
+            bot_overrides_json TEXT DEFAULT '${DEFAULT_BOT_OVERRIDES_JSON}',
+            blacklist_tickers_json TEXT DEFAULT '[]',
+            reason TEXT DEFAULT 'Initial default state',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            flash_sentiment_score NUMERIC(8,4) DEFAULT 0.0,
+            flash_recommended_action TEXT DEFAULT 'NORMAL',
+            flash_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            pro_sentiment_score NUMERIC(8,4) DEFAULT 0.0,
+            pro_recommended_action TEXT DEFAULT 'NORMAL',
+            pro_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            final_risk_alert INTEGER DEFAULT 0,
+            final_position_multiplier NUMERIC(8,4) DEFAULT 1.0,
+            final_bot_overrides_json TEXT DEFAULT '${DEFAULT_BOT_OVERRIDES_JSON}'
+          );
+        `);
         const regime = sqliteDb.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get();
         if (regime) {
+          const normalizedOverridesJson = normalizeBotOverridesJson(regime.bot_overrides_json);
+          const normalizedFinalOverridesJson = normalizeBotOverridesJson(regime.final_bot_overrides_json || normalizedOverridesJson);
           await this.pool.query(
             `INSERT INTO market_regime_filter (
                id, sentiment_score, market_regime, risk_alert, recommended_action,
@@ -136,17 +201,19 @@ export class PgSyncManager {
             [
               1, Number(regime.sentiment_score || 0), regime.market_regime || "SIDEWAYS",
               Number(regime.risk_alert || 0), regime.recommended_action || "NORMAL",
-              Number(regime.position_size_multiplier || 1.0), regime.bot_overrides_json || "{}",
+              Number(regime.position_size_multiplier ?? 1.0), normalizedOverridesJson,
               regime.blacklist_tickers_json || "[]", regime.reason || "", regime.updated_at || new Date().toISOString(),
               Number(regime.flash_sentiment_score || 0), regime.flash_recommended_action || "NORMAL",
               regime.flash_updated_at || null, Number(regime.pro_sentiment_score || 0),
               regime.pro_recommended_action || "NORMAL", regime.pro_updated_at || null,
-              Number(regime.final_risk_alert || 0), Number(regime.final_position_multiplier || 1.0),
-              regime.final_bot_overrides_json || "{}"
+              Number(regime.final_risk_alert || 0), Number(regime.final_position_multiplier ?? 1.0),
+              normalizedFinalOverridesJson
             ]
           );
         }
-      } catch (rErr) {}
+      } catch (rErr) {
+        console.warn(`[PgSync] market_regime_filter sync skip: ${rErr.message}`);
+      }
 
       // 2. bots
       try {

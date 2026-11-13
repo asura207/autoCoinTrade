@@ -34,6 +34,44 @@ DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_SQLITE_PATH = str(DATA_DIR / "auto_coin_trade.db")
 DEFAULT_DB_PATH = DEFAULT_SQLITE_PATH
 
+ALL_BOT_IDS = tuple(f"bot_{i:02d}" for i in range(1, 11))
+DEFAULT_BOT_OVERRIDES: Dict[str, str] = {bot_id: "ALLOW" for bot_id in ALL_BOT_IDS}
+DEFAULT_BOT_OVERRIDES_JSON = json.dumps(DEFAULT_BOT_OVERRIDES, ensure_ascii=False, separators=(",", ":"))
+LEGACY_BOT_OVERRIDE_ALIAS = {
+    "bot_vb": "bot_01",
+    "bot_momentum": "bot_03",
+    "bot_bb": "bot_05",
+}
+
+
+def normalize_bot_overrides(raw_overrides: Any) -> Dict[str, str]:
+    """
+    기존 3대 레거시 키(bot_vb 등)나 일부 누락된 봇 키가 전달되어도
+    표준 10대 봇(bot_01 ~ bot_10) 딕셔너리('ALLOW'|'BLOCK')로 병합/정규화합니다.
+    """
+    parsed: Dict[str, Any] = {}
+    if isinstance(raw_overrides, str) and raw_overrides.strip():
+        try:
+            loaded = json.loads(raw_overrides)
+            if isinstance(loaded, dict):
+                parsed = loaded
+        except Exception:
+            parsed = {}
+    elif isinstance(raw_overrides, dict):
+        parsed = raw_overrides
+
+    result: Dict[str, str] = {bot_id: "ALLOW" for bot_id in ALL_BOT_IDS}
+    for legacy_key, modern_key in LEGACY_BOT_OVERRIDE_ALIAS.items():
+        val = str(parsed.get(legacy_key, "")).strip().upper()
+        if val in ("ALLOW", "BLOCK") and modern_key not in parsed:
+            result[modern_key] = val
+
+    for bot_id in ALL_BOT_IDS:
+        val = str(parsed.get(bot_id, "")).strip().upper()
+        if val in ("ALLOW", "BLOCK"):
+            result[bot_id] = val
+    return result
+
 def _load_env():
     if ENV_PATH.exists():
         with open(ENV_PATH, "r", encoding="utf-8") as f:
@@ -289,7 +327,7 @@ def init_database(db_path: Optional[str] = None) -> None:
                 risk_alert INTEGER DEFAULT 0,
                 recommended_action TEXT DEFAULT 'NORMAL',
                 position_size_multiplier {real_type} DEFAULT 1.0,
-                bot_overrides_json TEXT DEFAULT '{{"bot_vb":"ALLOW","bot_momentum":"ALLOW","bot_bb":"ALLOW"}}',
+                bot_overrides_json TEXT DEFAULT '{DEFAULT_BOT_OVERRIDES_JSON}',
                 blacklist_tickers_json TEXT DEFAULT '[]',
                 reason TEXT DEFAULT 'Initial default state',
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -301,10 +339,35 @@ def init_database(db_path: Optional[str] = None) -> None:
                 pro_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 final_risk_alert INTEGER DEFAULT 0,
                 final_position_multiplier {real_type} DEFAULT 1.0,
-                final_bot_overrides_json TEXT DEFAULT '{{"bot_vb":"ALLOW","bot_momentum":"ALLOW","bot_bb":"ALLOW"}}'
+                final_bot_overrides_json TEXT DEFAULT '{DEFAULT_BOT_OVERRIDES_JSON}'
             );
             """
         )
+        # 기존 구버전 DB 마이그레이션 (dual AI 컬럼 누락 시 안전 추가)
+        regime_alter_cols = [
+            ("flash_sentiment_score", f"{real_type} DEFAULT 0.0"),
+            ("flash_recommended_action", "TEXT DEFAULT 'NORMAL'"),
+            ("flash_updated_at", "TIMESTAMP" if not sqlite_mode else "TEXT"),
+            ("pro_sentiment_score", f"{real_type} DEFAULT 0.0"),
+            ("pro_recommended_action", "TEXT DEFAULT 'NORMAL'"),
+            ("pro_updated_at", "TIMESTAMP" if not sqlite_mode else "TEXT"),
+            ("final_risk_alert", "INTEGER DEFAULT 0"),
+            ("final_position_multiplier", f"{real_type} DEFAULT 1.0"),
+            ("final_bot_overrides_json", f"TEXT DEFAULT '{DEFAULT_BOT_OVERRIDES_JSON}'"),
+        ]
+        newly_added_final_col = False
+        if sqlite_mode:
+            existing_cols = {
+                dict(r)["name"]
+                for r in conn.execute("PRAGMA table_info(market_regime_filter);").fetchall()
+            }
+            newly_added_final_col = "final_bot_overrides_json" not in existing_cols
+            for col_name, col_def in regime_alter_cols:
+                if col_name not in existing_cols:
+                    conn.execute(f"ALTER TABLE market_regime_filter ADD COLUMN {col_name} {col_def};")
+        else:
+            for col_name, col_def in regime_alter_cols:
+                conn.execute(f"ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS {col_name} {col_def};")
 
         # 4. 시스템 설정 테이블 (system_settings)
         conn.execute(
@@ -555,11 +618,8 @@ def init_database(db_path: Optional[str] = None) -> None:
             """
         )
 
-        # 10. market_regime_filter id=1 기본 행 초기화
-        initial_overrides = json.dumps(
-            {"bot_vb": "ALLOW", "bot_momentum": "ALLOW", "bot_bb": "ALLOW"},
-            ensure_ascii=False,
-        )
+        # 10. market_regime_filter id=1 기본 행 초기화 및 레거시(3봇)->표준(10봇) 안전 마이그레이션
+        initial_overrides = DEFAULT_BOT_OVERRIDES_JSON
         conn.execute(
             """
             INSERT OR IGNORE INTO market_regime_filter (
@@ -578,6 +638,43 @@ def init_database(db_path: Optional[str] = None) -> None:
             """,
             (initial_overrides, initial_overrides),
         )
+
+        regime_row = conn.execute(
+            "SELECT bot_overrides_json, final_bot_overrides_json FROM market_regime_filter WHERE id = 1;"
+        ).fetchone()
+        if regime_row is not None:
+            regime_dict = dict(regime_row)
+
+            def _needs_override_migration(raw_json: Any) -> bool:
+                try:
+                    parsed = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+                except Exception:
+                    return True
+                if not isinstance(parsed, dict):
+                    return True
+                if any(k in parsed for k in LEGACY_BOT_OVERRIDE_ALIAS):
+                    return True
+                return any(parsed.get(bot_id) not in ("ALLOW", "BLOCK") for bot_id in ALL_BOT_IDS)
+
+            raw_base = regime_dict.get("bot_overrides_json")
+            raw_final = None if newly_added_final_col else regime_dict.get("final_bot_overrides_json")
+            if _needs_override_migration(raw_base) or _needs_override_migration(raw_final):
+                migrated_base = json.dumps(
+                    normalize_bot_overrides(raw_base), ensure_ascii=False, separators=(",", ":")
+                )
+                migrated_final = json.dumps(
+                    normalize_bot_overrides(raw_final if raw_final else migrated_base),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                conn.execute(
+                    """
+                    UPDATE market_regime_filter
+                    SET bot_overrides_json = ?, final_bot_overrides_json = ?
+                    WHERE id = 1;
+                    """,
+                    (migrated_base, migrated_final),
+                )
 
         # 11. 10대 알고리즘 봇 기본 계좌 초기화
         initial_bots = [

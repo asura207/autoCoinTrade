@@ -377,6 +377,18 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
     while not stop_event.is_set():
         try:
             conn = get_db_connection(db_path)
+            allow_new_buys = True
+            if not is_dry_run():
+                b_row = conn.execute(
+                    "SELECT is_selected_for_live, is_running FROM bots WHERE bot_id = ?;",
+                    (bot_id,),
+                ).fetchone()
+                if b_row is not None:
+                    b_dict = dict(b_row)
+                    allow_new_buys = (
+                        int(b_dict.get("is_selected_for_live") or 0) == 1
+                        and int(b_dict.get("is_running") or 0) == 1
+                    )
             bot_acc = conn.execute("SELECT * FROM bot_accounts WHERE bot_id = ?;", (bot_id,)).fetchone()
             available_krw = float(bot_acc["virtual_krw"]) if bot_acc else 0.0
             open_positions = conn.execute(
@@ -384,6 +396,11 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
                 (bot_id,),
             ).fetchall()
             conn.close()
+
+            if not allow_new_buys and len(open_positions) == 0:
+                if stop_event.wait(timeout=15):
+                    break
+                continue
 
             # 1. 기존 오픈 포지션 청산/익절/손절 점검
             pos_by_ticker: Dict[str, List[Dict[str, Any]]] = {}
@@ -453,7 +470,7 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
                         peak_map.pop(p["id"], None)
                     continue
 
-                if eval_res["signal"] == "BUY" and eval_res.get("split_index") == 2:
+                if allow_new_buys and eval_res["signal"] == "BUY" and eval_res.get("split_index") == 2:
                     # 2차 분할 매수 실행
                     if available_krw >= MIN_ORDER_KRW:
                         can_enter, invest_krw, reason = can_enter_position(
@@ -463,56 +480,57 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
                             execute_buy_order(bot_id, ticker, invest_krw, step_level=2, db_path=db_path)
                             available_krw -= invest_krw
 
-            # 2. 신규 진입 종목 스캔 (유동성 상위 종목)
-            tickers_cache = get_cached_tickers()
-            krw_tickers = [t for t in tickers_cache if t.startswith("KRW-")]
-            if not krw_tickers:
-                krw_tickers = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-DOGE", "KRW-ADA", "KRW-AVAX", "KRW-SUI"]
+            # 2. 신규 진입 종목 스캔 (실전 선택 + 가동 상태일 때만 허용, Graceful Drain 중엔 차단)
+            if allow_new_buys:
+                tickers_cache = get_cached_tickers()
+                krw_tickers = [t for t in tickers_cache if t.startswith("KRW-")]
+                if not krw_tickers:
+                    krw_tickers = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-DOGE", "KRW-ADA", "KRW-AVAX", "KRW-SUI"]
 
-            top_candidates = krw_tickers[:20]
+                top_candidates = krw_tickers[:20]
 
-            for ticker in top_candidates:
-                if stop_event.is_set():
-                    break
-                if ticker in pos_by_ticker and len(pos_by_ticker[ticker]) >= 2:
-                    continue
-                if ticker in pos_by_ticker and len(pos_by_ticker[ticker]) == 1:
-                    continue  # 2차 분할은 위 루프에서 처리
+                for ticker in top_candidates:
+                    if stop_event.is_set():
+                        break
+                    if ticker in pos_by_ticker and len(pos_by_ticker[ticker]) >= 2:
+                        continue
+                    if ticker in pos_by_ticker and len(pos_by_ticker[ticker]) == 1:
+                        continue  # 2차 분할은 위 루프에서 처리
 
-                if available_krw < MIN_ORDER_KRW:
-                    break
+                    if available_krw < MIN_ORDER_KRW:
+                        break
 
-                cur_price = get_safe_current_price(ticker)
-                if cur_price <= 0:
-                    continue
+                    cur_price = get_safe_current_price(ticker)
+                    if cur_price <= 0:
+                        continue
 
-                df_15m = pyupbit.get_ohlcv(ticker, interval="minute15", count=100)
-                df_day = pyupbit.get_ohlcv(ticker, interval="day", count=30)
-                if df_15m is None or len(df_15m) < 20:
-                    continue
+                    df_15m = pyupbit.get_ohlcv(ticker, interval="minute15", count=100)
+                    df_day = pyupbit.get_ohlcv(ticker, interval="day", count=30)
+                    if df_15m is None or len(df_15m) < 20:
+                        continue
 
-                k = calculate_kellogg_indicators(df_15m, df_day, cur_price)
-                if not k:
-                    continue
+                    k = calculate_kellogg_indicators(df_15m, df_day, cur_price)
+                    if not k:
+                        continue
 
-                eval_res = evaluate_jack_kellogg_strategy(
-                    k,
-                    cur_price,
-                    open_positions=[],
-                    is_live=not is_dry_run(),
-                )
+                    eval_res = evaluate_jack_kellogg_strategy(
+                        k,
+                        cur_price,
+                        open_positions=[],
+                        is_live=not is_dry_run(),
+                    )
 
-                if eval_res["signal"] == "BUY":
-                    order_ratio = float(eval_res.get("order_ratio", 0.3))
-                    budget = available_krw * order_ratio
-                    if budget >= MIN_ORDER_KRW:
-                        can_enter, invest_krw, reason = can_enter_position(
-                            bot_id, ticker, budget, db_path=db_path
-                        )
-                        if can_enter:
-                            logger.info("[%s] BUY entered for %s: %s", bot_id, ticker, eval_res["reason"])
-                            execute_buy_order(bot_id, ticker, invest_krw, step_level=1, db_path=db_path)
-                            available_krw -= invest_krw
+                    if eval_res["signal"] == "BUY":
+                        order_ratio = float(eval_res.get("order_ratio", 0.3))
+                        budget = available_krw * order_ratio
+                        if budget >= MIN_ORDER_KRW:
+                            can_enter, invest_krw, reason = can_enter_position(
+                                bot_id, ticker, budget, db_path=db_path
+                            )
+                            if can_enter:
+                                logger.info("[%s] BUY entered for %s: %s", bot_id, ticker, eval_res["reason"])
+                                execute_buy_order(bot_id, ticker, invest_krw, step_level=1, db_path=db_path)
+                                available_krw -= invest_krw
 
         except Exception as loop_exc:
             logger.error("[%s] Unexpected error in Jack Kellogg loop: %s", bot_id, loop_exc, exc_info=True)
