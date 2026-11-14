@@ -10,6 +10,7 @@
 
 | 버전 (Version) | 릴리즈 일시 | 커밋 해시 | 주요 수정 내용 요약 |
 | :--- | :--- | :--- | :--- |
+| **v0.0.22** | 2026-11-14 | - | 주간 3대 전략군(추세·스윙/변동성·돌파/역추세·그리드)별 1위 봇 자동 선출(Auto-Rotation), 동적 자금 배분, 무손실 포지션 청산 대기(Graceful Drain) 및 정산금 자동 귀속 시스템 구축 |
 | **v0.0.21** | 2026-11-13 | `688eca6` | 설정 화면 내 봇별 손절/익절 기준 입력 필드 박스 영역 초과(Overflow) 현상 수정 및 반응형 그리드·인풋 너비 최적화 |
 | **v0.0.20** | 2026-11-13 | `37623f4` | 10대 알고리즘 매매 로직 정밀 고도화: 3단계 스마트 청산(시간/본절/동적 ATR), 윗꼬리·과열 방어 필터, Jack Kellogg 튜닝, 일일 손실 방어 서킷 브레이커(-4.0%) |
 | **v0.0.19** | 2026-11-13 | `cf8bbe7` | 오케스트레이터(10대 봇·시세 허브) 동기화, 이중 주문 방어(Double Execution Guard), DB 경로 통일, pg_sync 예외 방어 및 저장소 URL(asura207) 일괄 갱신 |
@@ -35,6 +36,25 @@
 ---
 
 ## 📝 상세 버전별 변경 내역 (Detailed Changelog)
+
+### [v0.0.22] - 2026-11-14
+- **변경 분류**: `feat` (주간 전략군별 1위 봇 자동 선출 엔진 & Graceful Drain 무손실 자금 이관)
+- **주요 변경 사항**:
+  - **10대 알고리즘 봇 3대 전략군 표준 분류 체계 도입 (`algo_lab_service.mjs`, `init_db.py`, `pg_sync.mjs`, `App.jsx`)**:
+    - **그룹 A (`TREND_SWING` · 추세·스윙형)**: `bot_02`(슈퍼트렌드-ATR), `bot_03`(듀얼 모멘텀), `bot_07`(MACD+RSI 골든크로스), `bot_08`(20일선 눌림목)
+    - **그룹 B (`VOLATILITY_BREAKOUT` · 변동성·돌파형)**: `bot_01`(변동성 돌파), `bot_04`(BB 스퀴즈 VCP), `bot_09`(거래량 스캘퍼)
+    - **그룹 C (`REVERSAL_GRID` · 역추세·그리드·올라운더형)**: `bot_05`(볼린저 역추세), `bot_06`(다단계 분할 그리드), `bot_10`(잭 켈로그 VWAP/LRC)
+  - **주간 7일 롤링 평가 및 종합 점수(`rotation_score`) 산출 (`evaluateWeeklyStrategyChampions`)**:
+    - 최근 7일 가상 실현 손익 + 보유 포지션 미실현 손익 기반 `weekly_return_pct`, 승률, MDD 계산 (그룹 내 7일 체결 0회 시 Arena 누적 수익률 안전 Fallback).
+    - `rotation_score = return_pct - (|mdd_pct| * 0.5) + (win_rate_pct * 0.05) + (7일 체결 >= 최소 기준 ? 1.0 : 0.0)` 산식으로 각 전략군 1위 봇(총 3개) 자동 선출.
+  - **동적 자금 배분 모드 & 주간 스케줄러 (`node_server.mjs`, `auto_rotation_config`, `auto_rotation_history`)**:
+    - `RANK_WEIGHTED_40_35_25`(기본 40:35:25), `RANK_WEIGHTED_40_40_20`(40:40:20), `EQUAL_34_33_33`(34:33:33) 지원 및 전 원화 예산 `Math.floor` 버림 처리.
+    - 매 1분 KST 스케줄러가 설정 요일·시각 도달 시 `executeWeeklyBotRotation` 실행 및 `GET /api/rotation/status`, `POST /api/rotation/config`, `POST /api/rotation/execute-now` 제공 (JSON Export/Import 포함).
+  - **탈락 봇 미매도 포지션 보호(Graceful Drain) & 정산금 자동 귀속 (`node_server.mjs`, `bots.py`)**:
+    - 교체 시 기존 보유 물량 강제 시장가 투매 금지, 신규 매수만 차단하고 고유 전략 익절/손절/트레일링 스탑 감시 유지.
+    - 미사용 가용 원화 즉시 이관 및 탈락 봇 청산 정산 완료 시 회수 원화(실현손익 포함)를 현재 활성 실전 봇의 `allocation_ratio` 비율대로 `Math.floor` 자동 충전.
+  - **프론트엔드 UI 고도화 (`App.jsx`)**:
+    - Arena·설정·실전 탭 전반에 3대 전략군 배지, 최근 7일 수익률, `[👑 전략군 1위 (차기 실전 후보)]` 배지, 주간 로테이션 제어 패널 및 즉시 배치 버튼, Graceful Drain 안전 감시 배너 반영.
 
 ### [v0.0.21] - 2026-11-13
 - **커밋 해시**: `688eca6`

@@ -175,6 +175,306 @@ function renderColoredProfit(val) {
   return <span className="pnl-Zero">0원</span>;
 }
 
+const ALL_BOT_IDS_UI = [
+  "bot_01",
+  "bot_02",
+  "bot_03",
+  "bot_04",
+  "bot_05",
+  "bot_06",
+  "bot_07",
+  "bot_08",
+  "bot_09",
+  "bot_10",
+];
+
+const BOT_SHORT_LABELS_UI = {
+  bot_01: "변동성돌파",
+  bot_02: "슈퍼트렌드",
+  bot_03: "듀얼모멘텀",
+  bot_04: "스퀴즈돌파",
+  bot_05: "볼린저역추세",
+  bot_06: "분할그리드",
+  bot_07: "MACD+RSI",
+  bot_08: "20선눌림목",
+  bot_09: "거래량폭발",
+  bot_10: "잭켈로그",
+};
+
+const LEGACY_BOT_OVERRIDE_ALIAS_UI = {
+  bot_vb: "bot_01",
+  bot_volatility: "bot_01",
+  bot_momentum: "bot_03",
+  bot_dual_momentum: "bot_03",
+  bot_bb: "bot_05",
+  bot_bollinger_reversal: "bot_05",
+};
+
+const STRATEGY_GROUP_ORDER_UI = ["TREND_SWING", "VOLATILITY_BREAKOUT", "REVERSAL_GRID"];
+
+const STRATEGY_GROUP_META_UI = {
+  TREND_SWING: {
+    code: "TREND_SWING",
+    group: "추세·스윙",
+    title: "그룹 A · 추세·스윙형 (TREND_SWING)",
+    championLabel: "그룹 A 추세 1위",
+    icon: "📈",
+    regimeFit: "추세·스윙형 특화 · 상승 추세 및 정배열 눌림목 대응",
+    detailDesc:
+      "슈퍼트렌드 ATR 추세추종(bot_02), 듀얼 모멘텀(bot_03), MACD+RSI 추세(bot_07), 20일선 정배열 눌림목(bot_08)이 속한 그룹 A 추세·스윙 전략군입니다.",
+    color: "#a5b4fc",
+    bg: "rgba(99, 102, 241, 0.2)",
+    border: "rgba(129, 140, 248, 0.48)",
+    sectionBg: "linear-gradient(135deg, rgba(99, 102, 241, 0.08), rgba(15, 23, 42, 0.72))",
+    sectionBorder: "rgba(129, 140, 248, 0.34)",
+  },
+  VOLATILITY_BREAKOUT: {
+    code: "VOLATILITY_BREAKOUT",
+    group: "변동성·돌파",
+    title: "그룹 B · 변동성·돌파형 (VOLATILITY_BREAKOUT)",
+    championLabel: "그룹 B 돌파 1위",
+    icon: "⚡",
+    regimeFit: "변동성·돌파형 특화 · 응축 스퀴즈 & 거래량 폭발 급등 포착",
+    detailDesc:
+      "변동성 돌파(bot_01), 볼린저 밴드 스퀴즈 VCP 돌파(bot_04), 거래량 폭발 모멘텀 스캘퍼(bot_09)가 속한 그룹 B 변동성·돌파 전략군입니다.",
+    color: "#fbbf24",
+    bg: "rgba(245, 158, 11, 0.18)",
+    border: "rgba(251, 191, 36, 0.48)",
+    sectionBg: "linear-gradient(135deg, rgba(245, 158, 11, 0.08), rgba(15, 23, 42, 0.72))",
+    sectionBorder: "rgba(251, 191, 36, 0.34)",
+  },
+  REVERSAL_GRID: {
+    code: "REVERSAL_GRID",
+    group: "역추세·그리드",
+    title: "그룹 C · 역추세·그리드·올라운더 (REVERSAL_GRID)",
+    championLabel: "그룹 C 역추세 1위",
+    icon: "🔄",
+    regimeFit: "역추세·그리드형 특화 · 박스권 분할·과매도 반등·VWAP 올라운더",
+    detailDesc:
+      "볼린저 밴드 역추세(bot_05), 다단계 분할 매수 그리드(bot_06), 잭 켈로그 VWAP/LRC 올라운더(bot_10)가 속한 그룹 C 역추세·그리드 전략군입니다.",
+    color: "#5eead4",
+    bg: "rgba(20, 184, 166, 0.16)",
+    border: "rgba(45, 212, 191, 0.45)",
+    sectionBg: "linear-gradient(135deg, rgba(20, 184, 166, 0.08), rgba(15, 23, 42, 0.72))",
+    sectionBorder: "rgba(45, 212, 191, 0.34)",
+  },
+};
+
+const BOT_STRATEGY_META_UI = {
+  bot_01: { groupCode: "VOLATILITY_BREAKOUT", subType: "변동성 돌파", marketFit: "BULL 장중 돌파 · 횡보/휩소 BLOCK" },
+  bot_02: { groupCode: "TREND_SWING", subType: "ATR 추세추종", marketFit: "BULL 중기 추세 · 횡보/휩소 BLOCK" },
+  bot_03: { groupCode: "TREND_SWING", subType: "듀얼 모멘텀", marketFit: "BULL 주도주 스윙 · 횡보/휩소 BLOCK" },
+  bot_04: { groupCode: "VOLATILITY_BREAKOUT", subType: "스퀴즈 VCP 돌파", marketFit: "BULL·응축 돌파 · 스퀴즈 시 조건부 ALLOW" },
+  bot_05: { groupCode: "REVERSAL_GRID", subType: "볼린저 역추세", marketFit: "SIDEWAYS 과매도 반등 · 패닉 폭락 BLOCK" },
+  bot_06: { groupCode: "REVERSAL_GRID", subType: "분할 매수 그리드", marketFit: "SIDEWAYS 박스권 분할 · 급락 쇼크 BLOCK" },
+  bot_07: { groupCode: "TREND_SWING", subType: "MACD+RSI 추세", marketFit: "BULL 정배열 추세 · 횡보/휩소 BLOCK" },
+  bot_08: { groupCode: "TREND_SWING", subType: "20일선 눌림목", marketFit: "상승 눌림·횡보 반등 · 급락 쇼크 BLOCK" },
+  bot_09: { groupCode: "VOLATILITY_BREAKOUT", subType: "거래량 스캘핑", marketFit: "BULL·거래량 폭발 · 조건부 ALLOW" },
+  bot_10: { groupCode: "REVERSAL_GRID", subType: "VWAP·LRC 올라운더", marketFit: "멀티 레짐(돌파+반등) · 패닉 쇼크 BLOCK" },
+};
+
+function getBotStrategyMeta(botOrId) {
+  const rawId = typeof botOrId === "string" ? botOrId : botOrId?.bot_id;
+  const botId = LEGACY_BOT_OVERRIDE_ALIAS_UI[rawId] || rawId;
+  const botMeta = BOT_STRATEGY_META_UI[botId];
+  let groupCode = botMeta?.groupCode;
+  if (!groupCode && typeof botOrId === "object" && botOrId) {
+    if (botOrId.strategy_group_code && STRATEGY_GROUP_META_UI[botOrId.strategy_group_code]) {
+      groupCode = botOrId.strategy_group_code;
+    } else if (botOrId.strategy_group && STRATEGY_GROUP_META_UI[botOrId.strategy_group]) {
+      groupCode = botOrId.strategy_group;
+    } else if (String(botOrId.strategy_group || "").includes("역추세") || String(botOrId.strategy_group || "").includes("그리드")) {
+      groupCode = "REVERSAL_GRID";
+    } else if (String(botOrId.strategy_group || "").includes("변동성") || String(botOrId.strategy_group || "").includes("돌파")) {
+      groupCode = "VOLATILITY_BREAKOUT";
+    } else if (String(botOrId.strategy_group || "").includes("추세") || String(botOrId.strategy_group || "").includes("스윙")) {
+      groupCode = "TREND_SWING";
+    }
+  }
+  const groupMeta = STRATEGY_GROUP_META_UI[groupCode] || STRATEGY_GROUP_META_UI.TREND_SWING;
+  return {
+    botId,
+    groupCode: groupMeta.code,
+    group: groupMeta.group,
+    groupTitle: groupMeta.title,
+    championLabel: groupMeta.championLabel,
+    icon: groupMeta.icon,
+    color: groupMeta.color,
+    bg: groupMeta.bg,
+    border: groupMeta.border,
+    sectionBg: groupMeta.sectionBg,
+    sectionBorder: groupMeta.sectionBorder,
+    detailDesc: groupMeta.detailDesc,
+    subType: (typeof botOrId === "object" && botOrId?.strategy_sub_label) || botMeta?.subType || "알고리즘",
+    marketFit: (typeof botOrId === "object" && botOrId?.strategy_rule) || botMeta?.marketFit || groupMeta.regimeFit,
+  };
+}
+
+function renderStrategyGroupBadge(botOrId, { showSubType = false, compact = false } = {}) {
+  const meta = getBotStrategyMeta(botOrId);
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: "4px",
+        flexWrap: "wrap",
+      }}
+      title={`${meta.groupTitle} · ${meta.subType} (${meta.marketFit})`}
+    >
+      <span
+        style={{
+          fontSize: compact ? "10.5px" : "11px",
+          padding: compact ? "2px 6px" : "2px 8px",
+          borderRadius: "5px",
+          fontWeight: 700,
+          background: meta.bg,
+          color: meta.color,
+          border: `1px solid ${meta.border}`,
+          whiteSpace: "nowrap",
+        }}
+      >
+        {meta.icon} {meta.group}
+      </span>
+      {showSubType && (
+        <span
+          style={{
+            fontSize: compact ? "10px" : "10.5px",
+            padding: compact ? "2px 6px" : "2px 7px",
+            borderRadius: "5px",
+            fontWeight: 600,
+            background: "rgba(148, 163, 184, 0.14)",
+            color: "#cbd5e1",
+            border: "1px solid rgba(148, 163, 184, 0.28)",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {meta.subType}
+        </span>
+      )}
+    </span>
+  );
+}
+
+function parseRegimeBotOverrides(rf) {
+  const result = {};
+  for (const id of ALL_BOT_IDS_UI) result[id] = "ALLOW";
+  if (!rf || typeof rf !== "object") return result;
+
+  let raw = rf.final_bot_overrides || rf.final_bot_overrides_json || rf.bot_overrides_json || rf.bot_overrides;
+  if (typeof raw === "string") {
+    try {
+      raw = JSON.parse(raw);
+    } catch {
+      raw = null;
+    }
+  }
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw)) {
+      const mappedKey = LEGACY_BOT_OVERRIDE_ALIAS_UI[k] || k;
+      if (mappedKey in result) {
+        result[mappedKey] = String(v || "ALLOW").toUpperCase() === "BLOCK" ? "BLOCK" : "ALLOW";
+      }
+    }
+  }
+  return result;
+}
+
+function parseRegimeBlacklist(rf) {
+  if (!rf || typeof rf !== "object") return [];
+  let raw = rf.blacklist_tickers !== undefined ? rf.blacklist_tickers : rf.blacklist_tickers_json;
+  if (typeof raw === "string") {
+    try {
+      raw = JSON.parse(raw);
+    } catch {
+      raw = [];
+    }
+  }
+  if (!Array.isArray(raw)) return [];
+  return raw.map((t) => String(t || "").trim()).filter(Boolean);
+}
+
+function getMarketRegimeMeta(regime) {
+  const key = String(regime || "SIDEWAYS").trim().toUpperCase();
+  if (key === "BULL") {
+    return {
+      code: "BULL",
+      label: "BULL (상승 추세장)",
+      color: "#4ade80",
+      bg: "rgba(34, 197, 94, 0.16)",
+      border: "rgba(34, 197, 94, 0.4)",
+    };
+  }
+  if (key === "BEAR") {
+    return {
+      code: "BEAR",
+      label: "BEAR (하락 방어장)",
+      color: "#f87171",
+      bg: "rgba(239, 68, 68, 0.18)",
+      border: "rgba(239, 68, 68, 0.45)",
+    };
+  }
+  if (key === "HIGH_VOLATILITY_SHOCK") {
+    return {
+      code: "HIGH_VOLATILITY_SHOCK",
+      label: "HIGH_VOLATILITY_SHOCK (돌발 악재)",
+      color: "#fca5a5",
+      bg: "rgba(239, 68, 68, 0.25)",
+      border: "rgba(239, 68, 68, 0.6)",
+    };
+  }
+  return {
+    code: key || "SIDEWAYS",
+    label: key === "SIDEWAYS" ? "SIDEWAYS (박스권 횡보장)" : key || "SIDEWAYS",
+    color: "#facc15",
+    bg: "rgba(234, 179, 8, 0.16)",
+    border: "rgba(234, 179, 8, 0.4)",
+  };
+}
+
+function getBotGatewayBadgeInfo(rf, botId) {
+  const overrides = parseRegimeBotOverrides(rf);
+  const overrideState = overrides[botId] || "ALLOW";
+  const multRaw =
+    rf && rf.final_position_multiplier !== undefined && rf.final_position_multiplier !== null
+      ? Number(rf.final_position_multiplier)
+      : 1.0;
+  const mult = Number.isFinite(multRaw) ? multRaw : 1.0;
+  const multPct = Math.round(mult * 100);
+  const action = String(rf?.recommended_action || rf?.final_recommended_action || "NORMAL").toUpperCase();
+  const isRiskAlert = Number(rf?.final_risk_alert || 0) === 1;
+  const isGlobalHalt = isRiskAlert || action === "HALT_NEW_BUYS" || action === "EMERGENCY_CLOSE_ALL" || mult <= 0;
+  const isBlocked = isGlobalHalt || overrideState === "BLOCK";
+  const regimeCode = String(rf?.market_regime || rf?.regime_status || "SIDEWAYS").toUpperCase();
+
+  if (isBlocked) {
+    return {
+      allowed: false,
+      overrideState,
+      multPct,
+      shortText: isGlobalHalt ? "🟡 AI 진입차단" : "🟡 AI 진입보류",
+      badgeText: "🟡 AI 신규진입 일시보류 (장세 불일치 · 보유물량 익절/손절 감시중)",
+      detailReason: isGlobalHalt
+        ? `전체 리스크 경보(${action}, 비중 ${multPct}%)로 신규 매수 일시 차단 · 기존 보유 포지션 익절/손절/트레일링 스탑 정상 감시중`
+        : `${regimeCode} 장세 대응 봇 스위치(${botId}: BLOCK) 적용 · 신규 매수만 보류하고 기존 보유 포지션은 고유 알고리즘으로 안전 청산 감시중`,
+      color: "#fde047",
+      bg: "rgba(234, 179, 8, 0.16)",
+      border: "rgba(234, 179, 8, 0.45)",
+    };
+  }
+  return {
+    allowed: true,
+    overrideState,
+    multPct,
+    shortText: `🟢 AI 허용 (${multPct}%)`,
+    badgeText: `🟢 AI 신규매수 허용 (비중 ${multPct}%)`,
+    detailReason: `${regimeCode} 장세에서 ${botId} 신규 매수 진입 허용 (최종 투자 비중 ${multPct}%)`,
+    color: "#4ade80",
+    bg: "rgba(34, 197, 94, 0.16)",
+    border: "rgba(34, 197, 94, 0.4)",
+  };
+}
+
 /**
  * 통계 선 그래프 컴포넌트 (요구사항 10, 11)
  * 2026.10.01부터의 일간/주간/월간 차익 이력을 꺾은선 그래프로 표기
@@ -966,7 +1266,7 @@ export default function App() {
   const [gateError, setGateError] = useState("");
 
   // 프로젝트 버전 및 히스토리 모달 상태
-  const [appVersion, setAppVersion] = useState("0.0.21");
+  const [appVersion, setAppVersion] = useState("0.0.22");
   const [historyModalOpen, setHistoryModalOpen] = useState(false);
   const [historyContent, setHistoryContent] = useState("");
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -1271,13 +1571,14 @@ export default function App() {
   });
   const [zeroBalanceAlerted, setZeroBalanceAlerted] = useState(false);
 
-  // 7) AI 실시간 마켓 브리핑 상태 (Gemini 3.5 Flash)
+  // 7) AI 실시간 마켓 브리핑 & 듀얼 AI 레짐 게이트웨이 상태
   const [aiBriefing, setAiBriefing] = useState({
     has_key: false,
     masked_key: "",
     latest: null,
     last_trigger_type: "MANUAL",
   });
+  const [regimeFilter, setRegimeFilter] = useState(null);
   const [geminiQuota, setGeminiQuota] = useState({
     daily_total_limit: 20,
     auto_reserved_count: 6,
@@ -1790,12 +2091,25 @@ export default function App() {
   const [algoLabLastUpdated, setAlgoLabLastUpdated] = useState("");
   const [arenaStatusInfo, setArenaStatusInfo] = useState({ last_cycle_at: "", last_cycle_summary: "" });
 
-  // 13) 설정 화면: 실전 담당 봇(1~3개) 선택 및 동적 투자금 배분 상태
+  // 13) 설정 화면: 실전 담당 봇(1~3개) 선택 및 동적 투자금 배분 상태 + 주간 자동 로테이션 상태
   const [selectedLiveBotIds, setSelectedLiveBotIds] = useState(["bot_01", "bot_03", "bot_05"]);
   const [savedLiveBotIds, setSavedLiveBotIds] = useState(["bot_01", "bot_03", "bot_05"]);
   const [isLiveConfigDirty, setIsLiveConfigDirty] = useState(false);
   const [liveAllocRatios, setLiveAllocRatios] = useState({ bot_01: 40, bot_03: 40, bot_05: 20 });
   const [savingLiveBots, setSavingLiveBots] = useState(false);
+  const [liveBotGroupFilter, setLiveBotGroupFilter] = useState("ALL"); // 'ALL' | 'TREND_SWING' | 'VOLATILITY_BREAKOUT' | 'REVERSAL_GRID'
+  const [liveBotViewMode, setLiveBotViewMode] = useState("group"); // 'group' | 'rank'
+  const [arenaGroupFilter, setArenaGroupFilter] = useState("ALL"); // 'ALL' | 'TREND_SWING' | 'VOLATILITY_BREAKOUT' | 'REVERSAL_GRID'
+  const [rotationStatus, setRotationStatus] = useState(null);
+  const [rotationConfigDraft, setRotationConfigDraft] = useState({
+    is_enabled: 1,
+    rotation_day_of_week: 1,
+    rotation_hour_kst: 9,
+    allocation_mode: "RANK_WEIGHTED_40_35_25",
+    min_weekly_trades: 2,
+  });
+  const [rotationSaving, setRotationSaving] = useState(false);
+  const [rotationExecuting, setRotationExecuting] = useState(false);
   const [statsModeTab, setStatsModeTab] = useState("live"); // 'live' | 'paper'
   // 통계 메뉴 최하단 실제 거래내역 페이징 상태 (한 페이지 50건 고정, 실거래 전용)
   const [statsTrades, setStatsTrades] = useState([]);
@@ -1819,6 +2133,119 @@ export default function App() {
       }
     } catch {}
   }, []);
+
+  const fetchRotationStatus = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/rotation/status`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data && data.success) {
+        setRotationStatus(data);
+        if (data.config) {
+          setRotationConfigDraft({
+            is_enabled: Number(data.config.is_enabled ?? 1),
+            rotation_day_of_week: Number(data.config.rotation_day_of_week ?? 1),
+            rotation_hour_kst: Number(data.config.rotation_hour_kst ?? 9),
+            allocation_mode: data.config.allocation_mode || "RANK_WEIGHTED_40_35_25",
+            min_weekly_trades: Number(data.config.min_weekly_trades ?? 2),
+          });
+        }
+      }
+    } catch {}
+  }, []);
+
+  const handleSaveRotationConfig = async (overrideDraft = null) => {
+    const payload = overrideDraft || rotationConfigDraft;
+    setRotationSaving(true);
+    try {
+      const resp = await fetch(`${API_BASE}/api/rotation/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        setRotationStatus(data);
+        if (data.config) {
+          setRotationConfigDraft({
+            is_enabled: Number(data.config.is_enabled ?? 1),
+            rotation_day_of_week: Number(data.config.rotation_day_of_week ?? 1),
+            rotation_hour_kst: Number(data.config.rotation_hour_kst ?? 9),
+            allocation_mode: data.config.allocation_mode || "RANK_WEIGHTED_40_35_25",
+            min_weekly_trades: Number(data.config.min_weekly_trades ?? 2),
+          });
+        }
+        await fetchAlgoLabModels();
+        showModal("주간 자동 로테이션 설정 저장", data.message || "설정이 저장되었습니다.", "success");
+      } else {
+        showModal("설정 저장 실패", data.detail || data.message || "오류가 발생했습니다.", "error");
+      }
+    } catch (err) {
+      showModal("통신 오류", err.message, "error");
+    } finally {
+      setRotationSaving(false);
+    }
+  };
+
+  const handleExecuteRotationNow = async () => {
+    if (
+      !window.confirm(
+        "3대 전략군(추세·스윙 / 변동성·돌파 / 역추세·그리드)별 주간 1위 봇 3개를 즉시 선출하여 실전 거래 봇으로 교체 및 자금 리밸런싱하시겠습니까?\n(기존 봇이 보유 중인 미매도 코인은 강제 손절 없이 Graceful Drain으로 안전 청산됩니다)"
+      )
+    ) {
+      return;
+    }
+    setRotationExecuting(true);
+    try {
+      const resp = await fetch(`${API_BASE}/api/rotation/execute-now`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        const selectedBots = data.apply_result?.selected_bots || [];
+        if (selectedBots.length > 0) {
+          const nextIds = selectedBots.map((b) => b.bot_id);
+          const nextRatios = {};
+          selectedBots.forEach((b) => {
+            nextRatios[b.bot_id] = Math.round(Number(b.allocation_ratio || 0) * 100);
+          });
+          setSelectedLiveBotIds(nextIds);
+          setSavedLiveBotIds(nextIds);
+          setLiveAllocRatios(nextRatios);
+          setIsLiveConfigDirty(false);
+        }
+        if (data.status) {
+          setRotationStatus(data.status);
+        } else {
+          await fetchRotationStatus();
+        }
+        await fetchAlgoLabModels();
+        await fetchOverviewAndBots(true);
+
+        const champLines = (data.elected_bots || [])
+          .map(
+            (c) =>
+              `• [${c.strategy_group}] ${c.nickname} (${c.allocation_ratio_pct}%) — 7일 ${c.weekly_return_pct >= 0 ? "+" : ""}${c.weekly_return_pct}% / 종합점수 ${c.rotation_score}`
+          )
+          .join("\n");
+        const drainCnt = Number(data.apply_result?.draining_positions_count || 0);
+        const reclaimedKrw = Math.floor(Number(data.apply_result?.reclaimed_virtual_krw || 0));
+        showModal(
+          "🏆 전략별 1위 봇 실전 자동 배치 완료",
+          `${champLines}\n\n• 보호된 미매도 포지션(Graceful Drain): ${drainCnt}건\n• 즉시 회수·이관된 가용 원화: ${reclaimedKrw.toLocaleString("ko-KR")}원`,
+          "success"
+        );
+      } else {
+        showModal("전략별 로테이션 실행 실패", data.detail || data.message || "실전 배치에 실패했습니다.", "error");
+      }
+    } catch (err) {
+      showModal("통신 오류", err.message, "error");
+    } finally {
+      setRotationExecuting(false);
+    }
+  };
 
   const fetchAlgoLabTrades = useCallback(async (modelId = null) => {
     try {
@@ -2024,9 +2451,15 @@ export default function App() {
         setIsLiveConfigDirty(false);
         await fetchOverviewAndBots(false, "live");
         await fetchAlgoLabModels();
+        const drainSummary =
+          Array.isArray(data.draining_bots) && data.draining_bots.length > 0
+            ? `\n\n🛡️ 포지션 보호(Graceful Drain) 모드 활성:\n${data.draining_bots
+                .map((d) => `- ${d.nickname || d.bot_id} [${getBotStrategyMeta(d).group}]: 보유 포지션 ${Math.floor(Number(d.used_capital || 0)).toLocaleString("ko-KR")}원 (강제 매도 없이 고유 청산 로직으로 안전 마무리)`)
+                .join("\n")}`
+            : "";
         showModal(
           "실전 봇 및 투자금 설정 저장 완료",
-          `${data.message}\n총 운용 원금: ${numericCapital.toLocaleString("ko-KR")}원 (실계좌 잔고 90% 자동 적용)\n선택된 실전 봇: ${data.selected_bots?.map((b) => b.nickname || b.bot_id).join(", ")}`,
+          `${data.message}\n총 운용 원금: ${numericCapital.toLocaleString("ko-KR")}원 (실계좌 잔고 90% 자동 적용)\n선택된 실전 봇: ${data.selected_bots?.map((b) => `${b.nickname || b.bot_id} [${getBotStrategyMeta(b).group}]`).join(", ")}${drainSummary}`,
           "success"
         );
       } else {
@@ -2046,6 +2479,9 @@ export default function App() {
       if (resp.ok) {
         const data = await resp.json();
         setAiBriefing(data);
+        if (data.regime_filter) {
+          setRegimeFilter(data.regime_filter);
+        }
         if (data.quota) {
           setGeminiQuota(data.quota);
         }
@@ -2211,6 +2647,9 @@ export default function App() {
               if (data.type === "meta") {
                 capturedMeta = data;
                 setStreamingMeta(data);
+                if (data.regime_filter) {
+                  setRegimeFilter(data.regime_filter);
+                }
                 if (data.quota) {
                   setGeminiQuota(data.quota);
                   setGeminiQuotaNotice(
@@ -2228,11 +2667,15 @@ export default function App() {
                     `금일 자동 분석 예약(${data.quota.auto_reserved_count}건) 제외 남은 무료 API 호출 건수: ${data.quota.remaining_calls}건 (일일 수동 한도 ${data.quota.manual_limit}건 중 ${data.quota.manual_used}건 사용)`
                   );
                 }
+                const nextRegimeFilter = data.regime_filter || capturedMeta?.regime_filter || null;
+                if (nextRegimeFilter) {
+                  setRegimeFilter(nextRegimeFilter);
+                }
                 setAiBriefing((prev) => ({
                   ...prev,
                   last_trigger_type: data.trigger_type || "MANUAL",
                   quota: data.quota || prev.quota,
-                  regime_filter: data.regime_filter || capturedMeta?.regime_filter || prev.regime_filter,
+                  regime_filter: nextRegimeFilter || prev.regime_filter,
                   latest: {
                     id: data.id,
                     provider: "gemini",
@@ -2346,6 +2789,22 @@ export default function App() {
     }
   };
 
+  const effectiveRegimeFilter = useMemo(
+    () => streamingMeta?.regime_filter || aiBriefing?.regime_filter || regimeFilter || null,
+    [streamingMeta, aiBriefing, regimeFilter]
+  );
+
+  const drainingBotsList = useMemo(
+    () =>
+      (bots || []).filter(
+        (b) =>
+          Number(b.is_selected_for_live) !== 1 &&
+          ((Array.isArray(b.open_positions) && b.open_positions.length > 0) ||
+            Number(b.used_capital || 0) > 0)
+      ),
+    [bots]
+  );
+
   // 날짜 변경(자정 경과) 실시간 감지: 하루가 지나 날짜가 바뀌면 즉시 인증 화면으로 전환
   // 브라우저 웹 알림 및 서비스 워커 초기화
   useEffect(() => {
@@ -2434,6 +2893,9 @@ export default function App() {
       const data = await resp.json();
       const botList = data.bots || [];
       setBots(botList);
+      if (data.regime_filter) {
+        setRegimeFilter(data.regime_filter);
+      }
       setTotalCapitalInput(
         data.total_capital !== null && data.total_capital !== undefined && data.total_capital !== 0
           ? data.total_capital
@@ -2626,6 +3088,9 @@ export default function App() {
       if (Array.isArray(data.bots)) {
         setBots(data.bots);
       }
+      if (data.regime_filter) {
+        setRegimeFilter(data.regime_filter);
+      }
     } catch {}
   };
 
@@ -2642,6 +3107,7 @@ export default function App() {
     fetchWeeklyBotSelection();
     fetchTradeMode();
     fetchAlgoLabModels();
+    fetchRotationStatus();
     fetchEntryCode();
 
     const timer = setInterval(() => {
@@ -2654,28 +3120,30 @@ export default function App() {
       fetchNewsAiBriefing(true);
     }, 6000);
     return () => clearInterval(timer);
-  }, [authenticated, selectedBotId, fetchTradeMode, fetchAlgoLabModels, fetchEntryCode]);
+  }, [authenticated, selectedBotId, fetchTradeMode, fetchAlgoLabModels, fetchRotationStatus, fetchEntryCode]);
 
   // 가상거래 경쟁(Arena) 활성화 시 5초 주기 실시간 리더보드 및 체결 일지 자동 갱신
   useEffect(() => {
     if (!authenticated || (activeMenu !== "arena" && activeMenu !== "algo-lab")) return;
     fetchAlgoLabModels();
     fetchAlgoLabTrades(selectedAlgoModelId);
+    fetchRotationStatus();
 
     const timer = setInterval(() => {
       fetchAlgoLabModels();
       fetchAlgoLabTrades(selectedAlgoModelId);
     }, 5000);
     return () => clearInterval(timer);
-  }, [authenticated, activeMenu, selectedAlgoModelId, fetchAlgoLabModels, fetchAlgoLabTrades]);
+  }, [authenticated, activeMenu, selectedAlgoModelId, fetchAlgoLabModels, fetchAlgoLabTrades, fetchRotationStatus]);
 
   useEffect(() => {
     sessionStorage.setItem("autoCoinTrade_menu", activeMenu);
     localStorage.setItem("autoCoinTrade_menu", activeMenu);
     if (activeMenu === "settings") {
       fetchEntryCode();
+      fetchRotationStatus();
     }
-  }, [activeMenu, fetchEntryCode]);
+  }, [activeMenu, fetchEntryCode, fetchRotationStatus]);
 
   useEffect(() => {
     sessionStorage.setItem("autoCoinTrade_bot", selectedBotId);
@@ -4322,8 +4790,11 @@ export default function App() {
                             비중 {(Number(b.allocation_ratio) * 100).toFixed(0)}%
                           </span>
                         </div>
-                        <div style={{ fontSize: "11px", color: "#94a3b8", marginBottom: "4px" }}>
-                          전략: {b.strategy_type || b.name}
+                        <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", marginBottom: "6px" }}>
+                          {renderStrategyGroupBadge(b, { showSubType: true, compact: true })}
+                          <span style={{ fontSize: "11px", color: "#94a3b8" }}>
+                            {b.strategy_type || b.name}
+                          </span>
                         </div>
                         <div style={{ fontSize: "11.5px", color: "#cbd5e1", lineHeight: 1.4 }}>
                           {b.reason}
@@ -4434,15 +4905,32 @@ export default function App() {
                     </span>
                   )}
                   {/* 접혀있을 때 듀얼 AI 교차검증 간략 요약 뱃지 표시 */}
-                  {!isAiBriefingExpanded && aiBriefing?.latest && (
+                  {!isAiBriefingExpanded && (aiBriefing?.latest || effectiveRegimeFilter) && (
                     <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", marginLeft: "4px" }}>
                       {(() => {
-                        const rf = aiBriefing?.regime_filter;
+                        const rf = effectiveRegimeFilter;
                         if (rf) {
-                          const isBlocked = rf.final_risk_alert || rf.final_position_multiplier === 0;
-                          const isReduced = !isBlocked && rf.final_position_multiplier <= 0.5;
+                          const isBlocked = Boolean(rf.final_risk_alert) || Number(rf.final_position_multiplier) === 0;
+                          const isReduced = !isBlocked && Number(rf.final_position_multiplier) <= 0.5;
+                          const multPct = isBlocked ? 0 : Math.round(Number(rf.final_position_multiplier ?? 1) * 100);
+                          const regimeMeta = getMarketRegimeMeta(rf.market_regime || aiBriefing?.latest?.regime_status);
+                          const blacklist = parseRegimeBlacklist(rf);
                           return (
                             <>
+                              <span
+                                style={{
+                                  fontSize: "11px",
+                                  fontWeight: 700,
+                                  padding: "2px 7px",
+                                  borderRadius: "6px",
+                                  background: regimeMeta.bg,
+                                  color: regimeMeta.color,
+                                  border: `1px solid ${regimeMeta.border}`,
+                                }}
+                                title={`현재 시장 체제: ${regimeMeta.label}`}
+                              >
+                                📊 체제: {regimeMeta.code}
+                              </span>
                               <span
                                 style={{
                                   fontSize: "11px",
@@ -4494,14 +4982,27 @@ export default function App() {
                                 title={`듀얼 AI 교차검증 결론: ${rf.reason || ""}`}
                               >
                                 {isBlocked
-                                  ? "🛡️ 최종: 신규매수차단"
-                                  : isReduced
-                                  ? `🛡️ 최종: 비중 ${(rf.final_position_multiplier * 100).toFixed(0)}%`
-                                  : "🛡️ 최종: 100% 정상거래"}
+                                  ? "🛡️ 최종 비중: 0% (신규매수 차단)"
+                                  : `🛡️ 최종 비중: ${multPct}%`}
+                              </span>
+                              <span
+                                style={{
+                                  fontSize: "11px",
+                                  fontWeight: 700,
+                                  padding: "2px 7px",
+                                  borderRadius: "6px",
+                                  background: blacklist.length > 0 ? "rgba(239, 68, 68, 0.18)" : "rgba(100, 116, 139, 0.18)",
+                                  color: blacklist.length > 0 ? "#fca5a5" : "#94a3b8",
+                                  border: `1px solid ${blacklist.length > 0 ? "rgba(239, 68, 68, 0.4)" : "rgba(100, 116, 139, 0.35)"}`,
+                                }}
+                                title={blacklist.length > 0 ? `진입 금지 코인: ${blacklist.join(", ")}` : "블랙리스트 진입 제한 종목 없음"}
+                              >
+                                ⛔ 블랙리스트: {blacklist.length > 0 ? blacklist.join(", ") : "없음"}
                               </span>
                             </>
                           );
                         }
+                        if (!aiBriefing?.latest) return null;
                         return (
                           <span
                             style={{
@@ -4526,7 +5027,7 @@ export default function App() {
                           </span>
                         );
                       })()}
-                      {aiBriefing.latest.btc_price && (
+                      {aiBriefing?.latest?.btc_price && (
                         <span style={{ fontSize: "12px", color: "#cbd5e1" }}>
                           BTC {Number(aiBriefing.latest.btc_price).toLocaleString("ko-KR")}원
                         </span>
@@ -4805,61 +5306,74 @@ export default function App() {
                         ⚡ 업비트 실시간 호가 & 봇 지표 취합 및 Gemini 연결 중...
                       </div>
                       <div style={{ fontSize: "12px", color: "#94a3b8" }}>
-                        비트코인 이평선 이격도, 변동성 지표, 3개 봇 포지션을 취합하여 맞춤형 스트리밍 브리핑을 준비하고 있습니다.
+                        비트코인 이평선 이격도, 변동성 지표, 실전 담당 봇 포지션을 취합하여 맞춤형 스트리밍 브리핑을 준비하고 있습니다.
                       </div>
                     </div>
                   )}
 
                   {/* 분석 결과 리포트 표시 (스트리밍 작성 중이거나, 완료된 브리핑이 있을 때) */}
-                  {(isStreaming || (!aiLoading && aiBriefing?.latest)) && (
+                  {(isStreaming || (!aiLoading && (aiBriefing?.latest || effectiveRegimeFilter))) && (
                     <div>
                       {/* 주요 지표 요약 바 & 듀얼 AI 교차 검증 매트릭스 */}
                       {(() => {
                         const currentMeta = isStreaming && streamingMeta ? streamingMeta : aiBriefing?.latest;
-                        const rf = aiBriefing?.regime_filter || streamingMeta?.regime_filter;
-                        if (!currentMeta) return null;
+                        const rf = effectiveRegimeFilter;
+                        if (!currentMeta && !rf) return null;
+                        const regimeMeta = getMarketRegimeMeta(rf?.market_regime || currentMeta?.regime_status);
+                        const blacklist = parseRegimeBlacklist(rf);
+                        const overridesMap = parseRegimeBotOverrides(rf);
+                        const finalMultPct = rf
+                          ? (Boolean(rf.final_risk_alert) || Number(rf.final_position_multiplier) === 0
+                              ? 0
+                              : Math.round(Number(rf.final_position_multiplier ?? 1) * 100))
+                          : 100;
+                        const liveBotIdSet = new Set(
+                          (bots || []).filter((b) => Number(b.is_selected_for_live) === 1).map((b) => b.bot_id)
+                        );
                         return (
                           <div>
                             {/* 1. 기본 시장 지표 요약 바 */}
-                            <div
-                              style={{
-                                display: "flex",
-                                flexWrap: "wrap",
-                                gap: "12px",
-                                marginBottom: "10px",
-                                padding: "10px 14px",
-                                background: "rgba(15, 23, 42, 0.5)",
-                                borderRadius: "8px",
-                                border: "1px solid rgba(255, 255, 255, 0.05)",
-                                alignItems: "center",
-                              }}
-                            >
-                              <div style={{ fontSize: "12.5px", color: "#94a3b8" }}>
-                                🪙 <strong style={{ color: "#f8fafc" }}>BTC 현재가:</strong>{" "}
-                                {currentMeta.btc_price ? Number(currentMeta.btc_price).toLocaleString("ko-KR") + "원" : "-"}
-                              </div>
-                              <div style={{ fontSize: "12.5px", color: "#94a3b8" }}>
-                                📈 <strong style={{ color: "#f8fafc" }}>일봉 20MA:</strong>{" "}
-                                {currentMeta.btc_daily_20ma ? Math.floor(Number(currentMeta.btc_daily_20ma)).toLocaleString("ko-KR") + "원" : "-"}
-                              </div>
-                              <div style={{ fontSize: "12.5px", color: "#94a3b8" }}>
-                                ⏱️ <strong style={{ color: "#f8fafc" }}>4시간 60MA:</strong>{" "}
-                                {currentMeta.btc_4h_60ma ? Math.floor(Number(currentMeta.btc_4h_60ma)).toLocaleString("ko-KR") + "원" : "-"}
-                              </div>
-                              <div style={{ fontSize: "12.5px" }}>
-                                {currentMeta.regime_status === "HOLD_CASH" ? (
-                                  <span style={{ color: "#f87171", fontWeight: 700 }}>🔴 기술 체제: 신규매수차단 (현금보유)</span>
-                                ) : (
-                                  <span style={{ color: "#4ade80", fontWeight: 700 }}>🟢 기술 체제: 정상거래 허용 (상승추세)</span>
+                            {currentMeta && (
+                              <div
+                                style={{
+                                  display: "flex",
+                                  flexWrap: "wrap",
+                                  gap: "12px",
+                                  marginBottom: "10px",
+                                  padding: "10px 14px",
+                                  background: "rgba(15, 23, 42, 0.5)",
+                                  borderRadius: "8px",
+                                  border: "1px solid rgba(255, 255, 255, 0.05)",
+                                  alignItems: "center",
+                                }}
+                              >
+                                <div style={{ fontSize: "12.5px", color: "#94a3b8" }}>
+                                  🪙 <strong style={{ color: "#f8fafc" }}>BTC 현재가:</strong>{" "}
+                                  {currentMeta.btc_price ? Number(currentMeta.btc_price).toLocaleString("ko-KR") + "원" : "-"}
+                                </div>
+                                <div style={{ fontSize: "12.5px", color: "#94a3b8" }}>
+                                  📈 <strong style={{ color: "#f8fafc" }}>일봉 20MA:</strong>{" "}
+                                  {currentMeta.btc_daily_20ma ? Math.floor(Number(currentMeta.btc_daily_20ma)).toLocaleString("ko-KR") + "원" : "-"}
+                                </div>
+                                <div style={{ fontSize: "12.5px", color: "#94a3b8" }}>
+                                  ⏱️ <strong style={{ color: "#f8fafc" }}>4시간 60MA:</strong>{" "}
+                                  {currentMeta.btc_4h_60ma ? Math.floor(Number(currentMeta.btc_4h_60ma)).toLocaleString("ko-KR") + "원" : "-"}
+                                </div>
+                                <div style={{ fontSize: "12.5px" }}>
+                                  {currentMeta.regime_status === "HOLD_CASH" ? (
+                                    <span style={{ color: "#f87171", fontWeight: 700 }}>🔴 기술 체제: 신규매수차단 (현금보유)</span>
+                                  ) : (
+                                    <span style={{ color: "#4ade80", fontWeight: 700 }}>🟢 기술 체제: 정상거래 허용 (상승추세)</span>
+                                  )}
+                                </div>
+                                {isStreaming && (
+                                  <div style={{ fontSize: "12px", color: "#38bdf8", marginLeft: "auto", display: "flex", alignItems: "center", gap: "6px" }}>
+                                    <span className="spinner" style={{ width: "12px", height: "12px" }} />
+                                    한 자씩 실시간 타이핑 중...
+                                  </div>
                                 )}
                               </div>
-                              {isStreaming && (
-                                <div style={{ fontSize: "12px", color: "#38bdf8", marginLeft: "auto", display: "flex", alignItems: "center", gap: "6px" }}>
-                                  <span className="spinner" style={{ width: "12px", height: "12px" }} />
-                                  한 자씩 실시간 타이핑 중...
-                                </div>
-                              )}
-                            </div>
+                            )}
 
                             {/* 2. 듀얼 AI 엔진 (30분 Flash & 1시간 Pro) 교차 검증 매트릭스 카드 */}
                             {rf && (
@@ -4965,14 +5479,147 @@ export default function App() {
                                       }}
                                     >
                                       {rf.final_risk_alert || Number(rf.final_position_multiplier) === 0
-                                        ? "신규 매수 전면 차단"
+                                        ? "신규 매수 전면 차단 (0%)"
                                         : Number(rf.final_position_multiplier) <= 0.5
-                                        ? `비중 ${(Number(rf.final_position_multiplier) * 100).toFixed(0)}% 축소 운용`
-                                        : "100% 정상 진입 허용"}
+                                        ? `비중 ${finalMultPct}% 축소 운용`
+                                        : `비중 ${finalMultPct}% 정상 진입 허용`}
                                     </span>
                                   </div>
                                   <div style={{ fontSize: "11px", color: "#cbd5e1", lineHeight: "1.4" }} title={rf.reason || ""}>
-                                    {rf.reason ? (rf.reason.length > 60 ? rf.reason.slice(0, 60) + "..." : rf.reason) : "보수적 리스크 우선 원칙 및 단기 쇼크 방어 적용"}
+                                    {rf.reason ? (rf.reason.length > 72 ? rf.reason.slice(0, 72) + "..." : rf.reason) : "보수적 리스크 우선 원칙 및 단기 쇼크 방어 적용"}
+                                  </div>
+                                </div>
+
+                                {/* 현재 시장 체제 / 최종 투입 비중 / 블랙리스트 / 10대 봇 스위치 요약 */}
+                                <div
+                                  style={{
+                                    gridColumn: "1 / -1",
+                                    padding: "10px 12px",
+                                    background: "rgba(15, 23, 42, 0.72)",
+                                    borderRadius: "6px",
+                                    border: "1px solid rgba(148, 163, 184, 0.2)",
+                                    display: "flex",
+                                    flexDirection: "column",
+                                    gap: "8px",
+                                  }}
+                                >
+                                  <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "10px", fontSize: "12px" }}>
+                                    <span
+                                      style={{
+                                        padding: "3px 9px",
+                                        borderRadius: "6px",
+                                        fontWeight: 700,
+                                        background: regimeMeta.bg,
+                                        color: regimeMeta.color,
+                                        border: `1px solid ${regimeMeta.border}`,
+                                      }}
+                                    >
+                                      📊 현재 시장 체제: {regimeMeta.label}
+                                    </span>
+                                    <span
+                                      style={{
+                                        padding: "3px 9px",
+                                        borderRadius: "6px",
+                                        fontWeight: 700,
+                                        background: finalMultPct === 0 ? "rgba(239, 68, 68, 0.18)" : finalMultPct <= 50 ? "rgba(234, 179, 8, 0.18)" : "rgba(34, 197, 94, 0.18)",
+                                        color: finalMultPct === 0 ? "#fca5a5" : finalMultPct <= 50 ? "#fde047" : "#4ade80",
+                                        border: `1px solid ${finalMultPct === 0 ? "rgba(239, 68, 68, 0.4)" : finalMultPct <= 50 ? "rgba(234, 179, 8, 0.4)" : "rgba(34, 197, 94, 0.4)"}`,
+                                      }}
+                                    >
+                                      ⚖️ 최종 투입 비중: {finalMultPct}%
+                                    </span>
+                                    <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                                      <span style={{ color: "#94a3b8", fontWeight: 700 }}>⛔ 블랙리스트 코인:</span>
+                                      {blacklist.length === 0 ? (
+                                        <span
+                                          style={{
+                                            padding: "2px 8px",
+                                            borderRadius: "6px",
+                                            background: "rgba(100, 116, 139, 0.18)",
+                                            color: "#cbd5e1",
+                                            fontSize: "11.5px",
+                                            fontWeight: 600,
+                                          }}
+                                        >
+                                          없음 (전체 대상 허용)
+                                        </span>
+                                      ) : (
+                                        blacklist.map((ticker) => (
+                                          <span
+                                            key={ticker}
+                                            style={{
+                                              padding: "2px 8px",
+                                              borderRadius: "6px",
+                                              background: "rgba(239, 68, 68, 0.22)",
+                                              color: "#fca5a5",
+                                              border: "1px solid rgba(239, 68, 68, 0.45)",
+                                              fontSize: "11.5px",
+                                              fontWeight: 700,
+                                            }}
+                                          >
+                                            {ticker}
+                                          </span>
+                                        ))
+                                      )}
+                                    </div>
+                                  </div>
+
+                                  <div style={{ display: "flex", flexDirection: "column", gap: "6px", paddingTop: "6px", borderTop: "1px solid rgba(255, 255, 255, 0.06)" }}>
+                                    <span style={{ fontSize: "11px", color: "#94a3b8", fontWeight: 700 }}>
+                                      🤖 10대 봇 전략군별 AI 게이트웨이(bot_overrides):
+                                    </span>
+                                    {STRATEGY_GROUP_ORDER_UI.map((groupCode) => {
+                                      const gMeta = STRATEGY_GROUP_META_UI[groupCode];
+                                      const groupBotIds = ALL_BOT_IDS_UI.filter(
+                                        (bid) => getBotStrategyMeta(bid).groupCode === groupCode
+                                      );
+                                      return (
+                                        <div key={groupCode} style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                                          <span
+                                            style={{
+                                              fontSize: "10.5px",
+                                              fontWeight: 700,
+                                              padding: "2px 7px",
+                                              borderRadius: "5px",
+                                              background: gMeta.bg,
+                                              color: gMeta.color,
+                                              border: `1px solid ${gMeta.border}`,
+                                              minWidth: "130px",
+                                              textAlign: "center",
+                                            }}
+                                            title={gMeta.detailDesc}
+                                          >
+                                            {gMeta.icon} {gMeta.group}
+                                          </span>
+                                          {groupBotIds.map((bid) => {
+                                            const st = overridesMap[bid] || "ALLOW";
+                                            const isBlk = st === "BLOCK" || finalMultPct === 0 || Boolean(rf.final_risk_alert);
+                                            const isLive = liveBotIdSet.has(bid);
+                                            const bMeta = getBotStrategyMeta(bid);
+                                            return (
+                                              <span
+                                                key={bid}
+                                                style={{
+                                                  fontSize: "10.5px",
+                                                  fontWeight: 700,
+                                                  padding: "2px 7px",
+                                                  borderRadius: "5px",
+                                                  background: isBlk ? "rgba(234, 179, 8, 0.16)" : "rgba(34, 197, 94, 0.16)",
+                                                  color: isBlk ? "#fde047" : "#4ade80",
+                                                  border: isLive
+                                                    ? `1.5px solid ${isBlk ? "#f59e0b" : "#3b82f6"}`
+                                                    : `1px solid ${isBlk ? "rgba(234, 179, 8, 0.35)" : "rgba(34, 197, 94, 0.35)"}`,
+                                                }}
+                                                title={`${bid} (${BOT_SHORT_LABELS_UI[bid]} · ${bMeta.group} / ${bMeta.subType}): ${isBlk ? "BLOCK (신규매수 보류 · 보유분 정상 감시)" : "ALLOW (신규매수 허용)"}${isLive ? " [현재 실전 선택 봇]" : ""}`}
+                                              >
+                                                {isLive ? "★" : ""}
+                                                {bid} {BOT_SHORT_LABELS_UI[bid]} · {isBlk ? "BLOCK" : "ALLOW"}
+                                              </span>
+                                            );
+                                          })}
+                                        </div>
+                                      );
+                                    })}
                                   </div>
                                 </div>
                               </div>
@@ -5040,58 +5687,260 @@ export default function App() {
               }
 
               return (
-                <div className="tab-bar">
-                  {liveBots.map((bot) => (
-                    <button
-                      key={bot.bot_id}
-                      className={`tab-btn ${selectedBotId === bot.bot_id ? "active" : ""}`}
-                      onClick={() => {
-                        setSelectedBotId(bot.bot_id);
-                        fetchTrades(bot.bot_id, "live");
+                <>
+                  <div className="tab-bar">
+                    {liveBots.map((bot) => {
+                      const gw = getBotGatewayBadgeInfo(effectiveRegimeFilter, bot.bot_id);
+                      const stratMeta = getBotStrategyMeta(bot);
+                      const arenaEntry = algoModels.find((m) => m.bot_id === bot.bot_id);
+                      const isGroupChamp =
+                        Boolean(arenaEntry?.is_group_champion) ||
+                        Boolean((rotationStatus?.champions || []).some((c) => c.bot_id === bot.bot_id));
+                      return (
+                        <button
+                          key={bot.bot_id}
+                          className={`tab-btn ${selectedBotId === bot.bot_id ? "active" : ""}`}
+                          title={`${bot.nickname || bot.name} · ${stratMeta.groupTitle} (${stratMeta.subType})`}
+                          onClick={() => {
+                            setSelectedBotId(bot.bot_id);
+                            fetchTrades(bot.bot_id, "live");
+                          }}
+                        >
+                          <span
+                            className={`status-dot ${bot.is_running ? "green" : "red"}`}
+                            style={{ width: "8px", height: "8px" }}
+                          />
+                          <span>{stratMeta.icon} {bot.nickname || bot.name}</span>
+                          <span
+                            style={{
+                              fontSize: "10px",
+                              marginLeft: "4px",
+                              padding: "1px 6px",
+                              borderRadius: "6px",
+                              background: stratMeta.bg,
+                              color: stratMeta.color,
+                              border: `1px solid ${stratMeta.border}`,
+                              fontWeight: 700,
+                            }}
+                          >
+                            {isGroupChamp ? `👑 ${stratMeta.championLabel}` : stratMeta.group}
+                          </span>
+                          <span
+                            style={{
+                              fontSize: "10.5px",
+                              marginLeft: "4px",
+                              padding: "1px 6px",
+                              borderRadius: "8px",
+                              background: "rgba(239, 68, 68, 0.25)",
+                              color: "#fca5a5",
+                              fontWeight: 700,
+                            }}
+                          >
+                            실전 {bot.allocation_ratio}%
+                          </span>
+                          <span
+                            style={{
+                              fontSize: "10px",
+                              marginLeft: "4px",
+                              padding: "1px 6px",
+                              borderRadius: "6px",
+                              background: gw.bg,
+                              color: gw.color,
+                              border: `1px solid ${gw.border}`,
+                              fontWeight: 700,
+                            }}
+                            title={gw.badgeText}
+                          >
+                            {gw.shortText}
+                          </span>
+                          {bot.circuit_breaker_active && (
+                            <span
+                              style={{
+                                fontSize: "10px",
+                                marginLeft: "4px",
+                                padding: "1px 5px",
+                                borderRadius: "4px",
+                                background: "rgba(239, 68, 68, 0.35)",
+                                color: "#fca5a5",
+                                fontWeight: 700,
+                              }}
+                              title="일일 손실 방어 서킷 브레이커 발동 (-4.0% 도달, 자정까지 신규 매수 차단)"
+                            >
+                              ⚡ 서킷차단
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* 선택된 1~3개 실전 담당 봇 제어 카드 각각에 AI 게이트웨이(ALLOW/BLOCK) 판정 상태 배지 표시 */}
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(290px, 1fr))",
+                      gap: "12px",
+                      marginBottom: "14px",
+                    }}
+                  >
+                    {liveBots.map((bot) => {
+                      const gw = getBotGatewayBadgeInfo(effectiveRegimeFilter, bot.bot_id);
+                      const isActiveTab = selectedBotId === bot.bot_id;
+                      const openCount = Array.isArray(bot.open_positions) ? bot.open_positions.length : 0;
+                      const usedCap = Math.floor(Number(bot.used_capital || 0));
+                      return (
+                        <div
+                          key={`gw-card-${bot.bot_id}`}
+                          onClick={() => {
+                            setSelectedBotId(bot.bot_id);
+                            fetchTrades(bot.bot_id, "live");
+                          }}
+                          style={{
+                            cursor: "pointer",
+                            padding: "12px 14px",
+                            borderRadius: "10px",
+                            background: isActiveTab
+                              ? "linear-gradient(135deg, rgba(30, 58, 138, 0.35), rgba(15, 23, 42, 0.9))"
+                              : "rgba(15, 23, 42, 0.78)",
+                            border: isActiveTab
+                              ? "1.5px solid #3b82f6"
+                              : `1px solid ${gw.allowed ? "rgba(34, 197, 94, 0.28)" : "rgba(234, 179, 8, 0.35)"}`,
+                            transition: "all 0.2s ease",
+                          }}
+                        >
+                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px", gap: "8px" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0 }}>
+                              <span
+                                className={`status-dot ${bot.is_running ? "green" : "red"}`}
+                                style={{ width: "8px", height: "8px", flexShrink: 0 }}
+                              />
+                              <strong style={{ fontSize: "13.5px", color: "#f8fafc", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                {bot.nickname || bot.name}
+                              </strong>
+                              <span style={{ fontSize: "11px", color: "#94a3b8" }}>({bot.bot_id})</span>
+                            </div>
+                            <span style={{ fontSize: "11px", fontWeight: 700, color: "#93c5fd", flexShrink: 0 }}>
+                              비중 {bot.allocation_ratio}% · 보유 {openCount}건
+                            </span>
+                          </div>
+
+                          <div style={{ marginBottom: "6px", display: "flex", alignItems: "center", gap: "5px", flexWrap: "wrap" }}>
+                            {renderStrategyGroupBadge(bot, { showSubType: true, compact: true })}
+                            {(algoModels.find((m) => m.bot_id === bot.bot_id)?.is_group_champion ||
+                              (rotationStatus?.champions || []).some((c) => c.bot_id === bot.bot_id)) && (
+                              <span
+                                style={{
+                                  fontSize: "10.5px",
+                                  padding: "2px 6px",
+                                  borderRadius: "5px",
+                                  fontWeight: 800,
+                                  background: "rgba(251, 191, 36, 0.18)",
+                                  color: "#fde68a",
+                                  border: "1px solid rgba(251, 191, 36, 0.45)",
+                                }}
+                              >
+                                👑 {getBotStrategyMeta(bot).championLabel}
+                              </span>
+                            )}
+                          </div>
+
+                          <div
+                            style={{
+                              display: "inline-block",
+                              fontSize: "11.5px",
+                              fontWeight: 700,
+                              padding: "4px 9px",
+                              borderRadius: "6px",
+                              background: gw.bg,
+                              color: gw.color,
+                              border: `1px solid ${gw.border}`,
+                              marginBottom: "6px",
+                            }}
+                            title={gw.detailReason}
+                          >
+                            {gw.badgeText}
+                          </div>
+
+                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "11px", color: "#94a3b8" }}>
+                            <span>투입중 {usedCap.toLocaleString("ko-KR")}원 · 가용 {Math.floor(Number(bot.virtual_krw || 0)).toLocaleString("ko-KR")}원</span>
+                            <span>{bot.is_running ? "가동중" : "중지됨"}</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* 실전 교체 후 잔여 포지션이 남은 봇 포지션 보호(Graceful Drain) 감시 카드 */}
+                  {drainingBotsList.length > 0 && (
+                    <div
+                      style={{
+                        marginBottom: "14px",
+                        padding: "12px 16px",
+                        borderRadius: "10px",
+                        background: "linear-gradient(135deg, rgba(120, 53, 15, 0.25), rgba(15, 23, 42, 0.85))",
+                        border: "1px solid rgba(245, 158, 11, 0.45)",
                       }}
                     >
-                      <span
-                        className={`status-dot ${bot.is_running ? "green" : "red"}`}
-                        style={{ width: "8px", height: "8px" }}
-                      />
-                      <span>{bot.nickname || bot.name}</span>
-                      <span
-                        style={{
-                          fontSize: "10.5px",
-                          marginLeft: "6px",
-                          padding: "1px 6px",
-                          borderRadius: "8px",
-                          background: "rgba(239, 68, 68, 0.25)",
-                          color: "#fca5a5",
-                          fontWeight: 700,
-                        }}
-                      >
-                        실전 {bot.allocation_ratio}%
-                      </span>
-                      {bot.circuit_breaker_active && (
-                        <span
-                          style={{
-                            fontSize: "10px",
-                            marginLeft: "4px",
-                            padding: "1px 5px",
-                            borderRadius: "4px",
-                            background: "rgba(239, 68, 68, 0.35)",
-                            color: "#fca5a5",
-                            fontWeight: 700,
-                          }}
-                          title="일일 손실 방어 서킷 브레이커 발동 (-4.0% 도달, 자정까지 신규 매수 차단)"
-                        >
-                          ⚡ 서킷차단
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "8px", marginBottom: "8px" }}>
+                        <strong style={{ fontSize: "13px", color: "#fde68a" }}>
+                          🛡️ 교체 봇 미매도 포지션 안전 감시 중 (Graceful Drain) — 강제 시장가 청산 없이 안전 정산 ({drainingBotsList.length}개)
+                        </strong>
+                        <span style={{ fontSize: "11px", color: "#cbd5e1" }}>
+                          탈락 봇의 신규 매수는 즉시 차단되며, 기존 보유 물량 청산 완료 시 회수 원화(실현손익 포함)가 현재 실전 담당 봇으로 자동 귀속됩니다.
                         </span>
-                      )}
-                    </button>
-                  ))}
-                </div>
+                      </div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: "10px" }}>
+                        {drainingBotsList.map((dBot) => {
+                          const posTickers = (dBot.open_positions || []).map((p) => p.market).join(", ");
+                          return (
+                            <div
+                              key={`drain-${dBot.bot_id}`}
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: "10px",
+                                padding: "6px 10px",
+                                borderRadius: "8px",
+                                background: "rgba(15, 23, 42, 0.72)",
+                                border: "1px solid rgba(245, 158, 11, 0.35)",
+                                fontSize: "12px",
+                              }}
+                            >
+                              <strong style={{ color: "#fcd34d" }}>{dBot.nickname || dBot.name}</strong>
+                              {renderStrategyGroupBadge(dBot, { compact: true })}
+                              <span style={{ color: "#e2e8f0" }}>
+                                보유 {Math.floor(Number(dBot.used_capital || 0)).toLocaleString("ko-KR")}원
+                                {posTickers ? ` (${posTickers})` : ""}
+                              </span>
+                              <button
+                                type="button"
+                                className="btn btn-outline"
+                                style={{ padding: "2px 8px", fontSize: "11px" }}
+                                onClick={() => {
+                                  setSelectedBotId(dBot.bot_id);
+                                  fetchTrades(dBot.bot_id, "live");
+                                }}
+                              >
+                                내역 보기
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </>
               );
             })()}
 
             {/* 선택된 봇 상태 및 거래시작 / 중단 버튼 (요구사항 20) */}
-            {currentBot && (
+            {currentBot && (() => {
+              const currentGw = getBotGatewayBadgeInfo(effectiveRegimeFilter, currentBot.bot_id);
+              const isCurrentDraining =
+                Number(currentBot.is_selected_for_live) !== 1 &&
+                ((Array.isArray(currentBot.open_positions) && currentBot.open_positions.length > 0) ||
+                  Number(currentBot.used_capital || 0) > 0);
+              return (
               <div className="card">
                 <div className="bot-control-panel">
                   <div>
@@ -5100,6 +5949,36 @@ export default function App() {
                       <span style={{ fontSize: "13px", color: "#94a3b8", fontWeight: 500 }}>
                         ({currentBot.name})
                       </span>
+                      {renderStrategyGroupBadge(currentBot, { showSubType: true })}
+                      <span
+                        style={{
+                          fontSize: "11.5px",
+                          padding: "3px 9px",
+                          borderRadius: "6px",
+                          background: currentGw.bg,
+                          border: `1px solid ${currentGw.border}`,
+                          color: currentGw.color,
+                          fontWeight: 700,
+                        }}
+                        title={currentGw.detailReason}
+                      >
+                        {currentGw.badgeText}
+                      </span>
+                      {isCurrentDraining && (
+                        <span
+                          style={{
+                            fontSize: "11px",
+                            padding: "3px 8px",
+                            borderRadius: "6px",
+                            background: "rgba(245, 158, 11, 0.2)",
+                            border: "1px solid rgba(245, 158, 11, 0.5)",
+                            color: "#fcd34d",
+                            fontWeight: 700,
+                          }}
+                        >
+                          🛡️ Graceful Drain 청산 대기 중 (신규 매수 불가 · 보유물량 안전 감시중)
+                        </span>
+                      )}
                       {currentBot.circuit_breaker_active && (
                         <span
                           style={{
@@ -5127,6 +6006,16 @@ export default function App() {
                           style={{ color: currentBot.is_running ? "#22c55e" : "#f87171" }}
                         >
                           {currentBot.is_running ? "● 거래 진행 중" : "■ 거래 중지됨"}
+                        </span>
+                      </div>
+                      <div className="meta-item">
+                        <span className="meta-label">AI 매수 게이트웨이 판정</span>
+                        <span
+                          className="meta-value"
+                          style={{ fontSize: "13px", color: currentGw.color, fontWeight: 700 }}
+                          title={currentGw.detailReason}
+                        >
+                          {currentGw.badgeText}
                         </span>
                       </div>
                       <div className="meta-item">
@@ -5202,7 +6091,8 @@ export default function App() {
                   </div>
                 </div>
               </div>
-            )}
+              );
+            })()}
 
             {/* 요구사항 9: 게시판 형식 거래정보 (매수, 매도, 매수일, 매도일, 차익 한 줄 표기 / 미매도 시 빈칸, 매도 시 업데이트) */}
             <div className="card">
@@ -6103,6 +6993,27 @@ export default function App() {
                 <button
                   type="button"
                   className="btn btn-primary"
+                  onClick={handleExecuteRotationNow}
+                  disabled={rotationExecuting}
+                  style={{
+                    padding: "8px 14px",
+                    fontSize: "12.5px",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    background: "linear-gradient(135deg, #f59e0b, #d97706)",
+                    borderColor: "#fbbf24",
+                    color: "#0f172a",
+                    fontWeight: 800,
+                  }}
+                  title="3대 전략군(추세·스윙 / 변동성·돌파 / 역추세·그리드)별 1위 봇 3개를 즉시 실전 배치합니다."
+                >
+                  <span>{rotationExecuting ? "⏳" : "🏆"}</span>
+                  <span>{rotationExecuting ? "전략별 1위 선출 중..." : "🏆 전략별 1위 봇 즉시 실전 배치"}</span>
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-primary"
                   onClick={handleRunAlgoLabCycle}
                   disabled={algoLabCycleRunning}
                   style={{ padding: "8px 14px", fontSize: "12.5px", display: "inline-flex", alignItems: "center", gap: "6px" }}
@@ -6155,20 +7066,40 @@ export default function App() {
 
                 return (
                   <div key={m.bot_id || m.model_id} className={`podium-card ${badgeClass}`}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px", gap: "6px", flexWrap: "wrap" }}>
                       <span style={{ fontSize: "15px", fontWeight: 800 }}>{medalIcon}</span>
-                      {Number(m.is_selected_for_live) === 1 && (
-                        <span className="badge-live-selected">⚡ 실전 담당 중</span>
-                      )}
+                      <div style={{ display: "flex", alignItems: "center", gap: "4px", flexWrap: "wrap" }}>
+                        {Boolean(m.is_group_champion) && (
+                          <span
+                            style={{
+                              fontSize: "10.5px",
+                              padding: "2px 7px",
+                              borderRadius: "6px",
+                              background: "rgba(251, 191, 36, 0.22)",
+                              color: "#fde68a",
+                              border: "1px solid rgba(251, 191, 36, 0.55)",
+                              fontWeight: 800,
+                            }}
+                          >
+                            👑 전략군 1위
+                          </span>
+                        )}
+                        {Number(m.is_selected_for_live) === 1 && (
+                          <span className="badge-live-selected">⚡ 실전 담당 중</span>
+                        )}
+                      </div>
                     </div>
 
-                    <div style={{ fontSize: "17px", fontWeight: 800, color: "#f8fafc", marginBottom: "4px", display: "flex", alignItems: "center", gap: "6px" }}>
+                    <div style={{ fontSize: "17px", fontWeight: 800, color: "#f8fafc", marginBottom: "6px", display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
                       <span>{m.nickname || m.name}</span>
                       {m.bot_id === "bot_10" && (
-                        <span style={{ fontSize: "11px", padding: "1px 6px", borderRadius: "4px", background: "rgba(168, 85, 247, 0.25)", color: "#c084fc", fontWeight: 700 }}>
+                        <span style={{ fontSize: "10.5px", padding: "1px 6px", borderRadius: "4px", background: "rgba(148, 163, 184, 0.16)", color: "#cbd5e1", fontWeight: 700 }}>
                           VWAP & LRC
                         </span>
                       )}
+                    </div>
+                    <div style={{ marginBottom: "8px", display: "flex", alignItems: "center", gap: "4px", flexWrap: "wrap" }}>
+                      {renderStrategyGroupBadge(m, { showSubType: true, compact: true })}
                     </div>
                     <div style={{ fontSize: "12px", color: "#94a3b8", marginBottom: "14px", minHeight: "34px", lineHeight: "1.4" }}>
                       {m.description}
@@ -6234,6 +7165,48 @@ export default function App() {
                   <div style={{ fontSize: "12px", color: "#94a3b8", marginTop: "3px" }}>
                     * 행을 클릭하면 하단에 해당 봇의 가상 체결 이력만 필터링되어 표시됩니다.
                   </div>
+                  <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "10px", alignItems: "center" }}>
+                    <button
+                      type="button"
+                      onClick={() => setArenaGroupFilter("ALL")}
+                      style={{
+                        padding: "4px 10px",
+                        borderRadius: "999px",
+                        fontSize: "11.5px",
+                        fontWeight: 700,
+                        cursor: "pointer",
+                        border: arenaGroupFilter === "ALL" ? "1px solid #60a5fa" : "1px solid #334155",
+                        background: arenaGroupFilter === "ALL" ? "rgba(59, 130, 246, 0.2)" : "rgba(15, 23, 42, 0.7)",
+                        color: arenaGroupFilter === "ALL" ? "#93c5fd" : "#94a3b8",
+                      }}
+                    >
+                      전체 ({algoModels.length})
+                    </button>
+                    {STRATEGY_GROUP_ORDER_UI.map((groupCode) => {
+                      const gMeta = STRATEGY_GROUP_META_UI[groupCode];
+                      const count = algoModels.filter((m) => getBotStrategyMeta(m).groupCode === groupCode).length;
+                      const isActive = arenaGroupFilter === groupCode;
+                      return (
+                        <button
+                          key={groupCode}
+                          type="button"
+                          onClick={() => setArenaGroupFilter(groupCode)}
+                          style={{
+                            padding: "4px 10px",
+                            borderRadius: "999px",
+                            fontSize: "11.5px",
+                            fontWeight: 700,
+                            cursor: "pointer",
+                            border: isActive ? `1px solid ${gMeta.border}` : "1px solid #334155",
+                            background: isActive ? gMeta.bg : "rgba(15, 23, 42, 0.7)",
+                            color: isActive ? gMeta.color : "#94a3b8",
+                          }}
+                        >
+                          {gMeta.icon} {gMeta.group} ({count})
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
 
                 <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
@@ -6265,7 +7238,10 @@ export default function App() {
                     <tr>
                       <th style={{ width: "70px", textAlign: "center" }}>순위</th>
                       <th>봇 별명 / 알고리즘명</th>
+                      <th>전략군</th>
                       <th style={{ textAlign: "right" }}>누적 수익률</th>
+                      <th style={{ textAlign: "right" }}>최근 7일 수익률</th>
+                      <th style={{ textAlign: "right" }}>로테이션 점수</th>
                       <th style={{ textAlign: "right" }}>총 평가자산</th>
                       <th style={{ textAlign: "right" }}>실현손익</th>
                       <th style={{ textAlign: "center" }}>승률 (전적)</th>
@@ -6276,17 +7252,29 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {algoModels.length === 0 ? (
-                      <tr>
-                        <td colSpan={10} style={{ textAlign: "center", padding: "32px", color: "#94a3b8" }}>
-                          가상 경쟁 리더보드 데이터를 집계하는 중입니다...
-                        </td>
-                      </tr>
-                    ) : (
-                      algoModels.map((m) => {
+                    {(() => {
+                      const filteredArenaModels =
+                        arenaGroupFilter === "ALL"
+                          ? algoModels
+                          : algoModels.filter((m) => getBotStrategyMeta(m).groupCode === arenaGroupFilter);
+                      if (filteredArenaModels.length === 0) {
+                        return (
+                          <tr>
+                            <td colSpan={13} style={{ textAlign: "center", padding: "32px", color: "#94a3b8" }}>
+                              {algoModels.length === 0
+                                ? "가상 경쟁 리더보드 데이터를 집계하는 중입니다..."
+                                : "선택한 전략군에 해당하는 봇이 없습니다."}
+                            </td>
+                          </tr>
+                        );
+                      }
+                      return filteredArenaModels.map((m) => {
                         const isSelected = selectedAlgoModelId === m.bot_id;
                         const profitRate = Number(m.profit_rate_pct || 0);
+                        const weeklyRate = Number(m.weekly_return_pct ?? profitRate);
+                        const rotScore = Number(m.rotation_score ?? 0);
                         const isLiveSelected = Number(m.is_selected_for_live) === 1;
+                        const isGroupChamp = Boolean(m.is_group_champion);
 
                         return (
                           <tr
@@ -6297,22 +7285,47 @@ export default function App() {
                             }}
                             style={{
                               cursor: "pointer",
-                              background: isSelected ? "rgba(99, 102, 241, 0.12)" : "transparent",
+                              background: isSelected
+                                ? "rgba(99, 102, 241, 0.12)"
+                                : isGroupChamp
+                                ? "rgba(251, 191, 36, 0.05)"
+                                : "transparent",
                             }}
                           >
                             <td style={{ textAlign: "center", fontWeight: 800 }}>
                               {m.rank === 1 ? "🥇 1위" : m.rank === 2 ? "🥈 2위" : m.rank === 3 ? "🥉 3위" : `${m.rank}위`}
                             </td>
                             <td>
-                              <div style={{ fontWeight: 700, fontSize: "14px", color: "#f8fafc", display: "flex", alignItems: "center", gap: "6px" }}>
+                              <div style={{ fontWeight: 700, fontSize: "14px", color: "#f8fafc", display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
                                 <span>{m.nickname || m.name}</span>
                                 {m.bot_id === "bot_10" && (
-                                  <span style={{ fontSize: "10.5px", padding: "1px 6px", borderRadius: "4px", background: "rgba(168, 85, 247, 0.25)", color: "#c084fc", fontWeight: 700 }}>
+                                  <span style={{ fontSize: "10.5px", padding: "1px 6px", borderRadius: "4px", background: "rgba(148, 163, 184, 0.16)", color: "#cbd5e1", fontWeight: 700 }}>
                                     VWAP & LRC
+                                  </span>
+                                )}
+                                {isGroupChamp && (
+                                  <span
+                                    style={{
+                                      fontSize: "10.5px",
+                                      padding: "2px 7px",
+                                      borderRadius: "6px",
+                                      background: "rgba(251, 191, 36, 0.22)",
+                                      color: "#fde68a",
+                                      border: "1px solid rgba(251, 191, 36, 0.55)",
+                                      fontWeight: 800,
+                                    }}
+                                    title={`그룹 내 1위 챔피언 · 차기 실전 후보 (${m.evaluation_basis === "ROLLING_7D" ? "7일 평가" : "누적 폴백"})`}
+                                  >
+                                    👑 전략군 1위 (차기 실전 후보)
                                   </span>
                                 )}
                               </div>
                               <div style={{ fontSize: "11.5px", color: "#94a3b8" }}>{m.name}</div>
+                            </td>
+                            <td>
+                              <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: "4px" }}>
+                                {renderStrategyGroupBadge(m, { showSubType: true, compact: true })}
+                              </div>
                             </td>
                             <td
                               style={{
@@ -6323,6 +7336,25 @@ export default function App() {
                               }}
                             >
                               {profitRate > 0 ? `+${profitRate}%` : `${profitRate}%`}
+                            </td>
+                            <td
+                              style={{
+                                textAlign: "right",
+                                fontWeight: 700,
+                                fontSize: "13.5px",
+                                color: weeklyRate > 0 ? "#f87171" : weeklyRate < 0 ? "#60a5fa" : "#cbd5e1",
+                              }}
+                            >
+                              <div>{weeklyRate > 0 ? `+${weeklyRate}%` : `${weeklyRate}%`}</div>
+                              <div style={{ fontSize: "10.5px", color: "#94a3b8", fontWeight: 500 }}>
+                                7일 {m.weekly_trade_count ?? 0}회
+                              </div>
+                            </td>
+                            <td style={{ textAlign: "right", fontWeight: 700, fontSize: "13px", color: isGroupChamp ? "#fde68a" : "#cbd5e1" }}>
+                              <div>{rotScore > 0 ? `+${rotScore.toFixed(2)}` : rotScore.toFixed(2)}</div>
+                              <div style={{ fontSize: "10.5px", color: "#94a3b8", fontWeight: 500 }}>
+                                그룹 #{m.group_rank || "-"}
+                              </div>
                             </td>
                             <td style={{ textAlign: "right", fontWeight: 700 }}>
                               {formatKRW(m.eval_assets_krw)}
@@ -6367,8 +7399,8 @@ export default function App() {
                             </td>
                           </tr>
                         );
-                      })
-                    )}
+                      });
+                    })()}
                   </tbody>
                 </table>
               </div>
@@ -7366,6 +8398,324 @@ export default function App() {
               )}
             </div>
 
+            {/* 🤖 주간 전략별 1위 봇 자동 선출 (Auto-Rotation) 설정 */}
+            <div
+              className="card"
+              style={{
+                marginBottom: "20px",
+                background: "linear-gradient(135deg, rgba(30, 41, 59, 0.92), rgba(15, 23, 42, 0.95))",
+                border: "1px solid rgba(251, 191, 36, 0.35)",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "12px", marginBottom: "16px" }}>
+                <div>
+                  <h3 style={{ fontSize: "17px", fontWeight: 800, margin: 0, color: "#f8fafc", display: "flex", alignItems: "center", gap: "8px" }}>
+                    <span>🤖</span> 주간 전략별 1위 봇 자동 선출 (Auto-Rotation) 설정
+                  </h3>
+                  <p style={{ margin: "5px 0 0 0", fontSize: "12.5px", color: "#94a3b8", lineHeight: "1.5" }}>
+                    매주 1회 3대 전략군(📈 추세·스윙형 / ⚡ 변동성·돌파형 / 🔄 역추세·그리드형)에서 최근 7일 종합점수 1위 봇을 각각 1개씩 선출하여 실전 거래 봇(3개)으로 자동 배치합니다. 교체 시 미매도 코인은 <strong>Graceful Drain</strong>으로 안전 감시 후 청산 정산금을 활성 봇에 자동 이관합니다.
+                  </p>
+                </div>
+
+                {/* ON/OFF 토글 스위치 & 실행 버튼 */}
+                <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const nextEnabled = Number(rotationConfigDraft.is_enabled) === 1 ? 0 : 1;
+                      const nextDraft = { ...rotationConfigDraft, is_enabled: nextEnabled };
+                      setRotationConfigDraft(nextDraft);
+                      handleSaveRotationConfig(nextDraft);
+                    }}
+                    disabled={rotationSaving}
+                    style={{
+                      padding: "6px 14px",
+                      borderRadius: "999px",
+                      fontSize: "12.5px",
+                      fontWeight: 800,
+                      cursor: "pointer",
+                      border: Number(rotationConfigDraft.is_enabled) === 1 ? "1px solid rgba(34, 197, 94, 0.55)" : "1px solid #475569",
+                      background: Number(rotationConfigDraft.is_enabled) === 1 ? "rgba(22, 163, 74, 0.24)" : "rgba(51, 65, 85, 0.5)",
+                      color: Number(rotationConfigDraft.is_enabled) === 1 ? "#86efac" : "#cbd5e1",
+                    }}
+                  >
+                    {Number(rotationConfigDraft.is_enabled) === 1 ? "🟢 주간 자동 로테이션 ON" : "⚪ 주간 자동 로테이션 OFF"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={handleExecuteRotationNow}
+                    disabled={rotationExecuting}
+                    style={{
+                      padding: "8px 16px",
+                      fontSize: "13px",
+                      fontWeight: 800,
+                      background: "linear-gradient(135deg, #f59e0b, #d97706)",
+                      borderColor: "#fbbf24",
+                      color: "#0f172a",
+                    }}
+                  >
+                    {rotationExecuting ? "⏳ 선출 및 이관 중..." : "⚡ 지금 즉시 전략별 1위 선출 및 실전 반영"}
+                  </button>
+                </div>
+              </div>
+
+              {/* 스케줄 / 자금 배분 모드 / 최소 거래 횟수 제어 바 */}
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+                  gap: "12px",
+                  padding: "14px",
+                  borderRadius: "10px",
+                  background: "rgba(15, 23, 42, 0.72)",
+                  border: "1px solid #1e293b",
+                  marginBottom: "16px",
+                }}
+              >
+                <div>
+                  <label style={{ display: "block", fontSize: "12px", color: "#94a3b8", marginBottom: "5px", fontWeight: 600 }}>
+                    실행 요일 (매주 KST)
+                  </label>
+                  <select
+                    className="form-input"
+                    value={rotationConfigDraft.rotation_day_of_week}
+                    onChange={(e) => setRotationConfigDraft((prev) => ({ ...prev, rotation_day_of_week: Number(e.target.value) }))}
+                    style={{ width: "100%", padding: "8px 10px" }}
+                  >
+                    {[
+                      { val: 1, label: "월요일 (기본 권장)" },
+                      { val: 2, label: "화요일" },
+                      { val: 3, label: "수요일" },
+                      { val: 4, label: "목요일" },
+                      { val: 5, label: "금요일" },
+                      { val: 6, label: "토요일" },
+                      { val: 0, label: "일요일" },
+                    ].map((d) => (
+                      <option key={d.val} value={d.val}>
+                        {d.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label style={{ display: "block", fontSize: "12px", color: "#94a3b8", marginBottom: "5px", fontWeight: 600 }}>
+                    실행 시각 (KST 정각)
+                  </label>
+                  <select
+                    className="form-input"
+                    value={rotationConfigDraft.rotation_hour_kst}
+                    onChange={(e) => setRotationConfigDraft((prev) => ({ ...prev, rotation_hour_kst: Number(e.target.value) }))}
+                    style={{ width: "100%", padding: "8px 10px" }}
+                  >
+                    {Array.from({ length: 24 }, (_, h) => (
+                      <option key={h} value={h}>
+                        {String(h).padStart(2, "0")}:00 KST {h === 9 ? "(일봉 마감 기준 기본값)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label style={{ display: "block", fontSize: "12px", color: "#94a3b8", marginBottom: "5px", fontWeight: 600 }}>
+                    동적 자금 배분 모드 (1·2·3위 순)
+                  </label>
+                  <select
+                    className="form-input"
+                    value={rotationConfigDraft.allocation_mode}
+                    onChange={(e) => setRotationConfigDraft((prev) => ({ ...prev, allocation_mode: e.target.value }))}
+                    style={{ width: "100%", padding: "8px 10px" }}
+                  >
+                    <option value="RANK_WEIGHTED_40_35_25">성적순 차등 A (40% : 35% : 25% · 기본값)</option>
+                    <option value="RANK_WEIGHTED_40_40_20">성적순 차등 B (40% : 40% : 20%)</option>
+                    <option value="EQUAL_34_33_33">전략군 균등 (34% : 33% : 33%)</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label style={{ display: "block", fontSize: "12px", color: "#94a3b8", marginBottom: "5px", fontWeight: 600 }}>
+                    7일 최소 체결 횟수 가산 기준 (+1.0점)
+                  </label>
+                  <div style={{ display: "flex", gap: "8px" }}>
+                    <input
+                      type="number"
+                      min="0"
+                      max="50"
+                      className="form-input"
+                      value={rotationConfigDraft.min_weekly_trades}
+                      onChange={(e) => setRotationConfigDraft((prev) => ({ ...prev, min_weekly_trades: Number(e.target.value) }))}
+                      style={{ flex: 1, padding: "8px 10px" }}
+                    />
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      onClick={() => handleSaveRotationConfig()}
+                      disabled={rotationSaving}
+                      style={{ padding: "8px 14px", whiteSpace: "nowrap" }}
+                    >
+                      {rotationSaving ? "저장 중..." : "설정 저장"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* 일정 요약 바 */}
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "10px", fontSize: "12px", color: "#94a3b8", marginBottom: "14px" }}>
+                <span>
+                  ⏰ 다음 자동 선출 예정:{" "}
+                  <strong style={{ color: Number(rotationConfigDraft.is_enabled) === 1 ? "#fde68a" : "#64748b" }}>
+                    {Number(rotationConfigDraft.is_enabled) === 1
+                      ? `${rotationStatus?.config?.next_rotation_at || "-"} KST`
+                      : "자동 스케줄 OFF"}
+                  </strong>
+                </span>
+                <span>
+                  🕒 최근 로테이션 실행:{" "}
+                  <strong style={{ color: "#e2e8f0" }}>
+                    {rotationStatus?.config?.last_rotated_at || "아직 실행 이력 없음"}
+                  </strong>
+                </span>
+              </div>
+
+              {/* 현재 그룹 A / B / C 1위 챔피언 미리보기 카드 3개 */}
+              <div style={{ fontSize: "12.5px", fontWeight: 800, color: "#e2e8f0", marginBottom: "10px" }}>
+                👑 현재 3대 전략군별 주간 성과 1위 챔피언 미리보기 (실시간 시뮬레이션 기준)
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "12px", marginBottom: "16px" }}>
+                {STRATEGY_GROUP_ORDER_UI.map((gCode) => {
+                  const gMeta = STRATEGY_GROUP_META_UI[gCode];
+                  const groupObj = rotationStatus?.groups?.[gCode];
+                  const champ = groupObj?.champion;
+                  const ratioPct =
+                    (rotationStatus?.champions || []).find((c) => c.bot_id === champ?.bot_id)?.recommended_ratio ??
+                    champ?.recommended_ratio ??
+                    "-";
+                  return (
+                    <div
+                      key={`rot-prev-${gCode}`}
+                      style={{
+                        padding: "12px 14px",
+                        borderRadius: "10px",
+                        background: gMeta.sectionBg,
+                        border: `1px solid ${gMeta.sectionBorder}`,
+                      }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px", gap: "6px" }}>
+                        <span style={{ fontSize: "11.5px", fontWeight: 800, color: gMeta.color }}>
+                          {gMeta.icon} {gMeta.title.split(" (")[0]}
+                        </span>
+                        <span
+                          style={{
+                            fontSize: "11px",
+                            padding: "2px 8px",
+                            borderRadius: "999px",
+                            background: "rgba(251, 191, 36, 0.2)",
+                            color: "#fde68a",
+                            border: "1px solid rgba(251, 191, 36, 0.45)",
+                            fontWeight: 800,
+                          }}
+                        >
+                          배정 예정 {ratioPct}%
+                        </span>
+                      </div>
+                      {champ ? (
+                        <>
+                          <div style={{ fontSize: "15px", fontWeight: 800, color: "#f8fafc", marginBottom: "4px" }}>
+                            🏆 {champ.nickname || champ.name}{" "}
+                            <span style={{ fontSize: "11px", color: "#94a3b8", fontWeight: 500 }}>({champ.bot_id})</span>
+                          </div>
+                          <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", fontSize: "11.5px", color: "#cbd5e1", marginBottom: "4px" }}>
+                            <span>
+                              7일 수익:{" "}
+                              <strong style={{ color: Number(champ.weekly_return_pct) >= 0 ? "#4ade80" : "#f87171" }}>
+                                {Number(champ.weekly_return_pct) >= 0 ? "+" : ""}
+                                {champ.weekly_return_pct}%
+                              </strong>
+                            </span>
+                            <span>
+                              누적: <strong>{Number(champ.profit_rate_pct) >= 0 ? "+" : ""}{champ.profit_rate_pct}%</strong>
+                            </span>
+                            <span>
+                              점수: <strong style={{ color: "#fde68a" }}>{Number(champ.rotation_score).toFixed(2)}</strong>
+                            </span>
+                          </div>
+                          <div style={{ fontSize: "11px", color: "#94a3b8" }}>
+                            7일 거래 {champ.weekly_trade_count}회 · 승률 {champ.eval_win_rate_pct ?? champ.win_rate_pct}% · MDD -{champ.mdd_pct}% ·{" "}
+                            <span style={{ color: champ.evaluation_basis === "ROLLING_7D" ? "#86efac" : "#93c5fd" }}>
+                              {champ.evaluation_basis === "ROLLING_7D" ? "7일 기준" : "누적 폴백"}
+                            </span>
+                          </div>
+                        </>
+                      ) : (
+                        <div style={{ fontSize: "12px", color: "#94a3b8" }}>후보 데이터를 불러오는 중...</div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* 최근 로테이션 교체 이력 */}
+              <div>
+                <div style={{ fontSize: "12.5px", fontWeight: 800, color: "#e2e8f0", marginBottom: "8px" }}>
+                  📜 최근 주간 전략별 1위 선출 및 교체 이력 ({rotationStatus?.history?.length || 0}건)
+                </div>
+                {!rotationStatus?.history || rotationStatus.history.length === 0 ? (
+                  <div style={{ padding: "12px", borderRadius: "8px", background: "rgba(15, 23, 42, 0.5)", fontSize: "12px", color: "#94a3b8" }}>
+                    아직 자동·수동 전략별 로테이션 교체 이력이 없습니다. 위 버튼으로 즉시 첫 로테이션을 실행하거나 예약 시점을 기다려주세요.
+                  </div>
+                ) : (
+                  <div className="table-container" style={{ maxHeight: "220px", overflowY: "auto" }}>
+                    <table className="board-table">
+                      <thead>
+                        <tr>
+                          <th>실행 일시</th>
+                          <th style={{ textAlign: "center" }}>방식</th>
+                          <th>선출된 3대 전략 1위 봇</th>
+                          <th style={{ textAlign: "center" }}>보호 포지션</th>
+                          <th style={{ textAlign: "right" }}>즉시 이관 원화</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {rotationStatus.history.slice(0, 8).map((h) => (
+                          <tr key={`rot-hist-${h.id}`}>
+                            <td style={{ fontSize: "11.5px", whiteSpace: "nowrap" }}>{h.created_at}</td>
+                            <td style={{ textAlign: "center" }}>
+                              <span
+                                style={{
+                                  fontSize: "10.5px",
+                                  padding: "2px 7px",
+                                  borderRadius: "6px",
+                                  fontWeight: 700,
+                                  background: h.trigger_type === "SCHEDULED_WEEKLY" ? "rgba(59, 130, 246, 0.2)" : "rgba(245, 158, 11, 0.2)",
+                                  color: h.trigger_type === "SCHEDULED_WEEKLY" ? "#93c5fd" : "#fcd34d",
+                                }}
+                              >
+                                {h.trigger_type === "SCHEDULED_WEEKLY" ? "⏰ 주간 자동" : "⚡ 수동 즉시"}
+                              </span>
+                            </td>
+                            <td style={{ fontSize: "11.5px" }}>
+                              {(h.elected_bots || []).length > 0
+                                ? h.elected_bots
+                                    .map((eb) => `[${eb.strategy_group}] ${eb.nickname}(${eb.allocation_ratio_pct}%)`)
+                                    .join(" · ")
+                                : h.summary_text}
+                            </td>
+                            <td style={{ textAlign: "center", fontSize: "12px", fontWeight: 700, color: h.draining_positions_count > 0 ? "#fcd34d" : "#94a3b8" }}>
+                              {h.draining_positions_count}건
+                            </td>
+                            <td style={{ textAlign: "right", fontSize: "12px", fontWeight: 700, color: "#4ade80" }}>
+                              {Math.floor(Number(h.transferred_krw || 0)).toLocaleString("ko-KR")}원
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </div>
+
             {/* 1. 실제 거래 담당 봇(1~3개) 선택 및 동적 투자금 배분 설정 */}
             <div className="card" style={{ marginBottom: "20px" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "10px", marginBottom: "16px" }}>
@@ -7374,7 +8724,7 @@ export default function App() {
                     <span>🎯</span> 1. 실제 거래 담당 봇 선택 및 동적 투자금 배분
                   </h3>
                   <p style={{ margin: "4px 0 0 0", fontSize: "12.5px", color: "#94a3b8" }}>
-                    10대 순수 알고리즘 봇 중 실제 거래를 수행할 봇을 <strong>최소 1개 ~ 최대 3개</strong> 선택하십시오. 선택된 봇들에게만 실전 운용 원금이 동적으로 배분됩니다.
+                    10대 순수 알고리즘 봇 중 실제 거래를 수행할 봇을 <strong>최소 1개 ~ 최대 3개</strong> 선택하십시오. 미매도 코인이 남은 기존 봇을 교체하더라도 강제 시장가 매도 없이 <strong>[기존 봇 포지션 청산 대기(Graceful Drain)]</strong> 모드로 안전 마무리 청산됩니다.
                   </p>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
@@ -7394,26 +8744,88 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Step 1: 10대 봇 선택 체크박스 카드 리스트 */}
+              {/* Step 1: 10대 봇 선택 체크박스 카드 리스트 (전략군 구분 지원) */}
               <div style={{ marginBottom: "24px" }}>
                 <div style={{ fontSize: "13.5px", fontWeight: 700, color: "#e2e8f0", marginBottom: "10px", display: "flex", alignItems: "center", gap: "6px" }}>
                   <span style={{ background: "#3b82f6", color: "#fff", borderRadius: "50%", width: "20px", height: "20px", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: "11px" }}>1</span>
-                  <span>10대 알고리즘 봇 중 실전 거래 담당 봇 선택 (클릭하여 토글)</span>
+                  <span>10대 알고리즘 봇 중 실전 거래 담당 봇 선택 (전략군별 구분 · 클릭하여 토글)</span>
                 </div>
 
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: "12px" }}>
-                  {(algoModels.length > 0 ? algoModels : bots).map((bot, idx) => {
+                {(() => {
+                  const baseBotsList = algoModels.length > 0 ? algoModels : bots;
+                  const allSelectableBots = baseBotsList.map((bot, idx) => ({
+                    ...bot,
+                    overallRank: bot.rank || idx + 1,
+                    stratMeta: getBotStrategyMeta(bot),
+                  }));
+
+                  const selectedBotItems = selectedLiveBotIds.map(
+                    (id) =>
+                      allSelectableBots.find((b) => b.bot_id === id) || {
+                        bot_id: id,
+                        nickname: BOT_SHORT_LABELS_UI[id] || id,
+                        stratMeta: getBotStrategyMeta(id),
+                      }
+                  );
+
+                  const selectedCountsByGroup = STRATEGY_GROUP_ORDER_UI.reduce((acc, code) => {
+                    acc[code] = selectedBotItems.filter((b) => b.stratMeta.groupCode === code).length;
+                    return acc;
+                  }, {});
+
+                  const blockedSelectedBots = effectiveRegimeFilter
+                    ? selectedBotItems.filter((b) => !getBotGatewayBadgeInfo(effectiveRegimeFilter, b.bot_id).allowed)
+                    : [];
+
+                  const regimeMeta = effectiveRegimeFilter
+                    ? getMarketRegimeMeta(effectiveRegimeFilter.market_regime || effectiveRegimeFilter.regime_status)
+                    : null;
+
+                  const groupCodesToRender =
+                    liveBotGroupFilter === "ALL"
+                      ? STRATEGY_GROUP_ORDER_UI
+                      : STRATEGY_GROUP_ORDER_UI.filter((code) => code === liveBotGroupFilter);
+
+                  const filteredByRank =
+                    liveBotGroupFilter === "ALL"
+                      ? allSelectableBots
+                      : allSelectableBots.filter((b) => b.stratMeta.groupCode === liveBotGroupFilter);
+
+                  const renderBotSelectCard = (bot) => {
                     const isSelected = selectedLiveBotIds.includes(bot.bot_id);
-                    const rank = bot.rank || idx + 1;
-                    const retPct = bot.total_return_pct ?? bot.profit_rate_pct ?? 0;
+                    const liveBot = bots.find((lb) => lb.bot_id === bot.bot_id) || bot;
+                    const openPositions = Array.isArray(liveBot?.open_positions) ? liveBot.open_positions : [];
+                    const usedCap = Math.floor(Number(liveBot?.used_capital || 0));
+                    const hasOpenPos = openPositions.length > 0 || usedCap > 0;
+                    const wasSavedLive = Number(liveBot?.is_selected_for_live) === 1;
+                    const isDrainingNow = !wasSavedLive && hasOpenPos;
+                    const willDrainOnSave = !isSelected && wasSavedLive && hasOpenPos;
+                    const rank = bot.overallRank || 1;
+                    const retPct = Number(bot.total_return_pct ?? bot.profit_rate_pct ?? 0);
+                    const stratMeta = bot.stratMeta || getBotStrategyMeta(bot);
+                    const gwBadge = effectiveRegimeFilter
+                      ? getBotGatewayBadgeInfo(effectiveRegimeFilter, bot.bot_id)
+                      : null;
+
                     return (
                       <div
                         key={bot.bot_id}
                         className={`bot-select-card ${isSelected ? "selected" : ""}`}
                         onClick={() => handleToggleLiveBotSelection(bot.bot_id)}
                         style={{
-                          background: isSelected ? "linear-gradient(135deg, rgba(30, 58, 138, 0.35), rgba(15, 23, 42, 0.85))" : "#111827",
-                          border: isSelected ? "2px solid #3b82f6" : "1px solid #1f2937",
+                          background: isSelected
+                            ? "linear-gradient(135deg, rgba(30, 58, 138, 0.35), rgba(15, 23, 42, 0.85))"
+                            : willDrainOnSave || isDrainingNow
+                            ? "linear-gradient(135deg, rgba(120, 53, 15, 0.22), #111827)"
+                            : "#111827",
+                          border: isSelected
+                            ? "2px solid #3b82f6"
+                            : willDrainOnSave || isDrainingNow
+                            ? "1.5px solid rgba(245, 158, 11, 0.6)"
+                            : "1px solid #1f2937",
+                          borderLeft: isSelected
+                            ? "4px solid #3b82f6"
+                            : `4px solid ${stratMeta.color}`,
                           borderRadius: "10px",
                           padding: "14px",
                           cursor: "pointer",
@@ -7421,22 +8833,22 @@ export default function App() {
                           position: "relative",
                         }}
                       >
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "8px" }}>
-                          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "8px", marginBottom: "8px" }}>
+                          <div style={{ display: "flex", alignItems: "flex-start", gap: "8px", minWidth: 0 }}>
                             <input
                               type="checkbox"
                               checked={isSelected}
                               readOnly
-                              style={{ width: "16px", height: "16px", cursor: "pointer", accentColor: "#3b82f6", pointerEvents: "none" }}
+                              style={{ width: "16px", height: "16px", marginTop: "2px", cursor: "pointer", accentColor: "#3b82f6", pointerEvents: "none", flexShrink: 0 }}
                             />
-                            <span style={{ fontWeight: 800, fontSize: "14px", color: isSelected ? "#93c5fd" : "#f1f5f9", display: "inline-flex", alignItems: "center", gap: "5px" }}>
-                              <span>{bot.nickname || bot.name}</span>
-                              {bot.bot_id === "bot_10" && (
-                                <span style={{ fontSize: "10px", padding: "1px 5px", borderRadius: "4px", background: "rgba(168, 85, 247, 0.25)", color: "#c084fc", fontWeight: 700 }}>
-                                  VWAP & LRC
-                                </span>
-                              )}
-                            </span>
+                            <div style={{ display: "flex", flexDirection: "column", gap: "2px", minWidth: 0 }}>
+                              <span style={{ fontWeight: 800, fontSize: "14px", color: isSelected ? "#93c5fd" : "#f1f5f9", display: "inline-flex", alignItems: "center", gap: "5px", flexWrap: "wrap" }}>
+                                <span>{bot.nickname || bot.name}</span>
+                              </span>
+                              <span style={{ fontSize: "10.5px", color: "#64748b", fontFamily: "monospace" }}>
+                                {bot.bot_id}
+                              </span>
+                            </div>
                           </div>
                           <span
                             style={{
@@ -7444,6 +8856,7 @@ export default function App() {
                               padding: "2px 7px",
                               borderRadius: "10px",
                               fontWeight: 700,
+                              flexShrink: 0,
                               background: rank === 1 ? "rgba(251, 191, 36, 0.2)" : rank === 2 ? "rgba(203, 213, 225, 0.2)" : rank === 3 ? "rgba(249, 115, 22, 0.2)" : "rgba(71, 85, 105, 0.3)",
                               color: rank === 1 ? "#fbbf24" : rank === 2 ? "#e2e8f0" : rank === 3 ? "#fb923c" : "#94a3b8",
                             }}
@@ -7452,29 +8865,116 @@ export default function App() {
                           </span>
                         </div>
 
+                        <div style={{ display: "flex", alignItems: "center", gap: "5px", flexWrap: "wrap", marginBottom: "8px" }}>
+                          {renderStrategyGroupBadge(bot, { showSubType: true, compact: true })}
+                          {Boolean(bot.is_group_champion) && (
+                            <span
+                              style={{
+                                fontSize: "10.5px",
+                                padding: "2px 6px",
+                                borderRadius: "6px",
+                                fontWeight: 800,
+                                background: "rgba(251, 191, 36, 0.2)",
+                                border: "1px solid rgba(251, 191, 36, 0.5)",
+                                color: "#fde68a",
+                              }}
+                            >
+                              👑 전략군 1위
+                            </span>
+                          )}
+                          {gwBadge && (
+                            <span
+                              title={gwBadge.detailReason}
+                              style={{
+                                fontSize: "10.5px",
+                                padding: "2px 6px",
+                                borderRadius: "6px",
+                                fontWeight: 700,
+                                background: gwBadge.bg,
+                                border: `1px solid ${gwBadge.border}`,
+                                color: gwBadge.color,
+                              }}
+                            >
+                              {gwBadge.allowed ? "🟢 AI 허용" : "🟡 AI 보류"}
+                            </span>
+                          )}
+                        </div>
+
+                        <div
+                          style={{
+                            fontSize: "11px",
+                            color: "#cbd5e1",
+                            background: "rgba(15, 23, 42, 0.6)",
+                            border: "1px solid rgba(148, 163, 184, 0.16)",
+                            borderRadius: "6px",
+                            padding: "4px 8px",
+                            marginBottom: "8px",
+                            lineHeight: "1.35",
+                          }}
+                        >
+                          🎯 적합 장세: {stratMeta.marketFit}
+                        </div>
+
                         <div style={{ fontSize: "11.5px", color: "#94a3b8", marginBottom: "8px", lineHeight: "1.4" }}>
                           {bot.description || bot.strategy_desc || bot.strategy || bot.bot_id}
                         </div>
 
+                        {hasOpenPos && (
+                          <div
+                            style={{
+                              fontSize: "11px",
+                              color: "#fde68a",
+                              background: "rgba(245, 158, 11, 0.14)",
+                              border: "1px solid rgba(245, 158, 11, 0.35)",
+                              borderRadius: "6px",
+                              padding: "4px 7px",
+                              marginBottom: "8px",
+                            }}
+                          >
+                            📦 실전 미매도 보유: {openPositions.length}건 ({usedCap.toLocaleString("ko-KR")}원)
+                          </div>
+                        )}
+
                         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "12px", borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: "8px" }}>
-                          <span style={{ color: "#64748b" }}>가상 수익률</span>
+                          <span style={{ color: "#64748b" }}>
+                            가상 수익률
+                            {(bot.win_rate_pct !== undefined || bot.mdd_pct !== undefined) && (
+                              <span style={{ fontSize: "10.5px", color: "#94a3b8", marginLeft: "6px" }}>
+                                (승률 {Number(bot.win_rate_pct || 0).toFixed(0)}% · MDD -{Number(bot.mdd_pct || 0).toFixed(1)}%)
+                              </span>
+                            )}
+                          </span>
                           <span style={{ fontWeight: 700, color: retPct >= 0 ? "#f87171" : "#38bdf8" }}>
                             {retPct >= 0 ? `+${retPct.toFixed(2)}%` : `${retPct.toFixed(2)}%`}
                           </span>
                         </div>
 
-                        <div style={{ marginTop: "6px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <div style={{ marginTop: "6px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
                           <span
                             style={{
                               fontSize: "10.5px",
                               padding: "2px 6px",
                               borderRadius: "4px",
                               fontWeight: 700,
-                              background: isSelected ? "rgba(59, 130, 246, 0.2)" : "rgba(75, 85, 99, 0.2)",
-                              color: isSelected ? "#60a5fa" : "#6b7280",
+                              background: isSelected
+                                ? "rgba(59, 130, 246, 0.2)"
+                                : willDrainOnSave || isDrainingNow
+                                ? "rgba(245, 158, 11, 0.2)"
+                                : "rgba(75, 85, 99, 0.2)",
+                              color: isSelected
+                                ? "#60a5fa"
+                                : willDrainOnSave || isDrainingNow
+                                ? "#fcd34d"
+                                : "#6b7280",
                             }}
                           >
-                            {isSelected ? "⚡ 실전 담당 중" : "가상 시뮬레이션 전용"}
+                            {isSelected
+                              ? "⚡ 실전 담당 중"
+                              : isDrainingNow
+                              ? "⏳ 포지션 청산 대기 (Graceful Drain)"
+                              : willDrainOnSave
+                              ? "🛡️ 저장 시 청산 대기 (강제청산 없음)"
+                              : "가상 시뮬레이션 전용"}
                           </span>
                           <span style={{ fontSize: "11px", color: "#64748b" }}>
                             {bot.market || "KRW-BTC"}
@@ -7482,8 +8982,276 @@ export default function App() {
                         </div>
                       </div>
                     );
-                  })}
-                </div>
+                  };
+
+                  return (
+                    <>
+                      {/* 현재 선택 전략군 구성 & 시장 체제 요약 바 */}
+                      <div
+                        style={{
+                          background: "rgba(15, 23, 42, 0.72)",
+                          border: "1px solid #1e293b",
+                          borderRadius: "10px",
+                          padding: "12px 14px",
+                          marginBottom: "12px",
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: "8px",
+                        }}
+                      >
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "8px" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                            <span style={{ fontSize: "12.5px", fontWeight: 800, color: "#e2e8f0" }}>
+                              현재 선택 구성 ({selectedBotItems.length}/3):
+                            </span>
+                            {STRATEGY_GROUP_ORDER_UI.map((code) => {
+                              const gMeta = STRATEGY_GROUP_META_UI[code];
+                              const cnt = selectedCountsByGroup[code] || 0;
+                              return (
+                                <span
+                                  key={code}
+                                  style={{
+                                    fontSize: "11.5px",
+                                    padding: "2px 8px",
+                                    borderRadius: "999px",
+                                    fontWeight: 700,
+                                    background: cnt > 0 ? gMeta.bg : "rgba(30, 41, 59, 0.7)",
+                                    border: cnt > 0 ? `1px solid ${gMeta.border}` : "1px solid #334155",
+                                    color: cnt > 0 ? gMeta.color : "#64748b",
+                                  }}
+                                >
+                                  {gMeta.icon} {gMeta.group} {cnt}개
+                                </span>
+                              );
+                            })}
+                          </div>
+                          {regimeMeta && (
+                            <span
+                              style={{
+                                fontSize: "11.5px",
+                                padding: "2px 9px",
+                                borderRadius: "999px",
+                                fontWeight: 700,
+                                background: regimeMeta.bg,
+                                border: `1px solid ${regimeMeta.border}`,
+                                color: regimeMeta.color,
+                              }}
+                            >
+                              현재 AI 시장 체제: {regimeMeta.label}
+                            </span>
+                          )}
+                        </div>
+
+                        {selectedBotItems.length === 0 ? (
+                          <div style={{ fontSize: "11.5px", color: "#94a3b8" }}>
+                            선택된 봇이 없습니다. 아래에서 실전 거래를 담당할 봇 1~3개를 선택하세요.
+                          </div>
+                        ) : (
+                          <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
+                            {selectedBotItems.map((b) => {
+                              const gMeta = b.stratMeta;
+                              const gwBadge = effectiveRegimeFilter
+                                ? getBotGatewayBadgeInfo(effectiveRegimeFilter, b.bot_id)
+                                : null;
+                              return (
+                                <span
+                                  key={b.bot_id}
+                                  style={{
+                                    fontSize: "11.5px",
+                                    padding: "3px 8px",
+                                    borderRadius: "6px",
+                                    fontWeight: 700,
+                                    background: gMeta.bg,
+                                    border: `1px solid ${gMeta.border}`,
+                                    color: "#f8fafc",
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    gap: "5px",
+                                  }}
+                                >
+                                  <span>{gMeta.icon} {b.nickname || b.name || b.bot_id}</span>
+                                  <span style={{ color: gMeta.color }}>[{gMeta.group}]</span>
+                                  {gwBadge && (
+                                    <span style={{ fontSize: "10.5px", color: gwBadge.color }}>
+                                      {gwBadge.allowed ? "· 🟢 허용" : "· 🟡 보류"}
+                                    </span>
+                                  )}
+                                </span>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {blockedSelectedBots.length > 0 ? (
+                          <div style={{ fontSize: "11.5px", color: "#fde68a", lineHeight: "1.45" }}>
+                            💡 참고: 선택한 봇 중{" "}
+                            <strong>{blockedSelectedBots.map((b) => `${b.nickname || b.bot_id} [${b.stratMeta.group}]`).join(", ")}</strong>
+                            은(는) 현재 시장 체제에서 AI 게이트웨이가 신규 매수를 보류(BLOCK) 중입니다. (설정 저장은 자유롭게 가능하며, 시장 체제 전환 시 즉시 활성화됩니다)
+                          </div>
+                        ) : selectedBotItems.length >= 2 &&
+                          STRATEGY_GROUP_ORDER_UI.some((code) => (selectedCountsByGroup[code] || 0) === 0) ? (
+                          <div style={{ fontSize: "11.5px", color: "#93c5fd", lineHeight: "1.45" }}>
+                            💡 참고: 일부 전략군이 미포함된 구성입니다. 3대 전략군(📈 추세·스윙 / ⚡ 변동성·돌파 / 🔄 역추세·그리드)을 균형 편성하면 장세 전환 대응력이 높아집니다.
+                          </div>
+                        ) : null}
+                      </div>
+
+                      {/* 전략군 필터 탭 & 보기 모드 전환 바 */}
+                      <div
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          flexWrap: "wrap",
+                          gap: "8px",
+                          marginBottom: "14px",
+                        }}
+                      >
+                        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
+                          <button
+                            type="button"
+                            onClick={() => setLiveBotGroupFilter("ALL")}
+                            style={{
+                              padding: "5px 11px",
+                              borderRadius: "999px",
+                              fontSize: "12px",
+                              fontWeight: 700,
+                              cursor: "pointer",
+                              border: liveBotGroupFilter === "ALL" ? "1px solid #60a5fa" : "1px solid #334155",
+                              background: liveBotGroupFilter === "ALL" ? "rgba(59, 130, 246, 0.22)" : "rgba(15, 23, 42, 0.75)",
+                              color: liveBotGroupFilter === "ALL" ? "#93c5fd" : "#94a3b8",
+                            }}
+                          >
+                            전체 봇 ({allSelectableBots.length})
+                          </button>
+                          {STRATEGY_GROUP_ORDER_UI.map((groupCode) => {
+                            const gMeta = STRATEGY_GROUP_META_UI[groupCode];
+                            const cnt = allSelectableBots.filter((b) => b.stratMeta.groupCode === groupCode).length;
+                            const isActive = liveBotGroupFilter === groupCode;
+                            return (
+                              <button
+                                key={groupCode}
+                                type="button"
+                                onClick={() => setLiveBotGroupFilter(groupCode)}
+                                style={{
+                                  padding: "5px 11px",
+                                  borderRadius: "999px",
+                                  fontSize: "12px",
+                                  fontWeight: 700,
+                                  cursor: "pointer",
+                                  border: isActive ? `1px solid ${gMeta.border}` : "1px solid #334155",
+                                  background: isActive ? gMeta.bg : "rgba(15, 23, 42, 0.75)",
+                                  color: isActive ? gMeta.color : "#94a3b8",
+                                }}
+                              >
+                                {gMeta.icon} {gMeta.group} ({cnt})
+                              </button>
+                            );
+                          })}
+                        </div>
+
+                        <div style={{ display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap" }}>
+                          <button
+                            type="button"
+                            onClick={() => setLiveBotViewMode("group")}
+                            style={{
+                              padding: "5px 10px",
+                              borderRadius: "8px",
+                              fontSize: "11.5px",
+                              fontWeight: 700,
+                              cursor: "pointer",
+                              border: liveBotViewMode === "group" ? "1px solid #60a5fa" : "1px solid #334155",
+                              background: liveBotViewMode === "group" ? "rgba(59, 130, 246, 0.2)" : "rgba(15, 23, 42, 0.7)",
+                              color: liveBotViewMode === "group" ? "#93c5fd" : "#94a3b8",
+                            }}
+                          >
+                            🗂️ 전략군별 구분 보기
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setLiveBotViewMode("rank")}
+                            style={{
+                              padding: "5px 10px",
+                              borderRadius: "8px",
+                              fontSize: "11.5px",
+                              fontWeight: 700,
+                              cursor: "pointer",
+                              border: liveBotViewMode === "rank" ? "1px solid #60a5fa" : "1px solid #334155",
+                              background: liveBotViewMode === "rank" ? "rgba(59, 130, 246, 0.2)" : "rgba(15, 23, 42, 0.7)",
+                              color: liveBotViewMode === "rank" ? "#93c5fd" : "#94a3b8",
+                            }}
+                          >
+                            🏆 수익률 순위순 보기
+                          </button>
+                        </div>
+                      </div>
+
+                      {liveBotViewMode === "group" ? (
+                        <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                          {groupCodesToRender.map((groupCode) => {
+                            const gMeta = STRATEGY_GROUP_META_UI[groupCode];
+                            const groupBots = allSelectableBots.filter((b) => b.stratMeta.groupCode === groupCode);
+                            const selectedInGroup = groupBots.filter((b) => selectedLiveBotIds.includes(b.bot_id)).length;
+                            return (
+                              <div
+                                key={groupCode}
+                                style={{
+                                  background: gMeta.sectionBg,
+                                  border: `1px solid ${gMeta.sectionBorder}`,
+                                  borderRadius: "12px",
+                                  padding: "14px",
+                                }}
+                              >
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    justifyContent: "space-between",
+                                    alignItems: "center",
+                                    flexWrap: "wrap",
+                                    gap: "8px",
+                                    marginBottom: "6px",
+                                  }}
+                                >
+                                  <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                                    <span style={{ fontSize: "14px", fontWeight: 800, color: gMeta.color }}>
+                                      {gMeta.icon} {gMeta.title} ({groupBots.length}종)
+                                    </span>
+                                    <span
+                                      style={{
+                                        fontSize: "11px",
+                                        padding: "2px 8px",
+                                        borderRadius: "999px",
+                                        fontWeight: 700,
+                                        background: gMeta.bg,
+                                        border: `1px solid ${gMeta.border}`,
+                                        color: gMeta.color,
+                                      }}
+                                    >
+                                      {gMeta.regimeFit}
+                                    </span>
+                                  </div>
+                                  <span style={{ fontSize: "12px", fontWeight: 700, color: selectedInGroup > 0 ? "#93c5fd" : "#94a3b8" }}>
+                                    현재 선택됨: {selectedInGroup}개
+                                  </span>
+                                </div>
+                                <div style={{ fontSize: "12px", color: "#cbd5e1", marginBottom: "12px", lineHeight: "1.45" }}>
+                                  {gMeta.detailDesc}
+                                </div>
+                                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: "12px" }}>
+                                  {groupBots.map((bot) => renderBotSelectCard(bot))}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: "12px" }}>
+                          {filteredByRank.map((bot) => renderBotSelectCard(bot))}
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
               </div>
 
               {/* Step 2: 선택된 실전 봇 동적 투자금 설정 패널 (선택된 1~3개 봇만 동적 렌더링) */}
@@ -7495,6 +9263,63 @@ export default function App() {
                   padding: "18px",
                 }}
               >
+                {(() => {
+                  const willDrainBots = bots.filter(
+                    (b) =>
+                      !selectedLiveBotIds.includes(b.bot_id) &&
+                      Number(b.is_selected_for_live) === 1 &&
+                      ((Array.isArray(b.open_positions) && b.open_positions.length > 0) ||
+                        Number(b.used_capital || 0) > 0)
+                  );
+                  if (willDrainBots.length === 0 && drainingBotsList.length === 0) return null;
+                  return (
+                    <div
+                      style={{
+                        background: "rgba(234, 179, 8, 0.12)",
+                        border: "1px solid rgba(245, 158, 11, 0.55)",
+                        borderRadius: "8px",
+                        padding: "12px 14px",
+                        marginBottom: "14px",
+                        color: "#fde68a",
+                        fontSize: "12.5px",
+                        lineHeight: "1.5",
+                      }}
+                    >
+                      <div style={{ fontWeight: 800, marginBottom: "4px", color: "#fcd34d" }}>
+                        🛡️ 포지션 보호(Graceful Drain) 안내 — 강제 시장가 손절 절대 없음
+                      </div>
+                      {willDrainBots.length > 0 && (
+                        <div>
+                          • 교체(해제) 예정 봇 중 미매도 코인 보유 봇:{" "}
+                          <strong>
+                            {willDrainBots
+                              .map(
+                                (b) =>
+                                  `${b.nickname || b.bot_id} [${getBotStrategyMeta(b).group}] (${(b.open_positions || []).length}건 · ${Math.floor(Number(b.used_capital || 0)).toLocaleString("ko-KR")}원)`
+                              )
+                              .join(", ")}
+                          </strong>
+                          <br />
+                          저장 시 강제 청산하지 않고 <strong>&quot;기존 봇 포지션 청산 대기(Graceful Drain)&quot;</strong> 모드로 자동 전환되어, 신규 매수만 중단하고 보유 물량은 해당 봇의 익절/손절/트레일링 스탑 알고리즘으로 끝까지 안전하게 매도합니다.
+                        </div>
+                      )}
+                      {drainingBotsList.length > 0 && (
+                        <div style={{ marginTop: willDrainBots.length > 0 ? "6px" : "0px", color: "#fef08a" }}>
+                          • 현재 청산 대기(Graceful Drain) 실행 중:{" "}
+                          <strong>
+                            {drainingBotsList
+                              .map(
+                                (b) =>
+                                  `${b.nickname || b.bot_id} [${getBotStrategyMeta(b).group}] (${(b.open_positions || []).map((p) => p.market).join(", ") || "보유중"} · ${Math.floor(Number(b.used_capital || 0)).toLocaleString("ko-KR")}원)`
+                              )
+                              .join(", ")}
+                          </strong>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+
                 {isLiveConfigDirty && (
                   <div
                     style={{
@@ -7668,11 +9493,16 @@ export default function App() {
                               padding: "16px",
                             }}
                           >
-                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
-                              <div style={{ fontWeight: 800, fontSize: "15px", color: "#93c5fd" }}>
-                                {botObj.nickname || botObj.name}
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "8px", marginBottom: "8px" }}>
+                              <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                                <div style={{ fontWeight: 800, fontSize: "15px", color: "#93c5fd" }}>
+                                  {botObj.nickname || botObj.name}
+                                </div>
+                                <div style={{ display: "flex", gap: "4px", flexWrap: "wrap" }}>
+                                  {renderStrategyGroupBadge(botObj.bot_id ? botObj : botId, { showSubType: true, compact: true })}
+                                </div>
                               </div>
-                              <span style={{ fontSize: "11px", color: "#64748b" }}>{botId}</span>
+                              <span style={{ fontSize: "11px", color: "#64748b", fontFamily: "monospace" }}>{botId}</span>
                             </div>
 
                             <div style={{ marginBottom: "12px" }}>
@@ -7733,6 +9563,15 @@ export default function App() {
                       return sum + Math.floor(numericCap * (Number(liveAllocRatios[id] || 0) / 100));
                     }, 0);
                     const is100 = Math.abs(ratioSum - 100) < 0.1;
+                    const groupRatioSplit = STRATEGY_GROUP_ORDER_UI.map((code) => {
+                      const gMeta = STRATEGY_GROUP_META_UI[code];
+                      const pct = selectedLiveBotIds.reduce(
+                        (sum, id) =>
+                          sum + (getBotStrategyMeta(id).groupCode === code ? Number(liveAllocRatios[id] || 0) : 0),
+                        0
+                      );
+                      return { code, gMeta, pct: Math.round(pct) };
+                    });
 
                     return (
                       <div style={{ background: "#111827", borderRadius: "8px", padding: "14px", border: "1px solid #1f2937" }}>
@@ -7741,6 +9580,27 @@ export default function App() {
                             <div style={{ fontSize: "12px", color: "#94a3b8" }}>비율 합계 검증</div>
                             <div style={{ fontSize: "15px", fontWeight: 800, color: is100 ? "#4ade80" : "#f87171" }}>
                               {ratioSum}% {is100 ? "✓ 100% 일치" : "(정확히 100%여야 저장 가능)"}
+                            </div>
+                          </div>
+                          <div>
+                            <div style={{ fontSize: "12px", color: "#94a3b8", marginBottom: "3px" }}>전략군별 배분 비중</div>
+                            <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
+                              {groupRatioSplit.map(({ code, gMeta, pct }) => (
+                                <span
+                                  key={code}
+                                  style={{
+                                    fontSize: "11.5px",
+                                    padding: "2px 8px",
+                                    borderRadius: "999px",
+                                    fontWeight: 700,
+                                    background: pct > 0 ? gMeta.bg : "rgba(30, 41, 59, 0.7)",
+                                    border: pct > 0 ? `1px solid ${gMeta.border}` : "1px solid #334155",
+                                    color: pct > 0 ? gMeta.color : "#64748b",
+                                  }}
+                                >
+                                  {gMeta.icon} {gMeta.group} {pct}%
+                                </span>
+                              ))}
                             </div>
                           </div>
                           <div>
@@ -7822,8 +9682,9 @@ export default function App() {
                         overflow: "hidden",
                       }}
                     >
-                      <div style={{ fontWeight: 800, fontSize: "15px", marginBottom: "4px" }}>
-                        {b.name}
+                      <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", marginBottom: "6px" }}>
+                        <span style={{ fontWeight: 800, fontSize: "15px" }}>{b.name}</span>
+                        {renderStrategyGroupBadge(b, { showSubType: true, compact: true })}
                       </div>
                       <div style={{ fontSize: "12px", color: "#94a3b8", marginBottom: "12px" }}>
                         알고리즘 소스: <code>backend/common/algo_lab_service.mjs (STRATEGIES.{b.bot_id})</code>
@@ -8170,7 +10031,7 @@ export default function App() {
                 4. 데이터 마이그레이션 및 복원 (JSON)
               </h3>
               <p style={{ fontSize: "13px", color: "#94a3b8", marginBottom: "16px" }}>
-                SQLite 데이터베이스의 전체 데이터(봇 설정, 거래 내역, 포지션, 시스템 설정)를 JSON 파일로 백업(마이그레이션)하거나, JSON 파일을 읽어 복원합니다.
+                SQLite 데이터베이스의 전체 데이터(봇 설정, 거래 내역, 포지션, 시스템 설정, 주간 로테이션 설정/이력)를 JSON 파일로 백업(마이그레이션)하거나, JSON 파일을 읽어 복원합니다.
               </p>
               <div className="btn-group">
                 <button type="button" className="btn btn-primary" onClick={handleExportJson}>

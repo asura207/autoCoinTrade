@@ -788,17 +788,127 @@ def execute_sell_order(
             ),
         )
 
-        # 2. bot_accounts에 회수된 원화 반영 및 실현 손익 누적
-        conn.execute(
-            """
-            UPDATE bot_accounts
-            SET virtual_krw = virtual_krw + ?,
-                total_realized_pnl = total_realized_pnl + ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE bot_id = ?;
-            """,
-            (net_sell_amount, realized_pnl, norm_bot_id),
-        )
+        # 2. 실전 선택 여부 확인 (Graceful Drain 탈락 봇 청산 시 회수 원화 활성 봇 자동 귀속)
+        bot_live_row = conn.execute(
+            "SELECT is_selected_for_live FROM bots WHERE bot_id = ?;",
+            (norm_bot_id,),
+        ).fetchone()
+        if bot_live_row is None:
+            bot_live_row = conn.execute(
+                "SELECT is_selected_for_live FROM bot_accounts WHERE bot_id = ?;",
+                (norm_bot_id,),
+            ).fetchone()
+        is_selected_live = int(dict(bot_live_row).get("is_selected_for_live") or 0) == 1 if bot_live_row is not None else True
+
+        if not is_selected_live:
+            # 탈락(Draining) 봇: 실현 손익 누적만 기록하고, 회수 원화는 현재 활성 실전 봇들의 allocation_ratio 비율대로 즉시 이관
+            remaining_open_row = conn.execute(
+                "SELECT COALESCE(SUM(buy_amount), 0) AS open_used FROM bot_positions WHERE (bot_id = ? OR bot_id = ?) AND status = 'OPEN';",
+                (bot_id, norm_bot_id),
+            ).fetchone()
+            remaining_open_used = math.floor(float(dict(remaining_open_row).get("open_used") or 0))
+            conn.execute(
+                """
+                UPDATE bot_accounts
+                SET virtual_krw = 0,
+                    allocated_capital = ?,
+                    total_realized_pnl = total_realized_pnl + ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE bot_id = ?;
+                """,
+                (remaining_open_used, realized_pnl, norm_bot_id),
+            )
+            conn.execute(
+                """
+                UPDATE bots
+                SET virtual_krw = 0,
+                    allocated_capital = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE bot_id = ?;
+                """,
+                (remaining_open_used, norm_bot_id),
+            )
+
+            floored_proceeds = max(0, math.floor(net_sell_amount))
+            active_rows = conn.execute(
+                """
+                SELECT bot_id, COALESCE(allocation_ratio, 0) AS allocation_ratio
+                FROM bots
+                WHERE is_selected_for_live = 1
+                ORDER BY allocation_ratio DESC, bot_id ASC;
+                """
+            ).fetchall()
+            if not active_rows:
+                active_rows = conn.execute(
+                    """
+                    SELECT bot_id, COALESCE(allocation_ratio, 0) AS allocation_ratio
+                    FROM bot_accounts
+                    WHERE is_selected_for_live = 1
+                    ORDER BY allocation_ratio DESC, bot_id ASC;
+                    """
+                ).fetchall()
+
+            active_list = [dict(r) for r in active_rows]
+            ratio_sum = sum(max(0.0, float(r.get("allocation_ratio") or 0.0)) for r in active_list)
+            transfer_logs = []
+            if active_list and floored_proceeds > 0:
+                for active_bot in active_list:
+                    ratio_val = max(0.0, float(active_bot.get("allocation_ratio") or 0.0))
+                    if ratio_sum > 0:
+                        share = math.floor(floored_proceeds * (ratio_val / ratio_sum))
+                    else:
+                        share = math.floor(floored_proceeds / len(active_list))
+                    if share > 0:
+                        target_id = active_bot["bot_id"]
+                        conn.execute(
+                            """
+                            UPDATE bot_accounts
+                            SET virtual_krw = virtual_krw + ?,
+                                allocated_capital = allocated_capital + ?,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE bot_id = ?;
+                            """,
+                            (share, share, target_id),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE bots
+                            SET virtual_krw = virtual_krw + ?,
+                                allocated_capital = allocated_capital + ?,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE bot_id = ?;
+                            """,
+                            (share, share, target_id),
+                        )
+                        transfer_logs.append(f"{target_id}+{share:,}원")
+
+            logger.info(
+                f"[{norm_bot_id}] [Graceful Drain 정산 이관] 탈락 봇 {ticker} 매도 정산금 {floored_proceeds:,}원 "
+                f"(실현손익 {realized_pnl:+,.0f}원) 회수 -> 활성 실전 봇 충전: "
+                f"{', '.join(transfer_logs) if transfer_logs else '이관 대상 없음'}"
+            )
+        else:
+            # 일반 활성 봇: bot_accounts & bots 가상 원화 복원 및 실현 손익 누적
+            floored_proceeds = math.floor(net_sell_amount)
+            conn.execute(
+                """
+                UPDATE bot_accounts
+                SET virtual_krw = virtual_krw + ?,
+                    total_realized_pnl = total_realized_pnl + ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE bot_id = ?;
+                """,
+                (floored_proceeds, realized_pnl, norm_bot_id),
+            )
+            conn.execute(
+                """
+                UPDATE bots
+                SET virtual_krw = virtual_krw + ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE bot_id = ?;
+                """,
+                (floored_proceeds, norm_bot_id),
+            )
 
         conn.execute("COMMIT;")
         logger.info(

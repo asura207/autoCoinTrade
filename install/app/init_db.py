@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -33,6 +34,72 @@ ENV_PATH = PROJECT_ROOT / ".env"
 DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_SQLITE_PATH = str(DATA_DIR / "auto_coin_trade.db")
 DEFAULT_DB_PATH = DEFAULT_SQLITE_PATH
+
+ALL_BOT_IDS = tuple(f"bot_{i:02d}" for i in range(1, 11))
+DEFAULT_BOT_OVERRIDES: Dict[str, str] = {bot_id: "ALLOW" for bot_id in ALL_BOT_IDS}
+DEFAULT_BOT_OVERRIDES_JSON = json.dumps(DEFAULT_BOT_OVERRIDES, ensure_ascii=False, separators=(",", ":"))
+LEGACY_BOT_OVERRIDE_ALIAS = {
+    "bot_vb": "bot_01",
+    "bot_momentum": "bot_03",
+    "bot_bb": "bot_05",
+}
+BOT_STRATEGY_GROUP_MAP: Dict[str, str] = {
+    "bot_02": "TREND_SWING",
+    "bot_03": "TREND_SWING",
+    "bot_07": "TREND_SWING",
+    "bot_08": "TREND_SWING",
+    "bot_01": "VOLATILITY_BREAKOUT",
+    "bot_04": "VOLATILITY_BREAKOUT",
+    "bot_09": "VOLATILITY_BREAKOUT",
+    "bot_05": "REVERSAL_GRID",
+    "bot_06": "REVERSAL_GRID",
+    "bot_10": "REVERSAL_GRID",
+}
+KST_TZ = timezone(timedelta(hours=9))
+
+
+def _now_kst_str() -> str:
+    return datetime.now(KST_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _compute_next_rotation_kst(day_of_week: int = 1, hour_kst: int = 9) -> str:
+    """0=일, 1=월 ... 6=토 기준 다음 주간 로테이션 예정 KST 시각 문자열 반환"""
+    now = datetime.now(KST_TZ).replace(minute=0, second=0, microsecond=0)
+    cur_dow = (now.weekday() + 1) % 7
+    delta_days = (int(day_of_week) - cur_dow) % 7
+    candidate = (now + timedelta(days=delta_days)).replace(hour=int(hour_kst), minute=0, second=0, microsecond=0)
+    if candidate <= datetime.now(KST_TZ):
+        candidate += timedelta(days=7)
+    return candidate.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def normalize_bot_overrides(raw_overrides: Any) -> Dict[str, str]:
+    """
+    기존 3대 레거시 키(bot_vb 등)나 일부 누락된 봇 키가 전달되어도
+    표준 10대 봇(bot_01 ~ bot_10) 딕셔너리('ALLOW'|'BLOCK')로 병합/정규화합니다.
+    """
+    parsed: Dict[str, Any] = {}
+    if isinstance(raw_overrides, str) and raw_overrides.strip():
+        try:
+            loaded = json.loads(raw_overrides)
+            if isinstance(loaded, dict):
+                parsed = loaded
+        except Exception:
+            parsed = {}
+    elif isinstance(raw_overrides, dict):
+        parsed = raw_overrides
+
+    result: Dict[str, str] = {bot_id: "ALLOW" for bot_id in ALL_BOT_IDS}
+    for legacy_key, modern_key in LEGACY_BOT_OVERRIDE_ALIAS.items():
+        val = str(parsed.get(legacy_key, "")).strip().upper()
+        if val in ("ALLOW", "BLOCK") and modern_key not in parsed:
+            result[modern_key] = val
+
+    for bot_id in ALL_BOT_IDS:
+        val = str(parsed.get(bot_id, "")).strip().upper()
+        if val in ("ALLOW", "BLOCK"):
+            result[bot_id] = val
+    return result
 
 def _load_env():
     if ENV_PATH.exists():
@@ -146,6 +213,8 @@ class PgConnectionWrapper:
             s = re.sub(r"INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", s, flags=re.I)
             if "ON CONFLICT" not in s.upper():
                 if tbl == "market_regime_filter":
+                    s += " ON CONFLICT (id) DO NOTHING"
+                elif tbl == "auto_rotation_config":
                     s += " ON CONFLICT (id) DO NOTHING"
                 elif tbl == "bot_accounts":
                     s += " ON CONFLICT (bot_id) DO NOTHING"
@@ -274,10 +343,35 @@ def init_database(db_path: Optional[str] = None) -> None:
                 step_level INTEGER DEFAULT 1,
                 status TEXT NOT NULL DEFAULT 'OPEN',
                 created_at TEXT NOT NULL,
-                closed_at TEXT
+                closed_at TEXT,
+                sell_order_uuid TEXT,
+                sell_price {real_type},
+                sell_amount {real_type},
+                sell_fee {real_type},
+                realized_pnl {real_type},
+                pnl_pct {real_type}
             );
             """
         )
+        pos_alter_cols = [
+            ("sell_order_uuid", "TEXT"),
+            ("sell_price", real_type),
+            ("sell_amount", real_type),
+            ("sell_fee", real_type),
+            ("realized_pnl", real_type),
+            ("pnl_pct", real_type),
+        ]
+        if sqlite_mode:
+            existing_pos_cols = {
+                dict(r)["name"]
+                for r in conn.execute("PRAGMA table_info(bot_positions);").fetchall()
+            }
+            for col_name, col_def in pos_alter_cols:
+                if col_name not in existing_pos_cols:
+                    conn.execute(f"ALTER TABLE bot_positions ADD COLUMN {col_name} {col_def};")
+        else:
+            for col_name, col_def in pos_alter_cols:
+                conn.execute(f"ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS {col_name} {col_def};")
 
         # 3. LLM 시장 체제 & 뉴스 감성 필터 테이블 (market_regime_filter)
         conn.execute(
@@ -289,7 +383,7 @@ def init_database(db_path: Optional[str] = None) -> None:
                 risk_alert INTEGER DEFAULT 0,
                 recommended_action TEXT DEFAULT 'NORMAL',
                 position_size_multiplier {real_type} DEFAULT 1.0,
-                bot_overrides_json TEXT DEFAULT '{{"bot_vb":"ALLOW","bot_momentum":"ALLOW","bot_bb":"ALLOW"}}',
+                bot_overrides_json TEXT DEFAULT '{DEFAULT_BOT_OVERRIDES_JSON}',
                 blacklist_tickers_json TEXT DEFAULT '[]',
                 reason TEXT DEFAULT 'Initial default state',
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -301,10 +395,35 @@ def init_database(db_path: Optional[str] = None) -> None:
                 pro_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 final_risk_alert INTEGER DEFAULT 0,
                 final_position_multiplier {real_type} DEFAULT 1.0,
-                final_bot_overrides_json TEXT DEFAULT '{{"bot_vb":"ALLOW","bot_momentum":"ALLOW","bot_bb":"ALLOW"}}'
+                final_bot_overrides_json TEXT DEFAULT '{DEFAULT_BOT_OVERRIDES_JSON}'
             );
             """
         )
+        # 기존 구버전 DB 마이그레이션 (dual AI 컬럼 누락 시 안전 추가)
+        regime_alter_cols = [
+            ("flash_sentiment_score", f"{real_type} DEFAULT 0.0"),
+            ("flash_recommended_action", "TEXT DEFAULT 'NORMAL'"),
+            ("flash_updated_at", "TIMESTAMP" if not sqlite_mode else "TEXT"),
+            ("pro_sentiment_score", f"{real_type} DEFAULT 0.0"),
+            ("pro_recommended_action", "TEXT DEFAULT 'NORMAL'"),
+            ("pro_updated_at", "TIMESTAMP" if not sqlite_mode else "TEXT"),
+            ("final_risk_alert", "INTEGER DEFAULT 0"),
+            ("final_position_multiplier", f"{real_type} DEFAULT 1.0"),
+            ("final_bot_overrides_json", f"TEXT DEFAULT '{DEFAULT_BOT_OVERRIDES_JSON}'"),
+        ]
+        newly_added_final_col = False
+        if sqlite_mode:
+            existing_cols = {
+                dict(r)["name"]
+                for r in conn.execute("PRAGMA table_info(market_regime_filter);").fetchall()
+            }
+            newly_added_final_col = "final_bot_overrides_json" not in existing_cols
+            for col_name, col_def in regime_alter_cols:
+                if col_name not in existing_cols:
+                    conn.execute(f"ALTER TABLE market_regime_filter ADD COLUMN {col_name} {col_def};")
+        else:
+            for col_name, col_def in regime_alter_cols:
+                conn.execute(f"ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS {col_name} {col_def};")
 
         # 4. 시스템 설정 테이블 (system_settings)
         conn.execute(
@@ -325,6 +444,7 @@ def init_database(db_path: Optional[str] = None) -> None:
                 name TEXT NOT NULL,
                 nickname TEXT NOT NULL,
                 strategy_type TEXT NOT NULL,
+                strategy_group TEXT DEFAULT 'TREND_SWING',
                 description TEXT NOT NULL,
                 allocation_ratio {real_type} NOT NULL DEFAULT 0,
                 allocated_capital BIGINT NOT NULL DEFAULT 0,
@@ -346,6 +466,18 @@ def init_database(db_path: Optional[str] = None) -> None:
             );
             """
         )
+        if sqlite_mode:
+            bot_cols = {
+                dict(r)["name"]
+                for r in conn.execute("PRAGMA table_info(bots);").fetchall()
+            }
+            if "strategy_group" not in bot_cols:
+                conn.execute("ALTER TABLE bots ADD COLUMN strategy_group TEXT DEFAULT 'TREND_SWING';")
+        else:
+            conn.execute("ALTER TABLE bots ADD COLUMN IF NOT EXISTS strategy_group TEXT DEFAULT 'TREND_SWING';")
+
+        for b_id, s_grp in BOT_STRATEGY_GROUP_MAP.items():
+            conn.execute("UPDATE bots SET strategy_group = ? WHERE bot_id = ?;", (s_grp, b_id))
 
         # 6. 실전 체결 원장 테이블 (trades)
         conn.execute(
@@ -555,11 +687,50 @@ def init_database(db_path: Optional[str] = None) -> None:
             """
         )
 
-        # 10. market_regime_filter id=1 기본 행 초기화
-        initial_overrides = json.dumps(
-            {"bot_vb": "ALLOW", "bot_momentum": "ALLOW", "bot_bb": "ALLOW"},
-            ensure_ascii=False,
+        # 9-2. 주간 전략별 1위 봇 자동 선출 설정 및 이력 테이블
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_rotation_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                is_enabled INTEGER DEFAULT 1,
+                rotation_day_of_week INTEGER DEFAULT 1,
+                rotation_hour_kst INTEGER DEFAULT 9,
+                allocation_mode TEXT DEFAULT 'RANK_WEIGHTED_40_35_25',
+                min_weekly_trades INTEGER DEFAULT 2,
+                last_rotated_at TEXT,
+                next_rotation_at TEXT,
+                updated_at TEXT
+            );
+            """
         )
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS auto_rotation_history (
+                id {id_primary_key},
+                trigger_type TEXT,
+                previous_bots_json TEXT,
+                elected_bots_json TEXT,
+                draining_positions_count INTEGER DEFAULT 0,
+                transferred_krw {real_type} DEFAULT 0,
+                summary_text TEXT,
+                created_at TEXT
+            );
+            """
+        )
+        now_kst = _now_kst_str()
+        next_rot = _compute_next_rotation_kst(1, 9)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO auto_rotation_config (
+                id, is_enabled, rotation_day_of_week, rotation_hour_kst,
+                allocation_mode, min_weekly_trades, last_rotated_at, next_rotation_at, updated_at
+            ) VALUES (1, 1, 1, 9, 'RANK_WEIGHTED_40_35_25', 2, NULL, ?, ?);
+            """,
+            (next_rot, now_kst),
+        )
+
+        # 10. market_regime_filter id=1 기본 행 초기화 및 레거시(3봇)->표준(10봇) 안전 마이그레이션
+        initial_overrides = DEFAULT_BOT_OVERRIDES_JSON
         conn.execute(
             """
             INSERT OR IGNORE INTO market_regime_filter (
@@ -578,6 +749,43 @@ def init_database(db_path: Optional[str] = None) -> None:
             """,
             (initial_overrides, initial_overrides),
         )
+
+        regime_row = conn.execute(
+            "SELECT bot_overrides_json, final_bot_overrides_json FROM market_regime_filter WHERE id = 1;"
+        ).fetchone()
+        if regime_row is not None:
+            regime_dict = dict(regime_row)
+
+            def _needs_override_migration(raw_json: Any) -> bool:
+                try:
+                    parsed = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+                except Exception:
+                    return True
+                if not isinstance(parsed, dict):
+                    return True
+                if any(k in parsed for k in LEGACY_BOT_OVERRIDE_ALIAS):
+                    return True
+                return any(parsed.get(bot_id) not in ("ALLOW", "BLOCK") for bot_id in ALL_BOT_IDS)
+
+            raw_base = regime_dict.get("bot_overrides_json")
+            raw_final = None if newly_added_final_col else regime_dict.get("final_bot_overrides_json")
+            if _needs_override_migration(raw_base) or _needs_override_migration(raw_final):
+                migrated_base = json.dumps(
+                    normalize_bot_overrides(raw_base), ensure_ascii=False, separators=(",", ":")
+                )
+                migrated_final = json.dumps(
+                    normalize_bot_overrides(raw_final if raw_final else migrated_base),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                conn.execute(
+                    """
+                    UPDATE market_regime_filter
+                    SET bot_overrides_json = ?, final_bot_overrides_json = ?
+                    WHERE id = 1;
+                    """,
+                    (migrated_base, migrated_final),
+                )
 
         # 11. 10대 알고리즘 봇 기본 계좌 초기화
         initial_bots = [

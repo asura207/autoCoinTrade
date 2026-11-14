@@ -10,13 +10,19 @@ import { pgSyncManager } from "./common/pg_sync.mjs";
 import { syncNewsToDatabase, queryNewsList } from "./common/news_service.mjs";
 import * as webpush from "web-push";
 import {
+  STRATEGY_GROUP_ORDER,
+  STRATEGY_GROUP_META,
+  ALLOCATION_MODE_WEIGHTS,
   ARENA_BOT_DEFS,
   ARENA_BOT_IDS,
   normalizeBotId,
+  getBotStrategyMeta,
   ensureArenaSchema,
   seedArenaBots,
   evaluateStrategy,
   evaluateSmartExit,
+  evaluateWeeklyStrategyChampions,
+  formatKstDateTime,
   buildMarketData,
   updatePeakPrice,
   runArenaCycle,
@@ -52,7 +58,7 @@ if (fs.existsSync(ENV_PATH)) {
 const HOST = process.env.BACKEND_HOST || "0.0.0.0";
 const PORT = Number(process.env.BACKEND_PORT || process.env.PORT || 8001);
 
-let APP_VERSION = "0.0.21";
+let APP_VERSION = "0.0.22";
 try {
   const pkgJsonPath = path.join(BASE_DIR, "package.json");
   if (fs.existsSync(pkgJsonPath)) {
@@ -66,9 +72,88 @@ if (!fs.existsSync(DATA_DIR)) {
 }
 
 function nowKSTString() {
-  const d = new Date();
+  return formatKstDateTime(new Date());
+}
+
+function getKstCalendarParts(dateInput = new Date()) {
+  const ref = dateInput instanceof Date ? dateInput : new Date(dateInput);
+  const kstEpoch = new Date(ref.getTime() + 9 * 3600 * 1000);
   const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  const year = kstEpoch.getUTCFullYear();
+  const month = kstEpoch.getUTCMonth() + 1;
+  const day = kstEpoch.getUTCDate();
+  const dayOfWeek = kstEpoch.getUTCDay(); // 0: Sun .. 6: Sat
+  const hour = kstEpoch.getUTCHours();
+  const minute = kstEpoch.getUTCMinutes();
+  const second = kstEpoch.getUTCSeconds();
+  const dateStr = `${year}-${pad(month)}-${pad(day)}`;
+  const timestampStr = `${dateStr} ${pad(hour)}:${pad(minute)}:${pad(second)}`;
+  return { year, month, day, dayOfWeek, hour, minute, second, dateStr, timestampStr };
+}
+
+function computeNextRotationKstString(dayOfWeek = 1, hourKst = 9, refDate = new Date()) {
+  const targetDow = Math.max(0, Math.min(6, Math.floor(Number(dayOfWeek ?? 1))));
+  const targetHour = Math.max(0, Math.min(23, Math.floor(Number(hourKst ?? 9))));
+  const kstMs = refDate.getTime() + 9 * 3600 * 1000;
+  const kstNow = new Date(kstMs);
+  const deltaDays = (targetDow - kstNow.getUTCDay() + 7) % 7;
+  const candidateMs = Date.UTC(
+    kstNow.getUTCFullYear(),
+    kstNow.getUTCMonth(),
+    kstNow.getUTCDate() + deltaDays,
+    targetHour,
+    0,
+    0,
+    0
+  );
+  const finalMs = candidateMs <= kstMs ? candidateMs + 7 * 24 * 3600 * 1000 : candidateMs;
+  const c = new Date(finalMs);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${c.getUTCFullYear()}-${pad(c.getUTCMonth() + 1)}-${pad(c.getUTCDate())} ${pad(c.getUTCHours())}:00:00`;
+}
+
+async function syncBotAccountsFromBots(db) {
+  try {
+    const bots = await db
+      .prepare(
+        "SELECT bot_id, nickname, name, allocation_ratio, allocated_capital, virtual_krw, is_selected_for_live, updated_at FROM bots"
+      )
+      .all();
+    for (const b of bots) {
+      const updAt = b.updated_at || nowKSTString();
+      await db
+        .prepare(
+          `INSERT INTO bot_accounts (bot_id, name, allocation_ratio, allocated_capital, virtual_krw, total_realized_pnl, is_selected_for_live, updated_at)
+           VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+           ON CONFLICT (bot_id) DO NOTHING`
+        )
+        .run(
+          b.bot_id,
+          b.nickname || b.name || b.bot_id,
+          Number(b.allocation_ratio || 0),
+          Math.floor(Number(b.allocated_capital || 0)),
+          Math.floor(Number(b.virtual_krw || 0)),
+          Number(b.is_selected_for_live || 0),
+          updAt
+        );
+      await db
+        .prepare(
+          `UPDATE bot_accounts
+           SET allocation_ratio = ?, allocated_capital = ?, virtual_krw = ?, is_selected_for_live = ?, updated_at = ?
+           WHERE bot_id = ?`
+        )
+        .run(
+          Number(b.allocation_ratio || 0),
+          Math.floor(Number(b.allocated_capital || 0)),
+          Math.floor(Number(b.virtual_krw || 0)),
+          Number(b.is_selected_for_live || 0),
+          updAt,
+          b.bot_id
+        );
+    }
+  } catch {
+    // bot_accounts 테이블이 없는 경우 무시
+  }
 }
 
 function todayDateString() {
@@ -501,7 +586,13 @@ async function initializeDatabase() {
       trade_id BIGINT NOT NULL,
       status TEXT NOT NULL DEFAULT 'OPEN',
       created_at TEXT NOT NULL,
-      closed_at TEXT
+      closed_at TEXT,
+      sell_order_uuid TEXT,
+      sell_price DOUBLE PRECISION,
+      sell_amount DOUBLE PRECISION,
+      sell_fee DOUBLE PRECISION,
+      realized_pnl DOUBLE PRECISION,
+      pnl_pct DOUBLE PRECISION
     );
     CREATE TABLE IF NOT EXISTS ai_market_briefings (
       id BIGSERIAL PRIMARY KEY,
@@ -614,6 +705,34 @@ async function initializeDatabase() {
       updated_at TEXT NOT NULL,
       PRIMARY KEY (year_month, mode)
     );
+    CREATE TABLE IF NOT EXISTS auto_rotation_config (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      is_enabled INTEGER DEFAULT 1,
+      rotation_day_of_week INTEGER DEFAULT 1,
+      rotation_hour_kst INTEGER DEFAULT 9,
+      allocation_mode TEXT DEFAULT 'RANK_WEIGHTED_40_35_25',
+      min_weekly_trades INTEGER DEFAULT 2,
+      last_rotated_at TEXT,
+      next_rotation_at TEXT,
+      updated_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS auto_rotation_history (
+      id BIGSERIAL PRIMARY KEY,
+      trigger_type TEXT,
+      previous_bots_json TEXT,
+      elected_bots_json TEXT,
+      draining_positions_count INTEGER DEFAULT 0,
+      transferred_krw DOUBLE PRECISION DEFAULT 0,
+      summary_text TEXT,
+      created_at TEXT
+    );
+    ALTER TABLE bots ADD COLUMN IF NOT EXISTS strategy_group TEXT DEFAULT 'TREND_SWING';
+    ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS sell_order_uuid TEXT;
+    ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS sell_price DOUBLE PRECISION;
+    ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS sell_amount DOUBLE PRECISION;
+    ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS sell_fee DOUBLE PRECISION;
+    ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS realized_pnl DOUBLE PRECISION;
+    ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS pnl_pct DOUBLE PRECISION;
     ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS flash_sentiment_score DOUBLE PRECISION DEFAULT 0.0;
     ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS flash_recommended_action TEXT DEFAULT 'NORMAL';
     ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS flash_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
@@ -656,6 +775,23 @@ async function initializeDatabase() {
   // 10대 알고리즘 Arena: bots 테이블 스키마 보강 및 봇 시드
   const arenaSchemaInfo = await ensureArenaSchema(db);
   await seedArenaBots(db, { hadSelectionColumn: arenaSchemaInfo.hadSelectionColumn });
+
+  // 주간 자동 로테이션 기본 설정 보장 (id = 1)
+  try {
+    const nowInit = nowKSTString();
+    const defaultNextRot = computeNextRotationKstString(1, 9);
+    await db
+      .prepare(
+        `INSERT INTO auto_rotation_config (
+           id, is_enabled, rotation_day_of_week, rotation_hour_kst,
+           allocation_mode, min_weekly_trades, last_rotated_at, next_rotation_at, updated_at
+         ) VALUES (1, 1, 1, 9, 'RANK_WEIGHTED_40_35_25', 2, NULL, ?, ?)
+         ON CONFLICT (id) DO NOTHING`
+      )
+      .run(defaultNextRot, nowInit);
+  } catch (rotSeedErr) {
+    console.warn("[DB Migration] auto_rotation_config seed warning:", rotSeedErr.message);
+  }
 
   // 기존에 들어가 있던 샘플(seed) 데이터 및 매수 테스트(order-bid-* / auto-bid-*) 가상 이력 제거
   await db.exec("DELETE FROM bot_positions WHERE order_uuid LIKE 'seed-%' OR order_uuid LIKE 'order-bid-%' OR order_uuid LIKE 'auto-bid-%';");
@@ -877,8 +1013,11 @@ async function getBots(mode = null) {
     const dailyLossLimit = allocatedCap > 0 ? -Math.floor(allocatedCap * 0.04) : -40000;
     const isCircuitBreaker = Number(r.is_selected_for_live || 0) === 1 && allocatedCap > 0 && dailyProfit <= dailyLossLimit;
 
+    const meta = getBotStrategyMeta(r.bot_id);
+
     result.push({
       ...r,
+      ...meta,
       virtual_krw: virtualKrw,
       config,
       open_positions: openPositions,
@@ -996,6 +1135,7 @@ async function recalculateAndApplyBotAllocations(flooredTotal, ratiosMap = null,
       "UPDATE bots SET allocation_ratio = ?, allocated_capital = ?, virtual_krw = ?, updated_at = ? WHERE bot_id = ?"
     ).run(it.ratio, it.allocated, it.virtual_krw, now, it.bot_id);
   }
+  await syncBotAccountsFromBots(db);
 
   return {
     totalUsed,
@@ -3216,7 +3356,7 @@ async function resetPaperArenaAndNotify(db) {
 // ============================================================================
 // [실전 담당 봇(1~3개) 동적 투자금 배분 및 미매도 포지션 안전 승계 함수]
 // ============================================================================
-async function applyLiveBotsSelection(selected, handoverMap = [], forcedCapital = null) {
+async function applyLiveBotsSelection(selected, handoverMap = [], forcedCapital = null, options = {}) {
   const db = getDb();
   const allBots = await getBots("live");
   const ids = (selected || []).map((it) => normalizeBotId(String(it?.bot_id || "")));
@@ -3255,6 +3395,23 @@ async function applyLiveBotsSelection(selected, handoverMap = [], forcedCapital 
 
   const selectedIdSet = new Set(ids);
   const currentLiveBots = allBots.filter((b) => Number(b.is_selected_for_live) === 1);
+  const previousBotsSnapshot = currentLiveBots.map((b) => ({
+    bot_id: b.bot_id,
+    nickname: b.nickname,
+    name: b.name,
+    ...getBotStrategyMeta(b.bot_id),
+    allocation_ratio: Number(b.allocation_ratio || 0),
+    allocated_capital: Math.floor(Number(b.allocated_capital || 0)),
+    virtual_krw: Math.floor(Number(b.virtual_krw || 0)),
+    used_capital: Math.floor(Number(b.used_capital || 0)),
+    open_positions_count: (b.open_positions || []).length,
+    is_running: Number(b.is_running || 0),
+  }));
+  const hadAnyPreviousLive = currentLiveBots.length > 0;
+  const wasAnyPreviousRunning = currentLiveBots.some((b) => Number(b.is_running) === 1);
+  const nextRunningFlag =
+    options?.inheritRunningFromPrevious && hadAnyPreviousLive ? (wasAnyPreviousRunning ? 1 : 0) : 1;
+
   const removedBots = currentLiveBots.filter((b) => !selectedIdSet.has(b.bot_id));
   const addedIds = ids.filter((id) => !currentLiveBots.some((b) => b.bot_id === id));
 
@@ -3280,9 +3437,13 @@ async function applyLiveBotsSelection(selected, handoverMap = [], forcedCapital 
   for (const h of handoverPairs) inheritedByTo[h.to] = h.from;
 
   const drainingBots = allBots.filter(
-    (b) => !selectedIdSet.has(b.bot_id) && !handedFromIds.has(b.bot_id) && Number(b.used_capital || 0) > 0
+    (b) => !selectedIdSet.has(b.bot_id) && !handedFromIds.has(b.bot_id) && (Number(b.used_capital || 0) > 0 || (b.open_positions || []).length > 0)
   );
+  const drainingPositionsCount = drainingBots.reduce((acc, b) => acc + (b.open_positions || []).length, 0);
   const totalDrainingUsed = drainingBots.reduce((acc, b) => acc + Math.floor(Number(b.used_capital || 0)), 0);
+  const reclaimedVirtualKrw = allBots
+    .filter((b) => !selectedIdSet.has(b.bot_id))
+    .reduce((acc, b) => acc + Math.max(0, Math.floor(Number(b.virtual_krw || 0))), 0);
   const availableForSelectedTotal = Math.max(0, flooredTotal - totalDrainingUsed);
 
   const selectedRatiosMap = Object.fromEntries(
@@ -3314,9 +3475,10 @@ async function applyLiveBotsSelection(selected, handoverMap = [], forcedCapital 
     for (const b of allBots) {
       if (selectedIdSet.has(b.bot_id)) continue;
       const drainUsed = handedFromIds.has(b.bot_id) ? 0 : Math.floor(Number(b.used_capital || 0));
+      const openCnt = handedFromIds.has(b.bot_id) ? 0 : (b.open_positions || []).length;
       const statusMsg =
-        drainUsed > 0
-          ? `[포지션 보호 청산 대기] 실전 해제됨 · 기존 보유 물량(${drainUsed.toLocaleString("ko-KR")}원) 고유 전략 익절/손절 감시중`
+        drainUsed > 0 || openCnt > 0
+          ? `[🛡️ Graceful Drain] 실전 교체됨 · 미매도 포지션 ${openCnt}건(${drainUsed.toLocaleString("ko-KR")}원) 매도 감시 및 청산 시 활성 봇 자동 이관 대기`
           : "실전 미선택 대기 중";
       await db.prepare(`
         UPDATE bots
@@ -3328,9 +3490,9 @@ async function applyLiveBotsSelection(selected, handoverMap = [], forcedCapital 
     for (const pl of plan) {
       await db.prepare(`
         UPDATE bots
-        SET is_selected_for_live = 1, is_running = 1, allocation_ratio = ?, allocated_capital = ?, virtual_krw = ?, updated_at = ?
+        SET is_selected_for_live = 1, is_running = ?, allocation_ratio = ?, allocated_capital = ?, virtual_krw = ?, updated_at = ?
         WHERE bot_id = ?
-      `).run(Number((pl.ratio * 100).toFixed(2)), pl.allocated, Math.max(0, pl.allocated - pl.used), now, pl.bot.bot_id);
+      `).run(nextRunningFlag, Number((pl.ratio * 100).toFixed(2)), pl.allocated, Math.max(0, pl.allocated - pl.used), now, pl.bot.bot_id);
     }
     await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('total_capital', ?, ?)").run(String(flooredTotal), now);
     await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('capital_configured', '1', ?)").run(now);
@@ -3352,18 +3514,27 @@ async function applyLiveBotsSelection(selected, handoverMap = [], forcedCapital 
   return {
     success: true,
     total_capital: flooredTotal,
+    reclaimed_virtual_krw: reclaimedVirtualKrw,
+    total_available_pool_krw: availableForSelectedTotal,
+    draining_positions_count: drainingPositionsCount,
+    previous_bots: previousBotsSnapshot,
     handover: handoverPairs.map((h) => ({ from_bot_id: h.from.bot_id, to_bot_id: h.to })),
     draining_bots: drainingBots.map((b) => ({
       bot_id: b.bot_id,
       nickname: b.nickname,
+      ...getBotStrategyMeta(b.bot_id),
+      open_positions_count: (b.open_positions || []).length,
       used_capital: Math.floor(Number(b.used_capital || 0)),
     })),
     selected_bots: updatedSelected.map((b) => ({
       bot_id: b.bot_id,
       nickname: b.nickname,
+      ...getBotStrategyMeta(b.bot_id),
       allocation_ratio: Number((Number(b.allocation_ratio || 0) / 100).toFixed(4)),
+      allocation_ratio_pct: Number(Number(b.allocation_ratio || 0).toFixed(2)),
       allocated_capital: b.allocated_capital,
       virtual_krw: b.virtual_krw,
+      is_running: Number(b.is_running || 0),
     })),
     bots: liveBots,
   };
@@ -3603,6 +3774,7 @@ ${botSummary}
           name: botInfo?.name || b.bot_id,
           nickname: botInfo?.nickname || b.bot_id,
           strategy_type: botInfo?.strategy_type || "",
+          ...getBotStrategyMeta(b.bot_id),
           allocation_ratio: b.allocation_ratio,
           reason: b.reason,
         };
@@ -3627,6 +3799,15 @@ ${botSummary}
 async function checkAndRunScheduledLlmWeeklyBotSelection() {
   if (isWeeklyBotSelectionRunning) return;
   try {
+    // 주간 전략별 1위 봇 자동 선출(Auto-Rotation)이 활성화되어 있으면 LLM 레거시 일괄 덮어쓰기를 건너뜀
+    try {
+      const db = getDb();
+      const rotCfg = await db.prepare("SELECT is_enabled FROM auto_rotation_config WHERE id = 1").get();
+      if (rotCfg && Number(rotCfg.is_enabled ?? 1) === 1) {
+        return;
+      }
+    } catch {}
+
     const slotInfo = getWeeklySundaySlotInfo();
     const lastSlotKey = await getSetting("llm_weekly_bot_selection_last_slot", "");
     // 현재 일요일 09:00 슬롯에 대한 자동 선정이 아직 실행되지 않았으면 실행
@@ -3636,6 +3817,261 @@ async function checkAndRunScheduledLlmWeeklyBotSelection() {
     }
   } catch (err) {
     console.warn("[Weekly Bot Scheduler] 스케줄러 실행 오류:", err.message);
+  }
+}
+
+// ============================================================================
+// [주간 전략별 챔피언(3대 전략군 1위 봇) 자동 로테이션 & Graceful Drain 엔진]
+// ============================================================================
+let isAutoRotationExecuting = false;
+
+async function getAutoRotationConfig(db) {
+  let row = await db.prepare("SELECT * FROM auto_rotation_config WHERE id = 1").get();
+  if (!row) {
+    const nowStr = nowKSTString();
+    const nextStr = computeNextRotationKstString(1, 9);
+    await db
+      .prepare(
+        `INSERT INTO auto_rotation_config (
+           id, is_enabled, rotation_day_of_week, rotation_hour_kst,
+           allocation_mode, min_weekly_trades, last_rotated_at, next_rotation_at, updated_at
+         ) VALUES (1, 1, 1, 9, 'RANK_WEIGHTED_40_35_25', 2, NULL, ?, ?)
+         ON CONFLICT (id) DO NOTHING`
+      )
+      .run(nextStr, nowStr);
+    row = await db.prepare("SELECT * FROM auto_rotation_config WHERE id = 1").get();
+  }
+  const dayOfWeek = Math.max(0, Math.min(6, Number(row?.rotation_day_of_week ?? 1)));
+  const hourKst = Math.max(0, Math.min(23, Number(row?.rotation_hour_kst ?? 9)));
+  const allocMode = ALLOCATION_MODE_WEIGHTS[row?.allocation_mode]
+    ? row.allocation_mode
+    : "RANK_WEIGHTED_40_35_25";
+  return {
+    id: 1,
+    is_enabled: Number(row?.is_enabled ?? 1),
+    rotation_day_of_week: dayOfWeek,
+    rotation_hour_kst: hourKst,
+    allocation_mode: allocMode,
+    min_weekly_trades: Math.max(0, Number(row?.min_weekly_trades ?? 2)),
+    last_rotated_at: row?.last_rotated_at || null,
+    next_rotation_at: row?.next_rotation_at || computeNextRotationKstString(dayOfWeek, hourKst),
+    updated_at: row?.updated_at || nowKSTString(),
+  };
+}
+
+async function updateAutoRotationConfig(payload = {}) {
+  const db = getDb();
+  const current = await getAutoRotationConfig(db);
+  const nextEnabled = payload.is_enabled !== undefined ? (Number(payload.is_enabled) ? 1 : 0) : current.is_enabled;
+  const nextDow =
+    payload.rotation_day_of_week !== undefined
+      ? Math.max(0, Math.min(6, Math.floor(Number(payload.rotation_day_of_week))))
+      : current.rotation_day_of_week;
+  const nextHour =
+    payload.rotation_hour_kst !== undefined
+      ? Math.max(0, Math.min(23, Math.floor(Number(payload.rotation_hour_kst))))
+      : current.rotation_hour_kst;
+  const nextMode =
+    payload.allocation_mode && ALLOCATION_MODE_WEIGHTS[payload.allocation_mode]
+      ? payload.allocation_mode
+      : current.allocation_mode;
+  const nextMinTrades =
+    payload.min_weekly_trades !== undefined
+      ? Math.max(0, Math.min(100, Math.floor(Number(payload.min_weekly_trades))))
+      : current.min_weekly_trades;
+
+  const nowStr = nowKSTString();
+  const nextRotationAt = computeNextRotationKstString(nextDow, nextHour);
+
+  await db
+    .prepare(
+      `UPDATE auto_rotation_config
+       SET is_enabled = ?, rotation_day_of_week = ?, rotation_hour_kst = ?,
+           allocation_mode = ?, min_weekly_trades = ?, next_rotation_at = ?, updated_at = ?
+       WHERE id = 1`
+    )
+    .run(nextEnabled, nextDow, nextHour, nextMode, nextMinTrades, nextRotationAt, nowStr);
+
+  return await getAutoRotationConfig(db);
+}
+
+async function getRotationStatusPayload() {
+  const db = getDb();
+  const config = await getAutoRotationConfig(db);
+  const evaluation = await evaluateWeeklyStrategyChampions(db, {
+    minWeeklyTrades: config.min_weekly_trades,
+    allocationMode: config.allocation_mode,
+  });
+  const liveBots = await getBots("live");
+  const drainingBots = liveBots
+    .filter((b) => Number(b.is_selected_for_live || 0) !== 1 && (b.open_positions || []).length > 0)
+    .map((b) => ({
+      bot_id: b.bot_id,
+      nickname: b.nickname,
+      ...getBotStrategyMeta(b.bot_id),
+      used_capital: Math.floor(Number(b.used_capital || 0)),
+      open_positions_count: (b.open_positions || []).length,
+      open_positions: b.open_positions || [],
+      last_status_msg: b.last_status_msg || "",
+    }));
+
+  const rawHistory = await db
+    .prepare("SELECT * FROM auto_rotation_history ORDER BY id DESC LIMIT 20")
+    .all();
+  const history = rawHistory.map((h) => {
+    let previousBots = [];
+    let electedBots = [];
+    try {
+      previousBots = JSON.parse(h.previous_bots_json || "[]");
+    } catch {}
+    try {
+      electedBots = JSON.parse(h.elected_bots_json || "[]");
+    } catch {}
+    return {
+      id: h.id,
+      trigger_type: h.trigger_type,
+      previous_bots: previousBots,
+      elected_bots: electedBots,
+      draining_positions_count: Number(h.draining_positions_count || 0),
+      transferred_krw: Math.floor(Number(h.transferred_krw || 0)),
+      summary_text: h.summary_text || "",
+      created_at: h.created_at,
+    };
+  });
+
+  return {
+    success: true,
+    config,
+    strategy_groups: STRATEGY_GROUP_ORDER.map((code) => STRATEGY_GROUP_META[code]),
+    allocation_modes: ALLOCATION_MODE_WEIGHTS,
+    evaluation,
+    champions: evaluation.champions,
+    groups: evaluation.groups,
+    draining_bots: drainingBots,
+    history,
+  };
+}
+
+async function executeWeeklyBotRotation({ triggerType = "MANUAL_IMMEDIATE", forcedCapital = null } = {}) {
+  if (isAutoRotationExecuting) {
+    return { success: false, message: "주간 전략별 1위 봇 로테이션이 이미 실행 중입니다." };
+  }
+  isAutoRotationExecuting = true;
+  try {
+    const db = getDb();
+    const config = await getAutoRotationConfig(db);
+    const evaluation = await evaluateWeeklyStrategyChampions(db, {
+      minWeeklyTrades: config.min_weekly_trades,
+      allocationMode: config.allocation_mode,
+    });
+
+    if (!evaluation.champions || evaluation.champions.length === 0) {
+      throw new Error("선출 가능한 전략군별 챔피언 봇이 없습니다.");
+    }
+
+    const selected = evaluation.champions.map((c) => ({
+      bot_id: c.bot_id,
+      allocation_ratio: Number((Number(c.recommended_ratio || 0) / 100).toFixed(4)),
+    }));
+
+    const applyRes = await applyLiveBotsSelection(selected, [], forcedCapital, {
+      inheritRunningFromPrevious: triggerType === "SCHEDULED_WEEKLY",
+    });
+
+    const nowStr = nowKSTString();
+    const nextRotStr = computeNextRotationKstString(config.rotation_day_of_week, config.rotation_hour_kst);
+
+    const electedSummaryItems = evaluation.champions.map((c) => ({
+      bot_id: c.bot_id,
+      nickname: c.nickname,
+      name: c.name,
+      strategy_group_code: c.strategy_group_code,
+      strategy_group: c.strategy_group,
+      strategy_group_label: c.strategy_group_label,
+      champion_rank: c.champion_rank,
+      allocation_ratio_pct: c.recommended_ratio,
+      weekly_return_pct: c.weekly_return_pct,
+      profit_rate_pct: c.profit_rate_pct,
+      mdd_pct: c.mdd_pct,
+      win_rate_pct: c.eval_win_rate_pct,
+      weekly_trade_count: c.weekly_trade_count,
+      rotation_score: c.rotation_score,
+      evaluation_basis: c.evaluation_basis,
+    }));
+
+    const champText = electedSummaryItems
+      .map(
+        (c) =>
+          `[${c.strategy_group}] ${c.nickname}(${c.allocation_ratio_pct}%, 점수 ${c.rotation_score >= 0 ? "+" : ""}${c.rotation_score})`
+      )
+      .join(" · ");
+    const summaryText = `${triggerType === "SCHEDULED_WEEKLY" ? "주간 자동" : "수동 즉시"} 로테이션 (${config.allocation_mode}): ${champText} | 보호 포지션 ${applyRes.draining_positions_count}건 · 즉시 이관 ${Number(applyRes.reclaimed_virtual_krw || 0).toLocaleString("ko-KR")}원`;
+
+    await db
+      .prepare(
+        `INSERT INTO auto_rotation_history (
+           trigger_type, previous_bots_json, elected_bots_json,
+           draining_positions_count, transferred_krw, summary_text, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        triggerType,
+        JSON.stringify(applyRes.previous_bots || []),
+        JSON.stringify(electedSummaryItems),
+        Number(applyRes.draining_positions_count || 0),
+        Math.floor(Number(applyRes.reclaimed_virtual_krw || 0)),
+        summaryText,
+        nowStr
+      );
+
+    await db
+      .prepare(
+        `UPDATE auto_rotation_config
+         SET last_rotated_at = ?, next_rotation_at = ?, updated_at = ?
+         WHERE id = 1`
+      )
+      .run(nowStr, nextRotStr, nowStr);
+
+    console.log(`[Auto-Rotation] ${summaryText}`);
+    const status = await getRotationStatusPayload();
+    return {
+      success: true,
+      trigger_type: triggerType,
+      summary_text: summaryText,
+      elected_bots: electedSummaryItems,
+      apply_result: applyRes,
+      status,
+    };
+  } finally {
+    isAutoRotationExecuting = false;
+  }
+}
+
+async function checkAndRunScheduledAutoRotation() {
+  if (isAutoRotationExecuting) return;
+  try {
+    const db = getDb();
+    const config = await getAutoRotationConfig(db);
+    if (Number(config.is_enabled) !== 1) return;
+
+    const kst = getKstCalendarParts(new Date());
+    if (kst.dayOfWeek !== Number(config.rotation_day_of_week)) return;
+    if (kst.hour < Number(config.rotation_hour_kst)) return;
+
+    const lastRotated = String(config.last_rotated_at || "");
+    if (lastRotated && lastRotated.slice(0, 10) === kst.dateStr) {
+      const lastHour = Number(lastRotated.slice(11, 13));
+      if (!Number.isNaN(lastHour) && lastHour >= Number(config.rotation_hour_kst)) {
+        return;
+      }
+    }
+
+    console.log(
+      `[Auto-Rotation Scheduler] KST ${kst.timestampStr} 예약 시점 도래 (요일=${config.rotation_day_of_week}, 시=${config.rotation_hour_kst}) -> 주간 전략별 1위 봇 자동 선출 실행`
+    );
+    await executeWeeklyBotRotation({ triggerType: "SCHEDULED_WEEKLY" });
+  } catch (err) {
+    console.warn("[Auto-Rotation Scheduler] 스케줄러 오류:", err.message);
   }
 }
 
@@ -4181,6 +4617,32 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/ai/weekly-bot-selection/run" && req.method === "POST") {
       const result = await runLlmWeeklyBotSelection(true);
       return sendJson(res, result.success ? 200 : 500, result);
+    }
+
+    // [주간 전략별(3대 그룹) 1위 봇 자동 로테이션 & Graceful Drain API]
+    if (pathname === "/api/rotation/status" && req.method === "GET") {
+      const data = await getRotationStatusPayload();
+      return sendJson(res, 200, data);
+    }
+
+    if (pathname === "/api/rotation/config" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      await updateAutoRotationConfig(body || {});
+      const data = await getRotationStatusPayload();
+      return sendJson(res, 200, { ...data, message: "주간 전략별 자동 로테이션 설정이 저장되었습니다." });
+    }
+
+    if (pathname === "/api/rotation/execute-now" && req.method === "POST") {
+      try {
+        const body = await readJsonBody(req);
+        const result = await executeWeeklyBotRotation({
+          triggerType: "MANUAL_IMMEDIATE",
+          forcedCapital: body?.forced_capital ? Number(body.forced_capital) : null,
+        });
+        return sendJson(res, result.success ? 200 : 400, result);
+      } catch (err) {
+        return sendJson(res, 400, { success: false, detail: err.message });
+      }
     }
 
     if (pathname === "/api/push/vapid-public-key" && req.method === "GET") {
@@ -4878,11 +5340,13 @@ const server = http.createServer(async (req, res) => {
         draining_bots: drainingBots.map((b) => ({
           bot_id: b.bot_id,
           nickname: b.nickname,
+          ...getBotStrategyMeta(b.bot_id),
           used_capital: b.used_capital,
         })),
         selected_bots: liveBots.map((b) => ({
           bot_id: b.bot_id,
           nickname: b.nickname,
+          ...getBotStrategyMeta(b.bot_id),
           allocation_ratio: Number((Number(b.allocation_ratio || 0) / 100).toFixed(4)),
           allocated_capital: b.allocated_capital,
           virtual_krw: b.virtual_krw,
@@ -5021,13 +5485,21 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === "/api/settings/export" && req.method === "GET") {
+      let autoRotationConfig = [];
+      let autoRotationHistory = [];
+      try {
+        autoRotationConfig = await db.prepare("SELECT * FROM auto_rotation_config").all();
+        autoRotationHistory = await db.prepare("SELECT * FROM auto_rotation_history ORDER BY id DESC LIMIT 100").all();
+      } catch {}
       const payload = {
-        schema_version: "1.0",
+        schema_version: "1.1",
         exported_at: nowKSTString(),
         system_settings: await db.prepare("SELECT * FROM system_settings").all(),
         bots: await db.prepare("SELECT * FROM bots").all(),
         trades: await db.prepare("SELECT * FROM trades").all(),
         bot_positions: await db.prepare("SELECT * FROM bot_positions").all(),
+        auto_rotation_config: autoRotationConfig,
+        auto_rotation_history: autoRotationHistory,
       };
       return sendJson(res, 200, payload);
     }
@@ -5047,20 +5519,24 @@ const server = http.createServer(async (req, res) => {
         );
       }
       for (const b of payload.bots || []) {
+        const meta = getBotStrategyMeta(b.bot_id);
         await db.prepare(`
           INSERT INTO bots (
-            bot_id, name, nickname, strategy_type, description,
+            bot_id, name, nickname, strategy_type, strategy_group, description,
             allocation_ratio, allocated_capital, virtual_krw, is_running,
             min_volume_krw, stop_loss_pct, take_profit_pct, config_json,
-            last_status_msg, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            last_status_msg, updated_at,
+            is_selected_for_live, paper_initial_capital, paper_virtual_krw,
+            paper_is_running, paper_peak_equity, paper_mdd_pct, paper_status_msg
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           b.bot_id,
           b.name,
           b.nickname,
           b.strategy_type,
+          b.strategy_group || meta.strategy_group_code,
           b.description || "",
-          Number(b.allocation_ratio || 33.33),
+          Number(b.allocation_ratio ?? 0),
           Math.floor(Number(b.allocated_capital || 0)),
           Math.floor(Number(b.virtual_krw || 0)),
           Number(b.is_running || 0),
@@ -5069,7 +5545,14 @@ const server = http.createServer(async (req, res) => {
           Number(b.take_profit_pct || 5.0),
           b.config_json || "{}",
           b.last_status_msg || "복원 완료",
-          b.updated_at || now
+          b.updated_at || now,
+          Number(b.is_selected_for_live ?? (Number(b.allocation_ratio) > 0 && Number(b.is_running) === 1 ? 1 : 0)),
+          Math.floor(Number(b.paper_initial_capital || 1000000)),
+          Math.floor(Number(b.paper_virtual_krw || 1000000)),
+          Number(b.paper_is_running ?? 1),
+          Math.floor(Number(b.paper_peak_equity || 1000000)),
+          Number(b.paper_mdd_pct || 0),
+          b.paper_status_msg || "시그널 대기 중"
         );
       }
       for (const t of payload.trades || []) {
@@ -5158,6 +5641,47 @@ const server = http.createServer(async (req, res) => {
           );
         }
       }
+      if (Array.isArray(payload.auto_rotation_config) && payload.auto_rotation_config.length > 0) {
+        await db.exec("DELETE FROM auto_rotation_config;");
+        for (const c of payload.auto_rotation_config) {
+          await db.prepare(`
+            INSERT INTO auto_rotation_config (
+              id, is_enabled, rotation_day_of_week, rotation_hour_kst,
+              allocation_mode, min_weekly_trades, last_rotated_at, next_rotation_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            1,
+            Number(c.is_enabled ?? 1),
+            Number(c.rotation_day_of_week ?? 1),
+            Number(c.rotation_hour_kst ?? 9),
+            c.allocation_mode || "RANK_WEIGHTED_40_35_25",
+            Number(c.min_weekly_trades ?? 2),
+            c.last_rotated_at ?? null,
+            c.next_rotation_at ?? computeNextRotationKstString(Number(c.rotation_day_of_week ?? 1), Number(c.rotation_hour_kst ?? 9)),
+            c.updated_at || now
+          );
+        }
+      }
+      if (Array.isArray(payload.auto_rotation_history) && payload.auto_rotation_history.length > 0) {
+        await db.exec("DELETE FROM auto_rotation_history;");
+        for (const h of payload.auto_rotation_history) {
+          await db.prepare(`
+            INSERT INTO auto_rotation_history (
+              trigger_type, previous_bots_json, elected_bots_json,
+              draining_positions_count, transferred_krw, summary_text, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            h.trigger_type || "MANUAL_IMMEDIATE",
+            typeof h.previous_bots_json === "string" ? h.previous_bots_json : JSON.stringify(h.previous_bots || []),
+            typeof h.elected_bots_json === "string" ? h.elected_bots_json : JSON.stringify(h.elected_bots || []),
+            Number(h.draining_positions_count || 0),
+            Math.floor(Number(h.transferred_krw || 0)),
+            h.summary_text || "",
+            h.created_at || now
+          );
+        }
+      }
+      await syncBotAccountsFromBots(db);
       await checkAndHaltIfZeroBalance();
       return sendJson(res, 200, {
         success: true,
@@ -6166,16 +6690,58 @@ async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel) {
   }
 
   // 매도 후 전체 운용 원금 대비 이미 사용된 투자금을 재계산하여 봇별 배정 원금 및 가용 잔고(virtual_krw) 재분배
+  const isDrainingBot = Number(bot.is_selected_for_live || 0) !== 1;
+  const netProceeds = Math.max(0, Math.floor(actualTotalFunds - actualTotalFee));
   const currentTotalCap = Math.floor(Number(await getSetting("total_capital", "0")));
-  await recalculateAndApplyBotAllocations(currentTotalCap);
+  const syncRes = await syncDynamicLiveCapitalFromUpbit(true).catch(() => null);
+  if (!syncRes?.success) {
+    const adjustedCap = Math.max(0, currentTotalCap + Math.floor(totalProfitKrw));
+    if (adjustedCap !== currentTotalCap) {
+      await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('total_capital', ?, ?)").run(String(adjustedCap), now);
+    }
+    await recalculateAndApplyBotAllocations(adjustedCap, null, "live");
+  }
 
-  await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
-    `${currentPos.market} ${reasonLabel} 매도 완료 (${targetPositions.length}건 통합 / ${
-      totalProfitKrw >= 0 ? "+" : ""
-    }${totalProfitKrw.toLocaleString("ko-KR")}원)`,
-    now,
-    bot.bot_id
-  );
+  try {
+    await db
+      .prepare("UPDATE bot_accounts SET total_realized_pnl = total_realized_pnl + ?, updated_at = ? WHERE bot_id = ?")
+      .run(totalProfitKrw, now, bot.bot_id);
+  } catch {}
+  await syncBotAccountsFromBots(db);
+
+  if (isDrainingBot) {
+    const remRow = await db
+      .prepare("SELECT COUNT(*) AS cnt, COALESCE(SUM(buy_amount), 0) AS rem_used FROM bot_positions WHERE bot_id = ? AND status = 'OPEN'")
+      .get(bot.bot_id);
+    const remCnt = Number(remRow?.cnt || 0);
+    const remUsed = Math.floor(Number(remRow?.rem_used || 0));
+    const activeBots = (await getBots("live")).filter((b) => Number(b.is_selected_for_live) === 1);
+    const activeDesc = activeBots
+      .map((ab) => `${ab.nickname}(비율 ${Number(ab.allocation_ratio || 0).toFixed(0)}% / 가용 ${Math.floor(Number(ab.virtual_krw || 0)).toLocaleString("ko-KR")}원)`)
+      .join(", ");
+    console.log(
+      `[Graceful Drain 정산 이관] 탈락 봇 ${bot.bot_id}(${bot.nickname}) ${currentPos.market} ${reasonLabel} 매도 정산금 ${netProceeds.toLocaleString("ko-KR")}원(실현손익 ${
+        totalProfitKrw >= 0 ? "+" : ""
+      }${totalProfitKrw.toLocaleString("ko-KR")}원) 회수 -> 활성 실전 봇 자동 귀속 (${activeDesc || "없음"})`
+    );
+    const drainStatusMsg =
+      remCnt > 0
+        ? `[🛡️ Graceful Drain] ${currentPos.market} 매도 정산금 ${netProceeds.toLocaleString("ko-KR")}원 활성 봇 이관 완료 · 잔여 포지션 ${remCnt}건(${remUsed.toLocaleString("ko-KR")}원) 계속 감시 중`
+        : `[✅ Graceful Drain 완료] ${currentPos.market} 최종 청산(${totalProfitKrw >= 0 ? "+" : ""}${totalProfitKrw.toLocaleString("ko-KR")}원) 및 정산금 ${netProceeds.toLocaleString("ko-KR")}원 활성 봇 자동 귀속 완료`;
+    await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
+      drainStatusMsg,
+      now,
+      bot.bot_id
+    );
+  } else {
+    await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
+      `${currentPos.market} ${reasonLabel} 매도 완료 (${targetPositions.length}건 통합 / ${
+        totalProfitKrw >= 0 ? "+" : ""
+      }${totalProfitKrw.toLocaleString("ko-KR")}원)`,
+      now,
+      bot.bot_id
+    );
+  }
   await checkAndHaltIfZeroBalance();
   return true;
 }
@@ -6669,12 +7235,14 @@ startBackgroundWorkers = async function() {
     await runAlwaysOnPaperArenaCycle().catch(() => {});
     await runLiveTradingBotsCycle().catch(() => {});
     await checkAndRunScheduledAiMarketAnalysis().catch(() => {});
+    await checkAndRunScheduledAutoRotation().catch(() => {});
     await checkAndRunScheduledLlmWeeklyBotSelection().catch(() => {});
   }, 1000);
 
   workerTimers.push(setInterval(runAlwaysOnPaperArenaCycle, 9000));
   workerTimers.push(setInterval(runLiveTradingBotsCycle, 10000));
   workerTimers.push(setInterval(checkAndRunScheduledAiMarketAnalysis, 10000));
+  workerTimers.push(setInterval(checkAndRunScheduledAutoRotation, 60000));
   workerTimers.push(setInterval(checkAndRunScheduledLlmWeeklyBotSelection, 60000));
 
   // 30분 간격 암호화폐 뉴스 백그라운드 자동 수집

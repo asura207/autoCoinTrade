@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -42,6 +43,34 @@ LEGACY_BOT_OVERRIDE_ALIAS = {
     "bot_momentum": "bot_03",
     "bot_bb": "bot_05",
 }
+BOT_STRATEGY_GROUP_MAP: Dict[str, str] = {
+    "bot_02": "TREND_SWING",
+    "bot_03": "TREND_SWING",
+    "bot_07": "TREND_SWING",
+    "bot_08": "TREND_SWING",
+    "bot_01": "VOLATILITY_BREAKOUT",
+    "bot_04": "VOLATILITY_BREAKOUT",
+    "bot_09": "VOLATILITY_BREAKOUT",
+    "bot_05": "REVERSAL_GRID",
+    "bot_06": "REVERSAL_GRID",
+    "bot_10": "REVERSAL_GRID",
+}
+KST_TZ = timezone(timedelta(hours=9))
+
+
+def _now_kst_str() -> str:
+    return datetime.now(KST_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _compute_next_rotation_kst(day_of_week: int = 1, hour_kst: int = 9) -> str:
+    """0=일, 1=월 ... 6=토 기준 다음 주간 로테이션 예정 KST 시각 문자열 반환"""
+    now = datetime.now(KST_TZ).replace(minute=0, second=0, microsecond=0)
+    cur_dow = (now.weekday() + 1) % 7
+    delta_days = (int(day_of_week) - cur_dow) % 7
+    candidate = (now + timedelta(days=delta_days)).replace(hour=int(hour_kst), minute=0, second=0, microsecond=0)
+    if candidate <= datetime.now(KST_TZ):
+        candidate += timedelta(days=7)
+    return candidate.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def normalize_bot_overrides(raw_overrides: Any) -> Dict[str, str]:
@@ -185,6 +214,8 @@ class PgConnectionWrapper:
             if "ON CONFLICT" not in s.upper():
                 if tbl == "market_regime_filter":
                     s += " ON CONFLICT (id) DO NOTHING"
+                elif tbl == "auto_rotation_config":
+                    s += " ON CONFLICT (id) DO NOTHING"
                 elif tbl == "bot_accounts":
                     s += " ON CONFLICT (bot_id) DO NOTHING"
                 elif tbl == "bot_positions":
@@ -312,10 +343,35 @@ def init_database(db_path: Optional[str] = None) -> None:
                 step_level INTEGER DEFAULT 1,
                 status TEXT NOT NULL DEFAULT 'OPEN',
                 created_at TEXT NOT NULL,
-                closed_at TEXT
+                closed_at TEXT,
+                sell_order_uuid TEXT,
+                sell_price {real_type},
+                sell_amount {real_type},
+                sell_fee {real_type},
+                realized_pnl {real_type},
+                pnl_pct {real_type}
             );
             """
         )
+        pos_alter_cols = [
+            ("sell_order_uuid", "TEXT"),
+            ("sell_price", real_type),
+            ("sell_amount", real_type),
+            ("sell_fee", real_type),
+            ("realized_pnl", real_type),
+            ("pnl_pct", real_type),
+        ]
+        if sqlite_mode:
+            existing_pos_cols = {
+                dict(r)["name"]
+                for r in conn.execute("PRAGMA table_info(bot_positions);").fetchall()
+            }
+            for col_name, col_def in pos_alter_cols:
+                if col_name not in existing_pos_cols:
+                    conn.execute(f"ALTER TABLE bot_positions ADD COLUMN {col_name} {col_def};")
+        else:
+            for col_name, col_def in pos_alter_cols:
+                conn.execute(f"ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS {col_name} {col_def};")
 
         # 3. LLM 시장 체제 & 뉴스 감성 필터 테이블 (market_regime_filter)
         conn.execute(
@@ -388,6 +444,7 @@ def init_database(db_path: Optional[str] = None) -> None:
                 name TEXT NOT NULL,
                 nickname TEXT NOT NULL,
                 strategy_type TEXT NOT NULL,
+                strategy_group TEXT DEFAULT 'TREND_SWING',
                 description TEXT NOT NULL,
                 allocation_ratio {real_type} NOT NULL DEFAULT 0,
                 allocated_capital BIGINT NOT NULL DEFAULT 0,
@@ -409,6 +466,18 @@ def init_database(db_path: Optional[str] = None) -> None:
             );
             """
         )
+        if sqlite_mode:
+            bot_cols = {
+                dict(r)["name"]
+                for r in conn.execute("PRAGMA table_info(bots);").fetchall()
+            }
+            if "strategy_group" not in bot_cols:
+                conn.execute("ALTER TABLE bots ADD COLUMN strategy_group TEXT DEFAULT 'TREND_SWING';")
+        else:
+            conn.execute("ALTER TABLE bots ADD COLUMN IF NOT EXISTS strategy_group TEXT DEFAULT 'TREND_SWING';")
+
+        for b_id, s_grp in BOT_STRATEGY_GROUP_MAP.items():
+            conn.execute("UPDATE bots SET strategy_group = ? WHERE bot_id = ?;", (s_grp, b_id))
 
         # 6. 실전 체결 원장 테이블 (trades)
         conn.execute(
@@ -616,6 +685,48 @@ def init_database(db_path: Optional[str] = None) -> None:
                 PRIMARY KEY (year_month, mode)
             );
             """
+        )
+
+        # 9-2. 주간 전략별 1위 봇 자동 선출 설정 및 이력 테이블
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_rotation_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                is_enabled INTEGER DEFAULT 1,
+                rotation_day_of_week INTEGER DEFAULT 1,
+                rotation_hour_kst INTEGER DEFAULT 9,
+                allocation_mode TEXT DEFAULT 'RANK_WEIGHTED_40_35_25',
+                min_weekly_trades INTEGER DEFAULT 2,
+                last_rotated_at TEXT,
+                next_rotation_at TEXT,
+                updated_at TEXT
+            );
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS auto_rotation_history (
+                id {id_primary_key},
+                trigger_type TEXT,
+                previous_bots_json TEXT,
+                elected_bots_json TEXT,
+                draining_positions_count INTEGER DEFAULT 0,
+                transferred_krw {real_type} DEFAULT 0,
+                summary_text TEXT,
+                created_at TEXT
+            );
+            """
+        )
+        now_kst = _now_kst_str()
+        next_rot = _compute_next_rotation_kst(1, 9)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO auto_rotation_config (
+                id, is_enabled, rotation_day_of_week, rotation_hour_kst,
+                allocation_mode, min_weekly_trades, last_rotated_at, next_rotation_at, updated_at
+            ) VALUES (1, 1, 1, 9, 'RANK_WEIGHTED_40_35_25', 2, NULL, ?, ?);
+            """,
+            (next_rot, now_kst),
         )
 
         # 10. market_regime_filter id=1 기본 행 초기화 및 레거시(3봇)->표준(10봇) 안전 마이그레이션

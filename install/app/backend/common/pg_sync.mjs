@@ -9,6 +9,46 @@ const __dirname = path.dirname(__filename);
 const ROOT_DIR = path.resolve(__dirname, "../..");
 const ENV_PATH = path.join(ROOT_DIR, ".env");
 
+const ALL_BOT_IDS = Array.from({ length: 10 }, (_, idx) => `bot_${String(idx + 1).padStart(2, "0")}`);
+const LEGACY_BOT_OVERRIDE_ALIAS = {
+  bot_vb: "bot_01",
+  bot_momentum: "bot_03",
+  bot_bb: "bot_05",
+};
+const DEFAULT_BOT_OVERRIDES = Object.fromEntries(ALL_BOT_IDS.map((id) => [id, "ALLOW"]));
+const DEFAULT_BOT_OVERRIDES_JSON = JSON.stringify(DEFAULT_BOT_OVERRIDES);
+
+function normalizeBotOverridesJson(rawValue) {
+  let parsed = {};
+  if (typeof rawValue === "string" && rawValue.trim()) {
+    try {
+      const candidate = JSON.parse(rawValue);
+      if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+        parsed = candidate;
+      }
+    } catch {
+      parsed = {};
+    }
+  } else if (rawValue && typeof rawValue === "object" && !Array.isArray(rawValue)) {
+    parsed = rawValue;
+  }
+
+  const normalized = { ...DEFAULT_BOT_OVERRIDES };
+  for (const [legacyKey, modernKey] of Object.entries(LEGACY_BOT_OVERRIDE_ALIAS)) {
+    const val = String(parsed[legacyKey] || "").trim().toUpperCase();
+    if ((val === "ALLOW" || val === "BLOCK") && parsed[modernKey] === undefined) {
+      normalized[modernKey] = val;
+    }
+  }
+  for (const botId of ALL_BOT_IDS) {
+    const val = String(parsed[botId] || "").trim().toUpperCase();
+    if (val === "ALLOW" || val === "BLOCK") {
+      normalized[botId] = val;
+    }
+  }
+  return JSON.stringify(normalized);
+}
+
 function loadEnv() {
   if (fs.existsSync(ENV_PATH)) {
     const raw = fs.readFileSync(ENV_PATH, "utf-8");
@@ -104,8 +144,33 @@ export class PgSyncManager {
 
       // 1-1. market_regime_filter
       try {
+        await this.pool.query(`
+          CREATE TABLE IF NOT EXISTS market_regime_filter (
+            id INTEGER PRIMARY KEY,
+            sentiment_score NUMERIC(8,4) DEFAULT 0.0,
+            market_regime TEXT DEFAULT 'SIDEWAYS',
+            risk_alert INTEGER DEFAULT 0,
+            recommended_action TEXT DEFAULT 'NORMAL',
+            position_size_multiplier NUMERIC(8,4) DEFAULT 1.0,
+            bot_overrides_json TEXT DEFAULT '${DEFAULT_BOT_OVERRIDES_JSON}',
+            blacklist_tickers_json TEXT DEFAULT '[]',
+            reason TEXT DEFAULT 'Initial default state',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            flash_sentiment_score NUMERIC(8,4) DEFAULT 0.0,
+            flash_recommended_action TEXT DEFAULT 'NORMAL',
+            flash_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            pro_sentiment_score NUMERIC(8,4) DEFAULT 0.0,
+            pro_recommended_action TEXT DEFAULT 'NORMAL',
+            pro_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            final_risk_alert INTEGER DEFAULT 0,
+            final_position_multiplier NUMERIC(8,4) DEFAULT 1.0,
+            final_bot_overrides_json TEXT DEFAULT '${DEFAULT_BOT_OVERRIDES_JSON}'
+          );
+        `);
         const regime = sqliteDb.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get();
         if (regime) {
+          const normalizedOverridesJson = normalizeBotOverridesJson(regime.bot_overrides_json);
+          const normalizedFinalOverridesJson = normalizeBotOverridesJson(regime.final_bot_overrides_json || normalizedOverridesJson);
           await this.pool.query(
             `INSERT INTO market_regime_filter (
                id, sentiment_score, market_regime, risk_alert, recommended_action,
@@ -136,21 +201,24 @@ export class PgSyncManager {
             [
               1, Number(regime.sentiment_score || 0), regime.market_regime || "SIDEWAYS",
               Number(regime.risk_alert || 0), regime.recommended_action || "NORMAL",
-              Number(regime.position_size_multiplier || 1.0), regime.bot_overrides_json || "{}",
+              Number(regime.position_size_multiplier ?? 1.0), normalizedOverridesJson,
               regime.blacklist_tickers_json || "[]", regime.reason || "", regime.updated_at || new Date().toISOString(),
               Number(regime.flash_sentiment_score || 0), regime.flash_recommended_action || "NORMAL",
               regime.flash_updated_at || null, Number(regime.pro_sentiment_score || 0),
               regime.pro_recommended_action || "NORMAL", regime.pro_updated_at || null,
-              Number(regime.final_risk_alert || 0), Number(regime.final_position_multiplier || 1.0),
-              regime.final_bot_overrides_json || "{}"
+              Number(regime.final_risk_alert || 0), Number(regime.final_position_multiplier ?? 1.0),
+              normalizedFinalOverridesJson
             ]
           );
         }
-      } catch (rErr) {}
+      } catch (rErr) {
+        console.warn(`[PgSync] market_regime_filter sync skip: ${rErr.message}`);
+      }
 
       // 2. bots
       try {
         await this.pool.query(`
+          ALTER TABLE bots ADD COLUMN IF NOT EXISTS strategy_group VARCHAR(32) NOT NULL DEFAULT 'TREND_SWING';
           ALTER TABLE bots ADD COLUMN IF NOT EXISTS is_selected_for_live INT NOT NULL DEFAULT 0;
           ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_initial_capital BIGINT NOT NULL DEFAULT 1000000;
           ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_virtual_krw BIGINT NOT NULL DEFAULT 1000000;
@@ -167,17 +235,18 @@ export class PgSyncManager {
       for (const b of bots) {
         await this.pool.query(
           `INSERT INTO bots (
-             bot_id, name, nickname, strategy_type, description,
+             bot_id, name, nickname, strategy_type, strategy_group, description,
              allocation_ratio, allocated_capital, virtual_krw, is_running,
              min_volume_krw, stop_loss_pct, take_profit_pct, config_json,
              last_status_msg, updated_at,
              is_selected_for_live, paper_initial_capital, paper_virtual_krw,
              paper_is_running, paper_peak_equity, paper_mdd_pct, paper_status_msg
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
            ON CONFLICT (bot_id) DO UPDATE SET
              name = EXCLUDED.name,
              nickname = EXCLUDED.nickname,
              strategy_type = EXCLUDED.strategy_type,
+             strategy_group = EXCLUDED.strategy_group,
              description = EXCLUDED.description,
              allocation_ratio = EXCLUDED.allocation_ratio,
              allocated_capital = EXCLUDED.allocated_capital,
@@ -197,7 +266,7 @@ export class PgSyncManager {
              paper_mdd_pct = EXCLUDED.paper_mdd_pct,
              paper_status_msg = EXCLUDED.paper_status_msg`,
           [
-            b.bot_id, b.name, b.nickname, b.strategy_type, b.description || "",
+            b.bot_id, b.name, b.nickname, b.strategy_type, b.strategy_group || "TREND_SWING", b.description || "",
             Number(b.allocation_ratio || 0), Math.floor(Number(b.allocated_capital || 0)),
             Math.floor(Number(b.virtual_krw || 0)), Number(b.is_running || 0),
             Math.floor(Number(b.min_volume_krw || 0)), Number(b.stop_loss_pct || 0),
@@ -592,6 +661,89 @@ export class PgSyncManager {
               Number(s.current_balance || 0), Number(s.krw_balance || 0),
               Number(s.coin_eval_balance || 0), Number(s.diff_amount || 0),
               Number(s.diff_rate || 0), s.snapshot_date, s.updated_at
+            ]
+          );
+        }
+      } catch {}
+
+      // 11. auto_rotation_config & auto_rotation_history
+      try {
+        await this.pool.query(`
+          CREATE TABLE IF NOT EXISTS auto_rotation_config (
+            id INT PRIMARY KEY,
+            is_enabled INT DEFAULT 1,
+            rotation_day_of_week INT DEFAULT 1,
+            rotation_hour_kst INT DEFAULT 9,
+            allocation_mode VARCHAR(64) DEFAULT 'RANK_WEIGHTED_40_35_25',
+            min_weekly_trades INT DEFAULT 2,
+            last_rotated_at TEXT,
+            next_rotation_at TEXT,
+            updated_at TEXT
+          );
+          CREATE TABLE IF NOT EXISTS auto_rotation_history (
+            id BIGINT PRIMARY KEY,
+            trigger_type TEXT,
+            previous_bots_json TEXT,
+            elected_bots_json TEXT,
+            draining_positions_count INT DEFAULT 0,
+            transferred_krw DOUBLE PRECISION DEFAULT 0,
+            summary_text TEXT,
+            created_at TEXT
+          );
+        `);
+        const rotCfg = sqliteDb.prepare("SELECT * FROM auto_rotation_config WHERE id = 1").get();
+        if (rotCfg) {
+          await this.pool.query(
+            `INSERT INTO auto_rotation_config (
+               id, is_enabled, rotation_day_of_week, rotation_hour_kst,
+               allocation_mode, min_weekly_trades, last_rotated_at, next_rotation_at, updated_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (id) DO UPDATE SET
+               is_enabled = EXCLUDED.is_enabled,
+               rotation_day_of_week = EXCLUDED.rotation_day_of_week,
+               rotation_hour_kst = EXCLUDED.rotation_hour_kst,
+               allocation_mode = EXCLUDED.allocation_mode,
+               min_weekly_trades = EXCLUDED.min_weekly_trades,
+               last_rotated_at = EXCLUDED.last_rotated_at,
+               next_rotation_at = EXCLUDED.next_rotation_at,
+               updated_at = EXCLUDED.updated_at`,
+            [
+              1,
+              Number(rotCfg.is_enabled ?? 1),
+              Number(rotCfg.rotation_day_of_week ?? 1),
+              Number(rotCfg.rotation_hour_kst ?? 9),
+              rotCfg.allocation_mode || "RANK_WEIGHTED_40_35_25",
+              Number(rotCfg.min_weekly_trades ?? 2),
+              rotCfg.last_rotated_at || null,
+              rotCfg.next_rotation_at || null,
+              rotCfg.updated_at || null,
+            ]
+          );
+        }
+        const rotHistory = sqliteDb.prepare("SELECT * FROM auto_rotation_history").all();
+        for (const h of rotHistory) {
+          await this.pool.query(
+            `INSERT INTO auto_rotation_history (
+               id, trigger_type, previous_bots_json, elected_bots_json,
+               draining_positions_count, transferred_krw, summary_text, created_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (id) DO UPDATE SET
+               trigger_type = EXCLUDED.trigger_type,
+               previous_bots_json = EXCLUDED.previous_bots_json,
+               elected_bots_json = EXCLUDED.elected_bots_json,
+               draining_positions_count = EXCLUDED.draining_positions_count,
+               transferred_krw = EXCLUDED.transferred_krw,
+               summary_text = EXCLUDED.summary_text,
+               created_at = EXCLUDED.created_at`,
+            [
+              h.id,
+              h.trigger_type || null,
+              h.previous_bots_json || "[]",
+              h.elected_bots_json || "[]",
+              Number(h.draining_positions_count || 0),
+              Number(h.transferred_krw || 0),
+              h.summary_text || "",
+              h.created_at || null,
             ]
           );
         }

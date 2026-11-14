@@ -13,10 +13,27 @@ export const PAPER_FEE_RATE = 0.0005;
 export const PAPER_MIN_ORDER_KRW = 5000;
 export const DEFAULT_PAPER_CAPITAL = 1000000;
 
+export function formatKstDateTime(dateInput = new Date()) {
+  const d = dateInput instanceof Date ? dateInput : new Date(dateInput);
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(d);
+  const map = {};
+  for (const p of parts) {
+    if (p.type !== "literal") map[p.type] = p.value;
+  }
+  return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}:${map.second}`;
+}
+
 export function nowKSTString() {
-  const d = new Date();
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  return formatKstDateTime(new Date());
 }
 
 /** 업비트 일봉 기준(09:00 KST) 거래일 문자열(YYYY-MM-DD). 서버 타임존과 무관하게 계산 */
@@ -637,8 +654,46 @@ export function evaluateSmartExit({
 }
 
 // ============================================================================
-// 3. 10대 알고리즘 봇 마스터 데이터
+// 3. 10대 알고리즘 봇 마스터 데이터 & 3대 전략군 표준 메타
 // ============================================================================
+export const STRATEGY_GROUP_ORDER = ["TREND_SWING", "VOLATILITY_BREAKOUT", "REVERSAL_GRID"];
+
+export const ALLOCATION_MODE_WEIGHTS = {
+  RANK_WEIGHTED_40_35_25: [40, 35, 25],
+  RANK_WEIGHTED_40_40_20: [40, 40, 20],
+  EQUAL_34_33_33: [34, 33, 33],
+};
+
+export const STRATEGY_GROUP_META = {
+  TREND_SWING: {
+    code: "TREND_SWING",
+    group: "추세·스윙",
+    label: "그룹 A · 추세·스윙형",
+    short_label: "추세·스윙",
+    badge: "📈 추세·스윙",
+    champion_badge: "그룹 A 추세 1위",
+    description: "슈퍼트렌드·듀얼모멘텀·MACD·20일선 눌림목 추세 스윙 전략군 (bot_02, bot_03, bot_07, bot_08)",
+  },
+  VOLATILITY_BREAKOUT: {
+    code: "VOLATILITY_BREAKOUT",
+    group: "변동성·돌파",
+    label: "그룹 B · 변동성·돌파형",
+    short_label: "변동성·돌파",
+    badge: "⚡ 변동성·돌파",
+    champion_badge: "그룹 B 돌파 1위",
+    description: "변동성 돌파·BB 스퀴즈·거래량 폭발 모멘텀 스캘핑 특화 전략군 (bot_01, bot_04, bot_09)",
+  },
+  REVERSAL_GRID: {
+    code: "REVERSAL_GRID",
+    group: "역추세·그리드",
+    label: "그룹 C · 역추세·그리드·올라운더",
+    short_label: "역추세·그리드",
+    badge: "🔄 역추세·그리드",
+    champion_badge: "그룹 C 역추세 1위",
+    description: "볼린저 과매도 반등·분할 그리드·VWAP/선형회귀 올라운더 전략군 (bot_05, bot_06, bot_10)",
+  },
+};
+
 export const ARENA_BOT_DEFS = [
   {
     bot_id: "bot_01",
@@ -646,6 +701,10 @@ export const ARENA_BOT_DEFS = [
     name: "필터 결합형 변동성 돌파 봇",
     nickname: "돌파봇-알파",
     strategy_type: "VOLATILITY_BREAKOUT",
+    strategy_group_code: "VOLATILITY_BREAKOUT",
+    strategy_group: "변동성·돌파",
+    strategy_sub_label: "변동성 돌파",
+    strategy_rule: "BULL ALLOW, SIDEWAYS/휩소 BLOCK",
     description: "장중 단타 / 1일 보유 | 변동성 돌파(K=0.3) + 20일 이평선 추세 필터 전략",
     min_volume_krw: 10000000000,
     stop_loss_pct: 2.5,
@@ -658,6 +717,10 @@ export const ARENA_BOT_DEFS = [
     name: "슈퍼트렌드 & ATR 트레일링 (SuperTrend ATR)",
     nickname: "슈퍼트렌드-ATR",
     strategy_type: "SUPERTREND_ATR",
+    strategy_group_code: "TREND_SWING",
+    strategy_group: "추세·스윙",
+    strategy_sub_label: "ATR 추세추종",
+    strategy_rule: "BULL ALLOW, SIDEWAYS/휩소 BLOCK",
     description: "1시간/4시간봉 SuperTrend 상승 전환 & 거래량(20봉 평균 1.5배) 돌파 진입 | 최고가 대비 2.5×ATR(14) 하락 시 트레일링 스탑",
     min_volume_krw: 8000000000,
     stop_loss_pct: 4.0,
@@ -670,6 +733,10 @@ export const ARENA_BOT_DEFS = [
     name: "듀얼 모멘텀 스윙 봇",
     nickname: "모멘텀봇-베타",
     strategy_type: "DUAL_MOMENTUM",
+    strategy_group_code: "TREND_SWING",
+    strategy_group: "추세·스윙",
+    strategy_sub_label: "듀얼 모멘텀",
+    strategy_rule: "BULL ALLOW, SIDEWAYS/휩소 BLOCK",
     description: "상대 모멘텀(상위 2종목) + 절대 모멘텀(+1.5% 이상) 스윙 전략",
     min_volume_krw: 15000000000,
     stop_loss_pct: 3.5,
@@ -682,6 +749,10 @@ export const ARENA_BOT_DEFS = [
     name: "볼린저 밴드 스퀴즈 돌파 (BB Squeeze VCP)",
     nickname: "스퀴즈봇-델타",
     strategy_type: "BB_SQUEEZE_VCP",
+    strategy_group_code: "VOLATILITY_BREAKOUT",
+    strategy_group: "변동성·돌파",
+    strategy_sub_label: "스퀴즈 VCP 돌파",
+    strategy_rule: "BULL ALLOW, 스퀴즈 응축 시 조건부 허용",
     description: "볼린저(20,2) 밴드폭이 최근 20봉 최저 수준으로 수축 후 거래량 급증과 함께 상단선 돌파 시 매수 | 중심선 이탈 시 청산",
     min_volume_krw: 5000000000,
     stop_loss_pct: 2.5,
@@ -694,6 +765,10 @@ export const ARENA_BOT_DEFS = [
     name: "고변동성 볼린저 밴드 역추세 봇",
     nickname: "볼린저봇-감마",
     strategy_type: "BOLLINGER_REVERSAL",
+    strategy_group_code: "REVERSAL_GRID",
+    strategy_group: "역추세·그리드",
+    strategy_sub_label: "볼린저 역추세",
+    strategy_rule: "SIDEWAYS/과매도 반등 ALLOW, 패닉 폭락 BLOCK",
     description: "고변동성 코인 볼린저 밴드(20, 2.0σ) 15분봉 단기 반등 전략",
     min_volume_krw: 8000000000,
     stop_loss_pct: 2.0,
@@ -706,6 +781,10 @@ export const ARENA_BOT_DEFS = [
     name: "다단계 분할 매수 그리드 (Dynamic Grid Reversion)",
     nickname: "그리드봇-엡실론",
     strategy_type: "DYNAMIC_GRID",
+    strategy_group_code: "REVERSAL_GRID",
+    strategy_group: "역추세·그리드",
+    strategy_sub_label: "분할 매수 그리드",
+    strategy_rule: "SIDEWAYS 박스권 ALLOW, 급락 쇼크 BLOCK",
     description: "단기 과매도(RSI≤40) 진입 후 -2.5%/-5.0% 추가 하락 시 최대 3분할 매수(order_uuid 개별 관리) | 개별 포지션 +1.8% 도달 시 개별 익절",
     min_volume_krw: 5000000000,
     stop_loss_pct: 9.0,
@@ -718,6 +797,10 @@ export const ARENA_BOT_DEFS = [
     name: "MACD + RSI 골든크로스 (MACD Trend)",
     nickname: "MACD봇-제타",
     strategy_type: "MACD_TREND",
+    strategy_group_code: "TREND_SWING",
+    strategy_group: "추세·스윙",
+    strategy_sub_label: "MACD+RSI 추세",
+    strategy_rule: "BULL ALLOW, SIDEWAYS/휩소 BLOCK",
     description: "15분/60분봉 EMA(20>60) 정배열 상태에서 MACD 시그널선 상향 돌파 & RSI 45~65 추세 확장 구간 매수",
     min_volume_krw: 8000000000,
     stop_loss_pct: 2.5,
@@ -730,6 +813,10 @@ export const ARENA_BOT_DEFS = [
     name: "정배열 20일선 눌림목 스윙 (MA20 Pullback)",
     nickname: "눌림목봇-에타",
     strategy_type: "MA20_PULLBACK",
+    strategy_group_code: "TREND_SWING",
+    strategy_group: "추세·스윙",
+    strategy_sub_label: "20일선 눌림목",
+    strategy_rule: "상승 눌림/횡보 반등 ALLOW, 급락 쇼크 BLOCK",
     description: "일봉/4시간봉 정배열(5>20>60) 상승 추세 종목이 거래량 감소와 함께 20선 부근(±1.5%) 지지 확인 시 매수 | 직전 고점 부근 익절",
     min_volume_krw: 10000000000,
     stop_loss_pct: 3.0,
@@ -742,6 +829,10 @@ export const ARENA_BOT_DEFS = [
     name: "거래량 폭발 모멘텀 스캘퍼 (Volume Spike Breakout)",
     nickname: "스파이크봇-세타",
     strategy_type: "VOLUME_SPIKE_BREAKOUT",
+    strategy_group_code: "VOLATILITY_BREAKOUT",
+    strategy_group: "변동성·돌파",
+    strategy_sub_label: "거래량 스캘핑",
+    strategy_rule: "BULL ALLOW, 거래량 폭발 시 조건부 허용",
     description: "15분봉 거래량이 직전 20봉 평균 대비 150% 이상 폭발하며 양봉 마감 시 진입 | 고점 대비 -1.5% 트레일링 스탑",
     min_volume_krw: 5000000000,
     stop_loss_pct: 2.0,
@@ -754,6 +845,10 @@ export const ARENA_BOT_DEFS = [
     name: "잭 켈로그 프라이스액션 (Jack Kellogg Price Action)",
     nickname: "잭 켈로그 프라이스액션",
     strategy_type: "JACK_KELLOGG_PRICE_ACTION",
+    strategy_group_code: "REVERSAL_GRID",
+    strategy_group: "역추세·그리드",
+    strategy_sub_label: "VWAP·LRC 올라운더",
+    strategy_rule: "VWAP/회귀 채널 멀티 레짐 ALLOW, 패닉 쇼크 BLOCK",
     description: "4대 핵심 지표(VWAP, 20봉 선형회귀 채널 LRC ±2σ, 거래량 폭발 RVOL, 당일시가/전일고저) 기반 돌파 및 과매도 2분할 반등 매매",
     min_volume_krw: 10000000000,
     stop_loss_pct: 2.5,
@@ -772,13 +867,32 @@ export const ARENA_BOT_DEFS = [
 
 export const ARENA_BOT_IDS = ARENA_BOT_DEFS.map((d) => d.bot_id);
 export const LEGACY_BOT_ID_MAP = {};
+const BOT_DEF_BY_ID = new Map();
 for (const d of ARENA_BOT_DEFS) {
+  BOT_DEF_BY_ID.set(d.bot_id, d);
   for (const lid of d.legacy_ids) LEGACY_BOT_ID_MAP[lid] = d.bot_id;
 }
 
 /** 구버전 봇 ID(bot_volatility 등)를 신규 ID(bot_01 등)로 변환 */
 export function normalizeBotId(botId) {
   return LEGACY_BOT_ID_MAP[botId] || botId;
+}
+
+/** 봇 ID별 전략군 메타 조회 */
+export function getBotStrategyMeta(botId) {
+  const normId = normalizeBotId(botId);
+  const def = BOT_DEF_BY_ID.get(normId);
+  const groupCode = def?.strategy_group_code || "TREND_SWING";
+  const gMeta = STRATEGY_GROUP_META[groupCode] || STRATEGY_GROUP_META.TREND_SWING;
+  return {
+    strategy_group_code: gMeta.code,
+    strategy_group: gMeta.group,
+    strategy_group_label: gMeta.label,
+    strategy_group_badge: gMeta.badge,
+    strategy_champion_badge: gMeta.champion_badge,
+    strategy_sub_label: def?.strategy_sub_label || "알고리즘",
+    strategy_rule: def?.strategy_rule || "",
+  };
 }
 
 // ============================================================================
@@ -1238,11 +1352,12 @@ async function addColumnSafe(db, table, name, ddl) {
   }
 }
 
-/** bots 테이블 선택/가상거래 컬럼 및 paper_trades 사유 컬럼 보강 (중복 컬럼 예외 방어) */
+/** bots 테이블 선택/전략군/가상거래 컬럼 및 paper_trades 사유 컬럼 보강 (중복 컬럼 예외 방어) */
 export async function ensureArenaSchema(db) {
   const cols = await columnNames(db, "bots");
   const hadSelectionColumn = cols.includes("is_selected_for_live");
   await addColumnSafe(db, "bots", "is_selected_for_live", "INTEGER NOT NULL DEFAULT 0");
+  await addColumnSafe(db, "bots", "strategy_group", "TEXT DEFAULT 'TREND_SWING'");
   await addColumnSafe(db, "bots", "paper_initial_capital", `BIGINT NOT NULL DEFAULT ${DEFAULT_PAPER_CAPITAL}`);
   await addColumnSafe(db, "bots", "paper_virtual_krw", `BIGINT NOT NULL DEFAULT ${DEFAULT_PAPER_CAPITAL}`);
   await addColumnSafe(db, "bots", "paper_is_running", "INTEGER NOT NULL DEFAULT 1");
@@ -1287,13 +1402,13 @@ export async function seedArenaBots(db, { hadSelectionColumn = true } = {}) {
 
   const insertBot = db.prepare(`
     INSERT OR IGNORE INTO bots (
-      bot_id, name, nickname, strategy_type, description,
+      bot_id, name, nickname, strategy_type, strategy_group, description,
       allocation_ratio, allocated_capital, virtual_krw, is_running,
       min_volume_krw, stop_loss_pct, take_profit_pct, config_json,
       last_status_msg, updated_at,
       is_selected_for_live, paper_initial_capital, paper_virtual_krw, paper_is_running,
       paper_peak_equity, paper_mdd_pct, paper_status_msg
-    ) VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?, ?, ?, '대기 중', ?, 0, ?, ?, 1, ?, 0, '시그널 대기 중')
+    ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?, ?, ?, '대기 중', ?, 0, ?, ?, 1, ?, 0, '시그널 대기 중')
   `);
   for (const def of ARENA_BOT_DEFS) {
     await insertBot.run(
@@ -1301,6 +1416,7 @@ export async function seedArenaBots(db, { hadSelectionColumn = true } = {}) {
       def.name,
       def.nickname,
       def.strategy_type,
+      def.strategy_group_code,
       def.description,
       def.min_volume_krw,
       def.stop_loss_pct,
@@ -1323,10 +1439,10 @@ export async function seedArenaBots(db, { hadSelectionColumn = true } = {}) {
         take_profit_pct = CASE WHEN take_profit_pct = 0 THEN ? ELSE take_profit_pct END
     WHERE bot_id = ?
   `);
-  const updateIdentity = db.prepare("UPDATE bots SET name = ?, strategy_type = ?, description = ? WHERE bot_id = ?");
+  const updateIdentity = db.prepare("UPDATE bots SET name = ?, strategy_type = ?, strategy_group = ?, description = ? WHERE bot_id = ?");
   for (const def of ARENA_BOT_DEFS) {
     await fillEmpty.run(def.nickname, def.description, def.min_volume_krw, def.stop_loss_pct, def.take_profit_pct, def.bot_id);
-    await updateIdentity.run(def.name, def.strategy_type, def.description, def.bot_id);
+    await updateIdentity.run(def.name, def.strategy_type, def.strategy_group_code, def.description, def.bot_id);
     // 기존 config_json 에 누락된 신규 파라미터만 기본값으로 보충
     const row = await db.prepare("SELECT config_json FROM bots WHERE bot_id = ?").get(def.bot_id);
     let cfg = {};
@@ -1649,24 +1765,202 @@ async function computeBotArenaStats(db, bot) {
   };
 }
 
-/** 10개 봇 실시간 가상거래 경쟁 순위 (1위~10위) */
-export async function getArenaLeaderboard(db) {
+function normalizeTimestampForCompare(v) {
+  return String(v || "").replace("T", " ").slice(0, 19);
+}
+
+/**
+ * 3대 전략군(TREND_SWING / VOLATILITY_BREAKOUT / REVERSAL_GRID) 주간 성과 평가 및 그룹별 1위 챔피언 선출
+ * - 최근 7일 가상 실현손익 + 보유 포지션 미실현손익 기반 weekly_return_pct 계산
+ * - 그룹 내 모든 봇의 7일 거래 횟수가 0회인 경우 Arena 누적 수익률(profit_rate_pct)로 안전 Fallback
+ * - rotation_score = eval_return_pct - (|mdd_pct| * 0.5) + (eval_win_rate * 0.05) + (7일거래 >= minWeeklyTrades ? 1.0 : 0.0)
+ */
+export async function evaluateWeeklyStrategyChampions(db, options = {}) {
+  const minWeeklyTrades = Math.max(0, Number(options.minWeeklyTrades ?? 2));
+  const allocationMode = ALLOCATION_MODE_WEIGHTS[options.allocationMode]
+    ? options.allocationMode
+    : "RANK_WEIGHTED_40_35_25";
+  const weights = ALLOCATION_MODE_WEIGHTS[allocationMode];
+  const cutoff7d = formatKstDateTime(new Date(Date.now() - 7 * 24 * 3600 * 1000));
+  const evaluatedAt = nowKSTString();
+
   const bots = await db.prepare("SELECT * FROM bots ORDER BY bot_id ASC").all();
-  const rows = [];
+  const allPaperTrades = await db
+    .prepare("SELECT bot_id, status, buy_date, sell_date, profit_krw FROM paper_trades")
+    .all();
+
+  const tradesByBot = new Map();
+  for (const tr of allPaperTrades) {
+    const bid = normalizeBotId(tr.bot_id);
+    if (!tradesByBot.has(bid)) tradesByBot.set(bid, []);
+    tradesByBot.get(bid).push(tr);
+  }
+
+  const enrichedBots = [];
   for (const bot of bots) {
     const s = await computeBotArenaStats(db, bot);
-    rows.push({
+    const meta = getBotStrategyMeta(bot.bot_id);
+    const mddPct = Number(Number(bot.paper_mdd_pct || 0).toFixed(2));
+    const botTrades = tradesByBot.get(bot.bot_id) || [];
+
+    let realizedBefore7d = 0;
+    let weeklyRealized = 0;
+    let weeklyWins = 0;
+    let weeklyLosses = 0;
+    let weeklyTradeCount = 0;
+
+    for (const tr of botTrades) {
+      const buyTs = normalizeTimestampForCompare(tr.buy_date);
+      const sellTs = normalizeTimestampForCompare(tr.sell_date);
+      const closeTs = sellTs || buyTs;
+      const isCompleted = tr.status === "COMPLETED";
+      const touchedLast7d = (buyTs && buyTs >= cutoff7d) || (isCompleted && closeTs && closeTs >= cutoff7d);
+      if (touchedLast7d) {
+        weeklyTradeCount++;
+      }
+      if (isCompleted) {
+        const pnl = Number(tr.profit_krw || 0);
+        if (closeTs && closeTs >= cutoff7d) {
+          weeklyRealized += pnl;
+          if (pnl > 0) weeklyWins++;
+          else if (pnl < 0) weeklyLosses++;
+        } else {
+          realizedBefore7d += pnl;
+        }
+      }
+    }
+
+    const baselineEquity = Math.max(1, Number(s.initial_capital || DEFAULT_PAPER_CAPITAL) + realizedBefore7d);
+    const weeklyTotalPnl = weeklyRealized + Number(s.unrealized_profit_krw || 0);
+    const weeklyReturnPct = Number(((weeklyTotalPnl / baselineEquity) * 100).toFixed(2));
+    const weeklyDecided = weeklyWins + weeklyLosses;
+    const weeklyWinRate = weeklyDecided > 0 ? Number(((weeklyWins / weeklyDecided) * 100).toFixed(1)) : 0.0;
+
+    enrichedBots.push({
       ...s,
       name: bot.name,
       nickname: bot.nickname,
       strategy_type: bot.strategy_type,
+      ...meta,
       description: bot.description,
       is_selected_for_live: Number(bot.is_selected_for_live || 0),
-      paper_is_running: Number(bot.paper_is_running || 1),
-      mdd_pct: Number(Number(bot.paper_mdd_pct || 0).toFixed(2)),
+      allocation_ratio: Number(bot.allocation_ratio || 0),
+      is_running: Number(bot.is_running || 0),
+      paper_is_running: Number(bot.paper_is_running ?? 1),
+      mdd_pct: mddPct,
       last_signal_text: bot.paper_status_msg || "시그널 대기 중",
+      weekly_realized_krw: Math.floor(weeklyRealized),
+      weekly_unrealized_krw: Math.floor(s.unrealized_profit_krw || 0),
+      weekly_total_pnl_krw: Math.floor(weeklyTotalPnl),
+      weekly_return_pct: weeklyReturnPct,
+      weekly_trade_count: weeklyTradeCount,
+      weekly_win_trades: weeklyWins,
+      weekly_lose_trades: weeklyLosses,
+      weekly_win_rate: weeklyWinRate,
     });
   }
+
+  const groups = {};
+  const champions = [];
+
+  for (const gCode of STRATEGY_GROUP_ORDER) {
+    const gMeta = STRATEGY_GROUP_META[gCode];
+    const gBots = enrichedBots.filter((b) => b.strategy_group_code === gCode);
+    const totalGroupWeeklyTrades = gBots.reduce((sum, b) => sum + b.weekly_trade_count, 0);
+    const useFallback = totalGroupWeeklyTrades === 0;
+    const basis = useFallback ? "ARENA_CUMULATIVE_FALLBACK" : "ROLLING_7D";
+
+    for (const b of gBots) {
+      const evalReturnPct = useFallback ? b.profit_rate_pct : b.weekly_return_pct;
+      const evalWinRatePct = useFallback ? b.win_rate_pct : b.weekly_win_rate;
+      const minTradeMet = !useFallback && b.weekly_trade_count >= minWeeklyTrades;
+      const tradeBonus = minTradeMet ? 1.0 : 0.0;
+      const rawScore = evalReturnPct - Math.abs(b.mdd_pct) * 0.5 + evalWinRatePct * 0.05 + tradeBonus;
+      b.eval_return_pct = evalReturnPct;
+      b.eval_win_rate_pct = evalWinRatePct;
+      b.min_trade_bonus = tradeBonus;
+      b.rotation_score = Number(rawScore.toFixed(3));
+      b.evaluation_basis = basis;
+    }
+
+    gBots.sort(
+      (a, b) =>
+        b.rotation_score - a.rotation_score ||
+        b.eval_return_pct - a.eval_return_pct ||
+        b.profit_rate_pct - a.profit_rate_pct ||
+        b.weekly_trade_count - a.weekly_trade_count ||
+        a.bot_id.localeCompare(b.bot_id)
+    );
+
+    gBots.forEach((b, idx) => {
+      b.group_rank = idx + 1;
+      b.is_group_champion = idx === 0;
+      b.champion_rank = null;
+      b.recommended_ratio = 0;
+    });
+
+    if (gBots.length > 0) {
+      champions.push(gBots[0]);
+    }
+
+    groups[gCode] = {
+      ...gMeta,
+      evaluation_basis: basis,
+      total_weekly_trades: totalGroupWeeklyTrades,
+      champion: gBots[0] || null,
+      candidates: gBots,
+    };
+  }
+
+  champions.sort(
+    (a, b) =>
+      b.rotation_score - a.rotation_score ||
+      b.eval_return_pct - a.eval_return_pct ||
+      b.profit_rate_pct - a.profit_rate_pct ||
+      a.bot_id.localeCompare(b.bot_id)
+  );
+
+  champions.forEach((champ, idx) => {
+    const assignedRatio = weights[idx] ?? Math.floor(100 / Math.max(1, champions.length));
+    champ.champion_rank = idx + 1;
+    champ.recommended_ratio = assignedRatio;
+  });
+
+  const byBotId = {};
+  for (const b of enrichedBots) {
+    byBotId[b.bot_id] = b;
+  }
+
+  return {
+    evaluated_at: evaluatedAt,
+    cutoff_7d: cutoff7d,
+    allocation_mode: allocationMode,
+    min_weekly_trades: minWeeklyTrades,
+    bots: enrichedBots,
+    by_bot_id: byBotId,
+    groups,
+    champions,
+  };
+}
+
+/** 10개 봇 실시간 가상거래 경쟁 순위 (1위~10위) */
+export async function getArenaLeaderboard(db, options = {}) {
+  let evalConfig = options;
+  if (!options.allocationMode) {
+    try {
+      const cfg = await db.prepare("SELECT allocation_mode, min_weekly_trades FROM auto_rotation_config WHERE id = 1").get();
+      if (cfg) {
+        evalConfig = {
+          allocationMode: cfg.allocation_mode || "RANK_WEIGHTED_40_35_25",
+          minWeeklyTrades: Number(cfg.min_weekly_trades ?? 2),
+        };
+      }
+    } catch {
+      // auto_rotation_config 초기화 전 fallback
+    }
+  }
+  const evaluation = await evaluateWeeklyStrategyChampions(db, evalConfig);
+  const rows = [...evaluation.bots];
   rows.sort(
     (a, b) =>
       b.profit_rate_pct - a.profit_rate_pct ||
