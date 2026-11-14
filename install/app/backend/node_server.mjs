@@ -2333,16 +2333,20 @@ function getDualAiCandidateModels(isProTarget = false, preferredModel = "") {
   const pref = String(preferredModel || "").trim();
   const baseList = isProTarget
     ? [
-        "gemini-2.5-pro",
+        "gemini-3.1-pro-preview",
         "gemini-pro-latest",
-        "gemini-2.5-flash",
+        "gemini-3.8-flash",
         "gemini-flash-latest",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
       ]
     : [
-        "gemini-2.5-flash",
+        "gemini-3.8-flash",
         "gemini-flash-latest",
-        "gemini-2.5-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
         "gemini-flash-lite-latest",
+        "gemini-2.5-flash",
       ];
   if (pref && !baseList.includes(pref)) {
     return [pref, ...baseList];
@@ -2385,10 +2389,12 @@ async function generateAiMarketAnalysis(options = {}) {
   let analysisText = "";
   let lastErrorMsg = "";
   let quota429Count = 0;
+  const unavailable404Models = new Set();
 
   for (let attempt = 0; attempt < backoffDelaysMs.length + 1 && !analysisText; attempt += 1) {
     quota429Count = 0;
     for (const model of candidateModels) {
+      if (unavailable404Models.has(model)) continue;
       let timeoutTimer = null;
       try {
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
@@ -2421,6 +2427,7 @@ async function generateAiMarketAnalysis(options = {}) {
         } else {
           const errText = await response.text();
           if (response.status === 429) quota429Count += 1;
+          if (response.status === 404 || response.status === 400) unavailable404Models.add(model);
           console.warn(`[Gemini API] Model ${model} failed (HTTP ${response.status}, attempt ${attempt + 1}):`, errText.slice(0, 200));
           try {
             const errJson = JSON.parse(errText);
@@ -2436,7 +2443,7 @@ async function generateAiMarketAnalysis(options = {}) {
       }
     }
 
-    if (!analysisText && attempt < backoffDelaysMs.length) {
+    if (!analysisText && unavailable404Models.size < candidateModels.length && attempt < backoffDelaysMs.length) {
       const waitMs = backoffDelaysMs[attempt];
       console.log(`[Gemini API] Waiting ${waitMs / 1000}s exponential backoff before retry...`);
       await new Promise((r) => setTimeout(r, waitMs));
@@ -2583,10 +2590,12 @@ async function generateAiMarketAnalysisStream(req, res) {
   let geminiResp = null;
   let chosenModel = candidateModels[0];
   let quota429Count = 0;
+  const unavailable404Models = new Set();
 
   for (let attempt = 0; attempt < backoffDelaysMs.length + 1 && !geminiResp; attempt += 1) {
     quota429Count = 0;
     for (const model of candidateModels) {
+      if (unavailable404Models.has(model)) continue;
       let timeoutTimer = null;
       try {
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${encodeURIComponent(
@@ -2614,6 +2623,7 @@ async function generateAiMarketAnalysisStream(req, res) {
         } else {
           const errTxt = await resp.text();
           if (resp.status === 429) quota429Count += 1;
+          if (resp.status === 404 || resp.status === 400) unavailable404Models.add(model);
           console.warn(`[Gemini Stream] Model ${model} failed (HTTP ${resp.status}, attempt ${attempt + 1}):`, errTxt.slice(0, 200));
         }
       } catch (e) {
@@ -2621,7 +2631,7 @@ async function generateAiMarketAnalysisStream(req, res) {
         console.warn(`[Gemini Stream] Exception with model ${model} (attempt ${attempt + 1}):`, e.message);
       }
     }
-    if (!geminiResp && attempt < backoffDelaysMs.length) {
+    if (!geminiResp && unavailable404Models.size < candidateModels.length && attempt < backoffDelaysMs.length) {
       await new Promise((r) => setTimeout(r, backoffDelaysMs[attempt]));
     }
   }
@@ -2904,13 +2914,7 @@ ${newsSummaryList}
 
 문장은 신뢰감 있고 가독성 높게, 적절한 불릿포인트와 이모지를 활용해주세요.`;
 
-  const candidateModels = [
-    "gemini-2.5-flash",
-    "gemini-flash-latest",
-    "gemini-2.5-flash-lite",
-    "gemini-flash-lite-latest",
-    "gemini-2.5-pro",
-  ];
+  const candidateModels = getDualAiCandidateModels(false);
 
   let chosenModel = candidateModels[0];
   let analysisText = "";
@@ -3155,13 +3159,7 @@ ${newsSummaryList}
 
 문장은 신뢰감 있고 가독성 높게, 적절한 불릿포인트와 이모지를 활용해주세요.`;
 
-  const candidateModels = [
-    "gemini-2.5-flash",
-    "gemini-flash-latest",
-    "gemini-2.5-flash-lite",
-    "gemini-flash-lite-latest",
-    "gemini-2.5-pro",
-  ];
+  const candidateModels = getDualAiCandidateModels(false);
 
   let geminiResp = null;
   let chosenModel = candidateModels[0];
@@ -3704,7 +3702,7 @@ ${botSummary}
     const apiKey = await getGeminiApiKey();
 
     if (apiKey) {
-      const candidateModels = ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"];
+      const candidateModels = getDualAiCandidateModels(false);
       for (const model of candidateModels) {
         let timer = null;
         try {
@@ -7322,7 +7320,7 @@ async function checkAndRunScheduledAiMarketAnalysis() {
     // 1. 30분 단위 Gemini Flash 시장 분석 & 봇 진단
     if (needFlashMarket) {
       console.log(`[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) Gemini Flash 자동 시장 분석을 시작합니다...`);
-      const marketResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: flashSlotKey, preferredModel: "gemini-2.5-flash" });
+      const marketResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: flashSlotKey, preferredModel: "gemini-3.8-flash" });
       if (marketResult.success) {
         lastScheduledMarketAiFailureMs = 0;
         console.log(`[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) 완료 (모델: ${marketResult.briefing?.model})`);
@@ -7353,7 +7351,7 @@ async function checkAndRunScheduledAiMarketAnalysis() {
     // 3. 1시간 정각 단위 Gemini Pro 심층 퀀트 분석
     if (needProInDepth) {
       console.log(`[AI Auto Pro Analysis] 1시간 정각 심층 슬롯(${proSlotKey}) Gemini Pro 심층 퀀트 분석을 시작합니다...`);
-      const proResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: proSlotKey, preferredModel: "gemini-2.5-pro", modelType: "pro" });
+      const proResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: proSlotKey, preferredModel: "gemini-3.1-pro-preview", modelType: "pro" });
       if (proResult.success) {
         lastScheduledProAiFailureMs = 0;
         const db = getDb();

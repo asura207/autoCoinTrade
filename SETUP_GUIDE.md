@@ -89,7 +89,7 @@ cd ..
 - **`access_key` / `secret_key`**:
   - 업비트 Open API 키. 모의투자(`paper`) 상태에서도 시세 조회, 캔들 조회, 잔고 조회가 가능하며, 미입력 시에도 기본 모의 봇 로직은 fallback 모드로 안전하게 작동합니다.
 - **`gemini_api_key`**:
-  - Google Gemini API Key. Dual AI 시황·뉴스 브리핑 및 `bot_01`~`bot_10` 개별 진입 제어(`gemini-2.5-flash` 30분 / `gemini-2.5-pro` 1시간 SSE 스트리밍)에 사용됩니다.
+  - Google Gemini API Key. Dual AI 시황·뉴스 브리핑 및 `bot_01`~`bot_10` 개별 진입 제어(`gemini-3.8-flash` 30분 / `gemini-3.1-pro-preview` 1시간 SSE 스트리밍)에 사용됩니다.
   - 이 파일에 직접 입력해도 되고, **웹 화면(`http://localhost:9000`) 우측 상단의 `[⚙️ API 키 등록]` 팝업**을 통해 브라우저에서 바로 입력/저장할 수도 있습니다.
 
 ---

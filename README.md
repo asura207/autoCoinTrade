@@ -293,7 +293,7 @@ autoCoinTrade/
 - **Frontend**: React 18, Vite 5, CSS3 Custom Properties (Dark Theme), Responsive Mobile Layout
 - **Backend**: Node.js >= 22.5.0 (`node:http`, `node:sqlite` DatabaseSync WAL, `node:crypto`)
 - **Dual Database**: SQLite 3 (WAL 모드) + PostgreSQL 16 (`coin_trader` 양방향 실시간 동기화)
-- **AI Engine**: Google Gemini API (`gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-2.0-flash` SSE 스트리밍 & Dual AI 체인)
+- **AI Engine**: Google Gemini API (`gemini-3.8-flash`, `gemini-3.1-pro-preview`, `gemini-flash-latest` SSE 스트리밍 & Dual AI 체인)
 - **Exchange API**: Upbit Open API v1.0 (JWT SHA-512 비대칭 서명 인증, Rate Limit 방어)
 - **Network Tunnel**: Cloudflare Quick Tunnel (`cloudflared --no-autoupdate`)
 - **Deployment**: Linux Shell Scripts & Windows Batch / VBScript 무음 백그라운드 자동화

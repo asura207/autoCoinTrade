@@ -47,7 +47,7 @@
 - **주간 TOP 1 로테이션 & 듀얼 AI·DB 동기화 (Area 2)**:
   - `init_db.py`, `backend/node_server.mjs`, `backend/common/pg_sync.mjs`에 신규 컬럼 자동 `ALTER TABLE` 마이그레이션 및 `market`/`ticker` 양방향 백필 보강, `llm_filter_worker.py`의 `used_capital` SQL 오류 수정 및 Graceful Drain 봇 context 포함.
   - `bots.py` Graceful Drain 이관 시 체결 정산금 + 잔여 현금 합산(`virtual_krw`), `is_selected_for_live = 0` 해제 및 8자리 버림(`round_down_volume_8`) 적용, `bot_01`~`bot_10` 차단 시에도 보유 포지션 매도 루프 무차단 검증.
-  - `/api/settings/export` · `/api/settings/import-json` (`schema_version: 1.2`)에 `paper_trades`, `paper_bot_positions`, `market_regime_filter` 백업/복원 포함 및 유효 Gemini 모델(`gemini-2.5-flash` / `gemini-2.5-pro`) 정렬.
+  - `/api/settings/export` · `/api/settings/import-json` (`schema_version: 1.2`)에 `paper_trades`, `paper_bot_positions`, `market_regime_filter` 백업/복원 포함 및 라이브 호환 Gemini 모델 체인(`gemini-3.8-flash` / `gemini-3.1-pro-preview` 우선, 404 비재시도) 정렬.
 - **주문 정합성·시세 캐시 & 프론트엔드/문서 안정화 (Area 3~5)**:
   - `backend/node_server.mjs` `checkAndHaltIfZeroBalance` SQLite 비동기/객체 추출 버그 수정, `upbitTickersCache`/`upbitCandlesCache` 및 `fetchUpbitPublicWithBackoff`(120ms 간격 + 429/503 1s/2s/4s 지수 백오프) 도입, `floorTo8DecimalsStr` 8자리 내림 정합성 강화.
   - `backend/common/algo_lab_service.mjs` Zero-Division/NaN 방어 및 2개 미만 전략군 챔피언 시 동적 비율 합계 100% 보정.

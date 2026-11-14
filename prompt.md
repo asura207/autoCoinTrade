@@ -144,7 +144,7 @@ autoCoinTrade/
 
 ### 3.4 AI 시황, 뉴스, 알림 및 시장 체제 테이블
 7. **`ai_market_briefings`**:
-   * `id` (INTEGER PRIMARY KEY AUTOINCREMENT), `provider` (TEXT NOT NULL DEFAULT 'gemini'), `model` (TEXT NOT NULL DEFAULT 'gemini-2.5-flash')
+   * `id` (INTEGER PRIMARY KEY AUTOINCREMENT), `provider` (TEXT NOT NULL DEFAULT 'gemini'), `model` (TEXT NOT NULL DEFAULT 'gemini-3.8-flash')
    * `btc_price` (REAL), `btc_daily_20ma` (REAL), `btc_4h_60ma` (REAL), `regime_status` (TEXT)
    * `briefing_text` (TEXT NOT NULL), `created_at` (TEXT NOT NULL)
 
@@ -154,7 +154,7 @@ autoCoinTrade/
    * 인덱스: `idx_crypto_news_pubdate ON crypto_news (published_at DESC)`
 
 9. **`ai_news_briefings`**:
-   * `id` (INTEGER PRIMARY KEY AUTOINCREMENT), `provider` (TEXT NOT NULL DEFAULT 'gemini'), `model` (TEXT NOT NULL DEFAULT 'gemini-2.5-flash')
+   * `id` (INTEGER PRIMARY KEY AUTOINCREMENT), `provider` (TEXT NOT NULL DEFAULT 'gemini'), `model` (TEXT NOT NULL DEFAULT 'gemini-3.8-flash')
    * `news_count` (INTEGER), `bullish_count` (INTEGER), `bearish_count` (INTEGER), `neutral_count` (INTEGER)
    * `briefing_text` (TEXT NOT NULL), `created_at` (TEXT NOT NULL)
 
@@ -203,7 +203,7 @@ autoCoinTrade/
 
 ### 5.2 듀얼 LLM 10대 봇 제어 · 주간 전략군 TOP 1 자동 로테이션 & 폴백 아키텍처
 1. **Gemini Dual AI 모델 호출 체인**:
-   - Flash(30분) / Pro(1시간 정각) 교차 검증으로 `gemini-2.5-flash` -> `gemini-2.5-pro` -> `gemini-2.0-flash` 순차 시도 및 `bot_01`~`bot_10` 개별 `ALLOW`/`BLOCK` 제어(`final_bot_overrides_json`, 청산 루프는 비차단).
+   - Flash(30분) / Pro(1시간 정각) 교차 검증으로 `gemini-3.8-flash` -> `gemini-3.1-pro-preview` -> `gemini-flash-latest` / `gemini-2.5-*` 폴백 체인 및 `bot_01`~`bot_10` 개별 `ALLOW`/`BLOCK` 제어(`final_bot_overrides_json`, 청산 루프는 비차단).
    - 각 호출 시 `AbortSignal.timeout(12000)` (12초 타임아웃) 강제 적용.
    - `generationConfig`: `temperature: 0.2`, `maxOutputTokens: 4096`, `responseMimeType: "application/json"` 필수 적용으로 마크다운 없는 순수 JSON 보장.
 2. **평가 입력 데이터**:
@@ -327,7 +327,7 @@ autoCoinTrade/
 ### [체크리스트 5] Gemini LLM 연동 및 안정성 검수
 - [ ] Gemini API 호출 시 `AbortSignal.timeout(12000)` 또는 `setTimeout` 기반 타임아웃 처리가 되어 있어 API 응답 지연 시 프로세스가 블로킹되지 않는가?
 - [ ] 주간 봇 선발 프롬프트에 `responseMimeType: "application/json"`이 설정되어 있어 파싱 에러 없는 순수 JSON 출력이 보장되는가?
-- [ ] `gemini-2.5-flash` -> `gemini-2.5-pro` -> `gemini-2.0-flash` 폴백 체인과 Dual AI(30분 Flash / 1시간 Pro) `bot_01`~`bot_10` 개별 제어, 그리고 최종 실패 시 모의투자 아레나·BTC 20MA 기반 **퀀트 룰베이스 알고리즘 폴백**이 완벽히 작동하는가?
+- [ ] `gemini-3.8-flash` -> `gemini-3.1-pro-preview` -> `gemini-flash-latest` / `gemini-2.5-*` 폴백 체인과 Dual AI(30분 Flash / 1시간 Pro) `bot_01`~`bot_10` 개별 제어, 그리고 최종 실패 시 모의투자 아레나·BTC 20MA 기반 **퀀트 룰베이스 알고리즘 폴백**이 완벽히 작동하는가?
 - [ ] 무료 API 호출 한도(Quota 429) 발생 시 이를 감지하고 사용자에게 안내하는가?
 
 ### [체크리스트 6] 비트코인 거시 체제 필터 (Regime Filter) 검수
