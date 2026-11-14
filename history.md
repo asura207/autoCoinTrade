@@ -10,7 +10,8 @@
 
 | 버전 (Version) | 릴리즈 일시 | 커밋 해시 | 주요 수정 내용 요약 |
 | :--- | :--- | :--- | :--- |
-| **v0.0.22** | 2026-11-14 | - | 주간 3대 전략군(추세·스윙/변동성·돌파/역추세·그리드)별 1위 봇 자동 선출(Auto-Rotation), 동적 자금 배분, 무손실 포지션 청산 대기(Graceful Drain) 및 정산금 자동 귀속 시스템 구축 |
+| **v0.0.23** | 2026-11-14 | - | 전수 코드 감사 5대 영역 수정: 루트·`/install` 실행/종료 스크립트 동기화 및 Node-Python 이중 실행 차단, Graceful Drain 잔고 이관·DB/PG 자동 마이그레이션·JSON Export/Import v1.2, 업비트 시세 캐시·지수 백오프·8자리 내림 주문 정합성, 프론트엔드 SSE 클린업, 문서·패키지 현행화 |
+| **v0.0.22** | 2026-11-14 | `b8bd374` | 주간 3대 전략군(추세·스윙/변동성·돌파/역추세·그리드)별 1위 봇 자동 선출(Auto-Rotation), 동적 자금 배분, 무손실 포지션 청산 대기(Graceful Drain) 및 정산금 자동 귀속 시스템 구축 |
 | **v0.0.21** | 2026-11-13 | `688eca6` | 설정 화면 내 봇별 손절/익절 기준 입력 필드 박스 영역 초과(Overflow) 현상 수정 및 반응형 그리드·인풋 너비 최적화 |
 | **v0.0.20** | 2026-11-13 | `37623f4` | 10대 알고리즘 매매 로직 정밀 고도화: 3단계 스마트 청산(시간/본절/동적 ATR), 윗꼬리·과열 방어 필터, Jack Kellogg 튜닝, 일일 손실 방어 서킷 브레이커(-4.0%) |
 | **v0.0.19** | 2026-11-13 | `cf8bbe7` | 오케스트레이터(10대 봇·시세 허브) 동기화, 이중 주문 방어(Double Execution Guard), DB 경로 통일, pg_sync 예외 방어 및 저장소 URL(asura207) 일괄 갱신 |
@@ -36,6 +37,21 @@
 ---
 
 ## 📝 상세 버전별 변경 내역 (Detailed Changelog)
+
+### [v0.0.23] - 2026-11-14
+**전수 코드 감사(b8bd374 기준), 구버전 스크립트/모듈 동기화 및 런타임 안전성 보강**
+- **실행·종료 스크립트 & `/install` 번들 동기화 (Area 1)**:
+  - `setup.sh`/`setup.bat` 루트 `npm install` 누락 보완 및 `.env` 포트 파싱 추가, `run_orchestrator.sh`/`run_orchestrator.bat` 환경변수(`PYTHONUTF8`, `.env`) 및 `logs/.orchestrator.pid` 락 통합.
+  - `stop_services.sh`/`stop_services.bat`/`stop.bat` 및 `/install/AutoCoinTrade_*` 스크립트에서 Node.js `>= 22.5.0` 검증, Grace Period 종료 및 repo-scoped 워커 안전 종료 구현.
+  - Node.js(`backend/node_server.mjs`) 실행 시 `main_orchestrator.py`·`bots.py`·`llm_filter_worker.py`·`agentBot/bot_10_jack_kellogg.py` 자동 Yield로 이중 매매/분석 루프(Double Execution) 원천 차단.
+- **주간 TOP 1 로테이션 & 듀얼 AI·DB 동기화 (Area 2)**:
+  - `init_db.py`, `backend/node_server.mjs`, `backend/common/pg_sync.mjs`에 신규 컬럼 자동 `ALTER TABLE` 마이그레이션 및 `market`/`ticker` 양방향 백필 보강, `llm_filter_worker.py`의 `used_capital` SQL 오류 수정 및 Graceful Drain 봇 context 포함.
+  - `bots.py` Graceful Drain 이관 시 체결 정산금 + 잔여 현금 합산(`virtual_krw`), `is_selected_for_live = 0` 해제 및 8자리 버림(`round_down_volume_8`) 적용, `bot_01`~`bot_10` 차단 시에도 보유 포지션 매도 루프 무차단 검증.
+  - `/api/settings/export` · `/api/settings/import-json` (`schema_version: 1.2`)에 `paper_trades`, `paper_bot_positions`, `market_regime_filter` 백업/복원 포함 및 유효 Gemini 모델(`gemini-2.5-flash` / `gemini-2.5-pro`) 정렬.
+- **주문 정합성·시세 캐시 & 프론트엔드/문서 안정화 (Area 3~5)**:
+  - `backend/node_server.mjs` `checkAndHaltIfZeroBalance` SQLite 비동기/객체 추출 버그 수정, `upbitTickersCache`/`upbitCandlesCache` 및 `fetchUpbitPublicWithBackoff`(120ms 간격 + 429/503 1s/2s/4s 지수 백오프) 도입, `floorTo8DecimalsStr` 8자리 내림 정합성 강화.
+  - `backend/common/algo_lab_service.mjs` Zero-Division/NaN 방어 및 2개 미만 전략군 챔피언 시 동적 비율 합계 100% 보정.
+  - `frontend/src/App.jsx` SSE `AbortError` 처리·탭 전환 시 스트림 정리·`tradeMode.mode` 폴링 의존성 동기화 및 전 프로젝트 문서/버전(`0.0.23`)·`/install` 패키지 현행화.
 
 ### [v0.0.22] - 2026-11-14
 - **변경 분류**: `feat` (주간 전략군별 1위 봇 자동 선출 엔진 & Graceful Drain 무손실 자금 이관)

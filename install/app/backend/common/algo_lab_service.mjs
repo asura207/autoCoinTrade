@@ -1503,10 +1503,17 @@ async function computePaperCash(db, botId, initial) {
 
 /** 가상 매수 체결: 예산을 Math.floor(예산 / 1.0005) 로 환산하고 수수료 0.05% 별도 반영 */
 async function paperBuy(db, bot, market, price, budgetKrw, reason) {
-  const buyAmount = Math.floor(budgetKrw / (1 + PAPER_FEE_RATE));
-  if (buyAmount < PAPER_MIN_ORDER_KRW) return null;
+  const safePrice = Number(price);
+  const safeBudget = Number(budgetKrw);
+  if (!Number.isFinite(safePrice) || safePrice <= 0 || !Number.isFinite(safeBudget) || safeBudget <= 0) {
+    return null;
+  }
+  const buyAmount = Math.floor(safeBudget / (1 + PAPER_FEE_RATE));
+  if (!Number.isFinite(buyAmount) || buyAmount < PAPER_MIN_ORDER_KRW) return null;
   const fee = Math.floor(buyAmount * PAPER_FEE_RATE);
-  const volume = (buyAmount / price).toFixed(8);
+  const flooredVol = Math.floor((buyAmount / safePrice) * 1e8) / 1e8;
+  if (!Number.isFinite(flooredVol) || flooredVol <= 0) return null;
+  const volume = flooredVol.toFixed(8);
   const now = nowKSTString();
   const uuid = `paper-bid-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
   const tr = await db
@@ -1514,36 +1521,44 @@ async function paperBuy(db, bot, market, price, budgetKrw, reason) {
       INSERT INTO paper_trades (bot_id, market, buy_order_uuid, buy_price, buy_volume, buy_amount, buy_date, status, buy_reason)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'HOLDING', ?)
     `)
-    .run(bot.bot_id, market, uuid, price, volume, buyAmount, now, reason);
+    .run(bot.bot_id, market, uuid, safePrice, volume, buyAmount, now, reason);
   const tradeId = Number(tr.lastInsertRowid);
   const pr = await db
     .prepare(`
       INSERT INTO paper_bot_positions (bot_id, market, order_uuid, volume, avg_buy_price, buy_amount, buy_fee, trade_id, status, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
     `)
-    .run(bot.bot_id, market, uuid, volume, price, buyAmount, fee, tradeId, now);
+    .run(bot.bot_id, market, uuid, volume, safePrice, buyAmount, fee, tradeId, now);
   return { positionId: Number(pr.lastInsertRowid), tradeId, buyAmount, fee, volume, uuid };
 }
 
 /** 가상 매도 체결 (포지션별 개별 정산, 수수료 0.05% 반영) */
 async function paperSell(db, bot, positions, price, reason) {
+  const safePrice = Number(price);
+  if (!Number.isFinite(safePrice) || safePrice <= 0 || !Array.isArray(positions) || positions.length === 0) {
+    return 0;
+  }
   const now = nowKSTString();
   const sellUuid = `paper-ask-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
   let totalProfit = 0;
   for (const p of positions) {
-    const gross = Math.floor(Number(p.volume) * price);
+    const pVol = Number(p.volume) || 0;
+    const buyAmt = Number(p.buy_amount) || 0;
+    const buyFee = Number(p.buy_fee) || 0;
+    const gross = Math.floor(pVol * safePrice);
     const fee = Math.floor(gross * PAPER_FEE_RATE);
     const net = gross - fee;
-    const profit = net - Number(p.buy_amount) - Number(p.buy_fee || 0);
-    const profitPct = Number(p.buy_amount) > 0 ? Number(((profit / Number(p.buy_amount)) * 100).toFixed(2)) : 0;
-    totalProfit += profit;
+    const profit = net - buyAmt - buyFee;
+    const rawPct = buyAmt > 0 ? (profit / buyAmt) * 100 : 0;
+    const profitPct = Number.isFinite(rawPct) ? Number(rawPct.toFixed(2)) : 0;
+    if (Number.isFinite(profit)) totalProfit += profit;
     await db.prepare("UPDATE paper_bot_positions SET status = 'CLOSED', closed_at = ? WHERE id = ? AND status = 'OPEN'").run(now, p.id);
     await db.prepare(`
       UPDATE paper_trades
       SET sell_order_uuid = ?, sell_price = ?, sell_volume = ?, sell_amount = ?, sell_date = ?,
           profit_krw = ?, profit_pct = ?, status = 'COMPLETED', sell_reason = ?
       WHERE id = ?
-    `).run(sellUuid, price, String(p.volume), gross, now, profit, profitPct, reason, p.trade_id);
+    `).run(sellUuid, safePrice, String(p.volume), gross, now, profit, profitPct, reason, p.trade_id);
     peakMap.delete(`paper-${p.id}`);
   }
   cooldownMap.set(`${bot.bot_id}|${positions[0].market}`, Date.now());
@@ -1706,7 +1721,8 @@ async function runPaperBot(db, bot, ctx) {
 // 9. 리더보드 / 통계 산출
 // ============================================================================
 async function computeBotArenaStats(db, bot) {
-  const initial = Number(bot.paper_initial_capital || DEFAULT_PAPER_CAPITAL);
+  const rawInitial = Number(bot.paper_initial_capital || DEFAULT_PAPER_CAPITAL);
+  const initial = Number.isFinite(rawInitial) && rawInitial > 0 ? rawInitial : DEFAULT_PAPER_CAPITAL;
   const closed = await db
     .prepare("SELECT profit_krw FROM paper_trades WHERE bot_id = ? AND status = 'COMPLETED'")
     .all(bot.bot_id);
@@ -1715,7 +1731,7 @@ async function computeBotArenaStats(db, bot) {
   let loses = 0;
   for (const t of closed) {
     const p = Number(t.profit_krw || 0);
-    realized += p;
+    if (Number.isFinite(p)) realized += p;
     if (p > 0) wins++;
     else if (p < 0) loses++;
   }
@@ -1726,20 +1742,25 @@ async function computeBotArenaStats(db, bot) {
   let openEval = 0;
   const openList = [];
   for (const p of open) {
-    openCost += Number(p.buy_amount || 0) + Number(p.buy_fee || 0);
+    const buyAmt = Number(p.buy_amount || 0);
+    const buyFee = Number(p.buy_fee || 0);
+    openCost += (Number.isFinite(buyAmt) ? buyAmt : 0) + (Number.isFinite(buyFee) ? buyFee : 0);
     const tk = lastPriceMap.get(p.market);
-    const cur = Number(tk?.trade_price || p.avg_buy_price);
-    const evalKrw = Math.floor(Number(p.volume) * cur);
+    const avgBuy = Number(p.avg_buy_price) || 0;
+    const cur = Number(tk?.trade_price) > 0 ? Number(tk.trade_price) : avgBuy;
+    const pVol = Number(p.volume) || 0;
+    const evalKrw = Number.isFinite(pVol * cur) ? Math.floor(pVol * cur) : 0;
     openEval += evalKrw;
+    const rawPnlPct = avgBuy > 0 ? pctChange(cur, avgBuy) : 0;
     openList.push({
       id: p.id,
       market: p.market,
-      avg_buy_price: Number(p.avg_buy_price),
+      avg_buy_price: avgBuy,
       current_price: cur,
       volume: p.volume,
-      buy_amount: Number(p.buy_amount),
+      buy_amount: buyAmt,
       eval_krw: evalKrw,
-      pnl_pct: Number(pctChange(cur, Number(p.avg_buy_price)).toFixed(2)),
+      pnl_pct: Number.isFinite(rawPnlPct) ? Number(rawPnlPct.toFixed(2)) : 0,
       created_at: p.created_at,
     });
   }
@@ -1747,19 +1768,21 @@ async function computeBotArenaStats(db, bot) {
   const evalAssets = cash + openEval;
   const profitKrw = evalAssets - initial;
   const decided = wins + loses;
+  const rawProfitRate = initial > 0 ? (profitKrw / initial) * 100 : 0;
+  const rawWinRate = decided > 0 ? (wins / decided) * 100 : 0;
   return {
     bot_id: bot.bot_id,
     initial_capital: initial,
-    cash_krw: cash,
-    eval_assets_krw: evalAssets,
-    cumulative_profit_krw: profitKrw,
-    profit_rate_pct: initial > 0 ? Number(((profitKrw / initial) * 100).toFixed(2)) : 0.0,
-    realized_profit_krw: realized,
-    unrealized_profit_krw: openEval - openCost,
+    cash_krw: Number.isFinite(cash) ? cash : 0,
+    eval_assets_krw: Number.isFinite(evalAssets) ? evalAssets : initial,
+    cumulative_profit_krw: Number.isFinite(profitKrw) ? profitKrw : 0,
+    profit_rate_pct: Number.isFinite(rawProfitRate) ? Number(rawProfitRate.toFixed(2)) : 0.0,
+    realized_profit_krw: Number.isFinite(realized) ? realized : 0,
+    unrealized_profit_krw: Number.isFinite(openEval - openCost) ? openEval - openCost : 0,
     win_trades: wins,
     lose_trades: loses,
     total_trades: closed.length,
-    win_rate_pct: decided > 0 ? Number(((wins / decided) * 100).toFixed(1)) : 0.0,
+    win_rate_pct: Number.isFinite(rawWinRate) ? Number(rawWinRate.toFixed(1)) : 0.0,
     open_positions_count: open.length,
     open_positions: openList,
   };
@@ -1920,8 +1943,19 @@ export async function evaluateWeeklyStrategyChampions(db, options = {}) {
       a.bot_id.localeCompare(b.bot_id)
   );
 
+  let assignedTotal = 0;
   champions.forEach((champ, idx) => {
-    const assignedRatio = weights[idx] ?? Math.floor(100 / Math.max(1, champions.length));
+    let assignedRatio = 0;
+    if (champions.length === 1) {
+      assignedRatio = 100;
+    } else if (idx === champions.length - 1) {
+      assignedRatio = Math.max(0, 100 - assignedTotal);
+    } else if (champions.length === 2) {
+      assignedRatio = idx === 0 ? 55 : 45;
+    } else {
+      assignedRatio = weights[idx] ?? Math.floor(100 / Math.max(1, champions.length));
+    }
+    assignedTotal += assignedRatio;
     champ.champion_rank = idx + 1;
     champ.recommended_ratio = assignedRatio;
   });

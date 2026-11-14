@@ -7,7 +7,7 @@
 ## 1. 시스템 핵심 아키텍처 및 기술 스택
 
 ### 1.1 기술 스택 (Tech Stack)
-- **Backend Runtime**: Node.js (v20+ 또는 v22.5.0+, Native ES Module `.mjs`, Native `node:http`, Native `node:sqlite` DatabaseSync WAL 모드, Native `node:crypto`, Port `8001`)
+- **Backend Runtime**: Node.js (`v22.5.0+`, Native ES Module `.mjs`, Native `node:http`, Native `node:sqlite` DatabaseSync WAL 모드, Native `node:crypto`, Port `8001`; Python 오케스트레이터 공존 시 Node 단일 실행 우선)
   - 비동기 봇 매매 루프 (8~10초 주기)
   - Gemini AI 실시간 스트리밍 (Server-Sent Events: SSE) 엔진
   - 구글 뉴스 & 토큰포스트 RSS 실시간 수집 및 감성 분석 백그라운드 워커 (30분 주기)
@@ -144,7 +144,7 @@ autoCoinTrade/
 
 ### 3.4 AI 시황, 뉴스, 알림 및 시장 체제 테이블
 7. **`ai_market_briefings`**:
-   * `id` (INTEGER PRIMARY KEY AUTOINCREMENT), `provider` (TEXT NOT NULL DEFAULT 'gemini'), `model` (TEXT NOT NULL DEFAULT 'gemini-3.5-flash')
+   * `id` (INTEGER PRIMARY KEY AUTOINCREMENT), `provider` (TEXT NOT NULL DEFAULT 'gemini'), `model` (TEXT NOT NULL DEFAULT 'gemini-2.5-flash')
    * `btc_price` (REAL), `btc_daily_20ma` (REAL), `btc_4h_60ma` (REAL), `regime_status` (TEXT)
    * `briefing_text` (TEXT NOT NULL), `created_at` (TEXT NOT NULL)
 
@@ -154,7 +154,7 @@ autoCoinTrade/
    * 인덱스: `idx_crypto_news_pubdate ON crypto_news (published_at DESC)`
 
 9. **`ai_news_briefings`**:
-   * `id` (INTEGER PRIMARY KEY AUTOINCREMENT), `provider` (TEXT NOT NULL DEFAULT 'gemini'), `model` (TEXT NOT NULL DEFAULT 'gemini-3.5-flash-lite')
+   * `id` (INTEGER PRIMARY KEY AUTOINCREMENT), `provider` (TEXT NOT NULL DEFAULT 'gemini'), `model` (TEXT NOT NULL DEFAULT 'gemini-2.5-flash')
    * `news_count` (INTEGER), `bullish_count` (INTEGER), `bearish_count` (INTEGER), `neutral_count` (INTEGER)
    * `briefing_text` (TEXT NOT NULL), `created_at` (TEXT NOT NULL)
 
@@ -201,9 +201,9 @@ autoCoinTrade/
   - 차기 슬롯: 현재 슬롯 + 7일 (`nextSundaySlot`).
   - D-Day 카운트다운: 차기 일요일 09:00까지의 잔여 일수(`daysRemaining`).
 
-### 5.2 LLM 주간 봇 평가 및 다중 폴백 아키텍처
-1. **Gemini 모델 호출 체인**:
-   - `gemini-3.5-flash-lite` -> `gemini-3.5-flash` -> `gemini-3.8-flash` 순차 시도.
+### 5.2 듀얼 LLM 10대 봇 제어 · 주간 전략군 TOP 1 자동 로테이션 & 폴백 아키텍처
+1. **Gemini Dual AI 모델 호출 체인**:
+   - Flash(30분) / Pro(1시간 정각) 교차 검증으로 `gemini-2.5-flash` -> `gemini-2.5-pro` -> `gemini-2.0-flash` 순차 시도 및 `bot_01`~`bot_10` 개별 `ALLOW`/`BLOCK` 제어(`final_bot_overrides_json`, 청산 루프는 비차단).
    - 각 호출 시 `AbortSignal.timeout(12000)` (12초 타임아웃) 강제 적용.
    - `generationConfig`: `temperature: 0.2`, `maxOutputTokens: 4096`, `responseMimeType: "application/json"` 필수 적용으로 마크다운 없는 순수 JSON 보장.
 2. **평가 입력 데이터**:
@@ -212,8 +212,9 @@ autoCoinTrade/
 3. **평가 기준**:
    - **하락/약세장**: 공격적 돌파봇(돌파봇, 스파이크봇 등) 차단, 손실 방어력 최상위 봇(MDD 0%대 눌림목봇, 슈퍼트렌드-ATR, 과매도 VWAP봇 등) 우선 배치.
    - **상승장**: 추세 추종 및 모멘텀 전략 봇 우선 배치.
-4. **퀀트 룰베이스 알고리즘 폴백 (LLM 실패 또는 Quota 소진 시)**:
-   - Gemini 호출이 전원 실패할 경우 시스템이 멈추지 않고, 모의투자 아레나의 **하락장 기준 `MDD 오름차순 -> 수익률 내림차순` 정렬 알고리즘**을 통해 상위 3개 봇을 자동 선발.
+4. **퀀트 룰베이스 알고리즘 폴백 및 주간 자동 로테이션 · Graceful Drain**:
+   - Gemini 호출이 전원 실패할 경우 시스템이 멈추지 않고 BTC 20MA 기계적 필터 및 모의투자 아레나의 **전략군(추세·스윙 / 변동성·돌파 / 역추세·그리드)별 1위 봇 자동 선발 + Graceful Drain(미매도 오픈 포지션 보유 구 봇은 신규 매수만 차단하고 전량 익절/손절 완료 후 잔여 원화를 신규 봇으로 이관)** 을 통해 무중단 운용.
+   - `bot_10`은 Jack Kellogg VWAP + 선형 회귀 채널 프라이스 액션 전략으로 가상/실전 양측 모두 지원.
 
 ---
 
@@ -259,7 +260,7 @@ autoCoinTrade/
    - 1위(금색), 2위(은색), 3위(동색) 카드에 배분 비중(%), 전략명, 선정 사유 표기.
    - 하단에 최근 편성 일시 및 차기 자동 갱신 일시 표기.
 3. **5대 메뉴 구성**:
-   - `📊 거래현황`: 실계좌 요약, 주간 봇 카드, AI 마켓 브리핑, 실전 3대 봇 제어 탭, 1줄 통합 체결 게시판.
+   - `📊 거래현황`: 실계좌 요약, 주간 자동 로테이션/Graceful Drain 봇 카드, 듀얼 AI(Flash/Pro) 마켓 브리핑, 실전 담당 봇(1~3개) 제어 탭, 1줄 통합 체결 게시판.
    - `📈 통계`: 일별/주별/월별 누적 손익 곡선 (이익: 빨강 `#ef4444`, 손실: 파랑 `#3b82f6`).
    - `🧪 검증소`: 10대 알고리즘 아레나 실시간 랭킹 보드, TOP 3 포디움, 가상 매매 체결 이력.
    - `📰 뉴스`: 30분 주기 뉴스 50건 페이징, 48px 고정 행 높이 1줄 말줄임, AI 종합 분석 SSE 타이핑.
@@ -326,7 +327,7 @@ autoCoinTrade/
 ### [체크리스트 5] Gemini LLM 연동 및 안정성 검수
 - [ ] Gemini API 호출 시 `AbortSignal.timeout(12000)` 또는 `setTimeout` 기반 타임아웃 처리가 되어 있어 API 응답 지연 시 프로세스가 블로킹되지 않는가?
 - [ ] 주간 봇 선발 프롬프트에 `responseMimeType: "application/json"`이 설정되어 있어 파싱 에러 없는 순수 JSON 출력이 보장되는가?
-- [ ] `gemini-3.5-flash-lite` -> `gemini-3.5-flash` -> `gemini-3.8-flash` 폴백 체인과, 최종 실패 시 모의투자 아레나 기반 **퀀트 룰베이스 알고리즘 폴백**이 완벽히 작동하는가?
+- [ ] `gemini-2.5-flash` -> `gemini-2.5-pro` -> `gemini-2.0-flash` 폴백 체인과 Dual AI(30분 Flash / 1시간 Pro) `bot_01`~`bot_10` 개별 제어, 그리고 최종 실패 시 모의투자 아레나·BTC 20MA 기반 **퀀트 룰베이스 알고리즘 폴백**이 완벽히 작동하는가?
 - [ ] 무료 API 호출 한도(Quota 429) 발생 시 이를 감지하고 사용자에게 안내하는가?
 
 ### [체크리스트 6] 비트코인 거시 체제 필터 (Regime Filter) 검수

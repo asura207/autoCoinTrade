@@ -366,29 +366,34 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
         execute_buy_order,
         execute_sell_order,
         get_safe_current_price,
+        is_backend_running,
         is_dry_run,
         MIN_ORDER_KRW,
     )
-    from market_hub import get_cached_tickers
+    from market_hub import get_cached_ohlcv, get_cached_tickers
 
     logger.info("Bot process [%s] (Jack Kellogg Price Action) started.", bot_id)
     peak_map: Dict[int, float] = {}
 
     while not stop_event.is_set():
         try:
+            if is_backend_running():
+                if stop_event.wait(timeout=10):
+                    break
+                continue
+
             conn = get_db_connection(db_path)
             allow_new_buys = True
-            if not is_dry_run():
-                b_row = conn.execute(
-                    "SELECT is_selected_for_live, is_running FROM bots WHERE bot_id = ?;",
-                    (bot_id,),
-                ).fetchone()
-                if b_row is not None:
-                    b_dict = dict(b_row)
-                    allow_new_buys = (
-                        int(b_dict.get("is_selected_for_live") or 0) == 1
-                        and int(b_dict.get("is_running") or 0) == 1
-                    )
+            b_row = conn.execute(
+                "SELECT is_selected_for_live, is_running FROM bots WHERE bot_id = ?;",
+                (bot_id,),
+            ).fetchone()
+            if b_row is not None:
+                b_dict = dict(b_row)
+                allow_new_buys = (
+                    int(b_dict.get("is_selected_for_live") or 0) == 1
+                    and int(b_dict.get("is_running") or 0) == 1
+                )
             bot_acc = conn.execute("SELECT * FROM bot_accounts WHERE bot_id = ?;", (bot_id,)).fetchone()
             available_krw = float(bot_acc["virtual_krw"]) if bot_acc else 0.0
             open_positions = conn.execute(
@@ -405,8 +410,10 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
             # 1. 기존 오픈 포지션 청산/익절/손절 점검
             pos_by_ticker: Dict[str, List[Dict[str, Any]]] = {}
             for pos in open_positions:
-                t = pos["ticker"]
-                pos_by_ticker.setdefault(t, []).append(dict(pos))
+                pd_row = dict(pos)
+                t = str(pd_row.get("market") or pd_row.get("ticker") or "")
+                if t:
+                    pos_by_ticker.setdefault(t, []).append(pd_row)
 
             for ticker, pos_list in list(pos_by_ticker.items()):
                 cur_price = get_safe_current_price(ticker)
@@ -417,8 +424,8 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
                     p_id = p["id"]
                     peak_map[p_id] = max(peak_map.get(p_id, float(p.get("highest_price") or p.get("avg_buy_price") or cur_price)), cur_price)
 
-                df_15m = pyupbit.get_ohlcv(ticker, interval="minute15", count=100)
-                df_day = pyupbit.get_ohlcv(ticker, interval="day", count=30)
+                df_15m = get_cached_ohlcv(ticker, interval="minute15", count=100)
+                df_day = get_cached_ohlcv(ticker, interval="day", count=30)
                 if df_15m is None or len(df_15m) < 20:
                     continue
 
@@ -504,8 +511,8 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
                     if cur_price <= 0:
                         continue
 
-                    df_15m = pyupbit.get_ohlcv(ticker, interval="minute15", count=100)
-                    df_day = pyupbit.get_ohlcv(ticker, interval="day", count=30)
+                    df_15m = get_cached_ohlcv(ticker, interval="minute15", count=100)
+                    df_day = get_cached_ohlcv(ticker, interval="day", count=30)
                     if df_15m is None or len(df_15m) < 20:
                         continue
 

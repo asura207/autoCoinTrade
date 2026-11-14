@@ -2700,11 +2700,20 @@ export default function App() {
 
       isStreamDoneRef.current = true;
       isAiBusyRef.current = false;
+      activeStreamAbortControllerRef.current = null;
     } catch (err) {
+      if (err?.name === "AbortError") {
+        isStreamDoneRef.current = true;
+        setIsStreaming(false);
+        setAiLoading(false);
+        isAiBusyRef.current = false;
+        return;
+      }
       setAiError(`서버 연결 오류: ${err.message}`);
       setIsStreaming(false);
       setAiLoading(false);
       isAiBusyRef.current = false;
+      activeStreamAbortControllerRef.current = null;
     }
   };
 
@@ -3120,7 +3129,7 @@ export default function App() {
       fetchNewsAiBriefing(true);
     }, 6000);
     return () => clearInterval(timer);
-  }, [authenticated, selectedBotId, fetchTradeMode, fetchAlgoLabModels, fetchRotationStatus, fetchEntryCode]);
+  }, [authenticated, selectedBotId, tradeMode.mode, fetchTradeMode, fetchAlgoLabModels, fetchRotationStatus, fetchEntryCode]);
 
   // 가상거래 경쟁(Arena) 활성화 시 5초 주기 실시간 리더보드 및 체결 일지 자동 갱신
   useEffect(() => {
@@ -3139,6 +3148,22 @@ export default function App() {
   useEffect(() => {
     sessionStorage.setItem("autoCoinTrade_menu", activeMenu);
     localStorage.setItem("autoCoinTrade_menu", activeMenu);
+    if (activeMenu !== "trades" && activeStreamAbortControllerRef.current) {
+      activeStreamAbortControllerRef.current.abort();
+      activeStreamAbortControllerRef.current = null;
+      isStreamDoneRef.current = true;
+      isAiBusyRef.current = false;
+      setIsStreaming(false);
+      setAiLoading(false);
+    }
+    if (activeMenu !== "news" && activeNewsStreamAbortControllerRef.current) {
+      activeNewsStreamAbortControllerRef.current.abort();
+      activeNewsStreamAbortControllerRef.current = null;
+      isNewsStreamDoneRef.current = true;
+      isNewsAiBusyRef.current = false;
+      setIsNewsStreaming(false);
+      setNewsAiLoading(false);
+    }
     if (activeMenu === "settings") {
       fetchEntryCode();
       fetchRotationStatus();
@@ -3327,11 +3352,20 @@ export default function App() {
       }
       isNewsStreamDoneRef.current = true;
       isNewsAiBusyRef.current = false;
+      activeNewsStreamAbortControllerRef.current = null;
     } catch (err) {
+      if (err?.name === "AbortError") {
+        isNewsStreamDoneRef.current = true;
+        setIsNewsStreaming(false);
+        setNewsAiLoading(false);
+        isNewsAiBusyRef.current = false;
+        return;
+      }
       setNewsStreamingText(`⚠️ 서버 연결 오류: ${err.message}`);
       setIsNewsStreaming(false);
       setNewsAiLoading(false);
       isNewsAiBusyRef.current = false;
+      activeNewsStreamAbortControllerRef.current = null;
     }
   };
 

@@ -324,6 +324,15 @@ def init_database(db_path: Optional[str] = None) -> None:
             );
             """
         )
+        if sqlite_mode:
+            acc_cols = {
+                dict(r)["name"]
+                for r in conn.execute("PRAGMA table_info(bot_accounts);").fetchall()
+            }
+            if "is_selected_for_live" not in acc_cols:
+                conn.execute("ALTER TABLE bot_accounts ADD COLUMN is_selected_for_live INTEGER NOT NULL DEFAULT 0;")
+        else:
+            conn.execute("ALTER TABLE bot_accounts ADD COLUMN IF NOT EXISTS is_selected_for_live INTEGER NOT NULL DEFAULT 0;")
 
         # 2. 봇별 독립 포지션 테이블 (bot_positions)
         conn.execute(
@@ -354,6 +363,11 @@ def init_database(db_path: Optional[str] = None) -> None:
             """
         )
         pos_alter_cols = [
+            ("market", "TEXT NOT NULL DEFAULT 'KRW-BTC'"),
+            ("ticker", "TEXT"),
+            ("trade_id", "BIGINT NOT NULL DEFAULT 0"),
+            ("highest_price", f"{real_type} DEFAULT 0.0"),
+            ("step_level", "INTEGER DEFAULT 1"),
             ("sell_order_uuid", "TEXT"),
             ("sell_price", real_type),
             ("sell_amount", real_type),
@@ -372,6 +386,13 @@ def init_database(db_path: Optional[str] = None) -> None:
         else:
             for col_name, col_def in pos_alter_cols:
                 conn.execute(f"ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS {col_name} {col_def};")
+
+        conn.execute(
+            "UPDATE bot_positions SET market = ticker WHERE (market IS NULL OR market = '') AND ticker IS NOT NULL AND ticker != '';"
+        )
+        conn.execute(
+            "UPDATE bot_positions SET ticker = market WHERE (ticker IS NULL OR ticker = '') AND market IS NOT NULL AND market != '';"
+        )
 
         # 3. LLM 시장 체제 & 뉴스 감성 필터 테이블 (market_regime_filter)
         conn.execute(
@@ -466,15 +487,27 @@ def init_database(db_path: Optional[str] = None) -> None:
             );
             """
         )
+        bots_alter_cols = [
+            ("strategy_group", "TEXT DEFAULT 'TREND_SWING'"),
+            ("is_selected_for_live", "INTEGER NOT NULL DEFAULT 0"),
+            ("paper_initial_capital", "BIGINT NOT NULL DEFAULT 1000000"),
+            ("paper_virtual_krw", "BIGINT NOT NULL DEFAULT 1000000"),
+            ("paper_is_running", "INTEGER NOT NULL DEFAULT 1"),
+            ("paper_peak_equity", "BIGINT NOT NULL DEFAULT 1000000"),
+            ("paper_mdd_pct", "NUMERIC(8,2) NOT NULL DEFAULT 0"),
+            ("paper_status_msg", "TEXT NOT NULL DEFAULT '시그널 대기 중'"),
+        ]
         if sqlite_mode:
             bot_cols = {
                 dict(r)["name"]
                 for r in conn.execute("PRAGMA table_info(bots);").fetchall()
             }
-            if "strategy_group" not in bot_cols:
-                conn.execute("ALTER TABLE bots ADD COLUMN strategy_group TEXT DEFAULT 'TREND_SWING';")
+            for col_name, col_def in bots_alter_cols:
+                if col_name not in bot_cols:
+                    conn.execute(f"ALTER TABLE bots ADD COLUMN {col_name} {col_def};")
         else:
-            conn.execute("ALTER TABLE bots ADD COLUMN IF NOT EXISTS strategy_group TEXT DEFAULT 'TREND_SWING';")
+            for col_name, col_def in bots_alter_cols:
+                conn.execute(f"ALTER TABLE bots ADD COLUMN IF NOT EXISTS {col_name} {col_def};")
 
         for b_id, s_grp in BOT_STRATEGY_GROUP_MAP.items():
             conn.execute("UPDATE bots SET strategy_group = ? WHERE bot_id = ?;", (s_grp, b_id))
@@ -528,6 +561,21 @@ def init_database(db_path: Optional[str] = None) -> None:
             );
             """
         )
+        paper_trade_alter_cols = [
+            ("buy_reason", "TEXT"),
+            ("sell_reason", "TEXT"),
+        ]
+        if sqlite_mode:
+            pt_cols = {
+                dict(r)["name"]
+                for r in conn.execute("PRAGMA table_info(paper_trades);").fetchall()
+            }
+            for col_name, col_def in paper_trade_alter_cols:
+                if col_name not in pt_cols:
+                    conn.execute(f"ALTER TABLE paper_trades ADD COLUMN {col_name} {col_def};")
+        else:
+            for col_name, col_def in paper_trade_alter_cols:
+                conn.execute(f"ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS {col_name} {col_def};")
         conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS paper_bot_positions (

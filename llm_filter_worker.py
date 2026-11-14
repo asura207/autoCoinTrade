@@ -31,6 +31,7 @@ from init_db import (
     get_db_connection,
     normalize_bot_overrides,
 )
+from market_hub import get_cached_ohlcv
 
 load_dotenv()
 
@@ -174,10 +175,10 @@ PRO_MODELS = [
 
 def _fetch_btc_4h_60ma() -> Dict[str, Any]:
     """
-    BTC 4시간봉 60 이동평균선(60MA)과 이격도를 조회합니다 (pyupbit 우선 + REST API 폴백).
+    BTC 4시간봉 60 이동평균선(60MA)과 이격도를 조회합니다 (market_hub 캐시 우선 + REST API 폴백).
     """
     try:
-        df4 = pyupbit.get_ohlcv("KRW-BTC", interval="minute240", count=65)
+        df4 = get_cached_ohlcv("KRW-BTC", interval="minute240", count=65)
         if df4 is not None and len(df4) >= 60:
             price_4h = float(df4["close"].iloc[-1])
             ma60_4h = float(df4["close"].rolling(60).mean().iloc[-1])
@@ -242,7 +243,7 @@ def fetch_btc_technical_summary() -> Dict[str, Any]:
     change_rate_1h = _fetch_btc_1h_change_pct()
 
     try:
-        df = pyupbit.get_ohlcv("KRW-BTC", interval="day", count=30)
+        df = get_cached_ohlcv("KRW-BTC", interval="day", count=30)
         if df is not None and len(df) >= 20:
             current_price = float(df["close"].iloc[-1])
             prev_close = float(df["close"].iloc[-2])
@@ -457,28 +458,36 @@ def fetch_live_context(db_path: Optional[str] = None) -> Dict[str, Any]:
     try:
         bot_rows = conn.execute(
             """
-            SELECT bot_id, name, nickname, strategy_type, is_running, used_capital, allocated_capital
+            SELECT bot_id, name, nickname, strategy_type, is_running, is_selected_for_live,
+                   allocated_capital, virtual_krw
             FROM bots
             WHERE is_selected_for_live = 1
-            ORDER BY bot_id ASC;
+               OR bot_id IN (SELECT DISTINCT bot_id FROM bot_positions WHERE status = 'OPEN')
+            ORDER BY is_selected_for_live DESC, bot_id ASC;
             """
         ).fetchall()
         for r in bot_rows:
             rd = dict(r)
             b_id = str(rd.get("bot_id") or "")
             profile = BOT_STRATEGY_PROFILES.get(b_id, {})
+            alloc_cap = float(rd.get("allocated_capital") or 0.0)
+            avail_krw = float(rd.get("virtual_krw") or 0.0)
+            used_cap = max(0.0, alloc_cap - avail_krw)
+            is_selected = int(rd.get("is_selected_for_live") or 0) == 1
             live_bots.append({
                 "bot_id": b_id,
                 "name": rd.get("nickname") or rd.get("name") or profile.get("name") or b_id,
                 "group": profile.get("group", ""),
                 "desc": profile.get("desc") or rd.get("strategy_type") or "",
                 "is_running": int(rd.get("is_running") or 0) == 1,
-                "used_capital": float(rd.get("used_capital") or 0.0),
+                "is_selected_for_live": is_selected,
+                "is_draining": not is_selected,
+                "used_capital": used_cap,
             })
 
         pos_rows = conn.execute(
             """
-            SELECT bot_id, market, buy_amount, avg_buy_price
+            SELECT bot_id, COALESCE(NULLIF(market, ''), ticker) AS market, buy_amount, avg_buy_price
             FROM bot_positions
             WHERE status = 'OPEN'
             ORDER BY id DESC;
@@ -1175,6 +1184,22 @@ def run_llm_sentiment_worker(stop_event, bot_id: str = "bot_llm_filter", db_path
     need_initial_run = True
 
     while not stop_event.is_set():
+        # Node.js 백엔드 기동 중일 때 듀얼 AI 스케줄러 중복 호출 방지 (백엔드 장애 시 자동 폴백)
+        if os.getenv("PYTHON_LLM_COEXIST", "false").strip().lower() != "true":
+            import socket
+            backend_port = int(os.getenv("BACKEND_PORT", "8001"))
+            backend_up = False
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(0.25)
+                    backend_up = sock.connect_ex(("127.0.0.1", backend_port)) == 0
+            except Exception:
+                backend_up = False
+            if backend_up:
+                if stop_event.wait(timeout=30.0):
+                    break
+                continue
+
         now = time.time()
         should_run_flash = need_initial_run or (now - last_flash_run >= flash_interval_sec)
         should_run_pro = need_initial_run or (now - last_pro_run >= pro_interval_sec)

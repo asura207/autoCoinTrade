@@ -91,11 +91,14 @@
 - **실시간 거래 실행 모드 전환 배너**:
   - `🧪 가상거래(모의투자)` ↔ `⚡ 실거래(업비트 실계좌)` 모드를 원클릭으로 전환.
   - 가상거래 모드 시 **`[🔄 가상거래 이력 초기화]`** 버튼을 통해 언제든 모의투자 기록을 0원부터 클린 리셋 가능.
-- **듀얼 Google Gemini AI(Flash 30분 / Pro 1시간) 실시간 시황 브리핑**:
-  - 비트코인(BTC) 시세, 일봉 20MA, 4시간봉 60MA 이격도 및 거시 시장 지표를 교차 검증하여 시장 체제(`🔴 신규매수차단 (현금보유)` vs `🟢 정상거래 허용`) 및 봇 행동을 명쾌하게 해설.
+- **듀얼 Google Gemini AI(Flash 30분 / Pro 1시간) 실시간 시황 브리핑 & 봇별 개별 제어**:
+  - 비트코인(BTC) 시세, 일봉 20MA, 4시간봉 60MA 이격도 및 거시 시장 지표를 교차 검증하여 시장 체제(`🔴 신규매수차단 (현금보유)` vs `🟢 정상거래 허용`) 및 **10대 봇(`bot_01`~`bot_10`) 각각의 `ALLOW`/`BLOCK` 개별 진입 게이트**를 자동 제어 (`BLOCK` 상태에서도 보유 포지션 익절/손절 청산 루프는 정상 유지).
   - 접이식(Collapsible) 아코디언 UI 적용 및 **Server-Sent Events(SSE) 기반 실시간 타자기(Typewriter) 애니메이션 스트리밍**.
-- **사용자가 선택한 1~3개 실전 담당 봇 전용 제어 카드**:
-  - 10대 알고리즘 중 `⚙️ 설정` 메뉴에서 사용자가 선택한 1~3개 봇만 대시보드에 동적으로 노출되어 실전 매매 제어.
+- **주간 전략군별 TOP 1 자동 로테이션 & 미매도 포지션 보호(Graceful Drain)**:
+  - 매주 월요일 00:05 KST(또는 `⚙️ 설정`에서 수동 즉시 실행) **3대 전략군(추세·스윙 / 변동성·돌파 / 역추세·그리드)**별 모의투자 TOP 1 봇을 실전 봇(1~3개)으로 자동 선출하고 동적 자금 비율(합계 100%)을 자동 배분.
+  - 교체되는 기존 실전 봇이 미매도 오픈 포지션(`bot_positions`)을 보유 중이면 강제 시장가 청산 없이 **청산 대기(`Graceful Drain`)** 상태로 전환해 신규 매수만 차단하고, 보유 포지션 전량 청산 시 잔여 가용 원화를 신규 TOP 1 봇으로 자동 이관.
+- **사용자가 선택한 1~3개 실전 담당 봇 전용 제어 카드 & Jack Kellogg 프라이스 액션**:
+  - 10대 알고리즘 중 `⚙️ 설정`에서 수동 선택하거나 주간 자동 로테이션으로 선출된 1~3개 실전 봇(및 **Jack Kellogg VWAP + 선형 회귀 채널 프라이스 액션 `bot_10`** 포함)이 대시보드에 동적으로 노출되어 실전 매매 제어.
   - 봇별 `거래 시작`, `거래 중지`, `매수 테스트`, `매도 테스트` 제어 버튼 및 실시간 상태 모달 팝업 제공.
 - **1줄(Row) 통합 실전 체결 게시판**:
   - 매수 정보와 매도 정보, 실현손익을 단일 행(Row)에서 직관적으로 추적 (미체결 보유 포지션은 매도 영역 공란 유지 후 청산 시 동일 행에 실시간 업데이트).
@@ -203,11 +206,14 @@ autoCoinTrade/
 │       ├── news_service.mjs     # 구글 뉴스 & 토큰포스트 RSS 파싱, 감성 분석, 태그 추출
 │       ├── pg_db.mjs            # PostgreSQL 비동기 풀 및 SQL 변환 레이어
 │       └── pg_sync.mjs          # PostgreSQL 16 실시간 데이터 동기화 매니저
+├── agentBot/
+│   └── bot_10_jack_kellogg.py     # [Python 전략 모듈] Jack Kellogg VWAP + 선형 회귀 채널 봇 (`bot_10`)
 ├── market_hub.py                # [중앙 시세 브로드캐스터] 인메모리 캐시 및 업비트 API 120ms Rate Limit 방어
-├── bots.py                      # [Python CLI] 3대 실전 트레이딩 봇 전략 (슈퍼트렌드, 볼린저 스퀴즈, DCA)
-├── llm_filter_worker.py         # [Python CLI] 듀얼 AI (Flash 30분 / Pro 1시간) 시장 분석 워커
-├── main_orchestrator.py         # [Python CLI] 멀티프로세싱 슈퍼바이저 오케스트레이터
-├── init_db.py                   # DB 스키마 및 마켓 체제 필터 테이블 초기화
+├── bots.py                      # [Python CLI] 10대 전략 실전 봇 루프 & Graceful Drain 이관 (Node 백엔드 미실행 시 독립 가동)
+├── llm_filter_worker.py         # [Python CLI] 듀얼 AI (Flash 30분 / Pro 1시간) bot_01~bot_10 개별 제어 워커
+├── main_orchestrator.py         # [Python CLI] 멀티프로세싱 슈퍼바이저 오케스트레이터 (이중 실행 방지)
+├── run_orchestrator.sh / .bat   # Python 멀티프로세싱 오케스트레이터 원클릭 실행 스크립트
+├── init_db.py                   # DB 스키마 및 자동 마이그레이션(주간 로테이션 · 듀얼 AI · 포지션 컬럼) 초기화
 ├── config/
 │   ├── upbit_config.json        # 업비트 및 Gemini API 키 설정 파일 (Git 추적 제외)
 │   └── upbit_config.example.json# 설정 파일 템플릿
@@ -287,7 +293,7 @@ autoCoinTrade/
 - **Frontend**: React 18, Vite 5, CSS3 Custom Properties (Dark Theme), Responsive Mobile Layout
 - **Backend**: Node.js >= 22.5.0 (`node:http`, `node:sqlite` DatabaseSync WAL, `node:crypto`)
 - **Dual Database**: SQLite 3 (WAL 모드) + PostgreSQL 16 (`coin_trader` 양방향 실시간 동기화)
-- **AI Engine**: Google Gemini API (`gemini-3.5-flash`, `gemini-3.5-flash-lite` SSE 스트리밍)
+- **AI Engine**: Google Gemini API (`gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-2.0-flash` SSE 스트리밍 & Dual AI 체인)
 - **Exchange API**: Upbit Open API v1.0 (JWT SHA-512 비대칭 서명 인증, Rate Limit 방어)
 - **Network Tunnel**: Cloudflare Quick Tunnel (`cloudflared --no-autoupdate`)
 - **Deployment**: Linux Shell Scripts & Windows Batch / VBScript 무음 백그라운드 자동화

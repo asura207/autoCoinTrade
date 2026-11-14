@@ -62,8 +62,8 @@ npm install
 cd ..
 ```
 
-> **백엔드 npm install이 필요 없는 이유**:
-> `backend/node_server.mjs`는 순수 Node.js 표준 내장 라이브러리(`node:http`, `node:fs`, `node:path`, `node:crypto`, `node:url`, `node:sqlite`)만을 사용하여 구현되어 있어, 백엔드에는 별도의 외부 npm 패키지 의존성이 전혀 없습니다 (Zero Dependency).
+> **Node.js 의존성 설치 안내**:
+> `backend/node_server.mjs`는 Node.js `>= 22.5.0`의 내장 `node:sqlite`를 사용함과 동시에 루트 `package.json`의 `pg`, `web-push` 등을 사용하므로, `setup.sh` / `setup.bat` 실행 시 **프로젝트 루트와 `frontend` 폴더 모두에서 `npm install`이 수행됩니다**.
 
 ---
 
@@ -89,7 +89,7 @@ cd ..
 - **`access_key` / `secret_key`**:
   - 업비트 Open API 키. 모의투자(`paper`) 상태에서도 시세 조회, 캔들 조회, 잔고 조회가 가능하며, 미입력 시에도 기본 모의 봇 로직은 fallback 모드로 안전하게 작동합니다.
 - **`gemini_api_key`**:
-  - Google Gemini API Key. 시장 상황 브리핑 및 봇 전략 진단(Gemini 3.5 Flash SSE 스트리밍)에 사용됩니다.
+  - Google Gemini API Key. Dual AI 시황·뉴스 브리핑 및 `bot_01`~`bot_10` 개별 진입 제어(`gemini-2.5-flash` 30분 / `gemini-2.5-pro` 1시간 SSE 스트리밍)에 사용됩니다.
   - 이 파일에 직접 입력해도 되고, **웹 화면(`http://localhost:9000`) 우측 상단의 `[⚙️ API 키 등록]` 팝업**을 통해 브라우저에서 바로 입력/저장할 수도 있습니다.
 
 ---
@@ -218,28 +218,31 @@ curl -s -I http://localhost:9000
 
 ---
 
-## 9. 파이썬 멀티프로세싱 오케스트레이터 및 LLM 장세 필터 실행 가이드
+## 9. 파이썬 멀티프로세싱 오케스트레이터 및 듀얼 LLM 장세 필터 실행 가이드
 
-독립된 Python 멀티프로세싱 아키텍처 기반으로 3개 전략 봇(`bot_vb`, `bot_momentum`, `bot_bb`)과 4번째 워커(`bot_llm_filter`)를 실행할 때 사용합니다:
+독립된 Python 멀티프로세싱 아키텍처 기반으로 10대 전략 봇(`bot_01`~`bot_10`, `agentBot/bot_10_jack_kellogg.py` 포함), 중앙 시세 허브(`market_hub.py`) 및 듀얼 LLM 워커(`llm_filter_worker.py`)를 실행할 때 사용합니다.
+> **중복 실행 방지(Coordinated Mode)**: Node.js 백엔드(`backend/node_server.mjs`, Port `8001`)가 이미 실행 중인 경우 Python 워커(`main_orchestrator.py` / `bots.py` / `llm_filter_worker.py`)는 자동으로 동일 매매 루프의 중복 집행을 차단(Yield)하고 단일 실행 무결성을 유지합니다.
 
 ### 파일 구성
-- **`init_db.py`**: SQLite(`data/auto_coin_trade.db`, WAL 모드) 가상 원장 및 단일 행(`id=1`) `market_regime_filter` 테이블 초기화
-- **`llm_filter_worker.py`**: 1~4시간 주기 시장 지표/뉴스 수집, LLM 분석, 룰베이스 폴백 및 DB 갱신 워커
-- **`bots.py`**: 공통 매수 게이트웨이(`can_enter_position`), 슬리피지 방어형 주문 래퍼, 3개 봇 전략(슈퍼트렌드 변동성 돌파, BB 스퀴즈 VCP 돌파, 다단계 분할 매수 DCA)
-- **`main_orchestrator.py`**: 4개 워커 프로세스 상시 헬스체크, 크래시 시 자동 재기동(Auto-Restart), Graceful Shutdown 관리
-- **`run_orchestrator.bat`**: Windows 원클릭 실행 스크립트
+- **`init_db.py`**: SQLite(`data/auto_coin_trade.db`, WAL 모드) 가상 원장, 주간 로테이션/포지션/듀얼 AI 컬럼 자동 마이그레이션(`ALTER TABLE`) 및 `market_regime_filter` 초기화
+- **`market_hub.py`**: 중앙 시세 브로드캐스터 (인메모리 OHLCV/티커 캐시 및 업비트 API `120ms` Rate Limit 방어)
+- **`llm_filter_worker.py`**: 듀얼 AI(30분 Gemini Flash / 1시간 Gemini Pro) 시장/뉴스 분석, `bot_01`~`bot_10` 개별 진입 제어(`ALLOW`/`BLOCK`), 룰베이스(BTC 20MA) 폴백 워커
+- **`bots.py` & `agentBot/bot_10_jack_kellogg.py`**: 공통 매수 게이트웨이(`can_enter_position`), 8자리 내림 주문(`round_down_volume_8`), Graceful Drain 청산 대기 및 잔여 원화 자동 이관, `bot_10` Jack Kellogg VWAP·선형 회귀 채널 전략
+- **`main_orchestrator.py`**: 봇/LLM 워커 상시 헬스체크, 크래시 시 자동 재기동(Auto-Restart), `logs/.orchestrator.pid` 기반 중복 실행 차단 및 Graceful Shutdown 관리
+- **`run_orchestrator.bat` / `run_orchestrator.sh`**: Windows / Linux 원클릭 실행 스크립트
 
 ### 실행 방법
 
 #### Linux / macOS:
 ```bash
+chmod +x run_orchestrator.sh
 ./run_orchestrator.sh
 ```
 
 #### Windows:
 ```powershell
-# 1. 패키지 설치
-pip install -r requirements.txt
+# 1. Node 루트/프론트엔드 및 Python 패키지 설치
+.\setup.bat
 
 # 2. .env 설정 복사 및 편집 (.env.example 참조, 기본: DRY_RUN=True 모의투자)
 copy .env.example .env

@@ -166,6 +166,15 @@ export class PgSyncManager {
             final_position_multiplier NUMERIC(8,4) DEFAULT 1.0,
             final_bot_overrides_json TEXT DEFAULT '${DEFAULT_BOT_OVERRIDES_JSON}'
           );
+          ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS flash_sentiment_score NUMERIC(8,4) DEFAULT 0.0;
+          ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS flash_recommended_action TEXT DEFAULT 'NORMAL';
+          ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS flash_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+          ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS pro_sentiment_score NUMERIC(8,4) DEFAULT 0.0;
+          ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS pro_recommended_action TEXT DEFAULT 'NORMAL';
+          ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS pro_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+          ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS final_risk_alert INTEGER DEFAULT 0;
+          ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS final_position_multiplier NUMERIC(8,4) DEFAULT 1.0;
+          ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS final_bot_overrides_json TEXT DEFAULT '${DEFAULT_BOT_OVERRIDES_JSON}';
         `);
         const regime = sqliteDb.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get();
         if (regime) {
@@ -316,27 +325,61 @@ export class PgSyncManager {
         );
       }
 
-      // 4. bot_positions
+      // 4. bot_positions (스키마 마이그레이션 + sell/메타 컬럼 포함 UPSERT)
+      try {
+        await this.pool.query(`
+          ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS ticker TEXT;
+          ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS highest_price NUMERIC(20,8) DEFAULT 0.0;
+          ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS step_level INT DEFAULT 1;
+          ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS sell_order_uuid TEXT;
+          ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS sell_price NUMERIC(20,8);
+          ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS sell_amount NUMERIC(20,2);
+          ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS sell_fee NUMERIC(20,4);
+          ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS realized_pnl NUMERIC(20,2);
+          ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS pnl_pct NUMERIC(8,2);
+        `);
+      } catch {}
+
       const positions = sqliteDb.prepare("SELECT * FROM bot_positions").all();
       for (const p of positions) {
+        const mkt = p.market || p.ticker || "KRW-BTC";
         await this.pool.query(
           `INSERT INTO bot_positions (
-             id, bot_id, market, order_uuid, volume,
+             id, bot_id, market, ticker, order_uuid, volume,
              avg_buy_price, buy_amount, buy_fee, trade_id,
-             status, created_at, closed_at
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             highest_price, step_level, status, created_at, closed_at,
+             sell_order_uuid, sell_price, sell_amount, sell_fee, realized_pnl, pnl_pct
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
            ON CONFLICT (order_uuid) DO UPDATE SET
+             bot_id = EXCLUDED.bot_id,
+             market = EXCLUDED.market,
+             ticker = EXCLUDED.ticker,
              volume = EXCLUDED.volume,
              avg_buy_price = EXCLUDED.avg_buy_price,
              buy_amount = EXCLUDED.buy_amount,
              buy_fee = EXCLUDED.buy_fee,
+             highest_price = EXCLUDED.highest_price,
+             step_level = EXCLUDED.step_level,
              status = EXCLUDED.status,
-             closed_at = EXCLUDED.closed_at`,
+             closed_at = EXCLUDED.closed_at,
+             sell_order_uuid = EXCLUDED.sell_order_uuid,
+             sell_price = EXCLUDED.sell_price,
+             sell_amount = EXCLUDED.sell_amount,
+             sell_fee = EXCLUDED.sell_fee,
+             realized_pnl = EXCLUDED.realized_pnl,
+             pnl_pct = EXCLUDED.pnl_pct`,
           [
-            p.id, p.bot_id, p.market, p.order_uuid, String(p.volume),
-            Number(p.avg_buy_price), Math.floor(Number(p.buy_amount)),
-            Number(p.buy_fee || 0), Number(p.trade_id),
-            p.status || "OPEN", p.created_at, p.closed_at ?? null
+            p.id, p.bot_id, mkt, p.ticker || mkt, p.order_uuid, String(p.volume),
+            Number(p.avg_buy_price || 0), Math.floor(Number(p.buy_amount || 0)),
+            Number(p.buy_fee || 0), Number(p.trade_id || 0),
+            Number(p.highest_price || 0), Number(p.step_level || 1),
+            p.status || "OPEN", p.created_at || new Date().toISOString(), p.closed_at ?? null,
+            p.sell_order_uuid ?? null,
+            p.sell_price !== null && p.sell_price !== undefined ? Number(p.sell_price) : null,
+            p.sell_amount !== null && p.sell_amount !== undefined ? Number(p.sell_amount) : null,
+            p.sell_fee !== null && p.sell_fee !== undefined ? Number(p.sell_fee) : null,
+            p.realized_pnl !== null && p.realized_pnl !== undefined ? Number(p.realized_pnl) : null,
+            p.pnl_pct !== null && p.pnl_pct !== undefined ? Number(p.pnl_pct) : null
           ]
         );
       }

@@ -186,13 +186,51 @@ def configure_multiprocessing_environment():
                     pass
 
 
+def _get_orchestrator_pid_path() -> str:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    logs_dir = os.path.join(base_dir, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    return os.path.join(logs_dir, ".orchestrator.pid")
+
+
+def _is_pid_alive(pid: int) -> bool:
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 def main():
     logger.info("=========================================================")
     logger.info("  Upbit Multi-Processing Auto Trading & LLM Filter System")
     logger.info("=========================================================")
 
-    # 1. 멀티프로세싱 환경 설정
+    # 1. 멀티프로세싱 환경 설정 및 중복 오케스트레이터 방지
     configure_multiprocessing_environment()
+
+    pid_file_path = _get_orchestrator_pid_path()
+    if os.path.isfile(pid_file_path):
+        try:
+            with open(pid_file_path, "r", encoding="utf-8") as f:
+                existing_pid = int((f.read() or "0").strip())
+            if _is_pid_alive(existing_pid):
+                logger.warning(
+                    "Another orchestrator instance is already running (PID: %d). Exiting to prevent duplicate workers.",
+                    existing_pid,
+                )
+                return
+        except Exception:
+            pass
+    try:
+        with open(pid_file_path, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+    except Exception as pid_err:
+        logger.warning("Could not write orchestrator PID file: %s", pid_err)
 
     # 2. SQLite 데이터베이스 및 스키마, 기본 시드 초기화
     logger.info("[Step 1/4] Initializing SQLite database schema & ledger...")
@@ -207,10 +245,12 @@ def main():
         logger.warning("Market Data Hub initial ticker fetch error: %s", hub_err)
 
     # Node.js 백엔드 구동 감지 및 조율 모드 확인
-    if is_backend_running():
+    backend_port = int(os.getenv("BACKEND_PORT", "8001"))
+    if is_backend_running(backend_port):
         logger.info(
-            "[Coordinated Execution Mode] Active Node.js backend detected on Port 8001. "
-            "Python workers will coordinate with backend to prevent double execution."
+            "[Coordinated Execution Mode] Active Node.js backend detected on Port %d. "
+            "Python workers will defer live/dry-run trading loops to backend to prevent double execution.",
+            backend_port,
         )
 
     # 4. 프로세스 간 종료 시그널 제어를 위한 컨트롤러
@@ -224,23 +264,27 @@ def main():
     signal.signal(signal.SIGINT, handle_shutdown_signal)
     signal.signal(signal.SIGTERM, handle_shutdown_signal)
 
-    # 5. 실행할 워커 목록 결정 (활성 실전 봇 및 듀얼 AI 필터 워커)
+    # 5. 실행할 워커 목록 결정 (활성 실전 봇, Graceful Drain 보유 포지션 봇 및 듀얼 AI 필터 워커)
     logger.info("[Step 3/4] Determining active trading and filter workers...")
     active_bot_ids = []
     try:
         conn = get_db_connection()
         rows = conn.execute(
-            "SELECT bot_id FROM bots WHERE is_selected_for_live = 1 ORDER BY bot_id ASC;"
+            """
+            SELECT DISTINCT bot_id FROM (
+                SELECT bot_id FROM bots WHERE is_selected_for_live = 1
+                UNION
+                SELECT DISTINCT bot_id FROM bot_positions WHERE status = 'OPEN'
+            ) ORDER BY bot_id ASC;
+            """
         ).fetchall()
         conn.close()
-        active_bot_ids = [r["bot_id"] for r in rows]
+        active_bot_ids = [normalize_bot_id(r["bot_id"]) for r in rows if r["bot_id"]]
     except Exception as db_err:
         logger.warning("Failed to query active bots from DB: %s", db_err)
 
     if not active_bot_ids:
-        active_bot_ids = ["bot_01", "bot_03", "bot_05", "bot_10"]
-    elif "bot_10" not in active_bot_ids:
-        active_bot_ids.append("bot_10")
+        active_bot_ids = ["bot_01", "bot_03", "bot_05"]
 
     # AI 필터 워커 항상 포함
     workers_to_spawn = list(dict.fromkeys(active_bot_ids + ["bot_llm_filter"]))
@@ -287,23 +331,31 @@ def main():
     except (KeyboardInterrupt, SystemExit):
         logger.info("Main supervisor loop interrupted.")
         stop_controller.set()
+    finally:
+        # 6. Graceful Shutdown 처리 및 PID 파일 정리
+        logger.info("Graceful shutdown in progress. Stopping all worker processes...")
+        stop_controller.set()
 
-    # 6. Graceful Shutdown 처리
-    logger.info("Graceful shutdown in progress. Stopping all worker processes...")
-    stop_controller.set()
-
-    for bot_id, proc in workers.items():
-        if proc.is_alive():
-            logger.info("Waiting for [%s] (PID %d) to stop...", bot_id, proc.pid)
-            proc.join(timeout=4.0)
+        for bot_id, proc in workers.items():
             if proc.is_alive():
-                logger.warning("Worker [%s] (PID %d) did not terminate in time. Forcing termination...", bot_id, proc.pid)
-                proc.terminate()
-                proc.join(timeout=1.0)
+                logger.info("Waiting for [%s] (PID %d) to stop...", bot_id, proc.pid)
+                proc.join(timeout=4.0)
+                if proc.is_alive():
+                    logger.warning("Worker [%s] (PID %d) did not terminate in time. Forcing termination...", bot_id, proc.pid)
+                    proc.terminate()
+                    proc.join(timeout=1.0)
 
-    logger.info("=========================================================")
-    logger.info("  All worker processes terminated safely. Goodbye!")
-    logger.info("=========================================================")
+        try:
+            if os.path.isfile(pid_file_path):
+                with open(pid_file_path, "r", encoding="utf-8") as f:
+                    if (f.read() or "").strip() == str(os.getpid()):
+                        os.remove(pid_file_path)
+        except Exception:
+            pass
+
+        logger.info("=========================================================")
+        logger.info("  All worker processes terminated safely. Goodbye!")
+        logger.info("=========================================================")
 
 
 if __name__ == "__main__":

@@ -7,20 +7,26 @@
 ## 1. 프로젝트 디렉토리 구조
 
 ```text
-autoCoindTrade/
-├── agentBot/                        # [봇 패키지] 각 봇의 매매 전략이 독립된 소스 파일로 분리된 패키지
+autoCoinTrade/
+├── agentBot/                        # [Python 전략 모듈] 확장 전략 봇 패키지
 │   ├── __init__.py
-│   ├── base_bot.py                  # 공통 규칙 (Rate Limit 0.12s, 유동성 필터, count=8/iloc[-8], 가상잔고 락, 분할매도)
-│   ├── volatility_breakout_bot.py   # [Bot 1] 필터 결합형 변동성 돌파 (장중 단타 / 1일 보유)
-│   ├── dual_momentum_bot.py         # [Bot 2] 상대 모멘텀 + 절대 모멘텀 (듀얼 모멘텀 스윙)
-│   ├── bollinger_reversal_bot.py    # [Bot 3] 고변동성 코인 볼린저 밴드 역추세 (분봉 단기 반등 매매)
-│   └── bot_manager.py               # 백그라운드 워커 및 봇별 장애 격리 오케스트레이터
+│   └── bot_10_jack_kellogg.py       # [Bot 10] Jack Kellogg VWAP + 선형 회귀 채널 프라이스 액션
 ├── backend/
 │   ├── common/
-│   │   ├── database.py              # SQLite 매니저 (세션 단절/자정 날짜 변경 시 자동 재접속, WAL 모드, 트랜잭션 락)
-│   │   └── upbit_client.py          # 공용 업비트 Open API 통신 모듈 (통신 상태 진단, 매수/매도/시세 조회)
-│   ├── main.py                      # FastAPI 백엔드 서버 엔드포인트
-│   └── requirements.txt             # Python 의존성 패키지 목록
+│   │   ├── algo_lab_service.mjs     # 10대 알고리즘 상시 모의투자 아레나 · 주간 전략군 TOP 1 로테이션 엔진
+│   │   ├── pg_sync.mjs              # PostgreSQL 16 양방향 실시간 동기화 및 자동 마이그레이션
+│   │   └── sqlite_db.mjs            # SQLite 3 (WAL 모드) 래퍼
+│   └── node_server.mjs              # Node.js >= 22.5.0 내장 http/sqlite 통합 API · SSE · 실전 봇 엔진 (Port 8001)
+├── frontend/                        # React 18 + Vite 5 웹 대시보드 (Port 9000)
+├── install/                         # Windows / Linux 배포형 원클릭 실행 패키지
+├── bots.py                          # Python 독립 봇 실행기 (Node 미실행 시 가동, Graceful Drain 지원)
+├── llm_filter_worker.py             # Gemini Dual AI (30분 Flash / 1시간 Pro) 10대 봇 개별 제어 워커
+├── market_hub.py                    # 중앙 시세 캐시 및 업비트 API 120ms Rate Limit 방어
+├── main_orchestrator.py             # Python 멀티프로세싱 오케스트레이터 (Node 실행 시 자동 Yield)
+├── init_db.py                       # SQLite 초기화 및 자동 스키마 마이그레이션
+├── run_orchestrator.sh / .bat       # Python 오케스트레이터 원클릭 실행 스크립트
+├── package.json                     # 루트 Node 의존성 (pg, web-push 등) 및 버전 메타데이터
+├── requirements.txt                 # Python 의존성 패키지 목록
 ├── config/
 │   ├── upbit_config.example.json    # 업비트 API Key 설정 템플릿 파일 (Git 추적용)
 │   └── upbit_config.json            # 실제 업비트 API Key 설정 파일 (.gitignore에 의해 Git Push 제외)
@@ -34,8 +40,8 @@ autoCoindTrade/
 │   ├── index.html
 │   ├── package.json
 │   └── vite.config.js
-├── start.bat                        # 원클릭 실행 스크립트 (Backend + Frontend 동시 시작)
-└── stop.bat                         # 원클릭 종료 스크립트 (Backend + Frontend 안전 종료)
+├── start.sh / start.bat             # 원클릭 실행 스크립트 (Backend 8001 + Frontend 9000)
+└── stop.sh / stop.bat               # 원클릭 종료 스크립트 (PID 및 프로세스 안전 종료)
 ```
 
 ---
@@ -65,7 +71,7 @@ Node.js 버전 확인, 디렉토리 생성, 설정 템플릿 복사, 프론트�
    npm install
    cd ..
    ```
-   *(백엔드는 Node.js 내장 표준 라이브러리만 사용하므로 별도의 npm install이 필요 없습니다.)*
+   *(루트 `package.json`의 `pg`, `web-push` 등과 `frontend` 패키지를 함께 설치하며, 백엔드 런타임은 **Node.js v22.5.0 이상**의 내장 `node:sqlite`가 필요합니다.)*
 
 ---
 
@@ -89,7 +95,7 @@ Node.js 버전 확인, 디렉토리 생성, 설정 템플릿 복사, 프론트�
   - `"paper"`: 로컬 시뮬레이션(모의) 안전 모드로 동작합니다. 실제 업비트 계좌의 돈을 쓰지 않고 실시간 시세 기반으로 가상 매수/매도 및 DB 검증을 안전하게 수행합니다.
   - `"live"`: 입력된 업비트 Open API Key를 사용하여 **실제 업비트 시장가 매수/매도 주문**을 실행합니다.
 - **`gemini_api_key`**:
-  - Google Gemini 3.5 Flash 실시간 AI 마켓 브리핑 기능에 사용됩니다. 웹 UI 상단의 `[⚙️ API 키 등록]` 버튼을 통해서도 바로 등록/저장할 수 있습니다.
+  - Google Gemini Dual AI(Flash 30분 / Pro 1시간 SSE 스트리밍 및 10대 봇 개별 진입 제어)에 사용됩니다. 웹 UI 상단의 `[⚙️ API 키 등록]` 버튼을 통해서도 바로 등록/저장할 수 있습니다.
 - **Git Push 제외 보안 규칙**:
   - `.gitignore`에 `config/upbit_config.json`이 등록되어 있어 커밋/푸시 시 개인 API Key가 외부로 유출되지 않습니다.
 
@@ -161,9 +167,9 @@ Node.js 버전 확인, 디렉토리 생성, 설정 템플릿 복사, 프론트�
 
 ### 6.3 [메뉴 1] ⚡ 실제거래 현황
 - **업비트 실계좌 자산 요약**: 원화 잔고, 총 평가금액, 총 평가손익(수익률 %), 보유 코인 목록 실시간 표시.
-- **듀얼 Gemini AI 시황 브리핑**: Flash(30분) / Pro(1시간) 교차 검증 시장 체제 분석 및 SSE 실시간 타자기 스트리밍.
-- **사용자 선택 실전 담당 봇(1~3개) 제어**:
-  - `⚙️ 설정`에서 선택한 봇만 동적으로 노출되며 개별 `▶ 거래시작` / `■ 거래중단` / `테스트` 제어 가능.
+- **듀얼 Gemini AI 시황 브리핑 & 10대 봇 개별 제어**: Flash(30분) / Pro(1시간) 교차 검증 시장 체제 분석, `bot_01`~`bot_10` 개별 `ALLOW`/`BLOCK` 게이트(청산 매도 루프는 상시 유지), SSE 실시간 타자기 스트리밍.
+- **사용자 선택 및 주간 자동 로테이션 실전 봇(1~3개) 제어**:
+  - `⚙️ 설정`에서 수동 선택하거나 주간 전략군 TOP 1 자동 로테이션으로 선출된 봇(Jack Kellogg 프라이스 액션 `bot_10` 포함)만 동적으로 노출되며 개별 `▶ 거래시작` / `■ 거래중단` / `테스트` 제어 가능. 교체 시 오픈 포지션이 있는 봇은 **청산 대기(Graceful Drain)** 배지로 안전 관리됩니다.
 - **잔고 0원 이하 자동 전체 중지 알림**:
   - 설정된 잔고가 `0`원 이하로 떨어지면 모든 봇이 자동으로 거래 중지되며, 진입 시 **Modal Popup**으로 즉시 안내.
 - **1줄(Row) 통합 실전 체결 게시판**:
@@ -195,28 +201,29 @@ Node.js 버전 확인, 디렉토리 생성, 설정 템플릿 복사, 프론트�
   - 행 높이 48px 및 1줄 말줄임표 처리, 마우스 호버 시 툴팁 제공.
 - **Gemini AI 종합 분석**: 수집된 최신 뉴스를 종합하여 시장 영향 분석 SSE 스트리밍 제공.
 
-### 6.7 [메뉴 5] ⚙️ 설정 (시스템·보안 및 동적 투자금 통합 관리)
-- **실전 담당 봇 선택 및 동적 투자금 배분 패널**:
-  - 10대 봇 중 실전에 투입할 담당 봇 1~3개 선택 시 해당 봇만 투자금 설정 패널에 동적 렌더링.
+### 6.7 [메뉴 5] ⚙️ 설정 (시스템·보안 · 주간 자동 로테이션 · 동적 투자금 통합 관리)
+- **실전 담당 봇 선택 · 주간 전략군 TOP 1 자동 로테이션 및 동적 투자금 배분 패널**:
+  - 10대 봇(`bot_01`~`bot_10`, Jack Kellogg VWAP 포함) 중 실전 투입 봇 1~3개를 직접 선택하거나 **주간 전략군 TOP 1 자동 로테이션(매주 월요일 00:05 KST / 즉시 로테이션)** 을 활성화할 수 있습니다.
+  - 교체 대상 봇이 오픈 포지션을 보유 중이면 **청산 대기(Graceful Drain)** 상태로 신규 매수만 차단하고, 전량 익절/손절 후 잔여 원화를 신규 TOP 1 봇으로 자동 이관합니다.
   - 비율 합계 100% 검증 및 소수점 버림(`Math.floor`) 내림 계산 적용.
 - **거래 모드 설정**: 가상거래(모의투자) ↔ 실거래 원클릭 전환.
 - **보안 입장 코드(Gate Code) 관리**:
   - 기본 입장 코드: **`stock`** (한글 자판 오타 `ㄴ새차` 자동 변환 지원)
   - 웹 화면 또는 `.env`(`GATE_CODE=...`)에서 사용자 지정 코드로 언제든 변경 및 SQLite/PostgreSQL 양방향 동기화.
 - **API 키 관리**: 업비트 Open API 및 Google Gemini API 키 마스킹 저장.
-- **데이터 마이그레이션 (JSON)**: SQLite 전체 DB 백업 내보내기(Export) 및 복원(Import).
+- **데이터 마이그레이션 (JSON)**: SQLite 전체 DB(실거래, 가상 아레나 전적, 듀얼 AI 필터 상태 포함 `schema_version: 1.2`) 백업 내보내기(Export) 및 복원(Import).
 
 ---
 
-## 7. 봇 매매기법 소스 수정 가이드 (`agentBot` 패키지)
+## 7. 확장 전략 봇 및 오케스트레이터 가이드 (`agentBot` & `bots.py`)
 
-각 봇의 매매 알고리즘을 직접 수정하고 싶을 때는 `agentBot/` 폴더 내의 개별 파이썬 파일만 수정하면 됩니다:
-- **Bot 1 (변동성 돌파)**: `agentBot/volatility_breakout_bot.py` 의 `execute_strategy_step()`
-- **Bot 2 (듀얼 모멘텀)**: `agentBot/dual_momentum_bot.py` 의 `execute_strategy_step()`
-- **Bot 3 (볼린저 역추세)**: `agentBot/bollinger_reversal_bot.py` 의 `execute_strategy_step()`
+파이썬 전략 엔진 및 Jack Kellogg 프라이스 액션 모듈은 루트 및 `agentBot/`에서 관리됩니다:
+- **Bot 1~9 핵심 전략**: `bots.py` 및 `backend/common/algo_lab_service.mjs`
+- **Bot 10 (Jack Kellogg VWAP · 선형 회귀 채널)**: `agentBot/bot_10_jack_kellogg.py` & `backend/common/algo_lab_service.mjs`
+- **오케스트레이터**: `main_orchestrator.py` (Node 백엔드Port `8001` 동시 가동 시 중복 주문 방지를 위해 자동 대기)
 
-> **주의 (봇 간 상호 간섭 방지 필수 규칙)**:
-> 1. 매도 시 절대 `get_balance()`로 코인 전량을 조회하여 매도하지 마세요. 반드시 `self.sell_position_isolated(position_id)`를 호출하여 `bot_positions` 테이블에 본인 `bot_id`로 기록된 `volume`만 분할 매도해야 합니다.
-> 2. 매수 시 반드시 `self.buy_market_with_lock(market, order_krw)`를 호출하여 사전 `virtual_krw` 예산 체크 및 트랜잭션 락을 통과하도록 유지하세요.
-> 3. 캔들 조회 시 `self.fetch_indexed_candles(market, unit, count=8)` 및 `self.get_base_reference_candle(df)`(`df.iloc[-8]`) 규칙과 `self.sleep_rate_limit()`(`time.sleep(0.12)`)을 유지하세요.
+> **주의 (봇 간 상호 간섭 및 주문 사고 방지 필수 규칙)**:
+> 1. 매도 시 절대 `get_balance()`로 코인 전량을 조회하여 매도하지 마세요. 반드시 `bot_positions` 테이블에 해당 `bot_id` 및 `order_uuid`로 기록된 `volume`(소수점 8자리 버림 `floorTo8DecimalsStr` / `round_down_volume_8`)만 분할 매도해야 합니다.
+> 2. 매수 시 반드시 `virtual_krw` 잔고 체크 및 수수료 완충(`Math.floor((예산 * 비중) / 1.0005)`, 업비트 최소 주문 5,000원 보정)과 미체결 타임아웃 취소/체결 확인(`done`, `executed_volume`, `paid_fee`)을 거쳐야 합니다.
+> 3. 캔들/시세 조회 시 `market_hub.py` 및 `fetchUpbitPublicWithBackoff` 캐시(API `120ms` 간격 및 `429/503` 1s→2s→4s 지수 백오프)를 유지하세요.
 

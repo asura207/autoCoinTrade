@@ -53,9 +53,13 @@ if [ ! -f ".env" ] && [ -f ".env.example" ]; then
     echo "[OK] Created .env from template."
 fi
 
-# 4. Frontend dependencies
+# 4. Node.js backend & frontend dependencies
 echo ""
-echo "[4/5] Installing frontend dependencies..."
+echo "[4/5] Installing Node.js backend and frontend dependencies..."
+if [ -f "package.json" ]; then
+    npm install
+    echo "[OK] Root backend dependencies installed successfully."
+fi
 cd frontend
 npm install
 cd "$PROJECT_ROOT"
@@ -85,12 +89,20 @@ fi
 # Make scripts executable
 chmod +x scripts/*.sh *.sh 2>/dev/null || true
 
+if [ -f "$PROJECT_ROOT/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$PROJECT_ROOT/.env"
+    set +a
+fi
+
 echo ""
 echo "==================================================="
 echo "[SUCCESS] Environment setup completed successfully!"
 echo "==================================================="
 echo "- Start services : ./start_services.sh (or ./start.sh)"
 echo "- Stop services  : ./stop_services.sh (or ./stop.sh)"
+echo "- Orchestrator   : ./run_orchestrator.sh (standalone Python mode)"
 FRONTEND_PORT="${FRONTEND_PORT:-9000}"
 BACKEND_PORT="${BACKEND_PORT:-8001}"
 echo "- Web Dashboard  : http://localhost:${FRONTEND_PORT}"

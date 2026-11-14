@@ -52,17 +52,18 @@ def round_down_volume_8(vol: Any) -> float:
         return 0.0
 
 
-def is_backend_running(port: int = 8001) -> bool:
+def is_backend_running(port: Optional[int] = None) -> bool:
     """
-    Node.js 백엔드(포트 8001)가 기동 중인지 검사합니다.
+    Node.js 백엔드(BACKEND_PORT, 기본 8001)가 기동 중인지 검사합니다.
     백엔드가 자체적으로 실전/가상 매매 루프를 실행 중인 경우,
     Python 봇 프로세스가 동일한 주문을 중복 실행(Double Execution)하지 않도록 방어합니다.
     """
     import socket
+    target_port = int(port or os.getenv("BACKEND_PORT", "8001"))
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(0.25)
-            if s.connect_ex(("127.0.0.1", port)) == 0:
+            if s.connect_ex(("127.0.0.1", target_port)) == 0:
                 return True
     except Exception:
         pass
@@ -313,12 +314,12 @@ def can_enter_position(
     # 0. 가상거래/시뮬레이션 모드일 경우 LLM 및 거시 리스크 필터 완전 우회 (Bypass)
     norm_id = normalize_bot_id(bot_id)
 
-    # 실전거래 모드에서 Node.js 백엔드가 실행 중이면 중복 주문(Double Execution) 방지를 위해 Python 주문 디퍼
-    if not is_paper and not is_dry_run() and is_backend_running():
+    # Node.js 백엔드가 실행 중이면 실전/모의 주문 중복 실행(Double Execution) 방지를 위해 Python 주문 디퍼
+    if not is_paper and is_backend_running():
         return (
             False,
             0.0,
-            f"DEFERRED_TO_NODEJS_BACKEND: Active Node.js backend manages live trading for {norm_id}",
+            f"DEFERRED_TO_NODEJS_BACKEND: Active Node.js backend manages trading for {norm_id}",
         )
 
     if is_paper or is_dry_run():
@@ -429,11 +430,11 @@ def can_enter_position(
         if multiplier <= 0.0:
             return False, 0.0, "LLM Filter Blocked: Position size multiplier is 0.0"
 
-        # 2. 기술적 대장주 필터 (BTC 일봉 20MA 참고 감축)
+        # 2. 기술적 대장주 필터 (BTC 일봉 20MA 참고 감축 - market_hub 캐시 공유)
         btc_price = get_safe_current_price("KRW-BTC")
         if btc_price > 0:
             try:
-                btc_df = pyupbit.get_ohlcv("KRW-BTC", interval="day", count=25)
+                btc_df = get_cached_ohlcv("KRW-BTC", interval="day", count=25)
                 if btc_df is not None and len(btc_df) >= 20:
                     btc_ma20 = float(btc_df["close"].rolling(20).mean().iloc[-1])
                     if btc_price < btc_ma20 and rec_action == "REDUCE_SIZE" and ticker != "KRW-BTC":
@@ -483,7 +484,10 @@ def execute_limit_order_with_polling(
     시장가 슬리피지 방어를 위한 최유리 지정가 주문 및 최대 40초 폴링 래퍼.
     미체결 시 주문 취소(cancel_order) 및 체결 수량/수수료 확인.
     """
-    vol_rounded = round(float(volume), 8)
+    vol_rounded = round_down_volume_8(volume)
+    if vol_rounded <= 0:
+        logger.warning("[%s %s] Rounded volume <= 0 (%s)", side, ticker, volume)
+        return None
     price_val = float(price)
     try:
         if side == "bid":
@@ -566,9 +570,9 @@ def execute_buy_order(
 
     norm_bot_id = normalize_bot_id(bot_id)
 
-    # Node.js 백엔드가 실거래를 관장 중인 경우 Python 중복 실거래 주문 차단
-    if not dry and upbit and is_backend_running():
-        logger.info("[%s] Node.js backend is active. Deferring live buy order on Upbit to backend.", norm_bot_id)
+    # Node.js 백엔드가 매매를 관장 중인 경우 Python 중복 주문 차단 (실전/DRY_RUN 공통)
+    if is_backend_running():
+        logger.info("[%s] Node.js backend is active. Deferring buy order to backend.", norm_bot_id)
         conn.close()
         return None
 
@@ -578,9 +582,14 @@ def execute_buy_order(
         conn.close()
         return None
 
+    invest_krw = float(math.floor(float(invest_krw)))
     buy_fee = invest_krw * UPBIT_FEE_RATE
     net_invest = invest_krw - buy_fee
-    volume = round(net_invest / current_price, 8)
+    volume = round_down_volume_8(net_invest / current_price)
+    if volume <= 0:
+        logger.error("[%s] Cannot execute buy: Computed volume <= 0 for %s", norm_bot_id, ticker)
+        conn.close()
+        return None
     order_uuid = f"sim-buy-{uuid.uuid4().hex[:12]}"
     executed_price = current_price
 
@@ -590,7 +599,7 @@ def execute_buy_order(
         if limit_res:
             order_uuid = limit_res["uuid"]
             executed_price = limit_res["executed_price"]
-            volume = round(limit_res["executed_volume"], 8)
+            volume = round_down_volume_8(limit_res["executed_volume"])
             buy_fee = limit_res["paid_fee"]
             invest_krw = math.floor(volume * executed_price + buy_fee)
         else:
@@ -606,7 +615,7 @@ def execute_buy_order(
             order_detail = retry_with_backoff(upbit.get_order, order_uuid)
             if order_detail:
                 executed_price = float(order_detail.get("price", current_price))
-                volume = round(float(order_detail.get("executed_volume", volume)), 8)
+                volume = round_down_volume_8(order_detail.get("executed_volume", volume))
                 buy_fee = float(order_detail.get("paid_fee", buy_fee))
                 trades = order_detail.get("trades", [])
                 total_funds = sum(float(t.get("funds", 0.0)) for t in trades)
@@ -617,16 +626,17 @@ def execute_buy_order(
     try:
         conn.execute("BEGIN IMMEDIATE;")
 
-        # bot_positions 테이블에 신규 포지션 기록
+        # bot_positions 테이블에 신규 포지션 기록 (market + ticker 동기화)
         conn.execute(
             """
             INSERT INTO bot_positions (
-                bot_id, ticker, order_uuid, volume, avg_buy_price,
+                bot_id, market, ticker, order_uuid, volume, avg_buy_price,
                 buy_amount, buy_fee, highest_price, step_level, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', CURRENT_TIMESTAMP);
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', CURRENT_TIMESTAMP);
             """,
             (
                 norm_bot_id,
+                ticker,
                 ticker,
                 order_uuid,
                 volume,
@@ -638,7 +648,7 @@ def execute_buy_order(
             ),
         )
 
-        # bot_accounts의 virtual_krw 차감
+        # bot_accounts 및 bots의 virtual_krw 동시 차감
         conn.execute(
             """
             UPDATE bot_accounts
@@ -647,6 +657,15 @@ def execute_buy_order(
             WHERE bot_id = ?;
             """,
             (invest_krw, norm_bot_id),
+        )
+        conn.execute(
+            """
+            UPDATE bots
+            SET virtual_krw = MAX(0, virtual_krw - ?),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE bot_id = ?;
+            """,
+            (math.floor(invest_krw), norm_bot_id),
         )
 
         conn.execute("COMMIT;")
@@ -703,9 +722,9 @@ def execute_sell_order(
     buy_amount = float(pos["buy_amount"])
     avg_buy_price = float(pos["avg_buy_price"])
 
-    # Node.js 백엔드가 실거래를 관장 중인 경우 Python 중복 실거래 주문 차단
-    if not dry and upbit and is_backend_running():
-        logger.info("[%s] Node.js backend is active. Deferring live sell order on Upbit to backend.", norm_bot_id)
+    # Node.js 백엔드가 매매를 관장 중인 경우 Python 중복 주문 차단 (실전/DRY_RUN 공통)
+    if is_backend_running():
+        logger.info("[%s] Node.js backend is active. Deferring sell order to backend.", norm_bot_id)
         conn.close()
         return None
 
@@ -801,17 +820,29 @@ def execute_sell_order(
         is_selected_live = int(dict(bot_live_row).get("is_selected_for_live") or 0) == 1 if bot_live_row is not None else True
 
         if not is_selected_live:
-            # 탈락(Draining) 봇: 실현 손익 누적만 기록하고, 회수 원화는 현재 활성 실전 봇들의 allocation_ratio 비율대로 즉시 이관
+            # 탈락(Draining) 봇: 실현 손익 누적만 기록하고, 회수 원화(+미사용 잔고)는 현재 활성 실전 봇들의 allocation_ratio 비율대로 안전 이관
+            prev_cash_row = conn.execute(
+                "SELECT COALESCE(virtual_krw, 0) AS vkrw FROM bot_accounts WHERE bot_id = ?;",
+                (norm_bot_id,),
+            ).fetchone()
+            prev_cash = max(0, math.floor(float(dict(prev_cash_row).get("vkrw") or 0))) if prev_cash_row else 0
             remaining_open_row = conn.execute(
-                "SELECT COALESCE(SUM(buy_amount), 0) AS open_used FROM bot_positions WHERE (bot_id = ? OR bot_id = ?) AND status = 'OPEN';",
+                "SELECT COUNT(*) AS open_cnt, COALESCE(SUM(buy_amount), 0) AS open_used FROM bot_positions WHERE (bot_id = ? OR bot_id = ?) AND status = 'OPEN';",
                 (bot_id, norm_bot_id),
             ).fetchone()
-            remaining_open_used = math.floor(float(dict(remaining_open_row).get("open_used") or 0))
+            rem_dict = dict(remaining_open_row) if remaining_open_row else {}
+            remaining_open_cnt = int(rem_dict.get("open_cnt") or 0)
+            remaining_open_used = max(0, math.floor(float(rem_dict.get("open_used") or 0)))
+
+            safe_proceeds = max(0, math.floor(net_sell_amount)) if math.isfinite(net_sell_amount) else 0
+            floored_proceeds = safe_proceeds + prev_cash
+
             conn.execute(
                 """
                 UPDATE bot_accounts
                 SET virtual_krw = 0,
                     allocated_capital = ?,
+                    is_selected_for_live = 0,
                     total_realized_pnl = total_realized_pnl + ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE bot_id = ?;
@@ -823,13 +854,13 @@ def execute_sell_order(
                 UPDATE bots
                 SET virtual_krw = 0,
                     allocated_capital = ?,
+                    is_selected_for_live = 0,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE bot_id = ?;
                 """,
                 (remaining_open_used, norm_bot_id),
             )
 
-            floored_proceeds = max(0, math.floor(net_sell_amount))
             active_rows = conn.execute(
                 """
                 SELECT bot_id, COALESCE(allocation_ratio, 0) AS allocation_ratio
@@ -848,16 +879,25 @@ def execute_sell_order(
                     """
                 ).fetchall()
 
-            active_list = [dict(r) for r in active_rows]
-            ratio_sum = sum(max(0.0, float(r.get("allocation_ratio") or 0.0)) for r in active_list)
+            active_list = [dict(r) for r in active_rows if r["bot_id"] != norm_bot_id]
+            ratio_sum = sum(
+                max(0.0, float(r.get("allocation_ratio") or 0.0))
+                for r in active_list
+                if math.isfinite(float(r.get("allocation_ratio") or 0.0))
+            )
             transfer_logs = []
             if active_list and floored_proceeds > 0:
-                for active_bot in active_list:
-                    ratio_val = max(0.0, float(active_bot.get("allocation_ratio") or 0.0))
-                    if ratio_sum > 0:
-                        share = math.floor(floored_proceeds * (ratio_val / ratio_sum))
+                distributed = 0
+                for idx, active_bot in enumerate(active_list):
+                    raw_ratio = float(active_bot.get("allocation_ratio") or 0.0)
+                    ratio_val = max(0.0, raw_ratio) if math.isfinite(raw_ratio) else 0.0
+                    if idx == len(active_list) - 1:
+                        share = max(0, floored_proceeds - distributed)
+                    elif ratio_sum > 0:
+                        share = max(0, math.floor(floored_proceeds * (ratio_val / ratio_sum)))
                     else:
-                        share = math.floor(floored_proceeds / len(active_list))
+                        share = max(0, math.floor(floored_proceeds / len(active_list)))
+                    distributed += share
                     if share > 0:
                         target_id = active_bot["bot_id"]
                         conn.execute(
@@ -884,7 +924,7 @@ def execute_sell_order(
 
             logger.info(
                 f"[{norm_bot_id}] [Graceful Drain 정산 이관] 탈락 봇 {ticker} 매도 정산금 {floored_proceeds:,}원 "
-                f"(실현손익 {realized_pnl:+,.0f}원) 회수 -> 활성 실전 봇 충전: "
+                f"(실현손익 {realized_pnl:+,.0f}원, 잔여포지션 {remaining_open_cnt}건) 회수 -> 활성 실전 봇 충전: "
                 f"{', '.join(transfer_logs) if transfer_logs else '이관 대상 없음'}"
             )
         else:
@@ -985,13 +1025,17 @@ def run_bot_vb(stop_event, bot_id: str = "bot_01", db_path: Optional[str] = None
 
     while not stop_event.is_set():
         try:
+            if is_backend_running():
+                if stop_event.wait(timeout=10):
+                    break
+                continue
+
             conn = get_db_connection(db_path)
             allow_new_buys = True
-            if not is_dry_run():
-                b_row = conn.execute("SELECT is_selected_for_live, is_running FROM bots WHERE bot_id = ?;", (norm_id,)).fetchone()
-                if b_row is not None:
-                    b_dict = dict(b_row)
-                    allow_new_buys = bool(b_dict.get("is_selected_for_live")) and bool(b_dict.get("is_running"))
+            b_row = conn.execute("SELECT is_selected_for_live, is_running FROM bots WHERE bot_id = ?;", (norm_id,)).fetchone()
+            if b_row is not None:
+                b_dict = dict(b_row)
+                allow_new_buys = bool(b_dict.get("is_selected_for_live")) and bool(b_dict.get("is_running"))
 
             bot_acc = conn.execute("SELECT * FROM bot_accounts WHERE bot_id = ?;", (norm_id,)).fetchone()
             available_krw = float(bot_acc["virtual_krw"]) if bot_acc else 0.0
@@ -1015,8 +1059,8 @@ def run_bot_vb(stop_event, bot_id: str = "bot_01", db_path: Optional[str] = None
                 if current_price <= 0:
                     continue
 
-                # 1. 4시간봉 캔들 데이터 수집
-                df = pyupbit.get_ohlcv(ticker, interval="minute240", count=50)
+                # 1. 4시간봉 캔들 데이터 수집 (market_hub 캐시 공유)
+                df = get_cached_ohlcv(ticker, interval="minute240", count=50)
                 if df is None or len(df) < 25:
                     continue
 
@@ -1026,10 +1070,10 @@ def run_bot_vb(stop_event, bot_id: str = "bot_01", db_path: Optional[str] = None
                 vol_ma20 = float(df["volume"].rolling(20).mean().iloc[-1])
                 curr_vol = float(df["volume"].iloc[-1])
 
-                # 현재 해당 코인에 대해 열려 있는 bot_vb 포지션 조회
+                # 현재 해당 코인에 대해 열려 있는 bot_vb 포지션 조회 (market/ticker 호환)
                 conn = get_db_connection(db_path)
                 open_pos = conn.execute(
-                    "SELECT * FROM bot_positions WHERE (bot_id = ? OR bot_id = ?) AND ticker = ? AND status = 'OPEN';",
+                    "SELECT * FROM bot_positions WHERE (bot_id = ? OR bot_id = ?) AND COALESCE(NULLIF(ticker, ''), market) = ? AND status = 'OPEN';",
                     (bot_id, norm_id, ticker),
                 ).fetchone()
                 conn.close()
@@ -1135,13 +1179,17 @@ def run_bot_momentum(stop_event, bot_id: str = "bot_03", db_path: Optional[str] 
 
     while not stop_event.is_set():
         try:
+            if is_backend_running():
+                if stop_event.wait(timeout=10):
+                    break
+                continue
+
             conn = get_db_connection(db_path)
             allow_new_buys = True
-            if not is_dry_run():
-                b_row = conn.execute("SELECT is_selected_for_live, is_running FROM bots WHERE bot_id = ?;", (norm_id,)).fetchone()
-                if b_row is not None:
-                    b_dict = dict(b_row)
-                    allow_new_buys = bool(b_dict.get("is_selected_for_live")) and bool(b_dict.get("is_running"))
+            b_row = conn.execute("SELECT is_selected_for_live, is_running FROM bots WHERE bot_id = ?;", (norm_id,)).fetchone()
+            if b_row is not None:
+                b_dict = dict(b_row)
+                allow_new_buys = bool(b_dict.get("is_selected_for_live")) and bool(b_dict.get("is_running"))
 
             bot_acc = conn.execute("SELECT * FROM bot_accounts WHERE bot_id = ?;", (norm_id,)).fetchone()
             available_krw = float(bot_acc["virtual_krw"]) if bot_acc else 0.0
@@ -1158,16 +1206,19 @@ def run_bot_momentum(stop_event, bot_id: str = "bot_03", db_path: Optional[str] 
 
             # 1. 기존 보유 포지션 스마트 청산 및 중심선(20일선) 하향 이탈 청산 체크
             for pos in open_positions:
-                pos_id = pos["id"]
-                ticker = pos["ticker"]
+                pos_dict = dict(pos)
+                pos_id = pos_dict["id"]
+                ticker = str(pos_dict.get("ticker") or pos_dict.get("market") or "")
+                if not ticker:
+                    continue
                 current_price = get_safe_current_price(ticker)
                 if current_price <= 0:
                     continue
 
-                df = pyupbit.get_ohlcv(ticker, interval="minute240", count=25)
+                df = get_cached_ohlcv(ticker, interval="minute240", count=25)
                 if df is not None and len(df) >= 20:
-                    highest_price = max(float(pos["highest_price"] or 0.0), current_price)
-                    if highest_price > float(pos["highest_price"] or 0.0):
+                    highest_price = max(float(pos_dict.get("highest_price") or 0.0), current_price)
+                    if highest_price > float(pos_dict.get("highest_price") or 0.0):
                         conn = get_db_connection(db_path)
                         conn.execute("UPDATE bot_positions SET highest_price = ? WHERE id = ?;", (highest_price, pos_id))
                         conn.close()
@@ -1184,7 +1235,7 @@ def run_bot_momentum(stop_event, bot_id: str = "bot_03", db_path: Optional[str] 
 
                     smart_exit = evaluate_smart_exit(
                         norm_id,
-                        dict(pos),
+                        pos_dict,
                         current_price,
                         atr=atr_val,
                         rvol=rvol_val,
@@ -1203,13 +1254,13 @@ def run_bot_momentum(stop_event, bot_id: str = "bot_03", db_path: Optional[str] 
                         )
                         execute_sell_order(pos_id, reason="BB_MIDDLE_BREAKDOWN", db_path=db_path)
 
-            # 2. 신규 진입 슬롯 확인
+            # 2. 신규 진입 슬롯 확인 (Graceful Drain/중지 봇은 신규 진입 차단)
             open_count = len(open_positions)
             remaining_slots = MAX_POSITIONS - open_count
 
-            if remaining_slots > 0 and available_krw >= MIN_ORDER_KRW:
-                # 24시간 거래대금 상위 종목 필터링 (100억 원 이상)
-                tickers = pyupbit.get_tickers(fiat="KRW")
+            if allow_new_buys and remaining_slots > 0 and available_krw >= MIN_ORDER_KRW:
+                # 24시간 거래대금 상위 종목 필터링 (100억 원 이상 - market_hub 캐시 공유)
+                tickers = get_cached_tickers(fiat="KRW")
                 qualifying_candidates = []
 
                 for t in tickers[:25]:  # 상위 후보 탐색
@@ -1218,10 +1269,10 @@ def run_bot_momentum(stop_event, bot_id: str = "bot_03", db_path: Optional[str] 
                     time.sleep(0.12)  # Rate Limit 준수
 
                     # 이미 보유 중인 코인 제외
-                    if any(p["ticker"] == t for p in open_positions):
+                    if any((dict(p).get("ticker") or dict(p).get("market")) == t for p in open_positions):
                         continue
 
-                    df = pyupbit.get_ohlcv(t, interval="minute240", count=30)
+                    df = get_cached_ohlcv(t, interval="minute240", count=30)
                     if df is None or len(df) < 22:
                         continue
 
@@ -1300,13 +1351,17 @@ def run_bot_bb(stop_event, bot_id: str = "bot_05", db_path: Optional[str] = None
 
     while not stop_event.is_set():
         try:
+            if is_backend_running():
+                if stop_event.wait(timeout=10):
+                    break
+                continue
+
             conn = get_db_connection(db_path)
             allow_new_buys = True
-            if not is_dry_run():
-                b_row = conn.execute("SELECT is_selected_for_live, is_running FROM bots WHERE bot_id = ?;", (norm_id,)).fetchone()
-                if b_row is not None:
-                    b_dict = dict(b_row)
-                    allow_new_buys = bool(b_dict.get("is_selected_for_live")) and bool(b_dict.get("is_running"))
+            b_row = conn.execute("SELECT is_selected_for_live, is_running FROM bots WHERE bot_id = ?;", (norm_id,)).fetchone()
+            if b_row is not None:
+                b_dict = dict(b_row)
+                allow_new_buys = bool(b_dict.get("is_selected_for_live")) and bool(b_dict.get("is_running"))
 
             bot_acc = conn.execute("SELECT * FROM bot_accounts WHERE bot_id = ?;", (norm_id,)).fetchone()
             available_krw = float(bot_acc["virtual_krw"]) if bot_acc else 0.0
@@ -1323,22 +1378,25 @@ def run_bot_bb(stop_event, bot_id: str = "bot_05", db_path: Optional[str] = None
 
             # 1. 기존 오픈 포지션별 스마트 청산 / 개별 익절 / 중심선 익절 / 최종 안전 손절 점검
             for pos in open_positions:
-                pos_id = pos["id"]
-                ticker = pos["ticker"]
-                avg_buy_price = float(pos["avg_buy_price"])
-                step_level = int(pos["step_level"] or 1)
+                pos_dict = dict(pos)
+                pos_id = pos_dict["id"]
+                ticker = str(pos_dict.get("ticker") or pos_dict.get("market") or "")
+                if not ticker:
+                    continue
+                avg_buy_price = float(pos_dict["avg_buy_price"])
+                step_level = int(pos_dict.get("step_level") or 1)
 
                 current_price = get_safe_current_price(ticker)
                 if current_price <= 0:
                     continue
 
-                highest_price = max(float(pos["highest_price"] or 0.0), current_price)
-                if highest_price > float(pos["highest_price"] or 0.0):
+                highest_price = max(float(pos_dict.get("highest_price") or 0.0), current_price)
+                if highest_price > float(pos_dict.get("highest_price") or 0.0):
                     conn = get_db_connection(db_path)
                     conn.execute("UPDATE bot_positions SET highest_price = ? WHERE id = ?;", (highest_price, pos_id))
                     conn.close()
 
-                df = pyupbit.get_ohlcv(ticker, interval="minute30", count=25)
+                df = get_cached_ohlcv(ticker, interval="minute30", count=25)
                 atr_val = 0.0
                 rvol_val = 1.0
                 middle_band = None
@@ -1357,7 +1415,7 @@ def run_bot_bb(stop_event, bot_id: str = "bot_05", db_path: Optional[str] = None
                 # 스마트 청산(본절 스탑, 시간 제한 청산, 동적 ATR 트레일링 스탑)
                 smart_exit = evaluate_smart_exit(
                     norm_id,
-                    dict(pos),
+                    pos_dict,
                     current_price,
                     atr=atr_val,
                     rvol=rvol_val,
@@ -1368,7 +1426,7 @@ def run_bot_bb(stop_event, bot_id: str = "bot_05", db_path: Optional[str] = None
                     execute_sell_order(pos_id, reason=smart_exit["reason"], db_path=db_path)
                     continue
 
-                pnl_ratio = (current_price - avg_buy_price) / avg_buy_price
+                pnl_ratio = (current_price - avg_buy_price) / avg_buy_price if avg_buy_price > 0 else 0.0
 
                 # A. 개별 포지션 +1.8% 익절
                 if pnl_ratio >= 0.018:
@@ -1382,17 +1440,14 @@ def run_bot_bb(stop_event, bot_id: str = "bot_05", db_path: Optional[str] = None
                     execute_sell_order(pos_id, reason="DCA_INDIVIDUAL_TP", db_path=db_path)
                     continue
 
-                # B. 중심선(20선) 평균회귀 익절
-                df = pyupbit.get_ohlcv(ticker, interval="minute30", count=25)
-                if df is not None and len(df) >= 20:
-                    middle_band = float(df["close"].rolling(20).mean().iloc[-1])
-                    if current_price >= middle_band and pnl_ratio > 0.005:
-                        logger.info(
-                            f"[{bot_id}] Mean reversion to middle band on {ticker} (pos {pos_id}): "
-                            f"Curr={current_price:,.0f} >= Mid={middle_band:,.0f}"
-                        )
-                        execute_sell_order(pos_id, reason="MEAN_REVERSION_TP", db_path=db_path)
-                        continue
+                # B. 중심선(20선) 평균회귀 익절 (캐시 재사용)
+                if middle_band is not None and current_price >= middle_band and pnl_ratio > 0.005:
+                    logger.info(
+                        f"[{bot_id}] Mean reversion to middle band on {ticker} (pos {pos_id}): "
+                        f"Curr={current_price:,.0f} >= Mid={middle_band:,.0f}"
+                    )
+                    execute_sell_order(pos_id, reason="MEAN_REVERSION_TP", db_path=db_path)
+                    continue
 
                 # C. 최종 안전 손절 (-5% for step 1, -7% for step 3)
                 stop_threshold = -0.07 if step_level >= 3 else -0.05
@@ -1407,72 +1462,72 @@ def run_bot_bb(stop_event, bot_id: str = "bot_05", db_path: Optional[str] = None
                     )
                     execute_sell_order(pos_id, reason="SAFETY_STOP_LOSS", db_path=db_path)
 
-            # 2. 신규 1차 진입 또는 추가 다단계 분할 매수(물타기) 점검
-            for ticker in target_tickers:
-                if stop_event.is_set():
-                    break
+            # 2. 신규 1차 진입 또는 추가 다단계 분할 매수(물타기) 점검 (Graceful Drain/중지 봇 차단)
+            if allow_new_buys and available_krw >= MIN_ORDER_KRW:
+                for ticker in target_tickers:
+                    if stop_event.is_set() or available_krw < MIN_ORDER_KRW:
+                        break
 
-                current_price = get_safe_current_price(ticker)
-                if current_price <= 0:
-                    continue
+                    current_price = get_safe_current_price(ticker)
+                    if current_price <= 0:
+                        continue
 
-                df = pyupbit.get_ohlcv(ticker, interval="minute30", count=30)
-                if df is None or len(df) < 22:
-                    continue
+                    df = get_cached_ohlcv(ticker, interval="minute30", count=30)
+                    if df is None or len(df) < 22:
+                        continue
 
-                middle, upper, lower, bw = compute_bollinger_bands(df, period=20, num_std=2.0)
-                rsi_series = compute_rsi(df, period=14)
+                    middle, upper, lower, bw = compute_bollinger_bands(df, period=20, num_std=2.0)
+                    rsi_series = compute_rsi(df, period=14)
 
-                lower_val = float(lower.iloc[-1])
-                rsi_val = float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50.0
+                    lower_val = float(lower.iloc[-1])
+                    rsi_val = float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50.0
 
-                # 해당 코인의 현재 열린 포지션 목록 조회
-                conn = get_db_connection(db_path)
-                ticker_positions = conn.execute(
-                    "SELECT * FROM bot_positions WHERE bot_id = ? AND ticker = ? AND status = 'OPEN' ORDER BY id ASC;",
-                    (bot_id, ticker),
-                ).fetchall()
-                conn.close()
+                    # 해당 코인의 현재 열린 포지션 목록 조회
+                    conn = get_db_connection(db_path)
+                    ticker_positions = conn.execute(
+                        "SELECT * FROM bot_positions WHERE (bot_id = ? OR bot_id = ?) AND COALESCE(NULLIF(ticker, ''), market) = ? AND status = 'OPEN' ORDER BY id ASC;",
+                        (bot_id, norm_id, ticker),
+                    ).fetchall()
+                    conn.close()
 
-                # Case A: 1차 신규 진입 (볼린저 하단 이탈 + RSI < 30)
-                if len(ticker_positions) == 0 and available_krw >= MIN_ORDER_KRW:
-                    if current_price <= lower_val and rsi_val <= 40.0:
-                        logger.info(
-                            f"[{bot_id}] Oversold dip on {ticker}: Price={current_price:,.0f} "
-                            f"<= Lower={lower_val:,.0f}, RSI={rsi_val:.1f}"
-                        )
-                        # 분할 매수를 위해 가용 잔고의 40% 투입
-                        first_entry_budget = available_krw * 0.40
-                        can_enter, invest_krw, reason = can_enter_position(
-                            bot_id, ticker, first_entry_budget, db_path=db_path
-                        )
-                        if can_enter:
-                            execute_buy_order(bot_id, ticker, invest_krw, step_level=1, db_path=db_path)
-                            available_krw -= invest_krw
+                    # Case A: 1차 신규 진입 (볼린저 하단 이탈 + RSI <= 40)
+                    if len(ticker_positions) == 0 and available_krw >= MIN_ORDER_KRW:
+                        if current_price <= lower_val and rsi_val <= 40.0:
+                            logger.info(
+                                f"[{bot_id}] Oversold dip on {ticker}: Price={current_price:,.0f} "
+                                f"<= Lower={lower_val:,.0f}, RSI={rsi_val:.1f}"
+                            )
+                            first_entry_budget = available_krw * 0.40
+                            can_enter, invest_krw, reason = can_enter_position(
+                                bot_id, ticker, first_entry_budget, db_path=db_path
+                            )
+                            if can_enter:
+                                execute_buy_order(bot_id, ticker, invest_krw, step_level=1, db_path=db_path)
+                                available_krw -= invest_krw
 
-                # Case B: 추가 분할 매수 (-3% 추가 하락 시 2차 진입, -6% 추가 하락 시 3차 진입)
-                elif len(ticker_positions) > 0 and available_krw >= MIN_ORDER_KRW:
-                    max_step = max(int(p["step_level"] or 1) for p in ticker_positions)
-                    base_buy_price = float(ticker_positions[0]["avg_buy_price"])
-                    drop_ratio = (current_price - base_buy_price) / base_buy_price
+                    # Case B: 추가 분할 매수 (-3% 추가 하락 시 2차 진입, -6% 추가 하락 시 3차 진입)
+                    elif len(ticker_positions) > 0 and available_krw >= MIN_ORDER_KRW:
+                        max_step = max(int(p["step_level"] or 1) for p in ticker_positions)
+                        base_buy_price = float(ticker_positions[0]["avg_buy_price"])
+                        drop_ratio = (current_price - base_buy_price) / base_buy_price if base_buy_price > 0 else 0.0
 
-                    if max_step == 1 and drop_ratio <= -0.03:
-                        logger.info("[%s] DCA Step 2 triggered on %s: Drop=%.2f%%", bot_id, ticker, drop_ratio * 100.0)
-                        can_enter, invest_krw, reason = can_enter_position(
-                            bot_id, ticker, available_krw * 0.50, db_path=db_path
-                        )
-                        if can_enter:
-                            execute_buy_order(bot_id, ticker, invest_krw, step_level=2, db_path=db_path)
-                            available_krw -= invest_krw
+                        if max_step == 1 and drop_ratio <= -0.03:
+                            logger.info("[%s] DCA Step 2 triggered on %s: Drop=%.2f%%", bot_id, ticker, drop_ratio * 100.0)
+                            can_enter, invest_krw, reason = can_enter_position(
+                                bot_id, ticker, available_krw * 0.50, db_path=db_path
+                            )
+                            if can_enter:
+                                execute_buy_order(bot_id, ticker, invest_krw, step_level=2, db_path=db_path)
+                                available_krw -= invest_krw
 
-                    elif max_step == 2 and drop_ratio <= -0.06:
-                        logger.info("[%s] DCA Step 3 triggered on %s: Drop=%.2f%%", bot_id, ticker, drop_ratio * 100.0)
-                        can_enter, invest_krw, reason = can_enter_position(
-                            bot_id, ticker, available_krw, db_path=db_path
-                        )
-                        if can_enter:
-                            execute_buy_order(bot_id, ticker, invest_krw, step_level=3, db_path=db_path)
-                            available_krw -= invest_krw
+                        elif max_step == 2 and drop_ratio <= -0.06:
+                            logger.info("[%s] DCA Step 3 triggered on %s: Drop=%.2f%%", bot_id, ticker, drop_ratio * 100.0)
+                            can_enter, invest_krw, reason = can_enter_position(
+                                bot_id, ticker, available_krw, db_path=db_path
+                            )
+                            if can_enter:
+                                execute_buy_order(bot_id, ticker, invest_krw, step_level=3, db_path=db_path)
+                                available_krw -= invest_krw
 
         except Exception as loop_exc:
             logger.error("[%s] Unexpected error in loop: %s", bot_id, loop_exc, exc_info=True)

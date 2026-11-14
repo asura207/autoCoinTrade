@@ -727,12 +727,29 @@ async function initializeDatabase() {
       created_at TEXT
     );
     ALTER TABLE bots ADD COLUMN IF NOT EXISTS strategy_group TEXT DEFAULT 'TREND_SWING';
+    ALTER TABLE bots ADD COLUMN IF NOT EXISTS is_selected_for_live INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_initial_capital BIGINT NOT NULL DEFAULT 1000000;
+    ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_virtual_krw BIGINT NOT NULL DEFAULT 1000000;
+    ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_is_running INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_peak_equity BIGINT NOT NULL DEFAULT 1000000;
+    ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_mdd_pct NUMERIC(8,2) NOT NULL DEFAULT 0;
+    ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_status_msg TEXT NOT NULL DEFAULT '시그널 대기 중';
+    ALTER TABLE bot_accounts ADD COLUMN IF NOT EXISTS is_selected_for_live INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS market TEXT NOT NULL DEFAULT 'KRW-BTC';
+    ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS ticker TEXT;
+    ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS trade_id BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS highest_price DOUBLE PRECISION DEFAULT 0.0;
+    ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS step_level INTEGER DEFAULT 1;
     ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS sell_order_uuid TEXT;
     ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS sell_price DOUBLE PRECISION;
     ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS sell_amount DOUBLE PRECISION;
     ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS sell_fee DOUBLE PRECISION;
     ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS realized_pnl DOUBLE PRECISION;
     ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS pnl_pct DOUBLE PRECISION;
+    ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS buy_reason TEXT;
+    ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS sell_reason TEXT;
+    UPDATE bot_positions SET market = ticker WHERE (market IS NULL OR market = '') AND ticker IS NOT NULL AND ticker != '';
+    UPDATE bot_positions SET ticker = market WHERE (ticker IS NULL OR ticker = '') AND market IS NOT NULL AND market != '';
     ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS flash_sentiment_score DOUBLE PRECISION DEFAULT 0.0;
     ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS flash_recommended_action TEXT DEFAULT 'NORMAL';
     ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS flash_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
@@ -1157,7 +1174,8 @@ async function checkAndHaltIfZeroBalance(mode = null) {
   const bots = (await getBots("live")).filter((b) => Number(b.is_selected_for_live) === 1);
   const totalVirtual = bots.reduce((acc, b) => acc + Number(b.virtual_krw || 0), 0);
   const posTable = getPositionsTableName(mode || "live");
-  const openPosCnt = await db.prepare(`SELECT COUNT(*) AS cnt FROM ${posTable} WHERE status = 'OPEN'`).get().cnt;
+  const openPosRow = await db.prepare(`SELECT COUNT(*) AS cnt FROM ${posTable} WHERE status = 'OPEN'`).get();
+  const openPosCnt = Number(openPosRow?.cnt || 0);
 
   let shouldHalt = false;
   let reason = "";
@@ -2315,18 +2333,16 @@ function getDualAiCandidateModels(isProTarget = false, preferredModel = "") {
   const pref = String(preferredModel || "").trim();
   const baseList = isProTarget
     ? [
-        "gemini-1.5-pro",
         "gemini-2.5-pro",
         "gemini-pro-latest",
-        "gemini-3.1-pro-preview",
-        "gemini-2.5-flash",
-      ]
-    : [
-        "gemini-1.5-flash",
         "gemini-2.5-flash",
         "gemini-flash-latest",
-        "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
+      ]
+    : [
+        "gemini-2.5-flash",
+        "gemini-flash-latest",
+        "gemini-2.5-flash-lite",
+        "gemini-flash-lite-latest",
       ];
   if (pref && !baseList.includes(pref)) {
     return [pref, ...baseList];
@@ -2502,7 +2518,7 @@ async function generateAiMarketAnalysis(options = {}) {
   await db.prepare(
     "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('ai_briefing_last_trigger_type', ?, ?)"
   ).run(triggerType, nowStr);
-  if (triggerType === "AUTO" && slotKey) {
+  if (triggerType === "AUTO" && slotKey && !isProTarget) {
     await db.prepare(
       "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('ai_briefing_last_auto_slot', ?, ?)"
     ).run(slotKey, nowStr);
@@ -2889,11 +2905,11 @@ ${newsSummaryList}
 문장은 신뢰감 있고 가독성 높게, 적절한 불릿포인트와 이모지를 활용해주세요.`;
 
   const candidateModels = [
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-3.8-flash",
+    "gemini-2.5-flash",
     "gemini-flash-latest",
+    "gemini-2.5-flash-lite",
     "gemini-flash-lite-latest",
+    "gemini-2.5-pro",
   ];
 
   let chosenModel = candidateModels[0];
@@ -3140,11 +3156,11 @@ ${newsSummaryList}
 문장은 신뢰감 있고 가독성 높게, 적절한 불릿포인트와 이모지를 활용해주세요.`;
 
   const candidateModels = [
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-3.8-flash",
+    "gemini-2.5-flash",
     "gemini-flash-latest",
+    "gemini-2.5-flash-lite",
     "gemini-flash-lite-latest",
+    "gemini-2.5-pro",
   ];
 
   let geminiResp = null;
@@ -5487,17 +5503,26 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/settings/export" && req.method === "GET") {
       let autoRotationConfig = [];
       let autoRotationHistory = [];
+      let paperTrades = [];
+      let paperBotPositions = [];
+      let marketRegimeFilter = [];
       try {
         autoRotationConfig = await db.prepare("SELECT * FROM auto_rotation_config").all();
         autoRotationHistory = await db.prepare("SELECT * FROM auto_rotation_history ORDER BY id DESC LIMIT 100").all();
+        paperTrades = await db.prepare("SELECT * FROM paper_trades ORDER BY id ASC").all();
+        paperBotPositions = await db.prepare("SELECT * FROM paper_bot_positions ORDER BY id ASC").all();
+        marketRegimeFilter = await db.prepare("SELECT * FROM market_regime_filter").all();
       } catch {}
       const payload = {
-        schema_version: "1.1",
+        schema_version: "1.2",
         exported_at: nowKSTString(),
         system_settings: await db.prepare("SELECT * FROM system_settings").all(),
         bots: await db.prepare("SELECT * FROM bots").all(),
         trades: await db.prepare("SELECT * FROM trades").all(),
         bot_positions: await db.prepare("SELECT * FROM bot_positions").all(),
+        paper_trades: paperTrades,
+        paper_bot_positions: paperBotPositions,
+        market_regime_filter: marketRegimeFilter,
         auto_rotation_config: autoRotationConfig,
         auto_rotation_history: autoRotationHistory,
       };
@@ -5681,6 +5706,91 @@ const server = http.createServer(async (req, res) => {
           );
         }
       }
+      if (Array.isArray(payload.paper_trades) && payload.paper_trades.length > 0) {
+        await db.exec("DELETE FROM paper_bot_positions; DELETE FROM paper_trades;");
+        for (const pt of payload.paper_trades) {
+          await db.prepare(`
+            INSERT INTO paper_trades (
+              id, bot_id, market, buy_order_uuid, sell_order_uuid,
+              buy_price, buy_volume, buy_amount, buy_date,
+              sell_price, sell_volume, sell_amount, sell_date,
+              profit_krw, profit_pct, status, buy_reason, sell_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            pt.id,
+            pt.bot_id,
+            pt.market,
+            pt.buy_order_uuid,
+            pt.sell_order_uuid ?? null,
+            Number(pt.buy_price) || 0,
+            String(pt.buy_volume ?? "0"),
+            Math.floor(Number(pt.buy_amount) || 0),
+            pt.buy_date || now,
+            pt.sell_price ?? null,
+            pt.sell_volume ?? null,
+            pt.sell_amount !== null && pt.sell_amount !== undefined ? Math.floor(Number(pt.sell_amount) || 0) : null,
+            pt.sell_date ?? null,
+            pt.profit_krw !== null && pt.profit_krw !== undefined ? Math.floor(Number(pt.profit_krw) || 0) : null,
+            pt.profit_pct ?? null,
+            pt.status || "HOLDING",
+            pt.buy_reason ?? null,
+            pt.sell_reason ?? null
+          );
+        }
+        for (const pp of payload.paper_bot_positions || []) {
+          await db.prepare(`
+            INSERT OR REPLACE INTO paper_bot_positions (
+              id, bot_id, market, order_uuid, volume, avg_buy_price, buy_amount, buy_fee, trade_id, status, created_at, closed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            pp.id,
+            pp.bot_id,
+            pp.market,
+            pp.order_uuid || `restored-paper-${pp.id || Date.now()}`,
+            String(pp.volume ?? "0"),
+            Number(pp.avg_buy_price) || 0,
+            Math.floor(Number(pp.buy_amount) || 0),
+            Number(pp.buy_fee || 0) || 0,
+            Number(pp.trade_id || 0) || 0,
+            pp.status || "OPEN",
+            pp.created_at || now,
+            pp.closed_at ?? null
+          );
+        }
+      }
+      if (Array.isArray(payload.market_regime_filter) && payload.market_regime_filter.length > 0) {
+        const mr = payload.market_regime_filter[0];
+        if (mr) {
+          await db.prepare(`
+            INSERT OR REPLACE INTO market_regime_filter (
+              id, sentiment_score, market_regime, risk_alert, recommended_action,
+              position_size_multiplier, bot_overrides_json, blacklist_tickers_json, reason, updated_at,
+              flash_sentiment_score, flash_recommended_action, flash_updated_at,
+              pro_sentiment_score, pro_recommended_action, pro_updated_at,
+              final_risk_alert, final_position_multiplier, final_bot_overrides_json
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            Number(mr.sentiment_score || 0) || 0,
+            mr.market_regime || "SIDEWAYS",
+            Number(mr.risk_alert || 0) || 0,
+            mr.recommended_action || "NORMAL",
+            Number(mr.position_size_multiplier ?? 1.0),
+            JSON.stringify(normalizeBotOverrides(mr.bot_overrides_json)),
+            mr.blacklist_tickers_json || "[]",
+            mr.reason || "Restored regime state",
+            mr.updated_at || now,
+            Number(mr.flash_sentiment_score || 0) || 0,
+            mr.flash_recommended_action || "NORMAL",
+            mr.flash_updated_at || now,
+            Number(mr.pro_sentiment_score || 0) || 0,
+            mr.pro_recommended_action || "NORMAL",
+            mr.pro_updated_at || now,
+            Number(mr.final_risk_alert ?? mr.risk_alert ?? 0) || 0,
+            Number(mr.final_position_multiplier ?? mr.position_size_multiplier ?? 1.0),
+            JSON.stringify(normalizeBotOverrides(mr.final_bot_overrides_json || mr.bot_overrides_json))
+          );
+        }
+      }
       await syncBotAccountsFromBots(db);
       await checkAndHaltIfZeroBalance();
       return sendJson(res, 200, {
@@ -5813,43 +5923,84 @@ server.listen(PORT, HOST, () => {
 // 백그라운드 3종 전략 봇 자동매매 스케줄러 워커 (8초 주기)
 // ============================================================================
 let isStrategyCycleRunning = false;
+const upbitTickersCache = new Map();
+const upbitCandlesCache = new Map();
+
+async function fetchUpbitPublicWithBackoff(url) {
+  const delays = [1000, 2000, 4000];
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
+    await new Promise((r) => setTimeout(r, 120));
+    try {
+      const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      if (resp.status === 200) {
+        return await resp.json();
+      }
+      if ((resp.status === 429 || resp.status === 503) && attempt < delays.length) {
+        await new Promise((r) => setTimeout(r, delays[attempt]));
+        continue;
+      }
+      return null;
+    } catch {
+      if (attempt < delays.length) {
+        await new Promise((r) => setTimeout(r, delays[attempt]));
+        continue;
+      }
+    }
+  }
+  return null;
+}
 
 async function fetchUpbitTickersMap(markets) {
   const map = new Map();
   if (!markets || markets.length === 0) return map;
-  try {
-    await new Promise((r) => setTimeout(r, 120));
-    const resp = await fetch(
-      `https://api.upbit.com/v1/ticker?markets=${encodeURIComponent(markets.join(","))}`,
-      { signal: AbortSignal.timeout(5000) }
-    );
-    if (resp.status === 200) {
-      const data = await resp.json();
-      if (Array.isArray(data)) {
-        for (const item of data) {
-          map.set(item.market, item);
-        }
-      }
+  const now = Date.now();
+  const missing = [];
+  for (const m of markets) {
+    const cached = upbitTickersCache.get(m);
+    if (cached && now - cached.ts < 3000) {
+      map.set(m, cached.data);
+    } else {
+      missing.push(m);
     }
-  } catch {}
+  }
+  if (missing.length === 0) return map;
+
+  const data = await fetchUpbitPublicWithBackoff(
+    `https://api.upbit.com/v1/ticker?markets=${encodeURIComponent(missing.join(","))}`
+  );
+  if (Array.isArray(data)) {
+    const fetchedAt = Date.now();
+    for (const item of data) {
+      upbitTickersCache.set(item.market, { ts: fetchedAt, data: item });
+      map.set(item.market, item);
+    }
+  }
+  for (const m of missing) {
+    if (!map.has(m)) {
+      const stale = upbitTickersCache.get(m);
+      if (stale?.data) map.set(m, stale.data);
+    }
+  }
   return map;
 }
 
 async function fetchUpbitCandlesSorted(market, unit = "days", count = 8) {
-  try {
-    await new Promise((r) => setTimeout(r, 120));
-    const resp = await fetch(
-      `https://api.upbit.com/v1/candles/${unit}?market=${encodeURIComponent(market)}&count=${Math.max(count, 8)}`,
-      { signal: AbortSignal.timeout(5000) }
-    );
-    if (resp.status === 200) {
-      const rows = await resp.json();
-      if (Array.isArray(rows) && rows.length >= 8) {
-        return rows.slice().reverse(); // 과거 -> 최신 오름차순 (index 0이 iloc[-8] 기준 시점)
-      }
-    }
-  } catch {}
-  return [];
+  const safeCount = Math.max(count, 8);
+  const cacheKey = `${market}:${unit}:${safeCount}`;
+  const cached = upbitCandlesCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < 8000) {
+    return cached.rows;
+  }
+
+  const rows = await fetchUpbitPublicWithBackoff(
+    `https://api.upbit.com/v1/candles/${unit}?market=${encodeURIComponent(market)}&count=${safeCount}`
+  );
+  if (Array.isArray(rows) && rows.length >= 8) {
+    const sorted = rows.slice().reverse(); // 과거 -> 최신 오름차순 (index 0이 iloc[-8] 기준 시점)
+    upbitCandlesCache.set(cacheKey, { ts: Date.now(), rows: sorted });
+    return sorted;
+  }
+  return cached?.rows || [];
 }
 
 function computeRsi(closes, period = 7) {
@@ -6122,12 +6273,17 @@ async function executeBotBuyOrder(bot, market, orderKrw, currentPrice) {
     const bestBidPrice = (await fetchUpbitBestBidPrice(market, currentPrice)) || currentPrice;
     if (!bestBidPrice || bestBidPrice <= 0) return false;
 
-    let rawVol = Math.floor(orderKrw) / bestBidPrice;
-    let limitVolNum = Number(rawVol.toFixed(8));
+    const rawVol = Math.floor(orderKrw) / bestBidPrice;
+    let limitVolNum = Number(floorTo8DecimalsStr(rawVol));
     if (limitVolNum * bestBidPrice < 5000) {
-      limitVolNum = Number((limitVolNum + 0.00000001).toFixed(8));
+      const stepped = Number(floorTo8DecimalsStr(limitVolNum + 0.00000001));
+      if (Math.ceil(stepped * bestBidPrice * 1.0005) <= Math.floor(Number(latestBot.virtual_krw || orderKrw))) {
+        limitVolNum = stepped;
+      } else {
+        return false;
+      }
     }
-    const limitVolumeStr = limitVolNum.toFixed(8);
+    const limitVolumeStr = floorTo8DecimalsStr(limitVolNum);
     const actualBuyAmount = Math.floor(limitVolNum * bestBidPrice);
     const fee = Math.floor(actualBuyAmount * 0.0005);
     const orderUuid = `paper-bid-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
@@ -6188,12 +6344,17 @@ async function executeBotBuyOrder(bot, market, orderKrw, currentPrice) {
     return false;
   }
 
-  let rawVol = Math.floor(orderKrw) / bestBidPrice;
-  let limitVolNum = Number(rawVol.toFixed(8));
+  const rawVol = Math.floor(orderKrw) / bestBidPrice;
+  let limitVolNum = Number(floorTo8DecimalsStr(rawVol));
   if (limitVolNum * bestBidPrice < 5000) {
-    limitVolNum = Number((limitVolNum + 0.00000001).toFixed(8));
+    const stepped = Number(floorTo8DecimalsStr(limitVolNum + 0.00000001));
+    if (Math.ceil(stepped * bestBidPrice * 1.0005) <= Math.floor(Number(latestBot.virtual_krw || orderKrw))) {
+      limitVolNum = stepped;
+    } else {
+      return false;
+    }
   }
-  const limitVolumeStr = limitVolNum.toFixed(8);
+  const limitVolumeStr = floorTo8DecimalsStr(limitVolNum);
   const limitPriceStr = String(bestBidPrice);
 
   let orderUuid = "";
@@ -6366,9 +6527,9 @@ async function executeBotBuyOrder(bot, market, orderKrw, currentPrice) {
 
   await db.prepare(`
     INSERT INTO bot_positions (
-      bot_id, market, order_uuid, volume, avg_buy_price, buy_amount, buy_fee, trade_id, status, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
-  `).run(bot.bot_id, market, orderUuid, execVolume, execPrice, actualBuyAmount, fee, trRes.lastInsertRowid, now);
+      bot_id, market, ticker, order_uuid, volume, avg_buy_price, buy_amount, buy_fee, trade_id, status, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
+  `).run(bot.bot_id, market, market, orderUuid, execVolume, execPrice, actualBuyAmount, fee, trRes.lastInsertRowid, now);
   return true;
 }
 
@@ -7161,7 +7322,7 @@ async function checkAndRunScheduledAiMarketAnalysis() {
     // 1. 30분 단위 Gemini Flash 시장 분석 & 봇 진단
     if (needFlashMarket) {
       console.log(`[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) Gemini Flash 자동 시장 분석을 시작합니다...`);
-      const marketResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: flashSlotKey, preferredModel: "gemini-1.5-flash" });
+      const marketResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: flashSlotKey, preferredModel: "gemini-2.5-flash" });
       if (marketResult.success) {
         lastScheduledMarketAiFailureMs = 0;
         console.log(`[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) 완료 (모델: ${marketResult.briefing?.model})`);
@@ -7192,7 +7353,7 @@ async function checkAndRunScheduledAiMarketAnalysis() {
     // 3. 1시간 정각 단위 Gemini Pro 심층 퀀트 분석
     if (needProInDepth) {
       console.log(`[AI Auto Pro Analysis] 1시간 정각 심층 슬롯(${proSlotKey}) Gemini Pro 심층 퀀트 분석을 시작합니다...`);
-      const proResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: proSlotKey, preferredModel: "gemini-1.5-pro", modelType: "pro" });
+      const proResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: proSlotKey, preferredModel: "gemini-2.5-pro", modelType: "pro" });
       if (proResult.success) {
         lastScheduledProAiFailureMs = 0;
         const db = getDb();
