@@ -10,7 +10,8 @@
 
 | 버전 (Version) | 릴리즈 일시 | 커밋 해시 | 주요 수정 내용 요약 |
 | :--- | :--- | :--- | :--- |
-| **v0.0.23** | 2026-11-14 | - | 전수 코드 감사 5대 영역 수정: 루트·`/install` 실행/종료 스크립트 동기화 및 Node-Python 이중 실행 차단, Graceful Drain 잔고 이관·DB/PG 자동 마이그레이션·JSON Export/Import v1.2, 업비트 시세 캐시·지수 백오프·8자리 내림 주문 정합성, 프론트엔드 SSE 클린업, 문서·패키지 현행화 |
+| **v0.0.24** | 2026-11-14 | - | 주간 TOP 1 로테이션 & Graceful Drain 자금 이관 7대 엣지 케이스 검증 및 결함 수정: Zero-Sum(`1원` 자투리 #1 봇 귀속) 불변식·`order_uuid` 독립 청산·AI `BLOCK`/잔고부족 시 매도 감시 유지·`drain_handoff_logs` 감사 원장·동시성 뮤텍스/신규 DB 마이그레이션 버그 수정 및 7대 시나리오 자동 검증 통과 |
+| **v0.0.23** | 2026-11-14 | `b64dbdb` | 전수 코드 감사 5대 영역 수정: 루트·`/install` 실행/종료 스크립트 동기화 및 Node-Python 이중 실행 차단, Graceful Drain 잔고 이관·DB/PG 자동 마이그레이션·JSON Export/Import v1.2, 업비트 시세 캐시·지수 백오프·8자리 내림 주문 정합성, 프론트엔드 SSE 클린업, 문서·패키지 현행화 |
 | **v0.0.22** | 2026-11-14 | `b8bd374` | 주간 3대 전략군(추세·스윙/변동성·돌파/역추세·그리드)별 1위 봇 자동 선출(Auto-Rotation), 동적 자금 배분, 무손실 포지션 청산 대기(Graceful Drain) 및 정산금 자동 귀속 시스템 구축 |
 | **v0.0.21** | 2026-11-13 | `688eca6` | 설정 화면 내 봇별 손절/익절 기준 입력 필드 박스 영역 초과(Overflow) 현상 수정 및 반응형 그리드·인풋 너비 최적화 |
 | **v0.0.20** | 2026-11-13 | `37623f4` | 10대 알고리즘 매매 로직 정밀 고도화: 3단계 스마트 청산(시간/본절/동적 ATR), 윗꼬리·과열 방어 필터, Jack Kellogg 튜닝, 일일 손실 방어 서킷 브레이커(-4.0%) |
@@ -37,6 +38,22 @@
 ---
 
 ## 📝 상세 버전별 변경 내역 (Detailed Changelog)
+
+### [v0.0.24] - 2026-11-14
+**주간 전략군별 TOP 1 자동 로테이션 & 미매도 포지션 청산 대기(Graceful Drain) 7대 엣지 케이스 전수 검증 및 결함 수정**
+- **자금 이관 Zero-Sum 불변식 & Remainder Dust 1원 정밀 보존**:
+  - `backend/node_server.mjs` `recalculateAndApplyBotAllocations()` · `applyLiveBotsSelection()` · `settleLiveSellOrderInDb()` 및 `bots.py`에서 `Math.floor` 내림 차액(1~2원)이 항상 1순위 활성 실전 봇(`allocation_ratio` 1위 · 챔피언 rank 우선)에게 정확히 귀속되도록 통일 (`bots.py` 끝 순위 봇 배정 오류 수정).
+  - 탈락 봇의 미사용 가용 원화만 회수하고 오픈 포지션 원금은 강제 시장가 청산 없이 100% 보존하며, 탈락 봇 `virtual_krw=0`, `allocation_ratio=0` 즉시 잠금 적용.
+- **Graceful Drain 다중 포지션 독립 청산 & 매도 루프 무결성 수정**:
+  - `executeBotSellOrder()`가 동일 종목에 2건 이상의 분할 포지션(`order_uuid`)을 보유할 때도 5,500원 이상 정상 규모 포지션은 무조건 병합하지 않고 해당 `order_uuid` 수량(`ROUND_DOWN` 8자리)만 독립 정산하도록 수정.
+  - `runLiveTradingBotsCycle()`가 잔고 0원 중단(`zero_balance_halted`)·AI `BLOCK`·`final_risk_alert = 1` 상황에서도 1단계 오픈 포지션 매도 감시 루프를 건너뛰지 않도록 분리하고, 마지막 포지션 청산 시 `"[✅ Graceful Drain 완료]"` 상태 메시지를 덮어쓰지 않도록 보호.
+- **감사 원장(`drain_handoff_logs`) · 동시성 뮤텍스 & 신규 DB 초기화 결함 수정**:
+  - `init_db.py`, `backend/node_server.mjs`, `backend/common/pg_sync.mjs`에 `drain_handoff_logs` 테이블 및 실시간 이관 이력 스키마 추가, `GET /api/rotation/status`에 포지션별 미실현 손익(`draining_positions`)과 누적 이관 원화(`total_drain_transferred_krw`) 노출.
+  - `applyLiveBotsSelection()` `liveSelectionMutex` 직렬화 + `BEGIN IMMEDIATE` 트랜잭션(Tx) 내 원자적 재분배 적용, `executeWeeklyBotRotation()` `already_running` 동시성 방어 강화.
+  - `backend/common/sqlite_db.mjs` `SqliteDatabase.exec()`에서 동일 블록 내 `CREATE TABLE` 이후 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`와 `tableExists()`를 순차 평가하도록 수정하여 신규/테스트 DB 초기화 시 `duplicate column` / `no such table: bot_accounts` 크래시 근절.
+- **UI 실시간 모니터링 & 7대 자동화 검증 슈트 구축**:
+  - `frontend/src/App.jsx` 5~6초 폴링 루프에 `fetchRotationStatus()` 연동 및 Graceful Drain 배너에 포지션별 수량·매수가·현재가·미실현 손익(%)·누적 자동 귀속 원화 실시간 표출.
+  - `tests/verify_rotation_drain_edge_cases.mjs` 신설 — 격리된 임시 SQLite DB로 7대 시나리오(TOP-1 선출, 1,000,003원 1원 자투리 Zero-Sum, AI BLOCK 하 매도/매수차단, 다중 `order_uuid` 익절+손절 분할 청산, 재선출·복귀 봇 자금 유지, Cold Start 폴백, 동시 로테이션·뮤텍스 방어) 전수 `PASS` 검증 및 자동 정리 구현.
 
 ### [v0.0.23] - 2026-11-14
 **전수 코드 감사(b8bd374 기준), 구버전 스크립트/모듈 동기화 및 런타임 안전성 보강**

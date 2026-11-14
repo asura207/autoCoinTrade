@@ -1823,7 +1823,8 @@ export async function evaluateWeeklyStrategyChampions(db, options = {}) {
   for (const bot of bots) {
     const s = await computeBotArenaStats(db, bot);
     const meta = getBotStrategyMeta(bot.bot_id);
-    const mddPct = Number(Number(bot.paper_mdd_pct || 0).toFixed(2));
+    const rawMdd = Number(bot.paper_mdd_pct);
+    const mddPct = Number((Number.isFinite(rawMdd) ? rawMdd : 0).toFixed(2));
     const botTrades = tradesByBot.get(bot.bot_id) || [];
 
     let realizedBefore7d = 0;

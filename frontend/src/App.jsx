@@ -3123,6 +3123,7 @@ export default function App() {
       fetchUpbitStatus();
       fetchUpbitAccount();
       refreshBotsStatusOnly();
+      fetchRotationStatus();
       fetchTrades(selectedBotId);
       fetchTradeMode();
       fetchAiBriefing(true);
@@ -3141,6 +3142,7 @@ export default function App() {
     const timer = setInterval(() => {
       fetchAlgoLabModels();
       fetchAlgoLabTrades(selectedAlgoModelId);
+      fetchRotationStatus();
     }, 5000);
     return () => clearInterval(timer);
   }, [authenticated, activeMenu, selectedAlgoModelId, fetchAlgoLabModels, fetchAlgoLabTrades, fetchRotationStatus]);
@@ -5905,7 +5907,16 @@ export default function App() {
                   </div>
 
                   {/* 실전 교체 후 잔여 포지션이 남은 봇 포지션 보호(Graceful Drain) 감시 카드 */}
-                  {drainingBotsList.length > 0 && (
+                  {(drainingBotsList.length > 0 || (rotationStatus?.draining_positions?.length || 0) > 0) && (() => {
+                    const liveDrainPositions = rotationStatus?.draining_positions || [];
+                    const totalDrainTransferred = Math.floor(Number(rotationStatus?.total_drain_transferred_krw || 0));
+                    const drainBotIds = [
+                      ...new Set([
+                        ...drainingBotsList.map((b) => b.bot_id),
+                        ...liveDrainPositions.map((p) => p.bot_id),
+                      ]),
+                    ];
+                    return (
                     <div
                       style={{
                         marginBottom: "14px",
@@ -5917,52 +5928,96 @@ export default function App() {
                     >
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "8px", marginBottom: "8px" }}>
                         <strong style={{ fontSize: "13px", color: "#fde68a" }}>
-                          🛡️ 교체 봇 미매도 포지션 안전 감시 중 (Graceful Drain) — 강제 시장가 청산 없이 안전 정산 ({drainingBotsList.length}개)
+                          🛡️ 교체 봇 미매도 포지션 안전 감시 중 (Graceful Drain) — 강제 시장가 청산 없이 안전 정산 ({drainBotIds.length}개 봇 · {liveDrainPositions.length || drainingBotsList.reduce((acc, b) => acc + (b.open_positions?.length || 0), 0)}건)
                         </strong>
                         <span style={{ fontSize: "11px", color: "#cbd5e1" }}>
                           탈락 봇의 신규 매수는 즉시 차단되며, 기존 보유 물량 청산 완료 시 회수 원화(실현손익 포함)가 현재 실전 담당 봇으로 자동 귀속됩니다.
+                          {totalDrainTransferred > 0 && (
+                            <strong style={{ color: "#86efac", marginLeft: "8px" }}>
+                              (누적 Drain 자동 귀속: {totalDrainTransferred.toLocaleString("ko-KR")}원)
+                            </strong>
+                          )}
                         </span>
                       </div>
                       <div style={{ display: "flex", flexWrap: "wrap", gap: "10px" }}>
-                        {drainingBotsList.map((dBot) => {
-                          const posTickers = (dBot.open_positions || []).map((p) => p.market).join(", ");
+                        {drainBotIds.map((botId) => {
+                          const dBot = drainingBotsList.find((b) => b.bot_id === botId)
+                            || (rotationStatus?.draining_bots || []).find((b) => b.bot_id === botId)
+                            || bots.find((b) => b.bot_id === botId)
+                            || { bot_id: botId, nickname: botId };
+                          const botDrainPositions = liveDrainPositions.filter((p) => p.bot_id === botId);
+                          const posTickers = (botDrainPositions.length > 0 ? botDrainPositions : (dBot.open_positions || []))
+                            .map((p) => p.market || p.ticker)
+                            .filter(Boolean)
+                            .join(", ");
+                          const totalBotUsedKrw = Math.floor(Number(dBot.used_capital || 0))
+                            || botDrainPositions.reduce((s, p) => s + Math.floor(Number(p.buy_amount || 0)), 0);
                           return (
                             <div
-                              key={`drain-${dBot.bot_id}`}
+                              key={`drain-${botId}`}
                               style={{
                                 display: "flex",
-                                alignItems: "center",
-                                gap: "10px",
-                                padding: "6px 10px",
+                                flexDirection: "column",
+                                gap: "6px",
+                                padding: "8px 12px",
                                 borderRadius: "8px",
                                 background: "rgba(15, 23, 42, 0.72)",
                                 border: "1px solid rgba(245, 158, 11, 0.35)",
                                 fontSize: "12px",
+                                minWidth: "280px",
                               }}
                             >
-                              <strong style={{ color: "#fcd34d" }}>{dBot.nickname || dBot.name}</strong>
-                              {renderStrategyGroupBadge(dBot, { compact: true })}
-                              <span style={{ color: "#e2e8f0" }}>
-                                보유 {Math.floor(Number(dBot.used_capital || 0)).toLocaleString("ko-KR")}원
-                                {posTickers ? ` (${posTickers})` : ""}
-                              </span>
-                              <button
-                                type="button"
-                                className="btn btn-outline"
-                                style={{ padding: "2px 8px", fontSize: "11px" }}
-                                onClick={() => {
-                                  setSelectedBotId(dBot.bot_id);
-                                  fetchTrades(dBot.bot_id, "live");
-                                }}
-                              >
-                                내역 보기
-                              </button>
+                              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
+                                <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                                  <strong style={{ color: "#fcd34d" }}>{dBot.nickname || dBot.name || botId}</strong>
+                                  {renderStrategyGroupBadge(dBot, { compact: true })}
+                                  <span style={{ color: "#e2e8f0" }}>
+                                    보유 {totalBotUsedKrw.toLocaleString("ko-KR")}원
+                                    {posTickers ? ` (${posTickers})` : ""}
+                                  </span>
+                                </div>
+                                <button
+                                  type="button"
+                                  className="btn btn-outline"
+                                  style={{ padding: "2px 8px", fontSize: "11px" }}
+                                  onClick={() => {
+                                    setSelectedBotId(botId);
+                                    fetchTrades(botId, "live");
+                                  }}
+                                >
+                                  내역 보기
+                                </button>
+                              </div>
+                              {botDrainPositions.length > 0 && (
+                                <div style={{ display: "flex", flexDirection: "column", gap: "3px", paddingTop: "4px", borderTop: "1px solid rgba(148, 163, 184, 0.16)" }}>
+                                  {botDrainPositions.map((pos, idx) => {
+                                    const pnlPct = Number(pos.unrealized_pnl_pct || 0);
+                                    const pnlKrw = Math.floor(Number(pos.unrealized_pnl_krw || 0));
+                                    const pnlColor = pnlPct > 0 ? "#4ade80" : pnlPct < 0 ? "#f87171" : "#cbd5e1";
+                                    return (
+                                      <div
+                                        key={`drain-pos-${botId}-${pos.position_id || idx}`}
+                                        style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", fontSize: "11px", color: "#cbd5e1" }}
+                                      >
+                                        <span>
+                                          <strong style={{ color: "#f8fafc" }}>{pos.market}</strong>{" "}
+                                          {Number(pos.volume || 0).toFixed(6)}개 · 매수 {Math.round(Number(pos.avg_buy_price || 0)).toLocaleString("ko-KR")}원 → 현재 {Math.round(Number(pos.current_price || 0)).toLocaleString("ko-KR")}원
+                                        </span>
+                                        <strong style={{ color: pnlColor, whiteSpace: "nowrap" }}>
+                                          {pnlPct >= 0 ? "+" : ""}{pnlPct.toFixed(2)}% ({pnlKrw >= 0 ? "+" : ""}{pnlKrw.toLocaleString("ko-KR")}원)
+                                        </strong>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
                             </div>
                           );
                         })}
                       </div>
                     </div>
-                  )}
+                    );
+                  })()}
                 </>
               );
             })()}
@@ -9305,7 +9360,9 @@ export default function App() {
                       ((Array.isArray(b.open_positions) && b.open_positions.length > 0) ||
                         Number(b.used_capital || 0) > 0)
                   );
-                  if (willDrainBots.length === 0 && drainingBotsList.length === 0) return null;
+                  const liveDrainPositions = rotationStatus?.draining_positions || [];
+                  const totalDrainTransferred = Math.floor(Number(rotationStatus?.total_drain_transferred_krw || 0));
+                  if (willDrainBots.length === 0 && drainingBotsList.length === 0 && liveDrainPositions.length === 0) return null;
                   return (
                     <div
                       style={{
@@ -9337,17 +9394,26 @@ export default function App() {
                           저장 시 강제 청산하지 않고 <strong>&quot;기존 봇 포지션 청산 대기(Graceful Drain)&quot;</strong> 모드로 자동 전환되어, 신규 매수만 중단하고 보유 물량은 해당 봇의 익절/손절/트레일링 스탑 알고리즘으로 끝까지 안전하게 매도합니다.
                         </div>
                       )}
-                      {drainingBotsList.length > 0 && (
+                      {(drainingBotsList.length > 0 || liveDrainPositions.length > 0) && (
                         <div style={{ marginTop: willDrainBots.length > 0 ? "6px" : "0px", color: "#fef08a" }}>
                           • 현재 청산 대기(Graceful Drain) 실행 중:{" "}
                           <strong>
-                            {drainingBotsList
-                              .map(
-                                (b) =>
-                                  `${b.nickname || b.bot_id} [${getBotStrategyMeta(b).group}] (${(b.open_positions || []).map((p) => p.market).join(", ") || "보유중"} · ${Math.floor(Number(b.used_capital || 0)).toLocaleString("ko-KR")}원)`
-                              )
-                              .join(", ")}
+                            {(drainingBotsList.length > 0
+                              ? drainingBotsList.map(
+                                  (b) =>
+                                    `${b.nickname || b.bot_id} [${getBotStrategyMeta(b).group}] (${(b.open_positions || []).map((p) => p.market).join(", ") || "보유중"} · ${Math.floor(Number(b.used_capital || 0)).toLocaleString("ko-KR")}원)`
+                                )
+                              : liveDrainPositions.map(
+                                  (p) =>
+                                    `${p.nickname || p.bot_id} (${p.market} ${Number(p.volume || 0).toFixed(4)}개 · 미실현 ${Number(p.unrealized_pnl_pct || 0) >= 0 ? "+" : ""}${Number(p.unrealized_pnl_pct || 0).toFixed(2)}%)`
+                                )
+                            ).join(", ")}
                           </strong>
+                          {totalDrainTransferred > 0 && (
+                            <span style={{ marginLeft: "8px", color: "#86efac" }}>
+                              (누적 이관 완료: {totalDrainTransferred.toLocaleString("ko-KR")}원)
+                            </span>
+                          )}
                         </div>
                       )}
                     </div>

@@ -886,18 +886,23 @@ def execute_sell_order(
                 if math.isfinite(float(r.get("allocation_ratio") or 0.0))
             )
             transfer_logs = []
+            alloc_summary = []
             if active_list and floored_proceeds > 0:
-                distributed = 0
-                for idx, active_bot in enumerate(active_list):
+                base_shares = []
+                for active_bot in active_list:
                     raw_ratio = float(active_bot.get("allocation_ratio") or 0.0)
                     ratio_val = max(0.0, raw_ratio) if math.isfinite(raw_ratio) else 0.0
-                    if idx == len(active_list) - 1:
-                        share = max(0, floored_proceeds - distributed)
-                    elif ratio_sum > 0:
+                    if ratio_sum > 0:
                         share = max(0, math.floor(floored_proceeds * (ratio_val / ratio_sum)))
                     else:
                         share = max(0, math.floor(floored_proceeds / len(active_list)))
-                    distributed += share
+                    base_shares.append(share)
+                # Math.floor 나머지 자투리 원화(1~2원)는 1위 활성 봇(idx == 0)에 합산하여 Zero-Sum 보장
+                remainder = floored_proceeds - sum(base_shares)
+                if remainder > 0 and base_shares:
+                    base_shares[0] += remainder
+
+                for active_bot, share in zip(active_list, base_shares):
                     if share > 0:
                         target_id = active_bot["bot_id"]
                         conn.execute(
@@ -921,6 +926,34 @@ def execute_sell_order(
                             (share, share, target_id),
                         )
                         transfer_logs.append(f"{target_id}+{share:,}원")
+                        alloc_summary.append({"bot_id": target_id, "amount_krw": share})
+
+            try:
+                import json as _json
+                conn.execute(
+                    """
+                    INSERT INTO drain_handoff_logs (
+                        from_bot_id, market, position_id, trade_id, reason,
+                        sell_amount, sell_fee, net_proceeds_krw, realized_pnl_krw,
+                        allocations_json, remaining_positions_count, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
+                    """,
+                    (
+                        norm_bot_id,
+                        ticker,
+                        position_id,
+                        int(pos_dict.get("trade_id") or 0),
+                        reason,
+                        float(net_sell_amount + sell_fee),
+                        float(sell_fee),
+                        float(floored_proceeds),
+                        float(realized_pnl),
+                        _json.dumps(alloc_summary, ensure_ascii=False),
+                        remaining_open_cnt,
+                    ),
+                )
+            except Exception:
+                pass
 
             logger.info(
                 f"[{norm_bot_id}] [Graceful Drain 정산 이관] 탈락 봇 {ticker} 매도 정산금 {floored_proceeds:,}원 "

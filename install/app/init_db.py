@@ -765,6 +765,25 @@ def init_database(db_path: Optional[str] = None) -> None:
             );
             """
         )
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS drain_handoff_logs (
+                id {id_primary_key},
+                from_bot_id TEXT NOT NULL,
+                market TEXT NOT NULL,
+                position_id INTEGER DEFAULT 0,
+                trade_id INTEGER DEFAULT 0,
+                reason TEXT,
+                sell_amount {real_type} DEFAULT 0,
+                sell_fee {real_type} DEFAULT 0,
+                net_proceeds_krw {real_type} DEFAULT 0,
+                realized_pnl_krw {real_type} DEFAULT 0,
+                allocations_json TEXT,
+                remaining_positions_count INTEGER DEFAULT 0,
+                created_at TEXT
+            );
+            """
+        )
         now_kst = _now_kst_str()
         next_rot = _compute_next_rotation_kst(1, 9)
         conn.execute(

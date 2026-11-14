@@ -46,10 +46,14 @@ export function translateSqlite(sql) {
 }
 
 export class SqliteDatabase {
-  constructor(dbFilePath = DB_PATH) {
+  constructor(dbFilePath = process.env.AUTOCOIN_DB_PATH || DB_PATH) {
     this.dbPath = dbFilePath;
     this.rawDb = null;
     this.engine = null; // 'better-sqlite3' | 'node:sqlite'
+    const dir = path.dirname(this.dbPath);
+    if (dir && !fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
     this.init();
   }
 
@@ -81,6 +85,17 @@ export class SqliteDatabase {
     }
   }
 
+  tableExists(tableName) {
+    try {
+      const row = this.rawDb
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+        .get(tableName);
+      return Boolean(row);
+    } catch {
+      return false;
+    }
+  }
+
   getTableColumns(tableName) {
     try {
       const rows = this.rawDb.prepare(`PRAGMA table_info(${tableName})`).all();
@@ -93,29 +108,34 @@ export class SqliteDatabase {
   async exec(sql) {
     if (!this.rawDb) this.init();
 
-    // ALTER TABLE <table> ADD COLUMN IF NOT EXISTS <col> <def> 지원
+    // ALTER TABLE <table> ADD COLUMN IF NOT EXISTS <col> <def> 지원:
+    // 동일 exec 블록 내 선행 CREATE TABLE 실행 이후 테이블/컬럼 존재 여부를 순차 평가하여 신규/구형 DB 모두 안전 보장
     const alterRegex = /ALTER\s+TABLE\s+([a-zA-Z0-9_]+)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+([a-zA-Z0-9_]+)\s+([^;]+);?/gi;
     let match;
-    let modifiedSql = sql;
+    let lastIndex = 0;
+    let result;
     while ((match = alterRegex.exec(sql)) !== null) {
-      const fullMatch = match[0];
+      const prefixChunk = sql.slice(lastIndex, match.index);
+      if (prefixChunk.trim()) {
+        result = this.rawDb.exec(translateSqlite(prefixChunk));
+      }
       const table = match[1];
       const column = match[2];
       const colDef = match[3];
-
-      const existingCols = this.getTableColumns(table);
-      if (existingCols.includes(column)) {
-        modifiedSql = modifiedSql.replace(fullMatch, ";");
-      } else {
-        modifiedSql = modifiedSql.replace(
-          fullMatch,
-          `ALTER TABLE ${table} ADD COLUMN ${column} ${translateSqlite(colDef)};`
-        );
+      if (this.tableExists(table)) {
+        const existingCols = this.getTableColumns(table);
+        if (!existingCols.includes(column)) {
+          result = this.rawDb.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${translateSqlite(colDef)};`);
+        }
       }
+      lastIndex = alterRegex.lastIndex;
     }
 
-    const cleanSql = translateSqlite(modifiedSql);
-    return this.rawDb.exec(cleanSql);
+    const tailChunk = sql.slice(lastIndex);
+    if (tailChunk.trim()) {
+      result = this.rawDb.exec(translateSqlite(tailChunk));
+    }
+    return result;
   }
 
   prepare(sql) {
@@ -182,11 +202,17 @@ export class SqliteDatabase {
   }
 }
 
-// 싱글톤 인스턴스 (lazy initialized)
+// 싱글톤 인스턴스 (lazy initialized; AUTOCOIN_DB_PATH 변경 시 자동 재바인딩)
 let _sqliteInstance = null;
 export function getSqliteDb() {
-  if (!_sqliteInstance) {
-    _sqliteInstance = new SqliteDatabase();
+  const desiredPath = process.env.AUTOCOIN_DB_PATH || DB_PATH;
+  if (!_sqliteInstance || _sqliteInstance.dbPath !== desiredPath) {
+    if (_sqliteInstance) {
+      try {
+        _sqliteInstance.rawDb?.close?.();
+      } catch {}
+    }
+    _sqliteInstance = new SqliteDatabase(desiredPath);
   }
   return _sqliteInstance;
 }

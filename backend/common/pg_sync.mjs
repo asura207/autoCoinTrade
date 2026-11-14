@@ -733,6 +733,21 @@ export class PgSyncManager {
             summary_text TEXT,
             created_at TEXT
           );
+          CREATE TABLE IF NOT EXISTS drain_handoff_logs (
+            id BIGINT PRIMARY KEY,
+            from_bot_id VARCHAR(50),
+            market VARCHAR(50),
+            position_id BIGINT DEFAULT 0,
+            trade_id BIGINT DEFAULT 0,
+            reason TEXT,
+            sell_amount DOUBLE PRECISION DEFAULT 0,
+            sell_fee DOUBLE PRECISION DEFAULT 0,
+            net_proceeds_krw DOUBLE PRECISION DEFAULT 0,
+            realized_pnl_krw DOUBLE PRECISION DEFAULT 0,
+            allocations_json TEXT,
+            remaining_positions_count INT DEFAULT 0,
+            created_at TEXT
+          );
         `);
         const rotCfg = sqliteDb.prepare("SELECT * FROM auto_rotation_config WHERE id = 1").get();
         if (rotCfg) {
@@ -790,6 +805,34 @@ export class PgSyncManager {
             ]
           );
         }
+        try {
+          const drainLogs = sqliteDb.prepare("SELECT * FROM drain_handoff_logs").all();
+          for (const d of drainLogs) {
+            await this.pool.query(
+              `INSERT INTO drain_handoff_logs (
+                 id, from_bot_id, market, position_id, trade_id, reason,
+                 sell_amount, sell_fee, net_proceeds_krw, realized_pnl_krw,
+                 allocations_json, remaining_positions_count, created_at
+               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+               ON CONFLICT (id) DO NOTHING`,
+              [
+                d.id,
+                d.from_bot_id || "",
+                d.market || "",
+                Number(d.position_id || 0),
+                Number(d.trade_id || 0),
+                d.reason || "",
+                Number(d.sell_amount || 0),
+                Number(d.sell_fee || 0),
+                Number(d.net_proceeds_krw || 0),
+                Number(d.realized_pnl_krw || 0),
+                d.allocations_json || "[]",
+                Number(d.remaining_positions_count || 0),
+                d.created_at || null,
+              ]
+            );
+          }
+        } catch {}
       } catch {}
     } catch (err) {
       if (err.code === "ECONNREFUSED" || err.message?.includes("Connection terminated") || err.message?.includes("closed")) {

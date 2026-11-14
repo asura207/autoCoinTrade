@@ -524,7 +524,7 @@ function enrichRegimeFilterRow(row) {
   };
 }
 
-async function initializeDatabase() {
+export async function initializeDatabase() {
   const db = getDb();
   await db.exec(`
     CREATE TABLE IF NOT EXISTS system_settings (
@@ -726,6 +726,21 @@ async function initializeDatabase() {
       summary_text TEXT,
       created_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS drain_handoff_logs (
+      id BIGSERIAL PRIMARY KEY,
+      from_bot_id TEXT NOT NULL,
+      market TEXT NOT NULL,
+      position_id BIGINT DEFAULT 0,
+      trade_id BIGINT DEFAULT 0,
+      reason TEXT,
+      sell_amount DOUBLE PRECISION DEFAULT 0,
+      sell_fee DOUBLE PRECISION DEFAULT 0,
+      net_proceeds_krw DOUBLE PRECISION DEFAULT 0,
+      realized_pnl_krw DOUBLE PRECISION DEFAULT 0,
+      allocations_json TEXT,
+      remaining_positions_count INTEGER DEFAULT 0,
+      created_at TEXT
+    );
     ALTER TABLE bots ADD COLUMN IF NOT EXISTS strategy_group TEXT DEFAULT 'TREND_SWING';
     ALTER TABLE bots ADD COLUMN IF NOT EXISTS is_selected_for_live INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_initial_capital BIGINT NOT NULL DEFAULT 1000000;
@@ -856,13 +871,15 @@ async function initializeDatabase() {
   await setDefault.run("entry_code", "stock", now);
 }
 
-try {
-  await initializeDatabase();
-} catch (err) {
-  if (!isConfigured) {
-    console.log("[Setup Mode] DB not yet initialized. Setup wizard will handle configuration.");
-  } else {
-    console.warn("[Init] Warning initializing database:", err.message);
+if (process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
+  try {
+    await initializeDatabase();
+  } catch (err) {
+    if (!isConfigured) {
+      console.log("[Setup Mode] DB not yet initialized. Setup wizard will handle configuration.");
+    } else {
+      console.warn("[Init] Warning initializing database:", err.message);
+    }
   }
 }
 
@@ -899,10 +916,12 @@ async function initVapidKeys() {
   }
 }
 
-try {
-  await initVapidKeys();
-} catch (err) {
-  // silent in setup mode
+if (process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
+  try {
+    await initVapidKeys();
+  } catch (err) {
+    // silent in setup mode
+  }
 }
 
 async function broadcastWebPushNotification({ title, body, data = {} }) {
@@ -973,6 +992,9 @@ async function getSetting(key, defaultVal = "") {
 }
 
 function isLiveMode() {
+  if (process.env.AUTOCOIN_FORCE_LIVE_MODE === "1" && process.env.AUTOCOIN_LIBRARY_MODE === "1") {
+    return true;
+  }
   const cfgPath = fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : EXAMPLE_CONFIG_PATH;
   let cfg = {};
   try {
@@ -997,7 +1019,27 @@ function getTradesTableName(mode = null) {
   return m === "live" ? "trades" : "paper_trades";
 }
 
-async function getBots(mode = null) {
+function isSqliteEngineActive() {
+  const mode = (process.env.DB_MODE || "sqlite").trim().toLowerCase();
+  const syncEnabled = process.env.PG_SYNC_ENABLED !== "false";
+  return mode === "sqlite" || !syncEnabled;
+}
+
+async function beginWriteTx(db) {
+  await db.exec(isSqliteEngineActive() ? "BEGIN IMMEDIATE" : "BEGIN");
+}
+
+async function commitWriteTx(db) {
+  await db.exec("COMMIT");
+}
+
+async function rollbackWriteTx(db) {
+  try {
+    await db.exec("ROLLBACK");
+  } catch {}
+}
+
+export async function getBots(mode = null) {
   const db = getDb();
   if (!db) return [];
   const rows = await db.prepare("SELECT * FROM bots ORDER BY bot_id ASC").all();
@@ -1016,7 +1058,15 @@ async function getBots(mode = null) {
     const usedCapital = Math.floor(
       openPositions.reduce((acc, p) => acc + Number(p.buy_amount || 0), 0)
     );
-    const virtualKrw = Math.max(0, Math.floor(Number(r.allocated_capital || 0) - usedCapital));
+    const isSelected = Number(r.is_selected_for_live || 0) === 1;
+    // 탈락(비선택/Draining) 봇의 가용 원화는 항상 0으로 고정, 활성 봇은 allocated - used 기준(단, allocated=0 & virtual>0 직접 시드 호환)
+    const allocMinusUsed = Math.max(0, Math.floor(Number(r.allocated_capital || 0) - usedCapital));
+    const dbVirtual = Math.max(0, Math.floor(Number(r.virtual_krw || 0)));
+    const virtualKrw = !isSelected
+      ? 0
+      : Number(r.allocated_capital || 0) === 0 && usedCapital === 0 && dbVirtual > 0
+      ? dbVirtual
+      : allocMinusUsed;
 
     let dailyProfit = 0;
     try {
@@ -1028,7 +1078,7 @@ async function getBots(mode = null) {
 
     const allocatedCap = Number(r.allocated_capital || 0);
     const dailyLossLimit = allocatedCap > 0 ? -Math.floor(allocatedCap * 0.04) : -40000;
-    const isCircuitBreaker = Number(r.is_selected_for_live || 0) === 1 && allocatedCap > 0 && dailyProfit <= dailyLossLimit;
+    const isCircuitBreaker = isSelected && allocatedCap > 0 && dailyProfit <= dailyLossLimit;
 
     const meta = getBotStrategyMeta(r.bot_id);
 
@@ -1047,11 +1097,12 @@ async function getBots(mode = null) {
   return result;
 }
 
-async function recalculateAndApplyBotAllocations(flooredTotal, ratiosMap = null, mode = null) {
+export async function recalculateAndApplyBotAllocations(flooredTotal, ratiosMap = null, mode = null, options = {}) {
   const db = getDb();
   const now = nowKSTString();
   const bots = await getBots(mode);
   const tradesTable = getTradesTableName(mode);
+  const rankPriorityMap = options?.rankPriorityMap || {};
   const items = [];
   for (const b of bots) {
     const used = Math.floor(Number(b.used_capital || 0));
@@ -1066,10 +1117,13 @@ async function recalculateAndApplyBotAllocations(flooredTotal, ratiosMap = null,
       .prepare(`SELECT COALESCE(SUM(profit_krw), 0) AS total_pnl FROM ${tradesTable} WHERE bot_id = ? AND status = 'COMPLETED'`)
       .get(b.bot_id);
     const realizedPnl = Math.floor(Number(pnlRow?.total_pnl || 0));
+    const rankOrder = Number.isFinite(Number(rankPriorityMap[b.bot_id])) ? Number(rankPriorityMap[b.bot_id]) : 999;
     items.push({
       bot_id: b.bot_id,
+      isSelected,
       used,
       ratio,
+      rankOrder,
       realizedPnl,
       allocated: 0,
       virtual_krw: 0,
@@ -1082,10 +1136,13 @@ async function recalculateAndApplyBotAllocations(flooredTotal, ratiosMap = null,
   if (flooredTotal <= 0) {
     for (const it of items) {
       await db.prepare(
-        "UPDATE bots SET allocation_ratio = ?, allocated_capital = 0, virtual_krw = 0, updated_at = ? WHERE bot_id = ?"
-      ).run(it.ratio, now, it.bot_id);
+        "UPDATE bots SET allocation_ratio = ?, allocated_capital = ?, virtual_krw = 0, updated_at = ? WHERE bot_id = ?"
+      ).run(it.ratio, it.used, now, it.bot_id);
     }
-    return { totalUsed, totalAllocated: 0, totalVirtual: 0 };
+    if (!options?.skipAccountSync) {
+      await syncBotAccountsFromBots(db);
+    }
+    return { totalUsed, totalAllocated: totalUsed, totalVirtual: 0, remainderDustAwarded: 0 };
   }
 
   const totalRatio = Number(items.reduce((acc, it) => acc + it.ratio, 0).toFixed(4));
@@ -1095,7 +1152,8 @@ async function recalculateAndApplyBotAllocations(flooredTotal, ratiosMap = null,
       : Math.max(totalUsed, Math.floor(flooredTotal * (totalRatio / 100.0)));
 
   // 이미 사용된 투자금(used)을 우선 반영하고, 잔여(신규 투입 포함) 투자금을 비율대로 분배하여
-  // 전체 투자금 총액과 각 봇별 배정 원금(이미 사용 + 가용 잔고)의 합계가 정확히 일치하도록 계산
+  // 전체 투자금 총액과 각 봇별 배정 원금(이미 사용 + 가용 잔고)의 합계가 1원 오차 없이 일치하도록 계산
+  let remainderDustAwarded = 0;
   while (true) {
     const unlocked = items.filter((it) => !it.locked);
     if (unlocked.length === 0) break;
@@ -1134,30 +1192,48 @@ async function recalculateAndApplyBotAllocations(flooredTotal, ratiosMap = null,
       if (remainder > 0 && unlockedRatioSum > 0) {
         const candidates = [...unlocked]
           .filter((it) => it.ratio > 0)
-          .sort((a, b) => b.ratio - a.ratio);
+          .sort((a, b) => b.ratio - a.ratio || a.rankOrder - b.rankOrder || a.bot_id.localeCompare(b.bot_id));
         if (candidates.length > 0) {
           candidates[0].allocated += remainder;
+          remainderDustAwarded += remainder;
         }
       }
       for (const it of unlocked) {
-        it.virtual_krw = Math.max(0, it.allocated - it.used);
+        it.virtual_krw = it.isSelected ? Math.max(0, it.allocated - it.used) : 0;
         it.locked = true;
       }
       break;
     }
   }
 
+  // 극단적 포지션 잠김 후 자투리 원화가 남는 경우 1위 활성 봇에 최종 보정 (Zero-Sum Invariant)
+  const allocatedSumAfterLoop = items.reduce((acc, it) => acc + it.allocated, 0);
+  const residualDust = Math.max(0, targetPool - allocatedSumAfterLoop);
+  if (residualDust > 0) {
+    const activeTop = items
+      .filter((it) => it.isSelected && it.ratio > 0)
+      .sort((a, b) => b.ratio - a.ratio || a.rankOrder - b.rankOrder || a.bot_id.localeCompare(b.bot_id))[0];
+    if (activeTop) {
+      activeTop.allocated += residualDust;
+      activeTop.virtual_krw = Math.max(0, activeTop.allocated - activeTop.used);
+      remainderDustAwarded += residualDust;
+    }
+  }
+
   for (const it of items) {
     await db.prepare(
       "UPDATE bots SET allocation_ratio = ?, allocated_capital = ?, virtual_krw = ?, updated_at = ? WHERE bot_id = ?"
-    ).run(it.ratio, it.allocated, it.virtual_krw, now, it.bot_id);
+    ).run(it.ratio, it.allocated, it.isSelected ? it.virtual_krw : 0, now, it.bot_id);
   }
-  await syncBotAccountsFromBots(db);
+  if (!options?.skipAccountSync) {
+    await syncBotAccountsFromBots(db);
+  }
 
   return {
     totalUsed,
     totalAllocated: items.reduce((acc, it) => acc + it.allocated, 0),
-    totalVirtual: items.reduce((acc, it) => acc + it.virtual_krw, 0),
+    totalVirtual: items.reduce((acc, it) => acc + (it.isSelected ? it.virtual_krw : 0), 0),
+    remainderDustAwarded,
   };
 }
 
@@ -3370,7 +3446,23 @@ async function resetPaperArenaAndNotify(db) {
 // ============================================================================
 // [실전 담당 봇(1~3개) 동적 투자금 배분 및 미매도 포지션 안전 승계 함수]
 // ============================================================================
-async function applyLiveBotsSelection(selected, handoverMap = [], forcedCapital = null, options = {}) {
+let liveSelectionMutex = Promise.resolve();
+
+export async function applyLiveBotsSelection(selected, handoverMap = [], forcedCapital = null, options = {}) {
+  const prevLock = liveSelectionMutex;
+  let releaseLock;
+  liveSelectionMutex = new Promise((res) => {
+    releaseLock = res;
+  });
+  await prevLock;
+  try {
+    return await _applyLiveBotsSelectionUnsafe(selected, handoverMap, forcedCapital, options);
+  } finally {
+    releaseLock();
+  }
+}
+
+async function _applyLiveBotsSelectionUnsafe(selected, handoverMap = [], forcedCapital = null, options = {}) {
   const db = getDb();
   const allBots = await getBots("live");
   const ids = (selected || []).map((it) => normalizeBotId(String(it?.bot_id || "")));
@@ -3393,15 +3485,24 @@ async function applyLiveBotsSelection(selected, handoverMap = [], forcedCapital 
     throw new Error(`선택된 봇들의 투자 비율 합계는 정확히 100%(1.0)여야 합니다. (현재 ${(ratioSum * 100).toFixed(2)}%)`);
   }
 
-  // 요구사항 보존: 총 실전 운영 원금은 실제 Upbit 실계좌 잔고 90%를 자동 설정하고 10%는 버퍼로 남김
-  const accountInfo = await fetchUpbitAccountBalance();
+  const existingTotalCashBefore = allBots.reduce((acc, b) => acc + Math.max(0, Math.floor(Number(b.virtual_krw || 0))), 0);
+  const totalAllUsedBefore = allBots.reduce((acc, b) => acc + Math.max(0, Math.floor(Number(b.used_capital || 0))), 0);
+  const poolFromCurrentBots = existingTotalCashBefore + totalAllUsedBefore;
+
+  // 명시적 forcedCapital 우선 적용, 미지정 시 실제 Upbit 실계좌 90% -> 현재 DB 실전 풀 합산액 순으로 안전 산출
   let flooredTotal = 0;
-  if (accountInfo?.success) {
-    const rawAsset = Number(accountInfo.total_asset_krw ?? accountInfo.krw_total ?? accountInfo.krw_balance ?? 0);
-    flooredTotal = Math.floor(rawAsset * 0.9);
+  if (Number(forcedCapital) > 0) {
+    flooredTotal = Math.floor(Number(forcedCapital));
+  } else if (!options?.skipLiveAccountSync) {
+    const accountInfo = await fetchUpbitAccountBalance();
+    if (accountInfo?.success) {
+      const rawAsset = Number(accountInfo.total_asset_krw ?? accountInfo.krw_total ?? accountInfo.krw_balance ?? 0);
+      flooredTotal = Math.floor(rawAsset * 0.9);
+    }
   }
   if (!(flooredTotal > 0)) {
-    flooredTotal = Math.floor(Number(forcedCapital || (await getSetting("total_capital", "0"))));
+    const settingCap = Math.floor(Number(await getSetting("total_capital", "0")));
+    flooredTotal = poolFromCurrentBots > 0 ? poolFromCurrentBots : settingCap;
   }
   if (!(flooredTotal > 0)) {
     throw new Error("업비트 실계좌 잔고를 확인할 수 없거나 잔고가 0원 이하입니다.");
@@ -3455,32 +3556,24 @@ async function applyLiveBotsSelection(selected, handoverMap = [], forcedCapital 
   );
   const drainingPositionsCount = drainingBots.reduce((acc, b) => acc + (b.open_positions || []).length, 0);
   const totalDrainingUsed = drainingBots.reduce((acc, b) => acc + Math.floor(Number(b.used_capital || 0)), 0);
-  const reclaimedVirtualKrw = allBots
+  const reclaimedFromDroppedKrw = allBots
     .filter((b) => !selectedIdSet.has(b.bot_id))
     .reduce((acc, b) => acc + Math.max(0, Math.floor(Number(b.virtual_krw || 0))), 0);
+  const retainedSelectedUsed = allBots
+    .filter((b) => selectedIdSet.has(b.bot_id))
+    .reduce((acc, b) => acc + Math.floor(Number(b.used_capital || 0)), 0)
+    + handoverPairs.reduce((acc, h) => acc + Math.floor(Number(h.from.used_capital || 0)), 0);
   const availableForSelectedTotal = Math.max(0, flooredTotal - totalDrainingUsed);
+  const totalTransferableKrw = Math.max(0, availableForSelectedTotal - retainedSelectedUsed);
 
   const selectedRatiosMap = Object.fromEntries(
     selected.map((it, idx) => [ids[idx], Number((Number(it.allocation_ratio) * 100).toFixed(4))])
   );
 
-  const plan = selected.map((it, idx) => {
-    const bot = allBots.find((b) => b.bot_id === ids[idx]);
-    const inheritedUsed = inheritedByTo[bot.bot_id] ? Math.floor(Number(inheritedByTo[bot.bot_id].used_capital || 0)) : 0;
-    const ownUsed = Math.floor(Number(bot.used_capital || 0)) + inheritedUsed;
-    const allocated = Math.floor(availableForSelectedTotal * Number(it.allocation_ratio));
-    return {
-      bot,
-      ratio: Number(it.allocation_ratio),
-      allocated: Math.max(allocated, ownUsed),
-      used: ownUsed,
-      inheritedFrom: inheritedByTo[bot.bot_id] || null,
-    };
-  });
-
   const now = nowKSTString();
+  let allocSummary = null;
   try {
-    await db.exec("BEGIN");
+    await beginWriteTx(db);
     for (const h of handoverPairs) {
       await db.prepare("UPDATE bot_positions SET bot_id = ? WHERE bot_id = ? AND status = 'OPEN'").run(h.to, h.from.bot_id);
       await db.prepare("UPDATE trades SET bot_id = ? WHERE bot_id = ? AND status = 'HOLDING'").run(h.to, h.from.bot_id);
@@ -3501,34 +3594,56 @@ async function applyLiveBotsSelection(selected, handoverMap = [], forcedCapital 
         WHERE bot_id = ?
       `).run(drainUsed, statusMsg, now, b.bot_id);
     }
-    for (const pl of plan) {
+    for (const it of selected) {
+      const botId = normalizeBotId(String(it?.bot_id || ""));
+      const botRow = allBots.find((b) => b.bot_id === botId);
+      const ratioPct = Number((Number(it.allocation_ratio) * 100).toFixed(2));
+      const wasDrainingOrInactive = Number(botRow?.is_selected_for_live || 0) !== 1;
+      const prevMsg = String(botRow?.last_status_msg || "");
+      const hasDrainNotice = prevMsg.includes("Graceful Drain") || prevMsg.includes("포지션 보호");
+      const openCnt = (botRow?.open_positions || []).length;
+      const nextStatusMsg =
+        wasDrainingOrInactive && (openCnt > 0 || hasDrainNotice)
+          ? `[🔄 실전 복귀] 전략군 대표 봇 재선출 · 기존 포지션 ${openCnt}건 유지 및 정상 가동`
+          : wasDrainingOrInactive
+          ? "신규 실전 배정 완료 · 진입 시그널 대기 중"
+          : prevMsg || "신규 실전 배정 완료 · 진입 시그널 대기 중";
       await db.prepare(`
         UPDATE bots
-        SET is_selected_for_live = 1, is_running = ?, allocation_ratio = ?, allocated_capital = ?, virtual_krw = ?, updated_at = ?
+        SET is_selected_for_live = 1, is_running = ?, allocation_ratio = ?, last_status_msg = ?, updated_at = ?
         WHERE bot_id = ?
-      `).run(nextRunningFlag, Number((pl.ratio * 100).toFixed(2)), pl.allocated, Math.max(0, pl.allocated - pl.used), now, pl.bot.bot_id);
+      `).run(nextRunningFlag, ratioPct, nextStatusMsg, now, botId);
     }
-    await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('total_capital', ?, ?)").run(String(flooredTotal), now);
+
+    // 동일 트랜잭션 내에서 워터필링 배분기로 draining 봇 자본 잠금 및 신규 선택 봇 자금 잔액을 1원 오차 없이 정밀 재분배
+    allocSummary = await recalculateAndApplyBotAllocations(flooredTotal, selectedRatiosMap, "live", {
+      rankPriorityMap: options?.rankPriorityMap,
+      skipAccountSync: true,
+    });
+
+    const syncedTotalCap = Math.max(flooredTotal, Number(allocSummary?.totalAllocated || flooredTotal));
+    await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('total_capital', ?, ?)").run(String(syncedTotalCap), now);
     await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('capital_configured', '1', ?)").run(now);
     await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('zero_balance_halted', '0', ?)").run(now);
     await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('zero_balance_reason', '', ?)").run(now);
-    await db.exec("COMMIT");
+    await syncBotAccountsFromBots(db);
+    await commitWriteTx(db);
   } catch (err) {
-    try {
-      await db.exec("ROLLBACK");
-    } catch {}
+    await rollbackWriteTx(db);
     throw new Error(`실전 봇 설정 저장 실패: ${err.message}`);
   }
 
-  // 워터필링 배분기로 draining 봇 자본을 잠근 상태에서 신규 선택 봇 자금 잔액을 정밀 재분배
-  await recalculateAndApplyBotAllocations(flooredTotal, selectedRatiosMap, "live");
-
   const liveBots = await getBots("live");
   const updatedSelected = liveBots.filter((b) => selectedIdSet.has(b.bot_id));
+  const actualDistributedVirtual = updatedSelected.reduce((acc, b) => acc + Math.floor(Number(b.virtual_krw || 0)), 0);
   return {
     success: true,
     total_capital: flooredTotal,
-    reclaimed_virtual_krw: reclaimedVirtualKrw,
+    reclaimed_virtual_krw: reclaimedFromDroppedKrw,
+    total_transferable_krw: totalTransferableKrw,
+    actual_distributed_virtual_krw: actualDistributedVirtual,
+    pooled_cash_before_krw: existingTotalCashBefore,
+    remainder_dust_awarded: Number(allocSummary?.remainderDustAwarded || 0),
     total_available_pool_krw: availableForSelectedTotal,
     draining_positions_count: drainingPositionsCount,
     previous_bots: previousBotsSnapshot,
@@ -3909,7 +4024,7 @@ async function updateAutoRotationConfig(payload = {}) {
   return await getAutoRotationConfig(db);
 }
 
-async function getRotationStatusPayload() {
+export async function getRotationStatusPayload(options = {}) {
   const db = getDb();
   const config = await getAutoRotationConfig(db);
   const evaluation = await evaluateWeeklyStrategyChampions(db, {
@@ -3917,17 +4032,76 @@ async function getRotationStatusPayload() {
     allocationMode: config.allocation_mode,
   });
   const liveBots = await getBots("live");
-  const drainingBots = liveBots
-    .filter((b) => Number(b.is_selected_for_live || 0) !== 1 && (b.open_positions || []).length > 0)
-    .map((b) => ({
+  const drainingRawBots = liveBots.filter(
+    (b) => Number(b.is_selected_for_live || 0) !== 1 && (b.open_positions || []).length > 0
+  );
+
+  // Draining 보유 포지션 실시간 현재가 및 미실현 수익률 산출 (캐시 우선, 라이브러리/오프라인 시 avg_buy_price 폴백)
+  const drainingMarkets = [...new Set(drainingRawBots.flatMap((b) => (b.open_positions || []).map((p) => p.market || p.ticker).filter(Boolean)))];
+  let livePriceMap = new Map();
+  if (drainingMarkets.length > 0) {
+    for (const m of drainingMarkets) {
+      const cached = upbitTickersCache.get("ALL_MARKETS") || upbitTickersCache.get(drainingMarkets.join(","));
+      if (cached?.data instanceof Map && cached.data.has(m)) {
+        livePriceMap.set(m, Number(cached.data.get(m)?.trade_price || 0));
+      }
+    }
+    if (livePriceMap.size < drainingMarkets.length && !options?.skipMarketFetch && process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
+      try {
+        const fetched = await fetchUpbitTickersMap(drainingMarkets);
+        for (const m of drainingMarkets) {
+          const tk = fetched?.get(m);
+          if (tk && Number(tk.trade_price) > 0) {
+            livePriceMap.set(m, Number(tk.trade_price));
+          }
+        }
+      } catch {}
+    }
+  }
+
+  const drainingPositions = [];
+  const drainingBots = drainingRawBots.map((b) => {
+    const meta = getBotStrategyMeta(b.bot_id);
+    const enrichedPositions = (b.open_positions || []).map((pos) => {
+      const mkt = pos.market || pos.ticker || "";
+      const avgBuy = Number(pos.avg_buy_price || 0);
+      const vol = Number(pos.volume || 0);
+      const buyAmt = Math.floor(Number(pos.buy_amount || 0));
+      const curPrice = livePriceMap.has(mkt) && livePriceMap.get(mkt) > 0 ? livePriceMap.get(mkt) : avgBuy;
+      const evalAmt = curPrice * vol;
+      const unrealizedPnlKrw = Math.floor(evalAmt - buyAmt);
+      const unrealizedPnlPct = avgBuy > 0 ? Number((((curPrice - avgBuy) / avgBuy) * 100).toFixed(2)) : 0;
+      const item = {
+        position_id: pos.id,
+        bot_id: b.bot_id,
+        nickname: b.nickname || b.name,
+        name: b.name,
+        strategy_group_code: meta.strategy_group_code,
+        strategy_group: meta.strategy_group,
+        market: mkt,
+        ticker: pos.ticker || mkt,
+        order_uuid: pos.order_uuid || "",
+        volume: vol,
+        avg_buy_price: avgBuy,
+        buy_amount: buyAmt,
+        current_price: curPrice,
+        unrealized_pnl_krw: unrealizedPnlKrw,
+        unrealized_pnl_pct: unrealizedPnlPct,
+        created_at: pos.created_at || "",
+      };
+      drainingPositions.push(item);
+      return item;
+    });
+    return {
       bot_id: b.bot_id,
       nickname: b.nickname,
-      ...getBotStrategyMeta(b.bot_id),
+      ...meta,
       used_capital: Math.floor(Number(b.used_capital || 0)),
-      open_positions_count: (b.open_positions || []).length,
-      open_positions: b.open_positions || [],
+      open_positions_count: enrichedPositions.length,
+      open_positions: enrichedPositions,
       last_status_msg: b.last_status_msg || "",
-    }));
+    };
+  });
 
   const rawHistory = await db
     .prepare("SELECT * FROM auto_rotation_history ORDER BY id DESC LIMIT 20")
@@ -3953,6 +4127,47 @@ async function getRotationStatusPayload() {
     };
   });
 
+  let drainHandoffLogs = [];
+  let totalDrainTransferredKrw = 0;
+  try {
+    const rawHandoffs = await db
+      .prepare("SELECT * FROM drain_handoff_logs ORDER BY id DESC LIMIT 30")
+      .all();
+    drainHandoffLogs = rawHandoffs.map((d) => {
+      let allocations = [];
+      try {
+        allocations = JSON.parse(d.allocations_json || "[]");
+      } catch {}
+      return {
+        id: d.id,
+        from_bot_id: d.from_bot_id,
+        market: d.market,
+        position_id: Number(d.position_id || 0),
+        trade_id: Number(d.trade_id || 0),
+        reason: d.reason || "",
+        sell_amount: Math.floor(Number(d.sell_amount || 0)),
+        sell_fee: Math.floor(Number(d.sell_fee || 0)),
+        net_proceeds_krw: Math.floor(Number(d.net_proceeds_krw || 0)),
+        realized_pnl_krw: Math.floor(Number(d.realized_pnl_krw || 0)),
+        allocations,
+        remaining_positions_count: Number(d.remaining_positions_count || 0),
+        created_at: d.created_at,
+      };
+    });
+    const sumRow = await db
+      .prepare("SELECT COALESCE(SUM(net_proceeds_krw), 0) AS total_drain_krw FROM drain_handoff_logs")
+      .get();
+    totalDrainTransferredKrw = Math.floor(Number(sumRow?.total_drain_krw || 0));
+  } catch {}
+
+  let totalRotationTransferredKrw = 0;
+  try {
+    const rotSumRow = await db
+      .prepare("SELECT COALESCE(SUM(transferred_krw), 0) AS total_rot_krw FROM auto_rotation_history")
+      .get();
+    totalRotationTransferredKrw = Math.floor(Number(rotSumRow?.total_rot_krw || 0));
+  } catch {}
+
   return {
     success: true,
     config,
@@ -3962,13 +4177,18 @@ async function getRotationStatusPayload() {
     champions: evaluation.champions,
     groups: evaluation.groups,
     draining_bots: drainingBots,
+    draining_positions: drainingPositions,
+    drain_handoff_logs: drainHandoffLogs,
+    total_drain_transferred_krw: totalDrainTransferredKrw,
+    total_rotation_transferred_krw: totalRotationTransferredKrw,
+    total_transferred_krw: totalRotationTransferredKrw + totalDrainTransferredKrw,
     history,
   };
 }
 
-async function executeWeeklyBotRotation({ triggerType = "MANUAL_IMMEDIATE", forcedCapital = null } = {}) {
+export async function executeWeeklyBotRotation({ triggerType = "MANUAL_IMMEDIATE", forcedCapital = null, skipLiveAccountSync = false } = {}) {
   if (isAutoRotationExecuting) {
-    return { success: false, message: "주간 전략별 1위 봇 로테이션이 이미 실행 중입니다." };
+    return { success: false, already_running: true, message: "주간 전략별 1위 봇 로테이션이 이미 실행 중입니다." };
   }
   isAutoRotationExecuting = true;
   try {
@@ -3983,6 +4203,9 @@ async function executeWeeklyBotRotation({ triggerType = "MANUAL_IMMEDIATE", forc
       throw new Error("선출 가능한 전략군별 챔피언 봇이 없습니다.");
     }
 
+    const rankPriorityMap = Object.fromEntries(
+      evaluation.champions.map((c) => [c.bot_id, Number(c.champion_rank || 999)])
+    );
     const selected = evaluation.champions.map((c) => ({
       bot_id: c.bot_id,
       allocation_ratio: Number((Number(c.recommended_ratio || 0) / 100).toFixed(4)),
@@ -3990,6 +4213,8 @@ async function executeWeeklyBotRotation({ triggerType = "MANUAL_IMMEDIATE", forc
 
     const applyRes = await applyLiveBotsSelection(selected, [], forcedCapital, {
       inheritRunningFromPrevious: triggerType === "SCHEDULED_WEEKLY",
+      rankPriorityMap,
+      skipLiveAccountSync,
     });
 
     const nowStr = nowKSTString();
@@ -4013,13 +4238,16 @@ async function executeWeeklyBotRotation({ triggerType = "MANUAL_IMMEDIATE", forc
       evaluation_basis: c.evaluation_basis,
     }));
 
+    const immediateTransferredKrw = Math.floor(
+      Number(applyRes.total_transferable_krw ?? applyRes.reclaimed_virtual_krw ?? 0)
+    );
     const champText = electedSummaryItems
       .map(
         (c) =>
           `[${c.strategy_group}] ${c.nickname}(${c.allocation_ratio_pct}%, 점수 ${c.rotation_score >= 0 ? "+" : ""}${c.rotation_score})`
       )
       .join(" · ");
-    const summaryText = `${triggerType === "SCHEDULED_WEEKLY" ? "주간 자동" : "수동 즉시"} 로테이션 (${config.allocation_mode}): ${champText} | 보호 포지션 ${applyRes.draining_positions_count}건 · 즉시 이관 ${Number(applyRes.reclaimed_virtual_krw || 0).toLocaleString("ko-KR")}원`;
+    const summaryText = `${triggerType === "SCHEDULED_WEEKLY" ? "주간 자동" : "수동 즉시"} 로테이션 (${config.allocation_mode}): ${champText} | 보호 포지션 ${applyRes.draining_positions_count}건 · 가용 원화 풀 ${immediateTransferredKrw.toLocaleString("ko-KR")}원(탈락 회수 ${Number(applyRes.reclaimed_virtual_krw || 0).toLocaleString("ko-KR")}원) 이관`;
 
     await db
       .prepare(
@@ -4033,7 +4261,7 @@ async function executeWeeklyBotRotation({ triggerType = "MANUAL_IMMEDIATE", forc
         JSON.stringify(applyRes.previous_bots || []),
         JSON.stringify(electedSummaryItems),
         Number(applyRes.draining_positions_count || 0),
-        Math.floor(Number(applyRes.reclaimed_virtual_krw || 0)),
+        immediateTransferredKrw,
         summaryText,
         nowStr
       );
@@ -4047,7 +4275,7 @@ async function executeWeeklyBotRotation({ triggerType = "MANUAL_IMMEDIATE", forc
       .run(nowStr, nextRotStr, nowStr);
 
     console.log(`[Auto-Rotation] ${summaryText}`);
-    const status = await getRotationStatusPayload();
+    const status = await getRotationStatusPayload({ skipMarketFetch: skipLiveAccountSync });
     return {
       success: true,
       trigger_type: triggerType,
@@ -5913,9 +6141,11 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`AutoCoinTrade Backend listening on http://${HOST}:${PORT}`);
-});
+if (process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
+  server.listen(PORT, HOST, () => {
+    console.log(`AutoCoinTrade Backend listening on http://${HOST}:${PORT}`);
+  });
+}
 
 // ============================================================================
 // 백그라운드 3종 전략 봇 자동매매 스케줄러 워커 (8초 주기)
@@ -6203,7 +6433,7 @@ async function cancelUpbitOrder(orderUuid, cfg) {
   }
 }
 
-async function executeBotBuyOrder(bot, market, orderKrw, currentPrice) {
+export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice) {
   const db = getDb();
 
   const latestBot = (await getBots()).find((b) => b.bot_id === bot.bot_id);
@@ -6506,7 +6736,9 @@ async function executeBotBuyOrder(bot, market, orderKrw, currentPrice) {
 
   const now = nowKSTString();
   const newVirtual = Math.max(0, Math.floor(Number(latestBot.virtual_krw) - actualBuyAmount - fee));
-  await db.prepare("UPDATE bots SET virtual_krw = ?, last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
+  const newAllocated = newVirtual + Math.floor(currentInvested + Number(actualBuyAmount || 0));
+  await db.prepare("UPDATE bots SET allocated_capital = ?, virtual_krw = ?, last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
+    newAllocated,
     newVirtual,
     `${market} 최유리 지정가(1호가 ${execPrice.toLocaleString("ko-KR")}원) 매수 체결 (${actualBuyAmount.toLocaleString("ko-KR")}원)`,
     now,
@@ -6531,7 +6763,210 @@ async function executeBotBuyOrder(bot, market, orderKrw, currentPrice) {
   return true;
 }
 
-async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel) {
+export async function settleLiveSellOrderInDb({
+  db,
+  bot,
+  targetPositions,
+  sellUuid,
+  sellPrice,
+  actualTotalFunds,
+  actualTotalFee,
+  reasonLabel,
+}) {
+  const now = nowKSTString();
+  const safeFunds = Number.isFinite(Number(actualTotalFunds)) ? Math.max(0, Math.floor(Number(actualTotalFunds))) : 0;
+  const safeFee = Number.isFinite(Number(actualTotalFee)) ? Math.max(0, Math.floor(Number(actualTotalFee))) : 0;
+  const netProceeds = Math.max(0, safeFunds - safeFee);
+  const totalBuyAmount = targetPositions.reduce((acc, p) => acc + Math.max(0, Number(p.buy_amount || 0)), 0) || 1;
+  const primaryPos = targetPositions[0];
+  let totalProfitKrw = 0;
+
+  let isDrainingBot = false;
+  let remainingOpenCnt = 0;
+  let remainingOpenUsed = 0;
+  let handoffAllocations = [];
+
+  try {
+    await beginWriteTx(db);
+
+    for (const p of targetPositions) {
+      const pBuyAmt = Math.max(0, Number(p.buy_amount || 0));
+      const pBuyFee = Math.max(0, Number(p.buy_fee || 0));
+      const weight = pBuyAmt / totalBuyAmount;
+      const posSellAmount = Math.floor(safeFunds * weight);
+      const posSellFee = Math.floor(safeFee * weight);
+      const posNetProceeds = Math.max(0, posSellAmount - posSellFee);
+      const posProfitKrw = Math.floor(posNetProceeds - pBuyAmt - pBuyFee);
+      const posProfitPct = pBuyAmt > 0 ? Number(((posProfitKrw / pBuyAmt) * 100).toFixed(2)) : 0;
+      totalProfitKrw += posProfitKrw;
+
+      await db.prepare("UPDATE bot_positions SET status = 'CLOSED', closed_at = ? WHERE id = ? AND bot_id = ?").run(
+        now,
+        p.id,
+        bot.bot_id
+      );
+      if (p.trade_id) {
+        await db.prepare(`
+          UPDATE trades
+          SET sell_order_uuid = ?, sell_price = ?, sell_volume = ?, sell_amount = ?, sell_date = ?, profit_krw = ?, profit_pct = ?, status = 'COMPLETED'
+          WHERE id = ? AND bot_id = ?
+        `).run(sellUuid, Number(sellPrice), p.volume, posSellAmount, now, posProfitKrw, posProfitPct, p.trade_id, bot.bot_id);
+      }
+    }
+
+    try {
+      await db
+        .prepare("UPDATE bot_accounts SET total_realized_pnl = total_realized_pnl + ?, updated_at = ? WHERE bot_id = ?")
+        .run(totalProfitKrw, now, bot.bot_id);
+    } catch {}
+
+    const freshBot = await db.prepare("SELECT * FROM bots WHERE bot_id = ?").get(bot.bot_id);
+    isDrainingBot = Number(freshBot?.is_selected_for_live || 0) !== 1;
+
+    const remRow = await db
+      .prepare("SELECT COUNT(*) AS cnt, COALESCE(SUM(buy_amount), 0) AS rem_used FROM bot_positions WHERE bot_id = ? AND status = 'OPEN'")
+      .get(bot.bot_id);
+    remainingOpenCnt = Number(remRow?.cnt || 0);
+    remainingOpenUsed = Math.max(0, Math.floor(Number(remRow?.rem_used || 0)));
+
+    if (isDrainingBot) {
+      const prevStrayCash = Math.max(0, Math.floor(Number(freshBot?.virtual_krw || 0)));
+      const distributable = Math.max(0, netProceeds + prevStrayCash);
+
+      const activeBots = await db
+        .prepare("SELECT * FROM bots WHERE is_selected_for_live = 1 ORDER BY allocation_ratio DESC, bot_id ASC")
+        .all();
+
+      const ratioSum = activeBots.reduce((acc, ab) => {
+        const r = Number(ab.allocation_ratio || 0);
+        return acc + (Number.isFinite(r) && r > 0 ? r : 0);
+      }, 0);
+
+      if (activeBots.length > 0 && distributable > 0) {
+        let distributed = 0;
+        const shares = activeBots.map((ab) => {
+          const r = Number(ab.allocation_ratio || 0);
+          const safeRatio = Number.isFinite(r) && r > 0 ? r : 0;
+          const share =
+            ratioSum > 0
+              ? Math.floor((distributable * safeRatio) / ratioSum)
+              : Math.floor(distributable / activeBots.length);
+          distributed += share;
+          return { ab, share };
+        });
+        const remainder = distributable - distributed;
+        if (remainder > 0 && shares.length > 0) {
+          shares[0].share += remainder; // 1위 활성 봇에 1~2원 자투리 전액 합산
+        }
+
+        for (const item of shares) {
+          const share = Math.max(0, item.share);
+          const ab = item.ab;
+          if (share <= 0) continue;
+          const abUsedRow = await db
+            .prepare("SELECT COALESCE(SUM(buy_amount), 0) AS used_amt FROM bot_positions WHERE bot_id = ? AND status = 'OPEN'")
+            .get(ab.bot_id);
+          const abUsed = Math.max(0, Math.floor(Number(abUsedRow?.used_amt || 0)));
+          const prevVirtual = Math.max(0, Math.floor(Number(ab.virtual_krw || 0)));
+          const prevAllocMinusUsed = Math.max(0, Math.floor(Number(ab.allocated_capital || 0)) - abUsed);
+          const baseVirtual = Math.max(prevVirtual, prevAllocMinusUsed);
+          const nextVirtual = baseVirtual + share;
+          const nextAlloc = nextVirtual + abUsed;
+
+          await db
+            .prepare("UPDATE bots SET virtual_krw = ?, allocated_capital = ?, updated_at = ? WHERE bot_id = ?")
+            .run(nextVirtual, nextAlloc, now, ab.bot_id);
+          handoffAllocations.push({
+            bot_id: ab.bot_id,
+            nickname: ab.nickname || ab.name,
+            ratio_pct: Number(ab.allocation_ratio || 0),
+            amount_krw: share,
+            new_virtual_krw: nextVirtual,
+          });
+        }
+      }
+
+      const drainStatusMsg =
+        remainingOpenCnt > 0
+          ? `[🛡️ Graceful Drain] ${primaryPos.market} 매도 정산금 ${distributable.toLocaleString("ko-KR")}원 활성 봇 이관 완료 · 잔여 포지션 ${remainingOpenCnt}건(${remainingOpenUsed.toLocaleString("ko-KR")}원) 계속 감시 중`
+          : `[✅ Graceful Drain 완료] ${primaryPos.market} 최종 청산(${totalProfitKrw >= 0 ? "+" : ""}${totalProfitKrw.toLocaleString("ko-KR")}원) 및 정산금 ${distributable.toLocaleString("ko-KR")}원 활성 봇 자동 귀속 완료`;
+
+      await db
+        .prepare(
+          `UPDATE bots
+           SET is_selected_for_live = 0, is_running = 0, allocation_ratio = 0,
+               allocated_capital = ?, virtual_krw = 0, last_status_msg = ?, updated_at = ?
+           WHERE bot_id = ?`
+        )
+        .run(remainingOpenUsed, drainStatusMsg, now, bot.bot_id);
+
+      try {
+        await db
+          .prepare(
+            `INSERT INTO drain_handoff_logs (
+               from_bot_id, market, position_id, trade_id, reason,
+               sell_amount, sell_fee, net_proceeds_krw, realized_pnl_krw,
+               allocations_json, remaining_positions_count, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            bot.bot_id,
+            primaryPos.market,
+            Number(primaryPos.id || 0),
+            Number(primaryPos.trade_id || 0),
+            reasonLabel || "",
+            safeFunds,
+            safeFee,
+            distributable,
+            totalProfitKrw,
+            JSON.stringify(handoffAllocations),
+            remainingOpenCnt,
+            now
+          );
+      } catch {}
+    } else {
+      const prevVirtual = Math.max(0, Math.floor(Number(freshBot?.virtual_krw || 0)));
+      const prevAllocMinusUsed = Math.max(
+        0,
+        Math.floor(Number(freshBot?.allocated_capital || 0)) - remainingOpenUsed
+      );
+      const nextVirtual = Math.max(prevVirtual, prevAllocMinusUsed) + netProceeds;
+      const nextAlloc = nextVirtual + remainingOpenUsed;
+      const statusMsg = `${primaryPos.market} ${reasonLabel} 매도 완료 (${targetPositions.length}건 / ${
+        totalProfitKrw >= 0 ? "+" : ""
+      }${totalProfitKrw.toLocaleString("ko-KR")}원)`;
+
+      await db
+        .prepare(
+          "UPDATE bots SET virtual_krw = ?, allocated_capital = ?, last_status_msg = ?, updated_at = ? WHERE bot_id = ?"
+        )
+        .run(nextVirtual, nextAlloc, statusMsg, now, bot.bot_id);
+    }
+
+    const totalCapRow = await db.prepare("SELECT COALESCE(SUM(allocated_capital), 0) AS total_cap FROM bots").get();
+    const newTotalCap = Math.max(0, Math.floor(Number(totalCapRow?.total_cap || 0)));
+    await db
+      .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('total_capital', ?, ?)")
+      .run(String(newTotalCap), now);
+
+    await syncBotAccountsFromBots(db);
+    await commitWriteTx(db);
+  } catch (txErr) {
+    await rollbackWriteTx(db);
+    throw txErr;
+  }
+
+  return {
+    isDrainingBot,
+    netProceeds,
+    totalProfitKrw,
+    remainingOpenCnt,
+    remainingOpenUsed,
+    handoffAllocations,
+  };
+}
+
+export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, options = {}) {
   const db = getDb();
   const isLive = isLiveMode();
 
@@ -6598,7 +7033,7 @@ async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel) {
   }
 
   // [실거래 모드 (Live Trading)]
-  // 이미 이전 루프(동일 코인 통합 매도 등)에서 CLOSED 처리된 포지션이면 스킵
+  // 이미 이전 루프 등에서 CLOSED 처리된 포지션이면 스킵
   const currentPos = await db
     .prepare("SELECT * FROM bot_positions WHERE id = ? AND bot_id = ? AND status = 'OPEN'")
     .get(pos.id, bot.bot_id);
@@ -6606,22 +7041,14 @@ async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel) {
     return false;
   }
 
-  const cfgPath = fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : EXAMPLE_CONFIG_PATH;
-  let cfg = {};
-  try {
-    cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
-  } catch {}
-
-  // 동일 봇·동일 마켓의 OPEN 포지션 조회
-  // 개별 포지션이 최소주문금액(5,000원) 부근(<= 5,500원)이거나 동일 마켓 복수 분할 포지션이 있을 때
-  // 손절 시 5,000원 미달 거부 및 소수점 잔량 불일치 방지를 위해 동일 마켓 OPEN 포지션을 통합 매도
+  // 개별 order_uuid 기준 정밀 매도: 단, 평가금액 < 5,500원 소액 포지션만 업비트 최소주문금액 회피를 위해 통합
   const sameMarketOpenPositions = await db
     .prepare("SELECT * FROM bot_positions WHERE bot_id = ? AND market = ? AND status = 'OPEN' ORDER BY id ASC")
     .all(bot.bot_id, currentPos.market);
 
   const singleEvalKrw = Number(currentPos.volume || 0) * Number(sellPrice || 0);
   const targetPositions =
-    sameMarketOpenPositions.length > 1 && (singleEvalKrw < 5500 || sameMarketOpenPositions.length >= 2)
+    sameMarketOpenPositions.length > 1 && singleEvalKrw < 5500
       ? sameMarketOpenPositions
       : [currentPos];
 
@@ -6629,6 +7056,37 @@ async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel) {
   if (dbSumVolume <= 0) {
     return false;
   }
+
+  // 시뮬레이션/테스트 모드에서는 외부 업비트 주문 없이 해당 포지션 volume만 정확히 체결 정산
+  if (options?.skipUpbitApi) {
+    const sellUuid = `sim-ask-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    const sellVolNum = Number(floorTo8DecimalsStr(dbSumVolume));
+    const safePrice = Number.isFinite(Number(sellPrice)) && Number(sellPrice) > 0 ? Number(sellPrice) : 0;
+    const actualTotalFunds = Math.max(0, Math.floor(sellVolNum * safePrice));
+    const actualTotalFee = Math.max(0, Math.floor(actualTotalFunds * 0.0005));
+    const settled = await settleLiveSellOrderInDb({
+      db,
+      bot,
+      targetPositions,
+      sellUuid,
+      sellPrice: safePrice,
+      actualTotalFunds,
+      actualTotalFee,
+      reasonLabel,
+    });
+    if (settled.isDrainingBot) {
+      console.log(
+        `[Graceful Drain 정산 이관] 탈락 봇 ${bot.bot_id} ${currentPos.market} ${reasonLabel} 정산금 ${settled.netProceeds.toLocaleString("ko-KR")}원 이관 (잔여 ${settled.remainingOpenCnt}건)`
+      );
+    }
+    return true;
+  }
+
+  const cfgPath = fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : EXAMPLE_CONFIG_PATH;
+  let cfg = {};
+  try {
+    cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
+  } catch {}
 
   // 업비트 실계좌 보유 수량 조회 — 절대 계좌 전량을 매도하지 않고 본인 봇/order_uuid 기록 volume(소수점 8자리 내림 ROUND_DOWN)만 사용
   const currency = String(currentPos.market || "").split("-")[1] || "";
@@ -6722,7 +7180,6 @@ async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel) {
           console.log(`[Smart Cleanse] ${currentPos.market} ${topupKrw}원 보충 매수 성공. 600ms 대기 후 전량 시장가 매도 진행...`);
           await new Promise((r) => setTimeout(r, 600));
 
-          // 갱신된 실계좌 잔고 재조회
           const acctToken2 = createUpbitJwt(String(cfg.access_key).trim(), String(cfg.secret_key).trim());
           const acctResp2 = await fetch("https://api.upbit.com/v1/accounts", {
             headers: { Authorization: `Bearer ${acctToken2}`, Accept: "application/json" },
@@ -6732,8 +7189,8 @@ async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel) {
             const cAcc = accs.find((a) => String(a.currency || "").toUpperCase() === currency.toUpperCase());
             const newBal = Number(cAcc?.balance || 0);
             if (newBal > 0) {
-              sellVolumeStr = String(cAcc.balance);
-              actualTotalFunds = Math.floor(newBal * Number(sellPrice));
+              sellVolumeStr = floorTo8DecimalsStr(newBal);
+              actualTotalFunds = Math.floor(Number(sellVolumeStr) * Number(sellPrice));
               console.log(`[Smart Cleanse] 새 청산 수량: ${sellVolumeStr} (평가액: ${actualTotalFunds}원 >= 5,000원)`);
             }
           }
@@ -6823,82 +7280,29 @@ async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel) {
     return false;
   }
 
-  const now = nowKSTString();
-  const totalBuyAmount = targetPositions.reduce((acc, p) => acc + Number(p.buy_amount || 0), 0) || 1;
-  let totalProfitKrw = 0;
+  const settled = await settleLiveSellOrderInDb({
+    db,
+    bot,
+    targetPositions,
+    sellUuid,
+    sellPrice,
+    actualTotalFunds,
+    actualTotalFee,
+    reasonLabel,
+  });
 
-  for (const p of targetPositions) {
-    const weight = Number(p.buy_amount || 0) / totalBuyAmount;
-    const posSellAmount = Math.floor(actualTotalFunds * weight);
-    const posSellFee = Math.floor(actualTotalFee * weight);
-    const posNetProceeds = posSellAmount - posSellFee;
-    const posProfitKrw = Math.floor(posNetProceeds - Number(p.buy_amount) - Number(p.buy_fee || 0));
-    const posProfitPct = Number(((posProfitKrw / Number(p.buy_amount)) * 100).toFixed(2));
-    totalProfitKrw += posProfitKrw;
+  // 업비트 실계좌 조회 가능 시 총 운영원금 동기화(성공 시 실잔고 90% 기준으로 정렬; 실패 시 위 Zero-Sum 직접 이관 유지)
+  await syncDynamicLiveCapitalFromUpbit(true).catch(() => null);
 
-    await db.prepare("UPDATE bot_positions SET status = 'CLOSED', closed_at = ? WHERE id = ? AND bot_id = ?").run(
-      now,
-      p.id,
-      bot.bot_id
-    );
-    await db.prepare(`
-      UPDATE trades
-      SET sell_order_uuid = ?, sell_price = ?, sell_volume = ?, sell_amount = ?, sell_date = ?, profit_krw = ?, profit_pct = ?, status = 'COMPLETED'
-      WHERE id = ? AND bot_id = ?
-    `).run(sellUuid, sellPrice, p.volume, posSellAmount, now, posProfitKrw, posProfitPct, p.trade_id, bot.bot_id);
-  }
-
-  // 매도 후 전체 운용 원금 대비 이미 사용된 투자금을 재계산하여 봇별 배정 원금 및 가용 잔고(virtual_krw) 재분배
-  const isDrainingBot = Number(bot.is_selected_for_live || 0) !== 1;
-  const netProceeds = Math.max(0, Math.floor(actualTotalFunds - actualTotalFee));
-  const currentTotalCap = Math.floor(Number(await getSetting("total_capital", "0")));
-  const syncRes = await syncDynamicLiveCapitalFromUpbit(true).catch(() => null);
-  if (!syncRes?.success) {
-    const adjustedCap = Math.max(0, currentTotalCap + Math.floor(totalProfitKrw));
-    if (adjustedCap !== currentTotalCap) {
-      await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('total_capital', ?, ?)").run(String(adjustedCap), now);
-    }
-    await recalculateAndApplyBotAllocations(adjustedCap, null, "live");
-  }
-
-  try {
-    await db
-      .prepare("UPDATE bot_accounts SET total_realized_pnl = total_realized_pnl + ?, updated_at = ? WHERE bot_id = ?")
-      .run(totalProfitKrw, now, bot.bot_id);
-  } catch {}
-  await syncBotAccountsFromBots(db);
-
-  if (isDrainingBot) {
-    const remRow = await db
-      .prepare("SELECT COUNT(*) AS cnt, COALESCE(SUM(buy_amount), 0) AS rem_used FROM bot_positions WHERE bot_id = ? AND status = 'OPEN'")
-      .get(bot.bot_id);
-    const remCnt = Number(remRow?.cnt || 0);
-    const remUsed = Math.floor(Number(remRow?.rem_used || 0));
+  if (settled.isDrainingBot) {
     const activeBots = (await getBots("live")).filter((b) => Number(b.is_selected_for_live) === 1);
     const activeDesc = activeBots
       .map((ab) => `${ab.nickname}(비율 ${Number(ab.allocation_ratio || 0).toFixed(0)}% / 가용 ${Math.floor(Number(ab.virtual_krw || 0)).toLocaleString("ko-KR")}원)`)
       .join(", ");
     console.log(
-      `[Graceful Drain 정산 이관] 탈락 봇 ${bot.bot_id}(${bot.nickname}) ${currentPos.market} ${reasonLabel} 매도 정산금 ${netProceeds.toLocaleString("ko-KR")}원(실현손익 ${
-        totalProfitKrw >= 0 ? "+" : ""
-      }${totalProfitKrw.toLocaleString("ko-KR")}원) 회수 -> 활성 실전 봇 자동 귀속 (${activeDesc || "없음"})`
-    );
-    const drainStatusMsg =
-      remCnt > 0
-        ? `[🛡️ Graceful Drain] ${currentPos.market} 매도 정산금 ${netProceeds.toLocaleString("ko-KR")}원 활성 봇 이관 완료 · 잔여 포지션 ${remCnt}건(${remUsed.toLocaleString("ko-KR")}원) 계속 감시 중`
-        : `[✅ Graceful Drain 완료] ${currentPos.market} 최종 청산(${totalProfitKrw >= 0 ? "+" : ""}${totalProfitKrw.toLocaleString("ko-KR")}원) 및 정산금 ${netProceeds.toLocaleString("ko-KR")}원 활성 봇 자동 귀속 완료`;
-    await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
-      drainStatusMsg,
-      now,
-      bot.bot_id
-    );
-  } else {
-    await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
-      `${currentPos.market} ${reasonLabel} 매도 완료 (${targetPositions.length}건 통합 / ${
-        totalProfitKrw >= 0 ? "+" : ""
-      }${totalProfitKrw.toLocaleString("ko-KR")}원)`,
-      now,
-      bot.bot_id
+      `[Graceful Drain 정산 이관] 탈락 봇 ${bot.bot_id}(${bot.nickname}) ${currentPos.market} ${reasonLabel} 매도 정산금 ${settled.netProceeds.toLocaleString("ko-KR")}원(실현손익 ${
+        settled.totalProfitKrw >= 0 ? "+" : ""
+      }${settled.totalProfitKrw.toLocaleString("ko-KR")}원) 회수 -> 활성 실전 봇 자동 귀속 (${activeDesc || "없음"})`
     );
   }
   await checkAndHaltIfZeroBalance();
@@ -6911,15 +7315,17 @@ async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel) {
 let isLiveCycleRunning = false;
 const liveBotPeakMap = new Map();
 
-async function runLiveTradingBotsCycle() {
+export async function runLiveTradingBotsCycle(options = {}) {
   if (isLiveCycleRunning) return;
   isLiveCycleRunning = true;
   try {
-    // 업비트 실계좌 잔고 기반 90% 동적 운영원금 및 각 봇별 비율 실시간 동기화
-    await syncDynamicLiveCapitalFromUpbit();
+    // 업비트 실계좌 잔고 기반 90% 동적 운영원금 동기화 (테스트/오프라인 skipUpbitApi 시 건너뜀)
+    if (!options?.skipUpbitApi) {
+      await syncDynamicLiveCapitalFromUpbit();
+    }
 
     const haltInfo = await checkAndHaltIfZeroBalance("live");
-    if (haltInfo.halted) return;
+    const allowNewBuysGlobal = !haltInfo.halted;
 
     const db = getDb();
     // 실전 선택+가동 중 봇 및 포지션 보호(Graceful Drain · 일시정지 보유 물량 포함) 대상 봇 모두 포함
@@ -6936,19 +7342,23 @@ async function runLiveTradingBotsCycle() {
       "KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-DOGE",
       "KRW-SUI", "KRW-AVAX", "KRW-SHIB"
     ];
-    const tickerMap = await fetchUpbitTickersMap(allMarkets);
+    const tickerMap = options?.tickerMapOverride || (await fetchUpbitTickersMap(allMarkets));
     if (!tickerMap || tickerMap.size === 0) return;
 
     // 지표 패키지 사전 빌드 (공유 캐시 활용)
-    const mdMap = new Map();
-    for (const m of allMarkets) {
-      const tk = tickerMap.get(m);
-      if (tk) {
-        mdMap.set(m, await buildMarketData(m, tk, fetchUpbitCandlesSorted));
+    const mdMap = options?.mdMapOverride || new Map();
+    if (!options?.mdMapOverride) {
+      for (const m of allMarkets) {
+        const tk = tickerMap.get(m);
+        if (tk) {
+          mdMap.set(m, await buildMarketData(m, tk, fetchUpbitCandlesSorted));
+        }
       }
     }
     const { computeMomentumRanking } = await import("./common/algo_lab_service.mjs");
-    const rankMap = computeMomentumRanking(mdMap, allMarkets);
+    const rankMap = options?.rankMapOverride || computeMomentumRanking(mdMap, allMarkets);
+
+    const sellOpts = options?.skipUpbitApi ? { skipUpbitApi: true } : {};
 
     for (const bot of cycleBots) {
       const now = nowKSTString();
@@ -6962,20 +7372,21 @@ async function runLiveTradingBotsCycle() {
         take_profit_pct: bot.take_profit_pct,
       };
 
-      // 1) 보유 포지션 손절/익절 및 알고리즘 SELL 시그널 평가 (BLOCK/해제/일시정지 여부와 무관하게 무조건 실행)
+      // 1) 보유 포지션 손절/익절 및 알고리즘 SELL 시그널 평가 (BLOCK/해제/일시정지/잔고부족 여부와 무관하게 무조건 실행)
       for (const pos of bot.open_positions || []) {
-        const tk = tickerMap.get(pos.market);
+        const mkt = pos.market || pos.ticker;
+        const tk = tickerMap.get(mkt);
         if (!tk) continue;
         const curPrice = Number(tk.trade_price);
         const avgBuy = Number(pos.avg_buy_price);
-        const pnlPct = ((curPrice - avgBuy) / avgBuy) * 100.0;
+        const pnlPct = avgBuy > 0 ? ((curPrice - avgBuy) / avgBuy) * 100.0 : 0;
 
         // 트레일링 스탑용 고점 갱신
         const peakKey = `live-${pos.id}`;
         const curPeak = Math.max(Number(liveBotPeakMap.get(peakKey) || avgBuy), curPrice);
         liveBotPeakMap.set(peakKey, curPeak);
 
-        const md = mdMap.get(pos.market);
+        const md = mdMap.get(mkt);
 
         // 3단계 스마트 청산 유틸리티 (본절 스탑, 시간 제한 청산, 동적 ATR 트레일링 스탑)
         const smartExit = evaluateSmartExit({
@@ -6988,18 +7399,18 @@ async function runLiveTradingBotsCycle() {
           stopLossPct: stopLossPct,
         });
         if (smartExit && smartExit.signal === "SELL") {
-          await executeBotSellOrder(bot, pos, curPrice, smartExit.reason);
+          await executeBotSellOrder(bot, pos, curPrice, smartExit.reason, sellOpts);
           liveBotPeakMap.delete(peakKey);
           continue;
         }
 
         if (pnlPct <= stopLossPct) {
-          await executeBotSellOrder(bot, pos, curPrice, `손절(${pnlPct.toFixed(2)}%)`);
+          await executeBotSellOrder(bot, pos, curPrice, `손절(${pnlPct.toFixed(2)}%)`, sellOpts);
           liveBotPeakMap.delete(peakKey);
           continue;
         }
         if (pnlPct >= takeProfitPct) {
-          await executeBotSellOrder(bot, pos, curPrice, `익절(+${pnlPct.toFixed(2)}%)`);
+          await executeBotSellOrder(bot, pos, curPrice, `익절(+${pnlPct.toFixed(2)}%)`, sellOpts);
           liveBotPeakMap.delete(peakKey);
           continue;
         }
@@ -7010,11 +7421,11 @@ async function runLiveTradingBotsCycle() {
             params,
             peakPrice: curPeak,
             momentumRank: rankMap,
-            market: pos.market,
+            market: mkt,
             isLive: true,
           });
           if (sig.signal === "SELL") {
-            await executeBotSellOrder(bot, pos, curPrice, sig.reason);
+            await executeBotSellOrder(bot, pos, curPrice, sig.reason, sellOpts);
             liveBotPeakMap.delete(peakKey);
             continue;
           }
@@ -7029,6 +7440,10 @@ async function runLiveTradingBotsCycle() {
       const isRunningLive = Number(refreshedBot.is_running) === 1;
 
       if (!isSelectedLive) {
+        const curMsg = String(refreshedBot.last_status_msg || "");
+        if (remainingOpenCount === 0 && curMsg.startsWith("[✅ Graceful Drain 완료]")) {
+          continue;
+        }
         const drainMsg =
           remainingOpenCount > 0
             ? `[포지션 보호 청산 대기] 실전 해제됨 · 보유 ${remainingOpenCount}건 고유 전략 청산 감시중`
@@ -7041,7 +7456,7 @@ async function runLiveTradingBotsCycle() {
         continue;
       }
 
-      if (!isRunningLive || Number(refreshedBot.allocated_capital) <= 0) {
+      if (!allowNewBuysGlobal || !isRunningLive || Number(refreshedBot.allocated_capital) <= 0) {
         if (remainingOpenCount > 0) {
           await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
             `[일시중지 · 포지션 보호] 보유 ${remainingOpenCount}건 익절/손절 감시중`,
@@ -7417,11 +7832,13 @@ startBackgroundWorkers = async function() {
   console.log("[Workers] Background schedulers and 10-bot Arena cycles started successfully.");
 };
 
-if (isConfigured) {
+if (process.env.AUTOCOIN_LIBRARY_MODE !== "1" && isConfigured) {
   startBackgroundWorkers().catch((err) => console.warn("[Startup] Background worker start error:", err.message));
-} else {
+} else if (process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
   console.log("[Setup] System is running in Setup Mode. Awaiting onboarding via /api/setup.");
 }
+
+export { evaluateWeeklyStrategyChampions, getSetting, syncBotAccountsFromBots, checkAndHaltIfZeroBalance };
 
 
 
