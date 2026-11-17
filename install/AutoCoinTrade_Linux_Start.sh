@@ -74,7 +74,7 @@ fi
 
 BACKEND_PORT="${BACKEND_PORT:-8001}"
 FRONTEND_PORT="${FRONTEND_PORT:-9000}"
-FRONTEND_HOST="${FRONTEND_HOST:-0.0.0.0}"
+FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
 
 # 4. 필수 패키지 점검 및 프론트엔드 번들 확인
 echo ""
@@ -84,12 +84,11 @@ if [ ! -d "$APP_DIR/node_modules" ] && [ -f "$APP_DIR/package.json" ]; then
     (cd "$APP_DIR" && npm install --silent >/dev/null 2>&1)
 fi
 
-if [ ! -d "$APP_DIR/frontend/node_modules" ]; then
-    echo "  -> 프론트엔드 패키지 자동 설치 중 (최초 1회 약 20초 소요)..."
-    (cd "$APP_DIR/frontend" && npm install --silent >/dev/null 2>&1)
-fi
-
-if [ ! -d "$APP_DIR/frontend/dist" ]; then
+if [ ! -f "$APP_DIR/frontend/dist/index.html" ]; then
+    if [ ! -d "$APP_DIR/frontend/node_modules" ]; then
+        echo "  -> 프론트엔드 패키지 자동 설치 중 (최초 1회 약 20초 소요)..."
+        (cd "$APP_DIR/frontend" && npm install --silent >/dev/null 2>&1)
+    fi
     echo "  -> 프론트엔드 프로덕션 번들 빌드 중..."
     (cd "$APP_DIR/frontend" && npm run build >/dev/null 2>&1)
 fi
@@ -103,11 +102,13 @@ echo ""
 echo "[5/5] 백엔드 및 웹 UI 서비스 기동 중..."
 cd "$APP_DIR"
 
+node backend/common/log_rotator.mjs --startup >/dev/null 2>&1 || true
+
 setsid node backend/node_server.mjs </dev/null >> logs/backend.log 2>&1 &
 BACKEND_PID=$!
 echo "$BACKEND_PID" > logs/.backend.pid
 
-setsid bash -c "cd frontend && npx vite --port ${FRONTEND_PORT} --host ${FRONTEND_HOST}" </dev/null >> logs/frontend.log 2>&1 &
+setsid env FRONTEND_HOST="${FRONTEND_HOST}" FRONTEND_PORT="${FRONTEND_PORT}" BACKEND_URL="http://127.0.0.1:${BACKEND_PORT}" node frontend/server.mjs </dev/null >> logs/frontend.log 2>&1 &
 FRONTEND_PID=$!
 echo "$FRONTEND_PID" > logs/.frontend.pid
 

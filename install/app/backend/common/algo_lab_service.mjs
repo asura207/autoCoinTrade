@@ -552,11 +552,21 @@ export function checkUpperWickAndOverextension(candle, currentPrice, ma20 = null
   return { ok: true };
 }
 
+function parseKstTimestampMs(timeStr) {
+  if (!timeStr) return NaN;
+  const raw = String(timeStr).trim();
+  // KST 문자열("YYYY-MM-DD HH:MM:SS")에 타임존 표기가 없으면 명시적으로 +09:00으로 해석하여 서버 TZ 영향 제거
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(raw)) {
+    return Date.parse(`${raw.replace(" ", "T")}+09:00`);
+  }
+  return Date.parse(raw);
+}
+
 /**
  * 횡보장 자금 잠김(Position Lock) 해소를 위한 3단계 스마트 청산(Exit) 엔진
  * 1) 본절 스탑 (Breakeven Stop): 최고 수익률 +1.2% 이상 도달 후 +0.25% 이하로 하락 시 수익 반납 방지 익절
  * 2) 시간 제한 청산 (Time-Stop): 단타 봇(bot_01, bot_04, bot_05, bot_09, bot_10)이 6시간(실전)/2시간(가상) 경과 후 -0.6%~+0.8% 박스권 & RVOL < 1.0 시 자금 회수
- * 3) ATR 기반 동적 트레일링 스탑: 진입가 대비 -2.2*ATR 하드 손절, 최고가 대비 -1.8*ATR 트레일링 스탑 (불가 시 고정 % 손절 Fallback)
+ * 3) ATR 기반 동적 트레일링 스탑: 진입가 대비 -2.2*ATR 하드 손절(분할 그리드 bot_06 제외), 최고가 수익 +1.0% 이상 도달 후 수익 구간 내 -1.8*ATR 트레일링 스탑
  */
 export function evaluateSmartExit({
   botId,
@@ -590,7 +600,7 @@ export function evaluateSmartExit({
   if (timeStopBots.has(normId)) {
     const timeStr = position.opened_at || position.created_at;
     if (timeStr) {
-      const entryTs = new Date(timeStr).getTime();
+      const entryTs = parseKstTimestampMs(timeStr);
       if (!isNaN(entryTs)) {
         const holdHours = (Date.now() - entryTs) / (3600 * 1000);
         const maxHoldHours = isLive ? 6.0 : 2.0;
@@ -617,20 +627,22 @@ export function evaluateSmartExit({
   // 3. ATR 기반 동적 트레일링 스탑 (Dynamic ATR Trailing Stop)
   const atr = Number(indicators?.m15?.atr14 || indicators?.m60?.atr14 || indicators?.atr || 0);
   if (atr > 0) {
-    // 3-1. 진입가 대비 2.2 * ATR 하락 시 손절 (Hard Stop)
-    const hardStopPrice = avgBuy - 2.2 * atr;
-    if (curPrice <= hardStopPrice) {
-      return {
-        signal: "SELL",
-        exitType: "ATR_HARD_STOP",
-        reason: `동적 ATR 손절(Hard Stop): 진입가 대비 -2.2×ATR(${ko(2.2 * atr)}원) 이탈 (수익률 ${fmt(pnlPct)}%)`,
-      };
+    // 3-1. 진입가 대비 2.2 * ATR 하락 시 손절 (다단계 분할 그리드 bot_06 은 -2.5%/-5.0% 물타기를 허용하고 고정 -9% 손절 사용)
+    if (normId !== "bot_06") {
+      const hardStopPrice = avgBuy - 2.2 * atr;
+      if (curPrice <= hardStopPrice) {
+        return {
+          signal: "SELL",
+          exitType: "ATR_HARD_STOP",
+          reason: `동적 ATR 손절(Hard Stop): 진입가 대비 -2.2×ATR(${ko(2.2 * atr)}원) 이탈 (수익률 ${fmt(pnlPct)}%)`,
+        };
+      }
     }
 
-    // 3-2. 최고가 대비 1.8 * ATR 하락 시 트레일링 스탑 (Dynamic Trailing Stop)
-    if (curPeak > avgBuy) {
+    // 3-2. 최고가 +1.0% 이상 수익 도달 후 수익 확보선(avgBuy 초과) 위에서 -1.8 * ATR 하락 시 트레일링 익절
+    if (peakPnlPct >= 1.0) {
       const trailingStopPrice = curPeak - 1.8 * atr;
-      if (curPrice <= trailingStopPrice) {
+      if (trailingStopPrice > avgBuy && curPrice <= trailingStopPrice) {
         return {
           signal: "SELL",
           exitType: "ATR_TRAILING_STOP",
@@ -659,6 +671,7 @@ export function evaluateSmartExit({
 export const STRATEGY_GROUP_ORDER = ["TREND_SWING", "VOLATILITY_BREAKOUT", "REVERSAL_GRID"];
 
 export const ALLOCATION_MODE_WEIGHTS = {
+  SINGLE_MARKET_FIT_100: [100],
   RANK_WEIGHTED_40_35_25: [40, 35, 25],
   RANK_WEIGHTED_40_40_20: [40, 40, 20],
   EQUAL_34_33_33: [34, 33, 33],
@@ -958,7 +971,7 @@ const STRATEGIES = {
   },
 
   // bot_03: 듀얼 모멘텀
-  bot_03({ held, params, options = {} }) {
+  bot_03({ price, ind, held, params, options = {} }) {
     const isLive = Boolean(options.isLive);
     const info = options.momentumRank?.[options.market];
     if (!info) return hold("모멘텀 순위 산출 대기");
@@ -969,8 +982,8 @@ const STRATEGIES = {
       return hold(`보유 중 (7일 모멘텀 ${fmt(info.momPct)}% / ${info.rank}위)`);
     }
     if (info.rank <= topN && info.momPct >= absTh) {
-      const m15 = options.indicators?.m15;
-      const curPrice = Number(options.currentPrice || options.price || 0);
+      const m15 = ind?.m15 || options.indicators?.m15;
+      const curPrice = Number(price || options.currentPrice || options.price || 0);
       if (m15 && curPrice > 0) {
         const filter = checkUpperWickAndOverextension(m15.cur || m15.closed, curPrice, m15.ema20, m15.vwap);
         if (!filter.ok) return hold(filter.reason);
@@ -1023,26 +1036,36 @@ const STRATEGIES = {
     const isLive = Boolean(options.isLive);
     const m = ind.m15;
     const tp = Number(params.take_profit_pct ?? 1.8);
+    const maxSplits = Math.max(1, Number(params.max_splits ?? 3));
+    const rawRatio = Number(params.order_ratio ?? 0.45);
+    const normRatio = Math.min(1, rawRatio > 1 ? rawRatio / 100 : (rawRatio > 0 ? rawRatio : 0.45));
+    const splitOrderRatio = normRatio / maxSplits;
     if (held.length > 0) {
       const winners = held.filter((p) => pctChange(price, Number(p.avg_buy_price)) >= tp);
       if (winners.length > 0) {
         return sell(`그리드 개별 익절 (+${tp}% 도달 ${winners.length}건)`, { sellPositionIds: winners.map((p) => p.id) });
       }
-      const maxSplits = Number(params.max_splits ?? 3);
       if (held.length < maxSplits) {
         const ref = Number(held.slice().sort((a, b) => a.id - b.id)[0].avg_buy_price);
         const drop = -pctChange(price, ref);
         const step1 = Number(params.grid_step_1_pct ?? 2.5);
         const step2 = Number(params.grid_step_2_pct ?? 5.0);
-        if (held.length === 1 && drop >= step1) return buy(`그리드 2차 분할 매수 (최초 대비 -${fmt(drop)}%)`, { splitIndex: 2 });
-        if (held.length === 2 && drop >= step2) return buy(`그리드 3차 분할 매수 (최초 대비 -${fmt(drop)}%)`, { splitIndex: 3 });
+        if (held.length === 1 && drop >= step1) {
+          return buy(`그리드 2차 분할 매수 (최초 대비 -${fmt(drop)}%)`, { splitIndex: 2, order_ratio: splitOrderRatio });
+        }
+        if (held.length === 2 && drop >= step2) {
+          return buy(`그리드 3차 분할 매수 (최초 대비 -${fmt(drop)}%)`, { splitIndex: 3, order_ratio: splitOrderRatio });
+        }
       }
       return hold(`그리드 보유 ${held.length}분할`);
     }
     if (!m || !m.bb) return hold("15분봉 데이터 부족");
     const rsiEntry = Number(params.rsi_entry ?? (isLive ? 30 : 38));
     if (m.rsi <= rsiEntry && price <= m.bb.lower * 1.005) {
-      return buy(`단기 과매도 그리드 1차 진입 (RSI ${fmt(m.rsi, 1)} ≤ ${rsiEntry}, BB 하단 부근)`, { splitIndex: 1 });
+      return buy(`단기 과매도 그리드 1차 진입 (RSI ${fmt(m.rsi, 1)} ≤ ${rsiEntry}, BB 하단 부근)`, {
+        splitIndex: 1,
+        order_ratio: splitOrderRatio,
+      });
     }
     return hold(`과매도 대기 (RSI ${fmt(m.rsi, 1)} / 기준 ≤ ${rsiEntry})`);
   },
@@ -1061,7 +1084,10 @@ const STRATEGIES = {
       return hold("보유 중 (MACD/EMA 감시)");
     }
     const aligned = m.ema20 > m.ema60 && h.ema20 > h.ema60;
-    const crossUp = [1, 2].some((back) => macd[n - back - 1] <= signal[n - back - 1] && macd[n - back] > signal[n - back]);
+    const macdStillAbove = Number.isFinite(macd[n - 1]) && Number.isFinite(signal[n - 1]) && macd[n - 1] > signal[n - 1];
+    const crossUp =
+      macdStillAbove &&
+      [1, 2].some((back) => macd[n - back - 1] <= signal[n - back - 1] && macd[n - back] > signal[n - back]);
     const rsiMin = Number(params.rsi_min ?? 45);
     const rsiMax = Number(params.rsi_max ?? 65);
     if (aligned && crossUp && m.rsi >= rsiMin && m.rsi <= rsiMax) {
@@ -1076,8 +1102,16 @@ const STRATEGIES = {
     const d = ind.day;
     const h4 = ind.m240;
     if (!d || !h4 || d.ma60 === null || h4.ma60 === null) return hold("일봉/4시간봉 데이터 부족");
+    const minTpPct = Number(params.min_tp_pct ?? 0.6);
+    const targetHighPrice = d.recentHigh20 ? d.recentHigh20 * 0.995 : 0;
     if (held.length > 0) {
-      if (d.recentHigh20 && price >= d.recentHigh20 * 0.995) return sell("직전 고점 부근 익절");
+      const totalCost = held.reduce((acc, p) => acc + Number(p.buy_amount || Number(p.volume || 0) * Number(p.avg_buy_price || 0)), 0);
+      const totalVol = held.reduce((acc, p) => acc + Number(p.volume || 0), 0);
+      const avgBuyPrice = totalVol > 0 ? totalCost / totalVol : Number(held[0].avg_buy_price || 0);
+      const pnlPct = avgBuyPrice > 0 ? pctChange(price, avgBuyPrice) : 0;
+      if (targetHighPrice > 0 && price >= targetHighPrice && pnlPct >= minTpPct) {
+        return sell(`직전 고점 부근 익절 (+${fmt(pnlPct)}%)`);
+      }
       return hold("보유 중 (직전 고점 익절 대기)");
     }
     const dayAligned = d.ma5 > d.ma20 && d.ma20 > d.ma60;
@@ -1085,7 +1119,9 @@ const STRATEGIES = {
     const band = Number(params.pullback_band_pct ?? (isLive ? 1.5 : 2.2));
     const gap = pctChange(price, d.ma20);
     const volDecline = h4.lastClosedVolRatio < 1.0;
-    if (dayAligned && h4Aligned && Math.abs(gap) <= band && volDecline) {
+    const roomToTargetPct = targetHighPrice > 0 && price > 0 ? ((targetHighPrice - price) / price) * 100 : Infinity;
+    const hasUpsideRoom = targetHighPrice <= 0 || (price < targetHighPrice && roomToTargetPct >= minTpPct);
+    if (dayAligned && h4Aligned && Math.abs(gap) <= band && volDecline && hasUpsideRoom) {
       return buy(`정배열(5>20>60) 20일선 눌림목 지지 (이격 ${fmt(gap)}%, 거래량 감소)`);
     }
     return hold(`정배열 ${dayAligned && h4Aligned ? "O" : "X"} / 20선 이격 ${fmt(gap)}%`);
@@ -1124,6 +1160,7 @@ const STRATEGIES = {
     const rvolDipTh = Number(params.rvol_dip ?? 1.3);
     const dipGapTh = Number(params.vwap_gap ?? (isLive ? -2.8 : -2.0));
     const trailingPct = Number(params.trailing_stop_pct ?? 1.5);
+    const minLrcTpPct = Number(params.min_lrc_tp_pct ?? 0.6);
 
     // ==========================================
     // 1. 보유 포지션 매도 / 익절 / 손절 평가
@@ -1134,18 +1171,33 @@ const STRATEGIES = {
       const avgBuyPrice = totalVol > 0 ? totalCost / totalVol : Number(held[0].avg_buy_price);
       const totalPnlPct = pctChange(price, avgBuyPrice);
 
-      const isBreakout = held.some((p) => String(p.buy_reason || "").includes("돌파") || String(p.buy_reason || "").includes("Setup A"));
-      const isDip = held.some((p) => String(p.buy_reason || "").includes("반등") || String(p.buy_reason || "").includes("Setup B"));
+      const hasExplicitBreakout = held.some((p) => String(p.buy_reason || "").includes("돌파") || String(p.buy_reason || "").includes("Setup A"));
+      const hasExplicitDip = held.some((p) => String(p.buy_reason || "").includes("반등") || String(p.buy_reason || "").includes("Setup B"));
+      const inferredDip = !hasExplicitBreakout && !hasExplicitDip && (avgBuyPrice < k.vwap || avgBuyPrice <= k.lrc.mid);
+      const isBreakout = hasExplicitBreakout || (!hasExplicitDip && !inferredDip);
+      const isDip = hasExplicitDip || inferredDip;
 
       // (1) 기계적 기준선 손절 (Key Level Hard Stop)
       if (isBreakout) {
-        if ((k.today_open > 0 && price < k.today_open && price < k.vwap) || totalPnlPct <= -2.0) {
+        const brokeBelowKeyLevels =
+          k.today_open > 0 &&
+          avgBuyPrice >= k.today_open &&
+          avgBuyPrice >= k.vwap &&
+          price < k.today_open * 0.995 &&
+          price < k.vwap * 0.995 &&
+          totalPnlPct <= -0.8;
+        if (brokeBelowKeyLevels || totalPnlPct <= -2.0) {
           return sell(`[Setup A 손절] 당일시가(${ko(k.today_open)}) 및 VWAP(${ko(k.vwap)}) 동시 이탈 / 손절(-2.0%) 청산 (수익률 ${fmt(totalPnlPct)}%)`);
         }
       }
 
       if (isDip) {
-        if (k.prev_low > 0 && price < k.prev_low) {
+        const brokePrevLow =
+          k.prev_low > 0 &&
+          avgBuyPrice >= k.prev_low * 1.005 &&
+          price < k.prev_low * 0.995 &&
+          totalPnlPct <= -1.0;
+        if (brokePrevLow) {
           return sell(`[Setup B 손절] 전일 저가(${ko(k.prev_low)}) 하향 이탈 손절 (수익률 ${fmt(totalPnlPct)}%)`);
         }
         if (totalPnlPct <= -2.5) {
@@ -1154,16 +1206,16 @@ const STRATEGIES = {
       }
 
       if (!isBreakout && !isDip) {
-        if ((k.today_open > 0 && price < k.today_open && price < k.vwap) || totalPnlPct <= -2.5) {
-          return sell(`[기계적 기준선 손절] 당일시가/VWAP 이탈 또는 -2.5% 손절 (수익률 ${fmt(totalPnlPct)}%)`);
+        if (totalPnlPct <= -2.5) {
+          return sell(`[기계적 기준선 손절] 평단가 대비 -2.5% 손절 (수익률 ${fmt(totalPnlPct)}%)`);
         }
       }
 
-      // (2) 선형 회귀 채널 익절 (Take Profit)
-      if (price >= k.lrc.upper) {
+      // (2) 선형 회귀 채널 익절 (Take Profit) — 업비트 왕복 수수료(0.1%)·호가 스프레드를 충분히 상회할 때만 익절
+      if (price >= k.lrc.upper && totalPnlPct >= minLrcTpPct) {
         return sell(`[LRC 상단 익절] +2σ 채널 상단(${ko(k.lrc.upper)}) 도달 전량 익절 (수익률 +${fmt(totalPnlPct)}%)`);
       }
-      if (isDip && price >= k.lrc.mid) {
+      if (isDip && price >= k.lrc.mid && totalPnlPct >= minLrcTpPct) {
         return sell(`[LRC 중심선 회귀 익절] LRC 중심선(${ko(k.lrc.mid)}) 도달 익절 (수익률 +${fmt(totalPnlPct)}%)`);
       }
 
@@ -1182,12 +1234,13 @@ const STRATEGIES = {
         return sell(`[트레일링 스탑] 고점 대비 -${trailingPct}% 반락 익절 (수익률 +${fmt(totalPnlPct)}%)`);
       }
 
-      // (5) Setup B 2차 분할 매수 (Scaling-In) 평가
+      // (5) Setup B 2차 분할 매수 (Scaling-In): -2.5% 손절 이전(-1.5%~-2.4%) 전일 저가 지지 반등 시 추가 분할 매수
       if (isDip && held.length === 1) {
         const firstBuyPrice = Number(held[0].avg_buy_price);
         const dropPct = pctChange(price, firstBuyPrice);
-        if (dropPct <= -2.5 && (k.prev_low === 0 || price >= k.prev_low)) {
-          return buy(`[Setup B 2차 분할 매수] 1차 진입가 대비 ${fmt(dropPct)}% 추가 하락 분할 매수 (Scaling-In)`, {
+        const hasRebound = k.curBullish || price > Number(k.closed.trade_price);
+        if (dropPct <= -1.5 && totalPnlPct > -2.5 && hasRebound && (k.prev_low === 0 || price >= k.prev_low)) {
+          return buy(`[Setup B 2차 분할 매수] 1차 진입가 대비 ${fmt(dropPct)}% 추가 하락 지지 반등 분할 매수 (Scaling-In)`, {
             setup: "B",
             splitIndex: 2,
             order_ratio: 0.15,
@@ -1203,8 +1256,9 @@ const STRATEGIES = {
     // ==========================================
 
     // Setup A [Breakout Long - 추세 돌파 진입]
+    const roomToUpperPct = price > 0 ? ((k.lrc.upper - price) / price) * 100 : 0;
     const setupA_trend = (k.today_open > 0 ? price > k.today_open : true) && price > k.vwap;
-    const setupA_slope = k.lrc.slope > 0 && price < k.lrc.upper;
+    const setupA_slope = k.lrc.slope > 0 && price < k.lrc.upper && roomToUpperPct >= minLrcTpPct;
     const setupA_break = (k.recent_high_20 > 0 && price >= k.recent_high_20 * 0.998) ||
                          (k.prev_high > 0 && price >= k.prev_high * 0.998);
     const setupA_vol = k.rvol >= rvolBreakoutTh;
@@ -1221,9 +1275,11 @@ const STRATEGIES = {
     }
 
     // Setup B [Dip Reversion Long - 과매도 이격 반등 1차 진입]
+    // 이미 LRC 중심선(목표 익절선) 이상이거나 기대 회귀 폭이 최소 순익절 기준 미만이면 진입 금지
+    const roomToMidPct = price > 0 ? ((k.lrc.mid - price) / price) * 100 : 0;
     const minLow = Math.min(Number(k.cur.low_price || price), Number(k.closed.low_price || price));
     const setupB_dip = k.vwap_disparity_pct <= dipGapTh;
-    const setupB_lrc = minLow <= k.lrc.lower * 1.002;
+    const setupB_lrc = minLow <= k.lrc.lower * 1.002 && price < k.lrc.mid && roomToMidPct >= minLrcTpPct;
     const setupB_rebound = k.curBullish || price > Number(k.closed.trade_price);
     const setupB_vol = k.rvol >= rvolDipTh;
 
@@ -1366,6 +1422,8 @@ export async function ensureArenaSchema(db) {
   await addColumnSafe(db, "bots", "paper_status_msg", "TEXT NOT NULL DEFAULT '시그널 대기 중'");
   await addColumnSafe(db, "paper_trades", "buy_reason", "TEXT");
   await addColumnSafe(db, "paper_trades", "sell_reason", "TEXT");
+  await addColumnSafe(db, "paper_bot_positions", "buy_reason", "TEXT");
+  await addColumnSafe(db, "bot_positions", "buy_reason", "TEXT");
   return { hadSelectionColumn };
 }
 
@@ -1525,10 +1583,10 @@ async function paperBuy(db, bot, market, price, budgetKrw, reason) {
   const tradeId = Number(tr.lastInsertRowid);
   const pr = await db
     .prepare(`
-      INSERT INTO paper_bot_positions (bot_id, market, order_uuid, volume, avg_buy_price, buy_amount, buy_fee, trade_id, status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
+      INSERT INTO paper_bot_positions (bot_id, market, order_uuid, volume, avg_buy_price, buy_amount, buy_fee, trade_id, status, created_at, buy_reason)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
     `)
-    .run(bot.bot_id, market, uuid, volume, safePrice, buyAmount, fee, tradeId, now);
+    .run(bot.bot_id, market, uuid, volume, safePrice, buyAmount, fee, tradeId, now, reason || null);
   return { positionId: Number(pr.lastInsertRowid), tradeId, buyAmount, fee, volume, uuid };
 }
 
@@ -1579,9 +1637,9 @@ function normalizedOrderRatio(cfg, fallback = 0.3) {
   return Math.min(1, raw > 1 ? raw / 100 : raw);
 }
 
-const COOLDOWN_MS = 3 * 60 * 1000;
+const COOLDOWN_MS = 15 * 60 * 1000;
 
-async function runPaperBot(db, bot, ctx) {
+export async function runPaperBot(db, bot, ctx) {
   const { mdMap, universe, rankMap, tickerMap } = ctx;
   const cfg = parseCfg(bot);
   const params = {
@@ -1700,10 +1758,10 @@ async function runPaperBot(db, bot, ctx) {
     if (sig.signal !== "BUY") continue;
 
     let ratio = normalizedOrderRatio(cfg, 0.3);
-    if (bot.bot_id === "bot_06") {
-      ratio = ratio / Math.max(1, Number(cfg.max_splits || 3));
-    } else if (bot.bot_id === "bot_10" && sig.order_ratio) {
+    if (sig.order_ratio) {
       ratio = Number(sig.order_ratio);
+    } else if (bot.bot_id === "bot_06") {
+      ratio = ratio / Math.max(1, Number(cfg.max_splits || 3));
     }
     const budget = Math.min(Math.floor(initial * ratio), Math.floor(cash / (1 + PAPER_FEE_RATE)));
     if (budget < PAPER_MIN_ORDER_KRW) break;
@@ -1798,11 +1856,150 @@ function normalizeTimestampForCompare(v) {
  * - 그룹 내 모든 봇의 7일 거래 횟수가 0회인 경우 Arena 누적 수익률(profit_rate_pct)로 안전 Fallback
  * - rotation_score = eval_return_pct - (|mdd_pct| * 0.5) + (eval_win_rate * 0.05) + (7일거래 >= minWeeklyTrades ? 1.0 : 0.0)
  */
+function parseBotOverridesSafe(raw) {
+  if (!raw) return {};
+  if (typeof raw === "object" && !Array.isArray(raw)) {
+    const out = {};
+    for (const [k, v] of Object.entries(raw)) {
+      const val = String(v || "").trim().toUpperCase();
+      if (val === "ALLOW" || val === "BLOCK") out[k] = val;
+    }
+    return out;
+  }
+  if (typeof raw === "string" && raw.trim()) {
+    try {
+      return parseBotOverridesSafe(JSON.parse(raw));
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+export async function readMarketRegimeContext(db, explicitRegime = null) {
+  let row = null;
+  if (!explicitRegime || (!explicitRegime.market_regime && !explicitRegime.recommended_action)) {
+    try {
+      row = await db
+        .prepare(
+          `SELECT market_regime, recommended_action, final_position_multiplier, position_size_multiplier,
+                  final_bot_overrides_json, bot_overrides_json, sentiment_score, reason
+           FROM market_regime_filter WHERE id = 1`
+        )
+        .get();
+    } catch {
+      row = null;
+    }
+  }
+  const src = { ...(row || {}), ...(explicitRegime || {}) };
+  const marketRegime = String(src.market_regime || "SIDEWAYS").trim().toUpperCase();
+  const recommendedAction = String(src.recommended_action || "NORMAL").trim().toUpperCase();
+  const botOverrides = parseBotOverridesSafe(
+    src.bot_overrides ?? src.final_bot_overrides_json ?? src.bot_overrides_json
+  );
+  const multiplier = Number(src.final_position_multiplier ?? src.position_size_multiplier ?? 1.0);
+  const isBearOrDefensive =
+    marketRegime === "BEAR" ||
+    marketRegime === "HIGH_VOLATILITY_SHOCK" ||
+    recommendedAction === "REDUCE_SIZE" ||
+    recommendedAction === "HOLD_ALL" ||
+    recommendedAction === "HALT_NEW_BUYS" ||
+    recommendedAction === "EMERGENCY_CLOSE_ALL";
+  const regimeBucket = isBearOrDefensive ? "BEAR" : marketRegime === "BULL" ? "BULL" : "SIDEWAYS";
+
+  return {
+    market_regime: marketRegime,
+    recommended_action: recommendedAction,
+    regime_bucket: regimeBucket,
+    position_multiplier: Number.isFinite(multiplier) ? multiplier : 1.0,
+    sentiment_score: Number(src.sentiment_score || 0),
+    bot_overrides: botOverrides,
+    reason: String(src.reason || ""),
+  };
+}
+
+export function selectSingleMarketFitChampion(enrichedBots = [], { regimeContext, minWeeklyTrades = 2 } = {}) {
+  const ctx = regimeContext || {
+    market_regime: "SIDEWAYS",
+    recommended_action: "NORMAL",
+    regime_bucket: "SIDEWAYS",
+    bot_overrides: {},
+  };
+  const overrides = ctx.bot_overrides || {};
+  const hasExplicitOverrides = Object.keys(overrides).length > 0;
+  const bucket = ctx.regime_bucket || "SIDEWAYS";
+
+  const isRegimeAllowed = (b) => {
+    if (hasExplicitOverrides && overrides[b.bot_id]) {
+      return overrides[b.bot_id] !== "BLOCK";
+    }
+    if (bucket === "BEAR") {
+      return b.strategy_group_code === "REVERSAL_GRID" || b.bot_id === "bot_08";
+    }
+    return true;
+  };
+
+  const isPreferredGroup = (b) => {
+    if (bucket === "BEAR") return b.strategy_group_code === "REVERSAL_GRID";
+    if (bucket === "SIDEWAYS") return b.strategy_group_code === "REVERSAL_GRID" || b.bot_id === "bot_08";
+    return true; // BULL: 추세·돌파·역추세 전 전략군 실력순 경쟁
+  };
+
+  const meetsMinTrades = (b) => (minWeeklyTrades <= 0 ? true : Number(b.weekly_trade_count || 0) >= minWeeklyTrades);
+  const hasAnyActivity = (b) => Number(b.weekly_trade_count || 0) > 0 || Number(b.total_trades || 0) > 0;
+
+  const tiers = [
+    (b) => isRegimeAllowed(b) && isPreferredGroup(b) && meetsMinTrades(b),
+    (b) => isRegimeAllowed(b) && isPreferredGroup(b) && hasAnyActivity(b),
+    (b) => isRegimeAllowed(b) && meetsMinTrades(b),
+    (b) => isRegimeAllowed(b) && hasAnyActivity(b),
+    (b) => isRegimeAllowed(b) && isPreferredGroup(b),
+    (b) => isRegimeAllowed(b),
+    (b) => isPreferredGroup(b) && meetsMinTrades(b),
+    (b) => isPreferredGroup(b),
+    () => true,
+  ];
+
+  let pool = [];
+  for (const pred of tiers) {
+    const matched = enrichedBots.filter(pred);
+    if (matched.length > 0) {
+      pool = matched;
+      break;
+    }
+  }
+
+  pool.sort(
+    (a, b) =>
+      Number(b.rotation_score || 0) - Number(a.rotation_score || 0) ||
+      Number(b.eval_return_pct || 0) - Number(a.eval_return_pct || 0) ||
+      Number(b.profit_rate_pct || 0) - Number(a.profit_rate_pct || 0) ||
+      Number(b.weekly_trade_count || 0) - Number(a.weekly_trade_count || 0) ||
+      (b.bot_id === "bot_10" ? 1 : 0) - (a.bot_id === "bot_10" ? 1 : 0) ||
+      a.bot_id.localeCompare(b.bot_id)
+  );
+
+  const winner = pool[0] || null;
+  const regimeLabel =
+    bucket === "BEAR" ? "약세/방어장" : bucket === "BULL" ? "상승장" : "횡보장";
+  const reason = winner
+    ? `[${ctx.market_regime}/${ctx.recommended_action}] ${regimeLabel} 적합 전략 1위 '${winner.nickname || winner.bot_id}'(${winner.strategy_group}) 단독 선출 (점수 ${winner.rotation_score >= 0 ? "+" : ""}${winner.rotation_score}, 주간수익 ${winner.weekly_return_pct}%, MDD ${winner.mdd_pct}%, 주간거래 ${winner.weekly_trade_count}건)`
+    : "선출 가능한 봇이 없습니다.";
+
+  return { champion: winner, eligible_bot_ids: pool.map((b) => b.bot_id), reason, regime_context: ctx };
+}
+
+/**
+ * 주간 전략군별(그룹 A/B/C) 1위 챔피언 선출 및 비중 산정
+ * - 최근 7일 롤링(ROLLING_7D) Arena 성과를 우선 평가하되,
+ *   해당 전략군 주간 거래가 0건인 초기 DB 환경에서는 누적 Arena 성적(ARENA_CUMULATIVE_FALLBACK)으로 자동 폴백
+ */
 export async function evaluateWeeklyStrategyChampions(db, options = {}) {
   const minWeeklyTrades = Math.max(0, Number(options.minWeeklyTrades ?? 2));
   const allocationMode = ALLOCATION_MODE_WEIGHTS[options.allocationMode]
     ? options.allocationMode
     : "RANK_WEIGHTED_40_35_25";
+  const isSingleMarketFitMode = allocationMode === "SINGLE_MARKET_FIT_100";
   const weights = ALLOCATION_MODE_WEIGHTS[allocationMode];
   const cutoff7d = formatKstDateTime(new Date(Date.now() - 7 * 24 * 3600 * 1000));
   const evaluatedAt = nowKSTString();
@@ -1936,6 +2133,23 @@ export async function evaluateWeeklyStrategyChampions(db, options = {}) {
     };
   }
 
+  let singleSelectionReason = null;
+  let singleEligibleBotIds = [];
+  let marketRegimeContext = null;
+  if (isSingleMarketFitMode) {
+    marketRegimeContext = await readMarketRegimeContext(db, options.marketRegime);
+    const singlePick = selectSingleMarketFitChampion(enrichedBots, {
+      regimeContext: marketRegimeContext,
+      minWeeklyTrades,
+    });
+    champions.length = 0;
+    if (singlePick.champion) {
+      champions.push(singlePick.champion);
+    }
+    singleSelectionReason = singlePick.reason;
+    singleEligibleBotIds = singlePick.eligible_bot_ids || [];
+  }
+
   champions.sort(
     (a, b) =>
       b.rotation_score - a.rotation_score ||
@@ -1970,6 +2184,10 @@ export async function evaluateWeeklyStrategyChampions(db, options = {}) {
     evaluated_at: evaluatedAt,
     cutoff_7d: cutoff7d,
     allocation_mode: allocationMode,
+    is_single_bot_mode: isSingleMarketFitMode,
+    market_regime_context: marketRegimeContext,
+    selection_reason: singleSelectionReason,
+    single_eligible_bot_ids: singleEligibleBotIds,
     min_weekly_trades: minWeeklyTrades,
     bots: enrichedBots,
     by_bot_id: byBotId,

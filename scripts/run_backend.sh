@@ -26,5 +26,7 @@ if [ -z "$NODE_BIN" ]; then
     exit 1
 fi
 
+"$NODE_BIN" "$PROJECT_ROOT/backend/common/log_rotator.mjs" --startup >/dev/null 2>&1 || true
+
 echo "[Backend] Starting Node.js server on port ${BACKEND_PORT}..."
 exec "$NODE_BIN" backend/node_server.mjs

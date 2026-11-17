@@ -75,12 +75,14 @@ if not exist "%APP_DIR%\.env" (
 
 set "BACKEND_PORT=8001"
 set "FRONTEND_PORT=9000"
-set "FRONTEND_HOST=0.0.0.0"
+set "FRONTEND_HOST=127.0.0.1"
+set "BACKEND_URL=http://127.0.0.1:8001"
 if exist "%APP_DIR%\.env" (
     for /f "usebackq eol=# tokens=1,* delims==" %%A in ("%APP_DIR%\.env") do (
         if /I "%%~A"=="BACKEND_PORT" set "BACKEND_PORT=%%~B"
         if /I "%%~A"=="FRONTEND_PORT" set "FRONTEND_PORT=%%~B"
         if /I "%%~A"=="FRONTEND_HOST" set "FRONTEND_HOST=%%~B"
+        if /I "%%~A"=="BACKEND_URL" set "BACKEND_URL=%%~B"
     )
 )
 
@@ -94,14 +96,13 @@ if not exist "%APP_DIR%\node_modules" if exist "%APP_DIR%\package.json" (
     popd
 )
 
-if not exist "%APP_DIR%\frontend\node_modules" (
-    echo   -> 프론트엔드 패키지 자동 설치 중 (최초 1회 약 20초 소요)...
-    pushd "%APP_DIR%\frontend"
-    call npm install --silent >nul 2>&1
-    popd
-)
-
-if not exist "%APP_DIR%\frontend\dist" (
+if not exist "%APP_DIR%\frontend\dist\index.html" (
+    if not exist "%APP_DIR%\frontend\node_modules" (
+        echo   -> 프론트엔드 패키지 자동 설치 중 (최초 1회 약 20초 소요)...
+        pushd "%APP_DIR%\frontend"
+        call npm install --silent >nul 2>&1
+        popd
+    )
     echo   -> 프론트엔드 프로덕션 빌드 생성 중...
     pushd "%APP_DIR%\frontend"
     call npm run build >nul 2>&1
@@ -116,9 +117,10 @@ for /f "tokens=5" %%a in ('netstat -aon ^| findstr ":!FRONTEND_PORT! " ^| findst
 echo.
 echo [5/5] 서비스 기동 중...
 pushd "%APP_DIR%"
-start /b "" node backend\node_server.mjs > logs\backend.log 2>&1
+node backend\common\log_rotator.mjs --startup >nul 2>&1
+start /b "" node backend\node_server.mjs >> logs\backend.log 2>&1
 cd frontend
-start /b "" npx vite --port !FRONTEND_PORT! --host !FRONTEND_HOST! > ..\logs\frontend.log 2>&1
+start /b "" node server.mjs >> ..\logs\frontend.log 2>&1
 popd
 
 :: 서버 기동 대기

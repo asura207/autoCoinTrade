@@ -19,7 +19,7 @@ fi
 
 BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8001}"
-FRONTEND_HOST="${FRONTEND_HOST:-0.0.0.0}"
+FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
 FRONTEND_PORT="${FRONTEND_PORT:-9000}"
 
 echo "==================================================="
@@ -48,16 +48,27 @@ if check_port "$BACKEND_PORT" || check_port "$FRONTEND_PORT"; then
     sleep 1
 fi
 
-# 2. 백엔드 실행 (Node.js Server)
+# 2. 프론트엔드 프로덕션 정적 번들 확인 및 자동 빌드 (Vite Dev Server 외부 노출 방지)
+if [ ! -f "$PROJECT_ROOT/frontend/dist/index.html" ] || [ "$PROJECT_ROOT/frontend/src/App.jsx" -nt "$PROJECT_ROOT/frontend/dist/index.html" ] || [ "$PROJECT_ROOT/frontend/src/styles.css" -nt "$PROJECT_ROOT/frontend/dist/index.html" ] || [ "$PROJECT_ROOT/frontend/index.html" -nt "$PROJECT_ROOT/frontend/dist/index.html" ]; then
+    echo "[0/2] 프론트엔드 정적 프로덕션 번들 빌드 중..."
+    (cd "$PROJECT_ROOT/frontend" && npm run build >/dev/null 2>&1 || npm run build)
+fi
+
+# 3. 이전 일자 로그 분할 및 7일 경과 로그 정리
+if command -v node >/dev/null 2>&1; then
+    node "$PROJECT_ROOT/backend/common/log_rotator.mjs" --startup >/dev/null 2>&1 || true
+fi
+
+# 4. 백엔드 실행 (Node.js Server)
 echo "[1/2] 백엔드 서비스 시작 중 (Port ${BACKEND_PORT})..."
 setsid node backend/node_server.mjs </dev/null >> logs/backend.log 2>&1 &
 BACKEND_PID=$!
 echo "$BACKEND_PID" > logs/.backend.pid
 echo "  -> 백엔드 PID: $BACKEND_PID (로그: logs/backend.log)"
 
-# 3. 프론트엔드 실행 (Vite Dev Server)
-echo "[2/2] 프론트엔드 서비스 시작 중 (Port ${FRONTEND_PORT})..."
-setsid bash -c "cd frontend && npx vite --port ${FRONTEND_PORT} --host ${FRONTEND_HOST}" </dev/null >> logs/frontend.log 2>&1 &
+# 4. 프론트엔드 실행 (보안 정적 파일 + API 프록시 서버)
+echo "[2/2] 프론트엔드 서비스 시작 중 (${FRONTEND_HOST}:${FRONTEND_PORT})..."
+setsid env FRONTEND_HOST="${FRONTEND_HOST}" FRONTEND_PORT="${FRONTEND_PORT}" BACKEND_URL="http://127.0.0.1:${BACKEND_PORT}" node frontend/server.mjs </dev/null >> logs/frontend.log 2>&1 &
 FRONTEND_PID=$!
 echo "$FRONTEND_PID" > logs/.frontend.pid
 echo "  -> 프론트엔드 PID: $FRONTEND_PID (로그: logs/frontend.log)"
@@ -67,7 +78,7 @@ echo ""
 echo "서비스 기동 상태 확인 중..."
 BACKEND_OK=0
 for i in {1..15}; do
-    if curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${BACKEND_PORT}/api/bots" 2>/dev/null | grep -q "200"; then
+    if curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${BACKEND_PORT}/api/version" 2>/dev/null | grep -q "200"; then
         echo "  [OK] 백엔드 API (http://localhost:${BACKEND_PORT}) 정상 응답"
         BACKEND_OK=1
         break

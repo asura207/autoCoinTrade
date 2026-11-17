@@ -2,6 +2,38 @@ import React, { useEffect, useMemo, useRef, useState, useCallback } from "react"
 
 const API_BASE = "";
 
+let onApiUnauthorizedHandler = null;
+if (typeof window !== "undefined" && !window.__autoCoinFetchWrapped) {
+  window.__autoCoinFetchWrapped = true;
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = async (input, init = {}) => {
+    const urlStr = typeof input === "string" ? input : input?.url || "";
+    const isSameOriginApi =
+      urlStr.startsWith("/api/") ||
+      (typeof window.location?.origin === "string" && urlStr.startsWith(`${window.location.origin}/api/`));
+    const nextInit = isSameOriginApi ? { credentials: "same-origin", ...init } : init;
+    const resp = await nativeFetch(input, nextInit);
+    if (
+      isSameOriginApi &&
+      resp.status === 401 &&
+      !urlStr.includes("/api/auth/verify") &&
+      !urlStr.includes("/api/auth/session") &&
+      !urlStr.includes("/api/auth/logout")
+    ) {
+      try {
+        sessionStorage.removeItem("autoCoinTrade_auth");
+        localStorage.removeItem("autoCoinTrade_auth");
+        sessionStorage.removeItem("autoCoinTrade_auth_date");
+        localStorage.removeItem("autoCoinTrade_auth_date");
+      } catch {}
+      if (typeof onApiUnauthorizedHandler === "function") {
+        onApiUnauthorizedHandler();
+      }
+    }
+    return resp;
+  };
+}
+
 function formatKRW(val) {
   if (val === null || val === undefined || val === "") return "";
   const cleaned = String(val).replace(/,/g, "");
@@ -1260,8 +1292,9 @@ function renderSimpleMarkdown(md) {
 }
 
 export default function App() {
-  // 1) 입장 코드 인증 상태 (날짜 변경 시 자동 만료 및 재인증 요구)
-  const [authenticated, setAuthenticated] = useState(() => isDailyGateAuthValid());
+  // 1) 입장 코드 인증 상태 (백엔드 HttpOnly 서명 쿠키 세션 검증 + KST 날짜 만료)
+  const [authenticated, setAuthenticated] = useState(false);
+  const [authChecking, setAuthChecking] = useState(true);
   const [entryCodeInput, setEntryCodeInput] = useState("");
   const [gateError, setGateError] = useState("");
 
@@ -1358,7 +1391,39 @@ export default function App() {
   }, [historyContent]);
 
   useEffect(() => {
+    onApiUnauthorizedHandler = () => {
+      setAuthenticated(false);
+      setEntryCodeInput("");
+      setGateError("인증 세션이 만료되었거나 무효화되었습니다. 입장 코드를 다시 입력해주세요.");
+    };
+    return () => {
+      onApiUnauthorizedHandler = null;
+    };
+  }, []);
+
+  useEffect(() => {
     fetchSetupStatus();
+    fetch(`${API_BASE}/api/auth/session`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (data && data.authenticated) {
+          const today = getTodayKSTDateString();
+          sessionStorage.setItem("autoCoinTrade_auth", "true");
+          localStorage.setItem("autoCoinTrade_auth", "true");
+          sessionStorage.setItem("autoCoinTrade_auth_date", today);
+          localStorage.setItem("autoCoinTrade_auth_date", today);
+          setAuthenticated(true);
+        } else {
+          sessionStorage.removeItem("autoCoinTrade_auth");
+          localStorage.removeItem("autoCoinTrade_auth");
+          sessionStorage.removeItem("autoCoinTrade_auth_date");
+          localStorage.removeItem("autoCoinTrade_auth_date");
+          setAuthenticated(false);
+        }
+      })
+      .catch(() => setAuthenticated(false))
+      .finally(() => setAuthChecking(false));
+
     fetch(`${API_BASE}/api/version`)
       .then((r) => r.json())
       .then((data) => {
@@ -1605,6 +1670,23 @@ export default function App() {
   const isStreamDoneRef = useRef(false);
   const isAiBusyRef = useRef(false);
   const activeStreamAbortControllerRef = useRef(null);
+
+  // 7-0) 로컬 Ollama(qwen3-news) 30분 단기 엔진 상태 & 설정 폼
+  const [ollamaStatus, setOllamaStatus] = useState({
+    enabled: true,
+    url: "http://192.168.0.100:11434",
+    reachable: false,
+    model: "qwen3-news",
+    latency_ms: 0,
+  });
+  const [ollamaForm, setOllamaForm] = useState({
+    use_local_ollama_news: true,
+    ollama_base_url: "http://192.168.0.100:11434",
+    ollama_news_model: "qwen3-news",
+    ollama_timeout_ms: 25000,
+  });
+  const [ollamaSaving, setOllamaSaving] = useState(false);
+  const [ollamaSaveMsg, setOllamaSaveMsg] = useState(null);
 
   // 7-1) AI 주간 봇 자동 추천 & 편성 상태 (1주일 주기)
   const [weeklyBotSelection, setWeeklyBotSelection] = useState({
@@ -2001,12 +2083,11 @@ export default function App() {
       const resp = await fetch(`${API_BASE}/api/settings/entry-code`);
       if (!resp.ok) return;
       const data = await resp.json();
-      if (data.success && data.entry_code) {
-        setEntryCodeSetting(data.entry_code);
-        setNewEntryCodeInput(data.entry_code);
+      if (data.success && data.configured) {
+        setEntryCodeSetting(data.masked || "••••••••");
       }
     } catch (err) {
-      console.warn("Failed to fetch entry code:", err);
+      console.warn("Failed to fetch entry code status:", err);
     }
   }, []);
 
@@ -2472,6 +2553,103 @@ export default function App() {
     }
   };
 
+  const getShortTermAiEngineMeta = useCallback((latestRecord = null, streamMetaObj = null) => {
+    const modelLabel = ollamaStatus?.model || "qwen3-news";
+    const activeProvider = streamMetaObj?.provider || latestRecord?.provider || "";
+    const isEnabled = Boolean(ollamaStatus?.enabled);
+    const isReachable = Boolean(ollamaStatus?.reachable);
+
+    if (isEnabled && (isReachable || (activeProvider === "ollama" && !streamMetaObj?.fallback_used))) {
+      return {
+        isOllama: true,
+        badgeText: `🟢 로컬 Ollama (${modelLabel})`,
+        bg: "rgba(16, 185, 129, 0.18)",
+        color: "#34d399",
+        border: "rgba(16, 185, 129, 0.45)",
+        tooltip: `맥북 프로 로컬 Ollama(${ollamaStatus?.url || ""}) 1순위 연동 중${
+          ollamaStatus?.latency_ms ? ` · ${ollamaStatus.latency_ms}ms` : ""
+        } · API 비용 0원`,
+      };
+    }
+
+    return {
+      isOllama: false,
+      badgeText: "🟡 Gemini Flash (Fallback)",
+      bg: "rgba(234, 179, 8, 0.18)",
+      color: "#facc15",
+      border: "rgba(234, 179, 8, 0.45)",
+      tooltip: isEnabled
+        ? `로컬 Ollama(${ollamaStatus?.url || ""}) 미응답 -> Gemini Flash 백업 엔진 자동 전환 모드`
+        : "로컬 Ollama 비활성화 -> Gemini Flash 백업 엔진 사용 중",
+    };
+  }, [ollamaStatus]);
+
+  const fetchOllamaSettings = useCallback(async (forceRefresh = false) => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/settings/ollama${forceRefresh ? "?refresh=1" : ""}`);
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.ollama) {
+          setOllamaStatus(data.ollama);
+        }
+        setOllamaForm({
+          use_local_ollama_news: Boolean(data.use_local_ollama_news),
+          ollama_base_url: data.ollama_base_url || "http://192.168.0.100:11434",
+          ollama_news_model: data.ollama_news_model || "qwen3-news",
+          ollama_timeout_ms: Number(data.ollama_timeout_ms || 25000),
+        });
+      }
+    } catch (err) {
+      console.warn("Failed to fetch Ollama settings:", err);
+    }
+  }, []);
+
+  const handleSaveOllamaSettings = async (e) => {
+    if (e) e.preventDefault();
+    setOllamaSaving(true);
+    setOllamaSaveMsg(null);
+    try {
+      const resp = await fetch(`${API_BASE}/api/settings/ollama`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          use_local_ollama_news: Boolean(ollamaForm.use_local_ollama_news),
+          ollama_base_url: String(ollamaForm.ollama_base_url || "").trim(),
+          ollama_news_model: String(ollamaForm.ollama_news_model || "").trim(),
+          ollama_timeout_ms: Number(ollamaForm.ollama_timeout_ms || 25000),
+        }),
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        if (data.ollama) {
+          setOllamaStatus(data.ollama);
+        }
+        setOllamaForm({
+          use_local_ollama_news: Boolean(data.use_local_ollama_news),
+          ollama_base_url: data.ollama_base_url,
+          ollama_news_model: data.ollama_news_model,
+          ollama_timeout_ms: Number(data.ollama_timeout_ms || 25000),
+        });
+        setOllamaSaveMsg({
+          type: data.use_local_ollama_news && !data.ollama?.reachable ? "warning" : "success",
+          text: data.message || "로컬 Ollama 설정이 저장되었습니다.",
+        });
+      } else {
+        setOllamaSaveMsg({
+          type: "danger",
+          text: data.message || "로컬 Ollama 설정 저장에 실패했습니다.",
+        });
+      }
+    } catch (err) {
+      setOllamaSaveMsg({
+        type: "danger",
+        text: `설정 저장 오류: ${err.message}`,
+      });
+    } finally {
+      setOllamaSaving(false);
+    }
+  };
+
   const fetchAiBriefing = async (silent = false) => {
     if (silent && isAiBusyRef.current) return;
     try {
@@ -2484,6 +2662,9 @@ export default function App() {
         }
         if (data.quota) {
           setGeminiQuota(data.quota);
+        }
+        if (data.ollama) {
+          setOllamaStatus(data.ollama);
         }
       }
     } catch (err) {
@@ -2502,6 +2683,9 @@ export default function App() {
         setNewsAiBriefing(data);
         if (data.quota) {
           setGeminiQuota(data.quota);
+        }
+        if (data.ollama) {
+          setOllamaStatus(data.ollama);
         }
         if (data.latest?.id) {
           if (lastBriefingIdRef.current !== null && Number(data.latest.id) > Number(lastBriefingIdRef.current)) {
@@ -2559,7 +2743,8 @@ export default function App() {
   };
 
   const triggerAiAnalysis = async () => {
-    if (geminiQuota && Number(geminiQuota.remaining_calls) <= 0) {
+    const canUseLocalOllama = Boolean(ollamaStatus?.enabled && ollamaStatus?.reachable);
+    if (!canUseLocalOllama && geminiQuota && Number(geminiQuota.remaining_calls) <= 0) {
       showModal(
         "무료 API 호출 한도 안내",
         "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
@@ -2678,7 +2863,7 @@ export default function App() {
                   regime_filter: nextRegimeFilter || prev.regime_filter,
                   latest: {
                     id: data.id,
-                    provider: "gemini",
+                    provider: data.provider || capturedMeta?.provider || "gemini",
                     model: data.model,
                     btc_price: capturedMeta?.btc_price,
                     btc_daily_20ma: capturedMeta?.btc_daily_20ma,
@@ -2757,20 +2942,22 @@ export default function App() {
     }
   };
 
-  // 입장 코드 검증 (기본: stock, 날짜가 바뀌면 재인증 요구)
+  // 입장 코드 검증 (백엔드 HttpOnly 서명 쿠키 발급, 날짜 변경 시 재인증 요구)
   const handleVerifyEntryCode = async (e) => {
     e.preventDefault();
     setGateError("");
     const trimmed = entryCodeInput.trim();
-    // 한글 자판 상태에서 stock을 입력한 경우(ㄴ새차) 자동 영문 변환
-    const normalized = trimmed === "ㄴ새차" ? "stock" : trimmed;
+    if (!trimmed) {
+      setGateError("입장 코드를 입력해주세요.");
+      return;
+    }
     const today = getTodayKSTDateString();
 
     try {
       const resp = await fetch(`${API_BASE}/api/auth/verify`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code: normalized }),
+        body: JSON.stringify({ code: trimmed }),
       });
       if (resp.ok) {
         sessionStorage.setItem("autoCoinTrade_auth", "true");
@@ -2784,18 +2971,21 @@ export default function App() {
         setGateError(err.message || "입장 코드가 일치하지 않습니다.");
       }
     } catch {
-      // 서버 연결 불가 시 기본 코드 'stock' 폴백
-      if (normalized.toLowerCase() === "stock") {
-        sessionStorage.setItem("autoCoinTrade_auth", "true");
-        localStorage.setItem("autoCoinTrade_auth", "true");
-        sessionStorage.setItem("autoCoinTrade_auth_date", today);
-        localStorage.setItem("autoCoinTrade_auth_date", today);
-        setEntryCodeInput("");
-        setAuthenticated(true);
-      } else {
-        setGateError("서버 연결 실패 또는 입장 코드가 일치하지 않습니다.");
-      }
+      setGateError("백엔드 서버와 통신할 수 없습니다. 잠시 후 다시 시도해주세요.");
     }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await fetch(`${API_BASE}/api/auth/logout`, { method: "POST" });
+    } catch {}
+    sessionStorage.removeItem("autoCoinTrade_auth");
+    localStorage.removeItem("autoCoinTrade_auth");
+    sessionStorage.removeItem("autoCoinTrade_auth_date");
+    localStorage.removeItem("autoCoinTrade_auth_date");
+    setEntryCodeInput("");
+    setGateError("");
+    setAuthenticated(false);
   };
 
   const effectiveRegimeFilter = useMemo(
@@ -2819,7 +3009,7 @@ export default function App() {
   useEffect(() => {
     if (typeof window !== "undefined" && "Notification" in window) {
       setNotificationPermission(Notification.permission);
-      if (Notification.permission === "granted") {
+      if (authenticated && Notification.permission === "granted") {
         registerAndSubscribePush(false);
       }
     }
@@ -2834,7 +3024,7 @@ export default function App() {
         navigator.serviceWorker.removeEventListener("message", handleSwMessage);
       };
     }
-  }, [registerAndSubscribePush]);
+  }, [authenticated, registerAndSubscribePush]);
 
   useEffect(() => {
     if (!authenticated) return;
@@ -2862,6 +3052,9 @@ export default function App() {
       const resp = await fetch(`${API_BASE}/api/upbit/status`);
       if (resp.ok) {
         const data = await resp.json();
+        if (data && data.ollama) {
+          setOllamaStatus(data.ollama);
+        }
         if (data && data.status) {
           setUpbitStatus(data);
         } else {
@@ -2904,6 +3097,9 @@ export default function App() {
       setBots(botList);
       if (data.regime_filter) {
         setRegimeFilter(data.regime_filter);
+      }
+      if (data.ollama) {
+        setOllamaStatus(data.ollama);
       }
       setTotalCapitalInput(
         data.total_capital !== null && data.total_capital !== undefined && data.total_capital !== 0
@@ -3100,6 +3296,9 @@ export default function App() {
       if (data.regime_filter) {
         setRegimeFilter(data.regime_filter);
       }
+      if (data.ollama) {
+        setOllamaStatus(data.ollama);
+      }
     } catch {}
   };
 
@@ -3118,6 +3317,7 @@ export default function App() {
     fetchAlgoLabModels();
     fetchRotationStatus();
     fetchEntryCode();
+    fetchOllamaSettings();
 
     const timer = setInterval(() => {
       fetchUpbitStatus();
@@ -3130,7 +3330,7 @@ export default function App() {
       fetchNewsAiBriefing(true);
     }, 6000);
     return () => clearInterval(timer);
-  }, [authenticated, selectedBotId, tradeMode.mode, fetchTradeMode, fetchAlgoLabModels, fetchRotationStatus, fetchEntryCode]);
+  }, [authenticated, selectedBotId, tradeMode.mode, fetchTradeMode, fetchAlgoLabModels, fetchRotationStatus, fetchEntryCode, fetchOllamaSettings]);
 
   // 가상거래 경쟁(Arena) 활성화 시 5초 주기 실시간 리더보드 및 체결 일지 자동 갱신
   useEffect(() => {
@@ -3169,8 +3369,9 @@ export default function App() {
     if (activeMenu === "settings") {
       fetchEntryCode();
       fetchRotationStatus();
+      fetchOllamaSettings(true);
     }
-  }, [activeMenu, fetchEntryCode, fetchRotationStatus]);
+  }, [activeMenu, fetchEntryCode, fetchRotationStatus, fetchOllamaSettings]);
 
   useEffect(() => {
     sessionStorage.setItem("autoCoinTrade_bot", selectedBotId);
@@ -3216,7 +3417,8 @@ export default function App() {
   );
 
   const triggerNewsAiAnalysis = async () => {
-    if (geminiQuota && Number(geminiQuota.remaining_calls) <= 0) {
+    const canUseLocalOllama = Boolean(ollamaStatus?.enabled && ollamaStatus?.reachable);
+    if (!canUseLocalOllama && geminiQuota && Number(geminiQuota.remaining_calls) <= 0) {
       showModal(
         "무료 API 호출 한도 안내",
         "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
@@ -3285,6 +3487,7 @@ export default function App() {
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let sseBuffer = "";
+      let capturedNewsMeta = null;
 
       while (true) {
         const { value, done } = await reader.read();
@@ -3302,6 +3505,7 @@ export default function App() {
             try {
               const data = JSON.parse(jsonStr);
               if (data.type === "meta") {
+                capturedNewsMeta = data;
                 setNewsStreamingMeta(data);
                 if (data.quota) {
                   setGeminiQuota(data.quota);
@@ -3333,7 +3537,7 @@ export default function App() {
                   quota: data.quota || prev.quota,
                   latest: {
                     id: data.id,
-                    provider: "gemini",
+                    provider: data.provider || capturedNewsMeta?.provider || "gemini",
                     model: data.model,
                     news_count: data.news_count,
                     bullish_count: data.bullish_count,
@@ -3675,8 +3879,8 @@ export default function App() {
       setEntryCodeMsg({ type: "error", text: "새 입장 코드를 입력해주세요." });
       return;
     }
-    if (trimmed.length < 2) {
-      setEntryCodeMsg({ type: "error", text: "입장 코드는 최소 2자 이상이어야 합니다." });
+    if (trimmed.length < 4) {
+      setEntryCodeMsg({ type: "error", text: "입장 코드는 보안을 위해 최소 4자 이상이어야 합니다." });
       return;
     }
     if (newEntryCodeConfirm !== "" && trimmed !== newEntryCodeConfirm.trim()) {
@@ -3692,16 +3896,16 @@ export default function App() {
       });
       const data = await resp.json();
       if (resp.ok && data.success) {
-        setEntryCodeSetting(data.entry_code);
-        setNewEntryCodeInput(data.entry_code);
+        setEntryCodeSetting(data.masked || "••••••••");
+        setNewEntryCodeInput("");
         setNewEntryCodeConfirm("");
         setEntryCodeMsg({
           type: "success",
-          text: `입장 코드가 [${data.entry_code}]로 성공적으로 변경되었습니다. 다음 접속 시 변경된 코드로 입장하세요.`,
+          text: data.message || "보안 입장 코드가 변경되었으며 기존 다른 세션은 즉시 무효화되었습니다.",
         });
         showModal(
           "입장 코드 변경 완료",
-          `입장 코드가 [${data.entry_code}]로 변경되었습니다.\n다음 로그인 시 변경된 코드를 입력해주세요.`,
+          "새 보안 입장 코드가 적용되었습니다.\n다음 접속부터 변경된 코드를 입력해야 하며, 다른 기기의 기존 로그인 세션은 즉시 만료되었습니다.",
           "success"
         );
       } else {
@@ -4308,14 +4512,15 @@ export default function App() {
             <input
               type="password"
               className="gate-input"
-              placeholder="입장 코드 입력 (기본: stock)"
+              placeholder="보안 입장 코드 입력"
               value={entryCodeInput}
               onChange={(e) => setEntryCodeInput(e.target.value)}
+              disabled={authChecking}
               autoFocus
             />
             {gateError && <div className="gate-error">{gateError}</div>}
-            <button type="submit" className="btn btn-primary" style={{ width: "100%" }}>
-              입장하기
+            <button type="submit" className="btn btn-primary" style={{ width: "100%" }} disabled={authChecking}>
+              {authChecking ? "세션 확인 중..." : "입장하기"}
             </button>
           </form>
           <div style={{ marginTop: "16px", textAlign: "center" }}>
@@ -4899,9 +5104,29 @@ export default function App() {
                     <span style={{ fontSize: "16px", fontWeight: 700, color: "#f8fafc" }}>
                       AI 실시간 시장 분석 & 봇 진단
                     </span>
+                    {(() => {
+                      const engineMeta = getShortTermAiEngineMeta(aiBriefing?.latest, streamingMeta);
+                      return (
+                        <span
+                          style={{
+                            marginLeft: "8px",
+                            fontSize: "11px",
+                            fontWeight: 700,
+                            padding: "2px 8px",
+                            borderRadius: "12px",
+                            background: engineMeta.bg,
+                            color: engineMeta.color,
+                            border: `1px solid ${engineMeta.border}`,
+                          }}
+                          title={engineMeta.tooltip}
+                        >
+                          {engineMeta.badgeText}
+                        </span>
+                      );
+                    })()}
                     <span
                       style={{
-                        marginLeft: "8px",
+                        marginLeft: "6px",
                         fontSize: "11px",
                         fontWeight: 600,
                         padding: "2px 8px",
@@ -4910,9 +5135,9 @@ export default function App() {
                         color: "#a5b4fc",
                         border: "1px solid rgba(99, 102, 241, 0.4)",
                       }}
-                      title="30분 단위 Gemini Flash 빠른 분석과 1시간 단위 Gemini Pro 심층 퀀트 분석 듀얼 엔진"
+                      title="30분 단위 로컬 Ollama(qwen3-news)/Gemini Flash 단기 분석과 1시간 단위 Gemini Pro 심층 퀀트 분석 듀얼 엔진"
                     >
-                      ⚡ Gemini Flash(30m) & Pro(1h) 듀얼 엔진
+                      ⚡ 30m 단기 & Pro(1h) 듀얼 엔진
                     </span>
                     <span
                       style={{
@@ -5080,29 +5305,36 @@ export default function App() {
                       padding: "5px 10px",
                       borderRadius: "8px",
                       background:
-                        Number(geminiQuota?.remaining_calls ?? 30) <= 0
+                        ollamaStatus?.enabled && ollamaStatus?.reachable
+                          ? "rgba(16, 185, 129, 0.16)"
+                          : Number(geminiQuota?.remaining_calls ?? 30) <= 0
                           ? "rgba(239, 68, 68, 0.18)"
                           : Number(geminiQuota?.remaining_calls ?? 30) <= 3
                           ? "rgba(234, 179, 8, 0.18)"
                           : "rgba(16, 185, 129, 0.16)",
                       color:
-                        Number(geminiQuota?.remaining_calls ?? 30) <= 0
+                        ollamaStatus?.enabled && ollamaStatus?.reachable
+                          ? "#34d399"
+                          : Number(geminiQuota?.remaining_calls ?? 30) <= 0
                           ? "#f87171"
                           : Number(geminiQuota?.remaining_calls ?? 30) <= 3
                           ? "#facc15"
                           : "#34d399",
                       border: `1px solid ${
-                        Number(geminiQuota?.remaining_calls ?? 30) <= 0
+                        ollamaStatus?.enabled && ollamaStatus?.reachable
+                          ? "rgba(16, 185, 129, 0.35)"
+                          : Number(geminiQuota?.remaining_calls ?? 30) <= 0
                           ? "rgba(239, 68, 68, 0.4)"
                           : Number(geminiQuota?.remaining_calls ?? 30) <= 3
                           ? "rgba(234, 179, 8, 0.4)"
                           : "rgba(16, 185, 129, 0.35)"
                       }`,
                     }}
-                    title={`일일 무료 한도 총 ${geminiQuota?.daily_total_limit ?? 50}건 중 자동 분석 예약(${geminiQuota?.auto_reserved_count ?? 6}건)을 제외한 수동 호출 잔여 건수`}
+                    title={`일일 Gemini 무료 한도 총 ${geminiQuota?.daily_total_limit ?? 50}건 중 자동 분석 예약(${geminiQuota?.auto_reserved_count ?? 6}건)을 제외한 수동 호출 잔여 건수`}
                   >
-                    무료 API 잔여: {geminiQuota?.remaining_calls ?? 30}/{geminiQuota?.manual_limit ?? 30}건 (자동예약{" "}
-                    {geminiQuota?.auto_reserved_count ?? 6}건 제외)
+                    {ollamaStatus?.enabled && ollamaStatus?.reachable
+                      ? `로컬 Ollama 무제한 (Gemini 백업 ${geminiQuota?.remaining_calls ?? 30}건)`
+                      : `무료 API 잔여: ${geminiQuota?.remaining_calls ?? 30}/${geminiQuota?.manual_limit ?? 30}건 (자동예약 ${geminiQuota?.auto_reserved_count ?? 6}건 제외)`}
                   </span>
 
                   <button
@@ -5134,10 +5366,16 @@ export default function App() {
                     ) : aiLoading ? (
                       <>
                         <span className="spinner" style={{ width: "13px", height: "13px" }} />
-                        Gemini 연결 중...
+                        {ollamaStatus?.enabled && ollamaStatus?.reachable ? "로컬 Ollama 연결 중..." : "Gemini 연결 중..."}
                       </>
                     ) : (
-                      <>⚡ AI 시황 분석 요청 ({geminiQuota?.remaining_calls ?? 30}건 남음)</>
+                      <>
+                        ⚡ AI 시황 분석 요청 (
+                        {ollamaStatus?.enabled && ollamaStatus?.reachable
+                          ? "로컬 Ollama"
+                          : `${geminiQuota?.remaining_calls ?? 30}건 남음`}
+                        )
+                      </>
                     )}
                   </button>
 
@@ -5300,7 +5538,7 @@ export default function App() {
                   </div>
 
                   {/* 아직 API 키가 없고 분석 기록도 없을 때의 안내 */}
-                  {!aiBriefing?.has_key && !aiBriefing?.latest && !aiLoading && !isStreaming && (
+                  {!aiBriefing?.has_key && !(ollamaStatus?.enabled && ollamaStatus?.reachable) && !aiBriefing?.latest && !aiLoading && !isStreaming && (
                     <div
                       style={{
                         padding: "20px",
@@ -5428,7 +5666,11 @@ export default function App() {
                                 {/* Flash 30분 단기 분석 */}
                                 <div style={{ padding: "8px 12px", background: "rgba(15, 23, 42, 0.6)", borderRadius: "6px", border: "1px solid rgba(56, 189, 248, 0.25)" }}>
                                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
-                                    <span style={{ fontSize: "12px", fontWeight: 700, color: "#38bdf8" }}>⚡ Gemini Flash (30분 단기)</span>
+                                    <span style={{ fontSize: "12px", fontWeight: 700, color: ollamaStatus?.enabled && ollamaStatus?.reachable ? "#34d399" : "#38bdf8" }}>
+                                      {ollamaStatus?.enabled && ollamaStatus?.reachable
+                                        ? `🟢 로컬 Ollama (${ollamaStatus?.model || "qwen3-news"} · 30분)`
+                                        : "⚡ Gemini Flash (30분 단기 · Fallback)"}
+                                    </span>
                                     <span
                                       style={{
                                         fontSize: "11px",
@@ -7051,7 +7293,10 @@ export default function App() {
         {(activeMenu === "arena" || activeMenu === "algo-lab") && (
           <div>
             {/* 페이지 상단 헤더 */}
-            <div className="page-header">
+            <div
+              className="page-header"
+              style={{ flexDirection: "column", alignItems: "stretch", gap: "12px" }}
+            >
               <div>
                 <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
                   <h2 className="page-title">🏆 가상거래 경쟁 (Always-On Arena)</h2>
@@ -7074,52 +7319,94 @@ export default function App() {
                 </p>
               </div>
 
-              {/* 우측 액션 버튼 */}
-              <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", marginTop: "10px" }}>
-                <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
+              {/* 하단 단일 행 액션 버튼 바 */}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "12px",
+                  flexWrap: "nowrap",
+                  overflowX: "auto",
+                  paddingTop: "4px",
+                }}
+              >
+                <span
+                  style={{
+                    fontSize: "12px",
+                    color: "var(--text-secondary)",
+                    whiteSpace: "nowrap",
+                    flexShrink: 0,
+                  }}
+                >
                   최근 갱신: {algoLabLastUpdated || "-"} (9초 상시)
                 </span>
-                <button
-                  type="button"
-                  className="btn btn-primary"
-                  onClick={handleExecuteRotationNow}
-                  disabled={rotationExecuting}
+                <div
                   style={{
-                    padding: "8px 14px",
-                    fontSize: "12.5px",
-                    display: "inline-flex",
+                    display: "flex",
                     alignItems: "center",
-                    gap: "6px",
-                    background: "linear-gradient(135deg, #f59e0b, #d97706)",
-                    borderColor: "#fbbf24",
-                    color: "#0f172a",
-                    fontWeight: 800,
+                    gap: "8px",
+                    flexWrap: "nowrap",
+                    flexShrink: 0,
                   }}
-                  title="3대 전략군(추세·스윙 / 변동성·돌파 / 역추세·그리드)별 1위 봇 3개를 즉시 실전 배치합니다."
                 >
-                  <span>{rotationExecuting ? "⏳" : "🏆"}</span>
-                  <span>{rotationExecuting ? "전략별 1위 선출 중..." : "🏆 전략별 1위 봇 즉시 실전 배치"}</span>
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-primary"
-                  onClick={handleRunAlgoLabCycle}
-                  disabled={algoLabCycleRunning}
-                  style={{ padding: "8px 14px", fontSize: "12.5px", display: "inline-flex", alignItems: "center", gap: "6px" }}
-                >
-                  <span>{algoLabCycleRunning ? "⏳" : "🔄"}</span>
-                  <span>{algoLabCycleRunning ? "시뮬레이션 중..." : "즉시 시뮬레이션 1사이클"}</span>
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-outline"
-                  onClick={handleResetAlgoLab}
-                  disabled={algoLabLoading}
-                  style={{ padding: "8px 14px", fontSize: "12.5px" }}
-                  title="가상거래 전용 원장(paper_trades)과 10대 봇 가상 잔고를 1,000만 원으로 리셋합니다."
-                >
-                  초기화 (가상거래 리셋)
-                </button>
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={handleExecuteRotationNow}
+                    disabled={rotationExecuting}
+                    style={{
+                      padding: "8px 14px",
+                      fontSize: "12.5px",
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      background: "linear-gradient(135deg, #f59e0b, #d97706)",
+                      borderColor: "#fbbf24",
+                      color: "#0f172a",
+                      fontWeight: 800,
+                      whiteSpace: "nowrap",
+                      flexShrink: 0,
+                    }}
+                    title="3대 전략군(추세·스윙 / 변동성·돌파 / 역추세·그리드)별 1위 봇 3개를 즉시 실전 배치합니다."
+                  >
+                    <span>{rotationExecuting ? "⏳" : "🏆"}</span>
+                    <span>{rotationExecuting ? "전략별 1위 선출 중..." : "전략별 1위 봇 즉시 실전 배치"}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={handleRunAlgoLabCycle}
+                    disabled={algoLabCycleRunning}
+                    style={{
+                      padding: "8px 14px",
+                      fontSize: "12.5px",
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      whiteSpace: "nowrap",
+                      flexShrink: 0,
+                    }}
+                  >
+                    <span>{algoLabCycleRunning ? "⏳" : "🔄"}</span>
+                    <span>{algoLabCycleRunning ? "시뮬레이션 중..." : "즉시 시뮬레이션 1사이클"}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-outline"
+                    onClick={handleResetAlgoLab}
+                    disabled={algoLabLoading}
+                    style={{
+                      padding: "8px 14px",
+                      fontSize: "12.5px",
+                      whiteSpace: "nowrap",
+                      flexShrink: 0,
+                    }}
+                    title="가상거래 전용 원장(paper_trades)과 10대 봇 가상 잔고를 1,000만 원으로 리셋합니다."
+                  >
+                    초기화 (가상거래 리셋)
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -7138,7 +7425,14 @@ export default function App() {
                 type="button"
                 className="btn btn-secondary"
                 onClick={() => handleMenuChange("settings")}
-                style={{ padding: "6px 14px", fontSize: "12px", borderColor: "rgba(99, 102, 241, 0.4)", color: "#c7d2fe" }}
+                style={{
+                  padding: "6px 14px",
+                  fontSize: "12px",
+                  borderColor: "rgba(99, 102, 241, 0.4)",
+                  color: "#c7d2fe",
+                  whiteSpace: "nowrap",
+                  flexShrink: 0,
+                }}
               >
                 ⚙️ 실전 담당 봇 선택 및 투자금 배분 설정 →
               </button>
@@ -7695,6 +7989,25 @@ export default function App() {
                       <h3 style={{ fontSize: "16px", fontWeight: 700, margin: 0, color: "#f8fafc" }}>
                         뉴스 기반 AI 종합 시장 판단 & 퀀트 운용 전략
                       </h3>
+                      {(() => {
+                        const newsEngineMeta = getShortTermAiEngineMeta(newsAiBriefing?.latest, newsStreamingMeta);
+                        return (
+                          <span
+                            style={{
+                              padding: "2px 8px",
+                              borderRadius: "12px",
+                              fontSize: "11px",
+                              fontWeight: 700,
+                              background: newsEngineMeta.bg,
+                              color: newsEngineMeta.color,
+                              border: `1px solid ${newsEngineMeta.border}`,
+                            }}
+                            title={newsEngineMeta.tooltip}
+                          >
+                            {newsEngineMeta.badgeText}
+                          </span>
+                        );
+                      })()}
                       <span
                         style={{
                           background: "rgba(99, 102, 241, 0.2)",
@@ -7705,7 +8018,12 @@ export default function App() {
                           fontWeight: 600,
                         }}
                       >
-                        {isNewsStreaming ? "⚡ 실시간 스트리밍 분석 중" : newsAiBriefing.latest?.model || "Gemini 3.5 Flash Lite"}
+                        {isNewsStreaming
+                          ? "⚡ 실시간 스트리밍 분석 중"
+                          : newsAiBriefing.latest?.model ||
+                            (ollamaStatus?.enabled && ollamaStatus?.reachable
+                              ? ollamaStatus?.model || "qwen3-news"
+                              : "Gemini Flash")}
                       </span>
                       <span
                         style={{
@@ -7757,29 +8075,36 @@ export default function App() {
                       padding: "6px 10px",
                       borderRadius: "8px",
                       background:
-                        Number(geminiQuota?.remaining_calls ?? 30) <= 0
+                        ollamaStatus?.enabled && ollamaStatus?.reachable
+                          ? "rgba(16, 185, 129, 0.16)"
+                          : Number(geminiQuota?.remaining_calls ?? 30) <= 0
                           ? "rgba(239, 68, 68, 0.18)"
                           : Number(geminiQuota?.remaining_calls ?? 30) <= 3
                           ? "rgba(234, 179, 8, 0.18)"
                           : "rgba(16, 185, 129, 0.16)",
                       color:
-                        Number(geminiQuota?.remaining_calls ?? 30) <= 0
+                        ollamaStatus?.enabled && ollamaStatus?.reachable
+                          ? "#34d399"
+                          : Number(geminiQuota?.remaining_calls ?? 30) <= 0
                           ? "#f87171"
                           : Number(geminiQuota?.remaining_calls ?? 30) <= 3
                           ? "#facc15"
                           : "#34d399",
                       border: `1px solid ${
-                        Number(geminiQuota?.remaining_calls ?? 30) <= 0
+                        ollamaStatus?.enabled && ollamaStatus?.reachable
+                          ? "rgba(16, 185, 129, 0.35)"
+                          : Number(geminiQuota?.remaining_calls ?? 30) <= 0
                           ? "rgba(239, 68, 68, 0.4)"
                           : Number(geminiQuota?.remaining_calls ?? 30) <= 3
                           ? "rgba(234, 179, 8, 0.4)"
                           : "rgba(16, 185, 129, 0.35)"
                       }`,
                     }}
-                    title={`일일 무료 한도 총 ${geminiQuota?.daily_total_limit ?? 50}건 중 자동 분석 예약(${geminiQuota?.auto_reserved_count ?? 6}건)을 제외한 수동 호출 잔여 건수`}
+                    title={`일일 Gemini 무료 한도 총 ${geminiQuota?.daily_total_limit ?? 50}건 중 자동 분석 예약(${geminiQuota?.auto_reserved_count ?? 6}건)을 제외한 수동 호출 잔여 건수`}
                   >
-                    무료 API 잔여: {geminiQuota?.remaining_calls ?? 30}/{geminiQuota?.manual_limit ?? 30}건 (자동예약{" "}
-                    {geminiQuota?.auto_reserved_count ?? 6}건 제외)
+                    {ollamaStatus?.enabled && ollamaStatus?.reachable
+                      ? `로컬 Ollama 무제한 (백업 ${geminiQuota?.remaining_calls ?? 30}건)`
+                      : `무료 API 잔여: ${geminiQuota?.remaining_calls ?? 30}/${geminiQuota?.manual_limit ?? 30}건 (자동예약 ${geminiQuota?.auto_reserved_count ?? 6}건 제외)`}
                   </span>
 
                   <button
@@ -7805,6 +8130,8 @@ export default function App() {
                         ? "AI 분석 스트리밍 중..."
                         : newsAiLoading
                         ? "AI 분석 준비 중..."
+                        : ollamaStatus?.enabled && ollamaStatus?.reachable
+                        ? "AI 분석하기 (로컬 Ollama)"
                         : `AI 분석하기 (${geminiQuota?.remaining_calls ?? 30}건 남음)`}
                     </span>
                   </button>
@@ -7908,7 +8235,7 @@ export default function App() {
                           ● 중립: {newsAiBriefing.latest.neutral_count || 0}건
                         </span>
                         <span style={{ fontSize: "12px", padding: "3px 8px", borderRadius: "6px", background: "rgba(99, 102, 241, 0.15)", color: "#a5b4fc" }}>
-                          모델: {newsAiBriefing.latest.model}
+                          엔진: {newsAiBriefing.latest.provider === "ollama" ? "🟢 로컬 Ollama" : "🟡 Gemini"} ({newsAiBriefing.latest.model})
                         </span>
                       </div>
                       <MarkdownViewer content={newsAiBriefing.latest.briefing_text} isStreaming={false} />
@@ -8616,6 +8943,7 @@ export default function App() {
                     onChange={(e) => setRotationConfigDraft((prev) => ({ ...prev, allocation_mode: e.target.value }))}
                     style={{ width: "100%", padding: "8px 10px" }}
                   >
+                    <option value="SINGLE_MARKET_FIT_100">시장 상황 맞춤 1개 집중 (100% · 단일 봇)</option>
                     <option value="RANK_WEIGHTED_40_35_25">성적순 차등 A (40% : 35% : 25% · 기본값)</option>
                     <option value="RANK_WEIGHTED_40_40_20">성적순 차등 B (40% : 40% : 20%)</option>
                     <option value="EQUAL_34_33_33">전략군 균등 (34% : 33% : 33%)</option>
@@ -10012,24 +10340,34 @@ export default function App() {
                     3. 보안 및 입장 코드(Gate Code) 설정
                   </h3>
                   <p style={{ margin: "4px 0 0 0", fontSize: "12.5px", color: "#94a3b8" }}>
-                    시스템 초기 진입 시 요구되는 개인 전용 보안 입장 코드를 조회하고 변경합니다. (기본값: <code>stock</code>)
+                    외부/내부 접속 시 HttpOnly 서명 쿠키 세션 발급에 사용되는 개인 전용 입장 코드를 변경합니다. (최소 4자)
                   </p>
                 </div>
-                {entryCodeSetting && (
-                  <span
-                    style={{
-                      padding: "4px 10px",
-                      borderRadius: "8px",
-                      fontSize: "12px",
-                      fontWeight: 600,
-                      background: "rgba(56, 189, 248, 0.15)",
-                      color: "#38bdf8",
-                      border: "1px solid rgba(56, 189, 248, 0.3)",
-                    }}
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                  {entryCodeSetting && (
+                    <span
+                      style={{
+                        padding: "4px 10px",
+                        borderRadius: "8px",
+                        fontSize: "12px",
+                        fontWeight: 600,
+                        background: "rgba(56, 189, 248, 0.15)",
+                        color: "#38bdf8",
+                        border: "1px solid rgba(56, 189, 248, 0.3)",
+                      }}
+                    >
+                      적용 상태: 설정됨 ({entryCodeSetting})
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    style={{ fontSize: "12px", padding: "5px 10px" }}
+                    onClick={handleLogout}
                   >
-                    현재 적용 코드: {showEntryCode ? entryCodeSetting : "••••••••"}
-                  </span>
-                )}
+                    🔒 세션 잠금(로그아웃)
+                  </button>
+                </div>
               </div>
 
               <form onSubmit={handleSaveEntryCode} style={{ maxWidth: "600px" }}>
@@ -10043,7 +10381,7 @@ export default function App() {
                 >
                   <div className="form-row" style={{ margin: 0 }}>
                     <label style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <span>새 입장 코드</span>
+                      <span>새 입장 코드 (최소 4자)</span>
                       <button
                         type="button"
                         onClick={() => setShowEntryCode(!showEntryCode)}
@@ -10056,13 +10394,13 @@ export default function App() {
                           padding: "0 2px",
                         }}
                       >
-                        {showEntryCode ? "숨기기 🙈" : "보기 👁️"}
+                        {showEntryCode ? "숨기기 🙈" : "입력값 보기 👁️"}
                       </button>
                     </label>
                     <input
                       type={showEntryCode ? "text" : "password"}
                       className="form-input"
-                      placeholder="새 입장 코드 입력"
+                      placeholder="새 입장 코드 입력 (최소 4자)"
                       value={newEntryCodeInput}
                       onChange={(e) => setNewEntryCodeInput(e.target.value)}
                       required
@@ -10120,6 +10458,190 @@ export default function App() {
                     title="기본값 stock으로 입력란을 채웁니다."
                   >
                     기본값(stock)으로 입력
+                  </button>
+                </div>
+              </form>
+            </div>
+
+            {/* 3-1. 로컬 Ollama (30분 단기 뉴스·시황 AI) 연동 설정 */}
+            <div className="card" style={{ marginBottom: "20px" }}>
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  marginBottom: "14px",
+                  flexWrap: "wrap",
+                  gap: "10px",
+                }}
+              >
+                <div>
+                  <h3 style={{ fontSize: "16px", fontWeight: 700, margin: 0, color: "#f8fafc" }}>
+                    3-1. 로컬 Ollama AI (30분 단기 뉴스·시황) 연동 설정
+                  </h3>
+                  <p style={{ margin: "4px 0 0 0", fontSize: "12.5px", color: "#94a3b8" }}>
+                    30분 주기 단기 뉴스 감성 및 시장 체제 분석(FLASH_30M)을 맥북 프로 로컬 Ollama(qwen3-news)로 1순위 호출하고, 장애 시 Gemini Flash → BTC 20MA 기계적 모드로 자동 전환합니다.
+                  </p>
+                </div>
+                <span
+                  style={{
+                    padding: "4px 10px",
+                    borderRadius: "8px",
+                    fontSize: "12px",
+                    fontWeight: 700,
+                    background:
+                      ollamaStatus?.enabled && ollamaStatus?.reachable
+                        ? "rgba(16, 185, 129, 0.18)"
+                        : "rgba(234, 179, 8, 0.18)",
+                    color:
+                      ollamaStatus?.enabled && ollamaStatus?.reachable ? "#34d399" : "#facc15",
+                    border: `1px solid ${
+                      ollamaStatus?.enabled && ollamaStatus?.reachable
+                        ? "rgba(16, 185, 129, 0.4)"
+                        : "rgba(234, 179, 8, 0.4)"
+                    }`,
+                  }}
+                >
+                  {ollamaStatus?.enabled
+                    ? ollamaStatus?.reachable
+                      ? `🟢 연결 정상 (${ollamaStatus.model} · ${ollamaStatus.latency_ms}ms)`
+                      : `🟡 미응답 (Gemini Flash Fallback 대기)`
+                    : "⚪ 비활성화 (Gemini Flash 직접 사용)"}
+                </span>
+              </div>
+
+              <form onSubmit={handleSaveOllamaSettings} style={{ maxWidth: "760px" }}>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "10px",
+                    marginBottom: "14px",
+                    padding: "10px 14px",
+                    borderRadius: "8px",
+                    background: "rgba(15, 23, 42, 0.6)",
+                    border: "1px solid rgba(148, 163, 184, 0.2)",
+                  }}
+                >
+                  <input
+                    id="useLocalOllamaNewsToggle"
+                    type="checkbox"
+                    checked={Boolean(ollamaForm.use_local_ollama_news)}
+                    onChange={(e) =>
+                      setOllamaForm((prev) => ({
+                        ...prev,
+                        use_local_ollama_news: e.target.checked,
+                      }))
+                    }
+                    style={{ width: "18px", height: "18px", accentColor: "#10b981", cursor: "pointer" }}
+                  />
+                  <label
+                    htmlFor="useLocalOllamaNewsToggle"
+                    style={{ fontSize: "13.5px", fontWeight: 700, color: "#f8fafc", cursor: "pointer", margin: 0 }}
+                  >
+                    30분 단기 시황·뉴스 분석에 로컬 Ollama 1순위 사용 (use_local_ollama_news)
+                  </label>
+                </div>
+
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                    gap: "12px",
+                    marginBottom: "12px",
+                  }}
+                >
+                  <div className="form-row" style={{ margin: 0 }}>
+                    <label>Ollama 서버 URL (ollama_base_url)</label>
+                    <input
+                      type="text"
+                      className="form-input"
+                      placeholder="http://192.168.0.100:11434"
+                      value={ollamaForm.ollama_base_url}
+                      onChange={(e) =>
+                        setOllamaForm((prev) => ({ ...prev, ollama_base_url: e.target.value }))
+                      }
+                      required
+                    />
+                  </div>
+                  <div className="form-row" style={{ margin: 0 }}>
+                    <label>Ollama 모델명 (ollama_news_model)</label>
+                    <input
+                      type="text"
+                      className="form-input"
+                      placeholder="qwen3-news"
+                      value={ollamaForm.ollama_news_model}
+                      onChange={(e) =>
+                        setOllamaForm((prev) => ({ ...prev, ollama_news_model: e.target.value }))
+                      }
+                      required
+                    />
+                  </div>
+                  <div className="form-row" style={{ margin: 0 }}>
+                    <label>타임아웃 (ms · 기본 25000)</label>
+                    <input
+                      type="number"
+                      min="3000"
+                      max="120000"
+                      step="1000"
+                      className="form-input"
+                      value={ollamaForm.ollama_timeout_ms}
+                      onChange={(e) =>
+                        setOllamaForm((prev) => ({
+                          ...prev,
+                          ollama_timeout_ms: Number(e.target.value || 25000),
+                        }))
+                      }
+                    />
+                  </div>
+                </div>
+
+                {ollamaSaveMsg && (
+                  <div
+                    style={{
+                      padding: "8px 12px",
+                      borderRadius: "6px",
+                      fontSize: "12.5px",
+                      marginBottom: "12px",
+                      background:
+                        ollamaSaveMsg.type === "success"
+                          ? "rgba(34, 197, 94, 0.15)"
+                          : ollamaSaveMsg.type === "warning"
+                          ? "rgba(234, 179, 8, 0.15)"
+                          : "rgba(239, 68, 68, 0.15)",
+                      color:
+                        ollamaSaveMsg.type === "success"
+                          ? "#4ade80"
+                          : ollamaSaveMsg.type === "warning"
+                          ? "#fde047"
+                          : "#fca5a5",
+                      border: `1px solid ${
+                        ollamaSaveMsg.type === "success"
+                          ? "#22c55e"
+                          : ollamaSaveMsg.type === "warning"
+                          ? "#eab308"
+                          : "#ef4444"
+                      }`,
+                    }}
+                  >
+                    {ollamaSaveMsg.text}
+                  </div>
+                )}
+
+                <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+                  <button
+                    type="submit"
+                    className="btn btn-primary"
+                    disabled={ollamaSaving}
+                  >
+                    {ollamaSaving ? "연결 확인 및 저장 중..." : "💾 로컬 Ollama 설정 저장 및 연결 테스트"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-outline"
+                    onClick={() => fetchOllamaSettings(true)}
+                  >
+                    🔄 연결 상태 새로고침
                   </button>
                 </div>
               </form>

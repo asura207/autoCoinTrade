@@ -27,16 +27,24 @@ trading_ledger.db
 # Logs & PID files
 logs/
 *.log
+*.log_*
 *.pid
 install/app/logs/*.log
+install/app/logs/*.log_*
+install/app/logs/.log_rotation_state.json
+install/app/logs/.rotate.lock
 install/app/logs/.backend.pid
 install/app/logs/.frontend.pid
+install/app/logs/.tunnel.pid
+install/app/logs/.orchestrator.pid
 
 # Environment & Secrets
 .env
 .env.*
 !.env.example
 config/upbit_config.json
+data/.session_secret
 install/app/.env
 install/app/config/upbit_config.json
+install/app/data/.session_secret
 .aider*

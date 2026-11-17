@@ -7,7 +7,13 @@ import pg from "pg";
 import { pgDb } from "./common/pg_db.mjs";
 import { sqliteDb } from "./common/sqlite_db.mjs";
 import { pgSyncManager } from "./common/pg_sync.mjs";
-import { syncNewsToDatabase, queryNewsList } from "./common/news_service.mjs";
+import {
+  syncNewsToDatabase,
+  queryNewsList,
+  getRecentNewsForAiAnalysis,
+  getNewsSentimentStats,
+} from "./common/news_service.mjs";
+import { startLogRotationScheduler } from "./common/log_rotator.mjs";
 import * as webpush from "web-push";
 import {
   STRATEGY_GROUP_ORDER,
@@ -37,9 +43,9 @@ const __dirname = path.dirname(__filename);
 const BASE_DIR = path.resolve(__dirname, "..");
 const DATA_DIR = path.join(BASE_DIR, "data");
 const DB_PATH = path.join(DATA_DIR, "auto_coin_trade.db");
-const CONFIG_PATH = path.join(BASE_DIR, "config", "upbit_config.json");
+const CONFIG_PATH = process.env.AUTOCOIN_CONFIG_PATH || path.join(BASE_DIR, "config", "upbit_config.json");
 const EXAMPLE_CONFIG_PATH = path.join(BASE_DIR, "config", "upbit_config.example.json");
-const ENV_PATH = path.join(BASE_DIR, ".env");
+const ENV_PATH = process.env.AUTOCOIN_ENV_PATH || path.join(BASE_DIR, ".env");
 if (fs.existsSync(ENV_PATH)) {
   const raw = fs.readFileSync(ENV_PATH, "utf-8");
   for (const line of raw.split(/\r?\n/)) {
@@ -55,7 +61,7 @@ if (fs.existsSync(ENV_PATH)) {
     }
   }
 }
-const HOST = process.env.BACKEND_HOST || "0.0.0.0";
+const HOST = process.env.BACKEND_HOST || "127.0.0.1";
 const PORT = Number(process.env.BACKEND_PORT || process.env.PORT || 8001);
 
 let APP_VERSION = "0.0.22";
@@ -288,24 +294,28 @@ function normalizeBlacklistTickers(rawList) {
 }
 
 function buildMechanicalFallbackRegime({ btcPrice = 0, btcDaily20Ma = 0, btc4h60Ma = 0, label = "Fallback" } = {}) {
-  const hasMa = btcPrice > 0 && btcDaily20Ma > 0;
-  const isAboveMa20 = !hasMa || btcPrice >= btcDaily20Ma;
-  const disparity = hasMa ? (((btcPrice - btcDaily20Ma) / btcDaily20Ma) * 100).toFixed(2) : "0.00";
+  const hasDailyMa = btcPrice > 0 && btcDaily20Ma > 0;
+  const has4hMa = btcPrice > 0 && btc4h60Ma > 0;
+  const isBelowDailyMa20 = hasDailyMa && btcPrice < btcDaily20Ma;
+  const isBelow4hMa60 = has4hMa && btcPrice < btc4h60Ma;
+  const isBelowDefenseMa = isBelowDailyMa20 || isBelow4hMa60;
+  const disparityDaily = hasDailyMa ? (((btcPrice - btcDaily20Ma) / btcDaily20Ma) * 100).toFixed(2) : "0.00";
+  const disparity4h = has4hMa ? (((btcPrice - btc4h60Ma) / btc4h60Ma) * 100).toFixed(2) : "0.00";
   const overrides = {};
   for (const id of ALL_BOT_IDS) {
-    overrides[id] = !isAboveMa20 && TREND_BREAKOUT_BOT_IDS.has(id) ? "BLOCK" : "ALLOW";
+    overrides[id] = isBelowDefenseMa && TREND_BREAKOUT_BOT_IDS.has(id) ? "BLOCK" : "ALLOW";
   }
   return {
-    sentiment_score: isAboveMa20 ? 0.2 : -0.3,
-    market_regime: isAboveMa20 ? "BULL" : "BEAR",
+    sentiment_score: isBelowDefenseMa ? -0.3 : 0.2,
+    market_regime: isBelowDailyMa20 ? "BEAR" : isBelow4hMa60 ? "SIDEWAYS" : "BULL",
     risk_alert: false,
-    recommended_action: isAboveMa20 ? "NORMAL" : "REDUCE_SIZE",
-    position_size_multiplier: isAboveMa20 ? 1.0 : 0.5,
+    recommended_action: isBelowDefenseMa ? "REDUCE_SIZE" : "NORMAL",
+    position_size_multiplier: isBelowDefenseMa ? 0.5 : 1.0,
     bot_overrides: overrides,
     blacklist_tickers: [],
-    reason: isAboveMa20
-      ? `[${label}] BTC 일봉 20MA(${Math.floor(btcDaily20Ma).toLocaleString("ko-KR")}원) 상단(${disparity}%) -> 10대 봇 전체 ALLOW(1.0x)`
-      : `[${label}] BTC 일봉 20MA(${Math.floor(btcDaily20Ma).toLocaleString("ko-KR")}원) 하단(${disparity}%) -> 돌파형 봇 BLOCK & 역추세·그리드·눌림목 ALLOW(0.5x)`,
+    reason: isBelowDefenseMa
+      ? `[${label}] BTC 지표 방어(일봉 20MA ${disparityDaily}% / 4시간 60MA ${disparity4h}%) 하단 -> 돌파형 봇 BLOCK & 역추세·그리드·눌림목 ALLOW(0.5x)`
+      : `[${label}] BTC 지표 상단(일봉 20MA ${disparityDaily}% / 4시간 60MA ${disparity4h}%) -> 10대 봇 전체 ALLOW(1.0x)`,
   };
 }
 
@@ -761,8 +771,10 @@ export async function initializeDatabase() {
     ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS sell_fee DOUBLE PRECISION;
     ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS realized_pnl DOUBLE PRECISION;
     ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS pnl_pct DOUBLE PRECISION;
+    ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS buy_reason TEXT;
     ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS buy_reason TEXT;
     ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS sell_reason TEXT;
+    ALTER TABLE paper_bot_positions ADD COLUMN IF NOT EXISTS buy_reason TEXT;
     UPDATE bot_positions SET market = ticker WHERE (market IS NULL OR market = '') AND ticker IS NOT NULL AND ticker != '';
     UPDATE bot_positions SET ticker = market WHERE (ticker IS NULL OR ticker = '') AND market IS NOT NULL AND market != '';
     ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS flash_sentiment_score DOUBLE PRECISION DEFAULT 0.0;
@@ -869,6 +881,10 @@ export async function initializeDatabase() {
   await setDefault.run("zero_balance_reason", "", now);
   await setDefault.run("stats_start_date", "2026-10-01", now);
   await setDefault.run("entry_code", "stock", now);
+  await setDefault.run("use_local_ollama_news", String(process.env.USE_LOCAL_OLLAMA_NEWS ?? "true"), now);
+  await setDefault.run("ollama_base_url", String(process.env.OLLAMA_BASE_URL || "http://192.168.0.100:11434"), now);
+  await setDefault.run("ollama_news_model", String(process.env.OLLAMA_NEWS_MODEL || "qwen3-news"), now);
+  await setDefault.run("ollama_timeout_ms", String(process.env.OLLAMA_TIMEOUT_MS || "25000"), now);
 }
 
 if (process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
@@ -1828,12 +1844,212 @@ async function checkUpbitStatus() {
   }
 }
 
+const SESSION_COOKIE_NAME = "autoCoinTrade_session";
+const SESSION_SECRET_PATH = path.join(DATA_DIR, ".session_secret");
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const AUTH_RATE_LIMIT_MAX_ATTEMPTS = 5;
+const AUTH_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
+const AUTH_RATE_LIMIT_LOCK_MS = 15 * 60 * 1000;
+const authFailedAttemptsByIp = new Map();
+let cachedSessionSecret = null;
+
+function getSessionSecret() {
+  if (cachedSessionSecret) return cachedSessionSecret;
+  const envSecret = String(process.env.SESSION_SECRET || "").trim();
+  if (envSecret.length >= 16) {
+    cachedSessionSecret = envSecret;
+    return cachedSessionSecret;
+  }
+  if (process.env.AUTOCOIN_LIBRARY_MODE === "1") {
+    cachedSessionSecret = crypto.randomBytes(32).toString("hex");
+    return cachedSessionSecret;
+  }
+  try {
+    if (fs.existsSync(SESSION_SECRET_PATH)) {
+      const saved = fs.readFileSync(SESSION_SECRET_PATH, "utf-8").trim();
+      if (saved.length >= 32) {
+        cachedSessionSecret = saved;
+        return cachedSessionSecret;
+      }
+    }
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    const generated = crypto.randomBytes(32).toString("hex");
+    fs.writeFileSync(SESSION_SECRET_PATH, generated + "\n", { encoding: "utf-8", mode: 0o600 });
+    fs.chmodSync(SESSION_SECRET_PATH, 0o600);
+    cachedSessionSecret = generated;
+    return cachedSessionSecret;
+  } catch {
+    cachedSessionSecret = crypto.randomBytes(32).toString("hex");
+    return cachedSessionSecret;
+  }
+}
+
+function timingSafeEqualText(a, b) {
+  const da = crypto.createHash("sha256").update(String(a ?? ""), "utf8").digest();
+  const db = crypto.createHash("sha256").update(String(b ?? ""), "utf8").digest();
+  return crypto.timingSafeEqual(da, db);
+}
+
+function entryCodeVersionTag(entryCode) {
+  return crypto.createHash("sha256").update(String(entryCode ?? ""), "utf8").digest("hex").slice(0, 16);
+}
+
+async function getEffectiveEntryCode() {
+  const defaultEntry = String(process.env.GATE_CODE || process.env.ENTRY_CODE || "stock").trim() || "stock";
+  try {
+    const gCode = await getSetting("gate_code", "");
+    if (gCode && String(gCode).trim()) return String(gCode).trim();
+    const eCode = await getSetting("entry_code", "");
+    if (eCode && String(eCode).trim()) return String(eCode).trim();
+  } catch {}
+  return defaultEntry;
+}
+
+function parseRequestCookies(req) {
+  const raw = String(req.headers?.cookie || "");
+  const out = {};
+  if (!raw) return out;
+  for (const part of raw.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq <= 0) continue;
+    const k = part.slice(0, eq).trim();
+    const v = part.slice(eq + 1).trim();
+    if (k) out[k] = v;
+  }
+  return out;
+}
+
+function createSignedSessionToken(entryCode) {
+  const nowMs = Date.now();
+  const payload = {
+    iat: nowMs,
+    exp: nowMs + SESSION_TTL_MS,
+    kst_date: todayDateString(),
+    v: entryCodeVersionTag(entryCode),
+    nonce: crypto.randomBytes(8).toString("hex"),
+  };
+  const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const sig = crypto.createHmac("sha256", getSessionSecret()).update(encoded).digest("base64url");
+  return `${encoded}.${sig}`;
+}
+
+function verifySignedSessionToken(token, entryCode) {
+  if (!token || typeof token !== "string") return false;
+  const parts = token.split(".");
+  if (parts.length !== 2) return false;
+  const [encoded, sig] = parts;
+  if (!encoded || !sig) return false;
+  const expectedSig = crypto.createHmac("sha256", getSessionSecret()).update(encoded).digest("base64url");
+  const sigBuf = Buffer.from(sig, "utf8");
+  const expBuf = Buffer.from(expectedSig, "utf8");
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    return false;
+  }
+  try {
+    const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+    if (!payload || typeof payload !== "object") return false;
+    if (Number(payload.exp || 0) <= Date.now()) return false;
+    if (String(payload.kst_date || "") !== todayDateString()) return false;
+    if (!timingSafeEqualText(payload.v || "", entryCodeVersionTag(entryCode))) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function buildSessionCookieHeader(req, token, maxAgeSec = 86400) {
+  const xfProto = String(req.headers?.["x-forwarded-proto"] || "").toLowerCase();
+  const isHttps = xfProto.split(",")[0]?.trim() === "https" || Boolean(req.socket?.encrypted);
+  return `${SESSION_COOKIE_NAME}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSec}${isHttps ? "; Secure" : ""}`;
+}
+
+async function isRequestAuthenticated(req) {
+  const cookies = parseRequestCookies(req);
+  const token = cookies[SESSION_COOKIE_NAME];
+  if (!token) return false;
+  const effectiveCode = await getEffectiveEntryCode();
+  return verifySignedSessionToken(token, effectiveCode);
+}
+
+function getClientIpForAuth(req) {
+  const rawRemote = String(req.socket?.remoteAddress || "127.0.0.1");
+  const isLoopback = rawRemote === "127.0.0.1" || rawRemote === "::1" || rawRemote === "::ffff:127.0.0.1";
+  if (isLoopback) {
+    const cfIp = String(req.headers?.["cf-connecting-ip"] || "").trim();
+    if (cfIp) return cfIp;
+    const xff = String(req.headers?.["x-forwarded-for"] || "").split(",")[0]?.trim();
+    if (xff) return xff;
+  }
+  return rawRemote.replace(/^::ffff:/, "");
+}
+
+function checkAuthRateLimit(ip) {
+  const now = Date.now();
+  if (authFailedAttemptsByIp.size > 1000) {
+    for (const [k, rec] of authFailedAttemptsByIp.entries()) {
+      if (rec.lockedUntil <= now && now - rec.firstFailAt > AUTH_RATE_LIMIT_WINDOW_MS) {
+        authFailedAttemptsByIp.delete(k);
+      }
+    }
+  }
+  const rec = authFailedAttemptsByIp.get(ip);
+  if (!rec) return { blocked: false, retryAfterSec: 0 };
+  if (rec.lockedUntil > now) {
+    return { blocked: true, retryAfterSec: Math.max(1, Math.ceil((rec.lockedUntil - now) / 1000)) };
+  }
+  if (now - rec.firstFailAt > AUTH_RATE_LIMIT_WINDOW_MS) {
+    authFailedAttemptsByIp.delete(ip);
+    return { blocked: false, retryAfterSec: 0 };
+  }
+  return { blocked: false, retryAfterSec: 0 };
+}
+
+function recordAuthFailure(ip) {
+  const now = Date.now();
+  let rec = authFailedAttemptsByIp.get(ip);
+  if (!rec || now - rec.firstFailAt > AUTH_RATE_LIMIT_WINDOW_MS) {
+    rec = { count: 1, firstFailAt: now, lockedUntil: 0 };
+  } else {
+    rec.count += 1;
+  }
+  if (rec.count >= AUTH_RATE_LIMIT_MAX_ATTEMPTS) {
+    rec.lockedUntil = now + AUTH_RATE_LIMIT_LOCK_MS;
+  }
+  authFailedAttemptsByIp.set(ip, rec);
+  return rec;
+}
+
+function getCorsHeaders(req) {
+  const origin = String(req?.headers?.origin || "").trim();
+  if (!origin) return {};
+  const rawRemote = String(req?.socket?.remoteAddress || "");
+  const isLoopback = rawRemote === "127.0.0.1" || rawRemote === "::1" || rawRemote === "::ffff:127.0.0.1";
+  const host = String(req?.headers?.host || "").trim();
+  const forwardedHost = isLoopback ? String(req?.headers?.["x-forwarded-host"] || "").split(",")[0]?.trim() : "";
+  const allowedList = String(process.env.CORS_ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const matchesHost = (h) => Boolean(h && (origin === `http://${h}` || origin === `https://${h}`));
+  if (matchesHost(host) || matchesHost(forwardedHost) || allowedList.includes(origin)) {
+    return {
+      "Access-Control-Allow-Origin": origin,
+      "Access-Control-Allow-Credentials": "true",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      Vary: "Origin",
+    };
+  }
+  return { Vary: "Origin" };
+}
+
 function sendJson(res, statusCode, payload, extraHeaders = {}) {
   res.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-    "Access-Control-Allow-Headers": "*",
+    "X-Content-Type-Options": "nosniff",
+    ...(res.__corsHeaders || {}),
     ...extraHeaders,
   });
   res.end(JSON.stringify(payload));
@@ -1857,12 +2073,241 @@ function readJsonBody(req) {
   });
 }
 
-async function getGeminiApiKey() {
+const DEFAULT_OLLAMA_BASE_URL = "http://192.168.0.100:11434";
+const DEFAULT_OLLAMA_NEWS_MODEL = "qwen3-news";
+const DEFAULT_OLLAMA_TIMEOUT_MS = 25000;
+
+function parseBooleanFlag(val, defaultVal = true) {
+  if (val === undefined || val === null || val === "") return defaultVal;
+  if (typeof val === "boolean") return val;
+  const s = String(val).trim().toLowerCase();
+  if (["true", "1", "yes", "on"].includes(s)) return true;
+  if (["false", "0", "no", "off"].includes(s)) return false;
+  return defaultVal;
+}
+
+function getRuntimeConfig() {
   const cfgPath = fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : EXAMPLE_CONFIG_PATH;
-  let cfg = {};
   try {
-    cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
-  } catch {}
+    return JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveRuntimeConfig(partial = {}) {
+  try {
+    let cfg = {};
+    if (fs.existsSync(CONFIG_PATH)) {
+      cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    } else if (fs.existsSync(EXAMPLE_CONFIG_PATH)) {
+      cfg = JSON.parse(fs.readFileSync(EXAMPLE_CONFIG_PATH, "utf-8"));
+    }
+    const merged = { ...cfg, ...partial };
+    fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(merged, null, 2), { encoding: "utf-8", mode: 0o600 });
+    fs.chmodSync(CONFIG_PATH, 0o600);
+    return merged;
+  } catch (err) {
+    console.error("Failed to write to config/upbit_config.json:", err.message);
+    return null;
+  }
+}
+
+let cachedOllamaStatus = {
+  key: "",
+  checkedAtMs: 0,
+  value: null,
+};
+
+function invalidateOllamaStatusCache() {
+  cachedOllamaStatus = { key: "", checkedAtMs: 0, value: null };
+}
+
+async function getOllamaRuntimeConfig(options = {}) {
+  const cfg = fs.existsSync(CONFIG_PATH) ? getRuntimeConfig() : {};
+  let uiConfigured = "";
+  let dbUseLocal = "";
+  let dbBaseUrl = "";
+  let dbModel = "";
+  let dbTimeout = "";
+
+  if (!options?.skipDb) {
+    try {
+      uiConfigured = await getSetting("ollama_ui_configured", "");
+      dbUseLocal = await getSetting("use_local_ollama_news", "");
+      dbBaseUrl = await getSetting("ollama_base_url", "");
+      dbModel = await getSetting("ollama_news_model", "");
+      dbTimeout = await getSetting("ollama_timeout_ms", "");
+    } catch {}
+  }
+
+  const envOverride = process.env.AUTOCOIN_LIBRARY_MODE === "1";
+
+  const enabled =
+    options?.enabled !== undefined
+      ? parseBooleanFlag(options.enabled, true)
+      : envOverride && process.env.USE_LOCAL_OLLAMA_NEWS !== undefined
+      ? parseBooleanFlag(process.env.USE_LOCAL_OLLAMA_NEWS, true)
+      : uiConfigured === "1" && dbUseLocal !== ""
+      ? parseBooleanFlag(dbUseLocal, true)
+      : cfg.use_local_ollama_news !== undefined
+      ? parseBooleanFlag(cfg.use_local_ollama_news, true)
+      : process.env.USE_LOCAL_OLLAMA_NEWS !== undefined
+      ? parseBooleanFlag(process.env.USE_LOCAL_OLLAMA_NEWS, true)
+      : dbUseLocal !== ""
+      ? parseBooleanFlag(dbUseLocal, true)
+      : true;
+
+  const rawBaseUrl =
+    options?.baseUrl ||
+    (envOverride ? process.env.OLLAMA_BASE_URL : "") ||
+    (uiConfigured === "1" ? dbBaseUrl : "") ||
+    cfg.ollama_base_url ||
+    process.env.OLLAMA_BASE_URL ||
+    dbBaseUrl ||
+    DEFAULT_OLLAMA_BASE_URL;
+
+  const baseUrl = String(rawBaseUrl || DEFAULT_OLLAMA_BASE_URL).trim().replace(/\/+$/, "");
+
+  const model = String(
+    options?.model ||
+      (envOverride ? process.env.OLLAMA_NEWS_MODEL : "") ||
+      (uiConfigured === "1" ? dbModel : "") ||
+      cfg.ollama_news_model ||
+      process.env.OLLAMA_NEWS_MODEL ||
+      dbModel ||
+      DEFAULT_OLLAMA_NEWS_MODEL
+  ).trim() || DEFAULT_OLLAMA_NEWS_MODEL;
+
+  const rawTimeout =
+    options?.timeoutMs ||
+    (envOverride ? process.env.OLLAMA_TIMEOUT_MS : "") ||
+    (uiConfigured === "1" ? dbTimeout : "") ||
+    cfg.ollama_timeout_ms ||
+    process.env.OLLAMA_TIMEOUT_MS ||
+    dbTimeout ||
+    DEFAULT_OLLAMA_TIMEOUT_MS;
+
+  const parsedTimeout = Number(rawTimeout);
+  const timeoutMs = Number.isFinite(parsedTimeout)
+    ? Math.min(120000, Math.max(3000, Math.floor(parsedTimeout)))
+    : DEFAULT_OLLAMA_TIMEOUT_MS;
+
+  return {
+    enabled,
+    baseUrl,
+    model,
+    timeoutMs,
+  };
+}
+
+async function saveOllamaSettings(payload = {}) {
+  const current = await getOllamaRuntimeConfig();
+  const enabled =
+    payload.use_local_ollama_news !== undefined
+      ? parseBooleanFlag(payload.use_local_ollama_news, current.enabled)
+      : current.enabled;
+
+  const rawUrl = String(payload.ollama_base_url ?? current.baseUrl).trim().replace(/\/+$/, "");
+  if (!/^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(rawUrl)) {
+    throw new Error("유효한 Ollama 서버 URL을 입력해주세요 (예: http://192.168.0.100:11434)");
+  }
+
+  const model = String(payload.ollama_news_model ?? current.model).trim();
+  if (!model) {
+    throw new Error("Ollama 모델명을 입력해주세요 (예: qwen3-news)");
+  }
+
+  const rawTimeout = Number(payload.ollama_timeout_ms ?? current.timeoutMs);
+  if (!Number.isFinite(rawTimeout) || rawTimeout < 3000 || rawTimeout > 120000) {
+    throw new Error("Ollama 타임아웃은 3,000ms ~ 120,000ms 사이여야 합니다.");
+  }
+  const timeoutMs = Math.floor(rawTimeout);
+
+  if (process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
+    saveRuntimeConfig({
+      use_local_ollama_news: enabled,
+      ollama_base_url: rawUrl,
+      ollama_news_model: model,
+      ollama_timeout_ms: timeoutMs,
+    });
+  }
+
+  const db = getDb();
+  const now = nowKSTString();
+  const upsert = await db.prepare(
+    "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES (?, ?, ?)"
+  );
+  await upsert.run("use_local_ollama_news", String(enabled), now);
+  await upsert.run("ollama_base_url", rawUrl, now);
+  await upsert.run("ollama_news_model", model, now);
+  await upsert.run("ollama_timeout_ms", String(timeoutMs), now);
+  await upsert.run("ollama_ui_configured", "1", now);
+
+  invalidateOllamaStatusCache();
+  const ollama = await checkOllamaStatus({ forceRefresh: true });
+  return {
+    use_local_ollama_news: enabled,
+    ollama_base_url: rawUrl,
+    ollama_news_model: model,
+    ollama_timeout_ms: timeoutMs,
+    ollama,
+  };
+}
+
+async function checkOllamaStatus(options = {}) {
+  const cfg = await getOllamaRuntimeConfig(options);
+  const cacheKey = `${cfg.enabled}|${cfg.baseUrl}|${cfg.model}`;
+  const nowMs = Date.now();
+  if (
+    !options?.forceRefresh &&
+    cachedOllamaStatus.value &&
+    cachedOllamaStatus.key === cacheKey &&
+    nowMs - cachedOllamaStatus.checkedAtMs < 10000
+  ) {
+    return cachedOllamaStatus.value;
+  }
+
+  if (!cfg.enabled) {
+    const disabledState = {
+      enabled: false,
+      url: cfg.baseUrl,
+      reachable: false,
+      model: cfg.model,
+      latency_ms: 0,
+    };
+    cachedOllamaStatus = { key: cacheKey, checkedAtMs: nowMs, value: disabledState };
+    return disabledState;
+  }
+
+  const startMs = Date.now();
+  let reachable = false;
+  try {
+    const resp = await fetch(`${cfg.baseUrl}/api/tags`, {
+      method: "GET",
+      signal: AbortSignal.timeout(1500),
+    });
+    if (resp.ok) {
+      reachable = true;
+    }
+  } catch {
+    reachable = false;
+  }
+
+  const statusObj = {
+    enabled: true,
+    url: cfg.baseUrl,
+    reachable,
+    model: cfg.model,
+    latency_ms: Date.now() - startMs,
+  };
+  cachedOllamaStatus = { key: cacheKey, checkedAtMs: nowMs, value: statusObj };
+  return statusObj;
+}
+
+async function getGeminiApiKey() {
+  const cfg = getRuntimeConfig();
   if (cfg.gemini_api_key && cfg.gemini_api_key !== "YOUR_GEMINI_API_KEY_HERE" && cfg.gemini_api_key.trim().length > 0) {
     return cfg.gemini_api_key.trim();
   }
@@ -1875,16 +2320,7 @@ async function getGeminiApiKey() {
 
 async function saveGeminiApiKey(key) {
   const cleanKey = (key || "").trim();
-  try {
-    let cfg = {};
-    if (fs.existsSync(CONFIG_PATH)) {
-      cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
-    }
-    cfg.gemini_api_key = cleanKey;
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), "utf-8");
-  } catch (err) {
-    console.error("Failed to write to config/upbit_config.json:", err.message);
-  }
+  saveRuntimeConfig({ gemini_api_key: cleanKey });
   const now = nowKSTString();
   const db = getDb();
   await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('gemini_api_key', ?, ?)").run(cleanKey, now);
@@ -1993,6 +2429,7 @@ async function getLatestAiBriefing() {
   const apiKey = await getGeminiApiKey();
   const maskedKey = apiKey ? `${apiKey.slice(0, 6)}...${apiKey.slice(-4)}` : "";
   const quota = await getGeminiQuotaStatus();
+  const ollama = await checkOllamaStatus();
   const enrichedRegime = enrichRegimeFilterRow(regimeRow);
   return {
     has_key: !!apiKey,
@@ -2001,6 +2438,7 @@ async function getLatestAiBriefing() {
     last_trigger_type: quota.last_trigger_type,
     regime_filter: enrichedRegime,
     quota,
+    ollama,
   };
 }
 
@@ -2010,6 +2448,7 @@ async function getLatestAiNewsBriefing() {
   const apiKey = await getGeminiApiKey();
   const maskedKey = apiKey ? `${apiKey.slice(0, 6)}...${apiKey.slice(-4)}` : "";
   const quota = await getGeminiQuotaStatus();
+  const ollama = await checkOllamaStatus();
   return {
     has_key: !!apiKey,
     masked_key: maskedKey,
@@ -2017,6 +2456,7 @@ async function getLatestAiNewsBriefing() {
     last_trigger_type: await getSetting("ai_news_briefing_last_trigger_type", "MANUAL"),
     last_auto_slot: await getSetting("ai_news_briefing_last_auto_slot", ""),
     quota,
+    ollama,
   };
 }
 
@@ -2405,62 +2845,411 @@ ${allBotProfilesText}
   };
 }
 
+const GEMINI_FLASH_WORKING_MODELS = [
+  "gemini-3.8-flash",
+  "gemini-flash-latest",
+  "gemini-3.5-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-flash-lite-latest",
+];
+const GEMINI_FLASH_CANDIDATE_MODELS = [...GEMINI_FLASH_WORKING_MODELS, "gemini-2.5-flash"];
+const GEMINI_PRO_CANDIDATE_MODELS = [
+  "gemini-3.1-pro-preview",
+  "gemini-pro-latest",
+  ...GEMINI_FLASH_WORKING_MODELS,
+  "gemini-2.5-pro",
+  "gemini-2.5-flash",
+];
+
+/** Pro/Flash 분석 슬롯별 우선순위 + 무료 티어 Fallback 후보 모델 목록을 반환합니다. */
 function getDualAiCandidateModels(isProTarget = false, preferredModel = "") {
   const pref = String(preferredModel || "").trim();
-  const baseList = isProTarget
-    ? [
-        "gemini-3.1-pro-preview",
-        "gemini-pro-latest",
-        "gemini-3.8-flash",
-        "gemini-flash-latest",
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
-      ]
-    : [
-        "gemini-3.8-flash",
-        "gemini-flash-latest",
-        "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
-        "gemini-flash-lite-latest",
-        "gemini-2.5-flash",
-      ];
+  const baseList = isProTarget ? [...GEMINI_PRO_CANDIDATE_MODELS] : [...GEMINI_FLASH_CANDIDATE_MODELS];
   if (pref && !baseList.includes(pref)) {
     return [pref, ...baseList];
   }
   return baseList;
 }
 
-async function generateAiMarketAnalysis(options = {}) {
-  const triggerType = options?.triggerType === "AUTO" ? "AUTO" : "MANUAL";
-  const slotKey = options?.slotKey || null;
-  const apiKey = await getGeminiApiKey();
-  if (!apiKey) {
-    return {
-      success: false,
-      error: "NO_API_KEY",
-      message: "Gemini API 키가 등록되지 않았습니다. config/upbit_config.json 파일의 gemini_api_key 항목에 키를 입력하시거나 웹 화면에서 등록해주세요.",
-      quota: await getGeminiQuotaStatus(),
-    };
+let cachedFngData = { checkedAtMs: 0, value: "N/A", classification: "N/A" };
+
+async function fetchQuickFearAndGreedIndex(options = {}) {
+  if (options?.skipExternalApi) {
+    return { value: "N/A", classification: "N/A" };
+  }
+  const nowMs = Date.now();
+  if (nowMs - cachedFngData.checkedAtMs < 5 * 60 * 1000 && cachedFngData.value !== "N/A") {
+    return { value: cachedFngData.value, classification: cachedFngData.classification };
+  }
+  try {
+    const resp = await fetch("https://api.alternative.me/fng/?limit=1", {
+      signal: AbortSignal.timeout(4000),
+    });
+    if (resp.ok) {
+      const json = await resp.json();
+      const entry = json?.data?.[0];
+      if (entry) {
+        cachedFngData = {
+          checkedAtMs: nowMs,
+          value: String(entry.value ?? "N/A"),
+          classification: String(entry.value_classification ?? "N/A"),
+        };
+        return { value: cachedFngData.value, classification: cachedFngData.classification };
+      }
+    }
+  } catch {}
+  return { value: cachedFngData.value || "N/A", classification: cachedFngData.classification || "N/A" };
+}
+
+async function fetchUpbitTickersSummary(markets = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP"], options = {}) {
+  if (options?.skipUpbitApi) {
+    return { btcPrice: null, btcChangePct: null, tickerLines: "" };
+  }
+  try {
+    const tResp = await fetch(`https://api.upbit.com/v1/ticker?markets=${markets.join(",")}`, {
+      signal: AbortSignal.timeout(4500),
+    });
+    if (tResp.ok) {
+      const tickers = await tResp.json();
+      const btcItem = Array.isArray(tickers) ? tickers.find((t) => t.market === "KRW-BTC") : null;
+      const btcPrice = btcItem ? Number(btcItem.trade_price || 0) : null;
+      const btcChangePct = btcItem ? Number((Number(btcItem.signed_change_rate || 0) * 100).toFixed(2)) : null;
+      const tickerLines = (Array.isArray(tickers) ? tickers : [])
+        .map(
+          (t) =>
+            `- ${t.market}: 현재가 ${Number(t.trade_price).toLocaleString("ko-KR")}원 (전일대비 ${(
+              Number(t.signed_change_rate) * 100
+            ).toFixed(2)}%)`
+        )
+        .join("\n");
+      return { btcPrice, btcChangePct, tickerLines };
+    }
+  } catch {}
+  return { btcPrice: null, btcChangePct: null, tickerLines: "" };
+}
+
+async function fetchLiveMarketContextForOllama(db, regimeCtx = null, options = {}) {
+  const regimeFilter = regimeCtx || (await checkMarketRegimeFilter(null, options));
+  const [tickerSummary, fng, allBots, posRows, tradeRows] = await Promise.all([
+    fetchUpbitTickersSummary(["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP"], options),
+    fetchQuickFearAndGreedIndex(options),
+    getBots("live").catch(() => []),
+    db.prepare("SELECT DISTINCT market FROM bot_positions WHERE status = 'OPEN'").all().catch(() => []),
+    db.prepare("SELECT DISTINCT market FROM trades WHERE status = 'HOLDING'").all().catch(() => []),
+  ]);
+
+  const btcPrice = Number(regimeFilter?.btcPrice || tickerSummary.btcPrice || 0);
+  const btcDaily20Ma = Number(regimeFilter?.ma20Day || 0);
+  const btc4h60Ma = Number(regimeFilter?.ma60_4h || 0);
+  const openTickers = Array.from(
+    new Set([
+      ...(posRows || []).map((r) => String(r.market || "").trim()).filter(Boolean),
+      ...(tradeRows || []).map((r) => String(r.market || "").trim()).filter(Boolean),
+    ])
+  );
+  const selectedBots = (allBots || []).filter((b) => Number(b.is_selected_for_live) === 1);
+  const activeBots = selectedBots.length > 0 ? selectedBots : allBots || [];
+
+  return {
+    regimeFilter,
+    marketContext: {
+      btcPrice: btcPrice || null,
+      btcChangePct: tickerSummary.btcChangePct,
+      btcDaily20Ma: btcDaily20Ma || null,
+      btc4h60Ma: btc4h60Ma || null,
+      fngValue: fng.value,
+      fngClass: fng.classification,
+      openTickers,
+      tickerLines: tickerSummary.tickerLines,
+    },
+    activeBots,
+  };
+}
+
+/**
+ * 맥북 프로 로컬 Ollama(qwen3-news) API를 호출하여 최근 30분 암호화폐 뉴스 감성 및 업비트 10대 봇 제어 상태를 JSON으로 분석
+ */
+async function callLocalOllamaCoinNewsAnalyzer(newsList = [], marketContext = {}, activeBots = [], options = {}) {
+  const config = typeof getRuntimeConfig === "function" ? getRuntimeConfig() : {};
+  const envOverride = process.env.AUTOCOIN_LIBRARY_MODE === "1";
+  const baseUrl = String(
+    options?.baseUrl ||
+      (envOverride ? process.env.OLLAMA_BASE_URL : "") ||
+      config.ollama_base_url ||
+      process.env.OLLAMA_BASE_URL ||
+      "http://127.0.0.1:11434"
+  ).replace(/\/+$/, "");
+  const modelName = String(
+    options?.model ||
+      (envOverride ? process.env.OLLAMA_NEWS_MODEL : "") ||
+      config.ollama_news_model ||
+      process.env.OLLAMA_NEWS_MODEL ||
+      "qwen3-news"
+  ).trim() || "qwen3-news";
+  const timeoutMs = Number(
+    options?.timeoutMs ||
+      (envOverride ? process.env.OLLAMA_TIMEOUT_MS : "") ||
+      config.ollama_timeout_ms ||
+      process.env.OLLAMA_TIMEOUT_MS ||
+      DEFAULT_OLLAMA_TIMEOUT_MS
+  ) || DEFAULT_OLLAMA_TIMEOUT_MS;
+
+  // 토큰 최적화(4096 ctx 이내 유지): 최신 코인 뉴스 최대 12건, 제목 + 요약 150자 이내로 압축
+  const compactNewsText = (Array.isArray(newsList) ? newsList : [])
+    .slice(0, 12)
+    .map((n, idx) => {
+      if (typeof n === "string") {
+        return `${idx + 1}. ${n.replace(/\s+/g, " ").slice(0, 180)}`;
+      }
+      const sentimentTag = n?.sentiment === "BULLISH" ? "호재" : n?.sentiment === "BEARISH" ? "악재" : "중립";
+      const title = String(n?.title || "").trim();
+      const snippet = String(n?.summary || "").replace(/\s+/g, " ").slice(0, 150);
+      return `${idx + 1}. [${sentimentTag}] ${title}${snippet ? ` - ${snippet}` : ""}`;
+    })
+    .join("\n");
+
+  const activeBotDesc =
+    Array.isArray(activeBots) && activeBots.length > 0
+      ? activeBots.map((b) => `${b.bot_id}(${b.nickname || b.name || b.bot_id})`).join(", ")
+      : "bot_01 ~ bot_10";
+
+  const userPrompt = `다음 최근 30분 업비트 암호화폐 시황 지표와 뉴스 헤드라인을 분석해 반드시 지정된 JSON 스키마로만 응답하라.
+
+[1. 현재 암호화폐 시장 기술적 요약]
+- KRW-BTC 현재가: ${marketContext.btcPrice ?? "N/A"}원 (24h 변동률: ${marketContext.btcChangePct ?? "N/A"}%)
+- KRW-BTC 일봉 20MA: ${marketContext.btcDaily20Ma ?? "N/A"}원 | 4시간봉 60MA: ${marketContext.btc4h60Ma ?? "N/A"}원
+- 크립토 공포·탐욕 지수: ${marketContext.fngValue ?? "N/A"} (${marketContext.fngClass ?? "N/A"})
+- 현재 실전 가동 봇: ${activeBotDesc}
+- 현재 보유 오픈 포지션: ${(marketContext.openTickers || []).join(", ") || "없음"}
+
+[2. 최근 수집된 주요 암호화폐 뉴스]
+${compactNewsText || "특이 신규 속보 없음 (보합세)"}
+
+[출력 JSON 스키마]
+{
+  "sentiment_score": -1.0에서 1.0 사이의 소수점 첫째 자리 실수,
+  "market_regime": "BULL | SIDEWAYS | BEAR | HIGH_VOLATILITY_SHOCK",
+  "risk_alert": true 또는 false (거래소 해킹, 디페깅, 상장폐지, 거시 쇼크 시 true),
+  "recommended_action": "NORMAL | REDUCE_SIZE | HALT_NEW_BUYS | EMERGENCY_CLOSE_ALL",
+  "position_size_multiplier": 0.0, 0.5, 1.0 중 택1,
+  "bot_overrides": {
+    "bot_01": "ALLOW | BLOCK",
+    "bot_02": "ALLOW | BLOCK",
+    "bot_03": "ALLOW | BLOCK",
+    "bot_04": "ALLOW | BLOCK",
+    "bot_05": "ALLOW | BLOCK",
+    "bot_06": "ALLOW | BLOCK",
+    "bot_07": "ALLOW | BLOCK",
+    "bot_08": "ALLOW | BLOCK",
+    "bot_09": "ALLOW | BLOCK",
+    "bot_10": "ALLOW | BLOCK"
+  },
+  "blacklist_tickers": ["해킹·유의종목 지정 등 치명적 악재가 발생한 업비트 원화마켓 티커(예: KRW-XRP), 없으면 []"],
+  "reason": "암호화폐 단기 시황, 뉴스 감성 및 봇 진입 제어 판단 근거 한국어 2~3문장 요약"
+}`;
+
+  const startedAt = Date.now();
+  const res = await fetch(`${baseUrl}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(timeoutMs),
+    body: JSON.stringify({
+      model: modelName,
+      stream: false,
+      think: false, // 필수: Qwen3 내부 추론 비활성화 (인텔 맥북 CPU 응답 속도 단축)
+      format: "json", // 필수: 엄격한 JSON 출력 강제
+      messages: [{ role: "user", content: userPrompt }],
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`Ollama HTTP ${res.status}: ${errText.slice(0, 200)}`);
   }
 
-  const quotaBefore = await getGeminiQuotaStatus();
-  if (triggerType === "MANUAL" && quotaBefore.remaining_calls <= 0) {
-    return {
-      success: false,
-      error: "DAILY_QUOTA_EXCEEDED",
-      message: "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
-      quota: quotaBefore,
-    };
+  const data = await res.json();
+  const rawContent = String(data?.message?.content || data?.response || "").trim();
+  if (!rawContent) {
+    throw new Error("Ollama returned empty message content");
+  }
+  const cleanedJsonStr = rawContent.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
+  const parsed = JSON.parse(cleanedJsonStr);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Ollama response JSON is not an object");
+  }
+  const hasCoreField =
+    "sentiment_score" in parsed ||
+    "market_regime" in parsed ||
+    "recommended_action" in parsed ||
+    "bot_overrides" in parsed;
+  if (!hasCoreField) {
+    throw new Error("Ollama response JSON missing required decision fields");
   }
 
-  const isProTarget = options?.modelType === "pro" || String(options?.preferredModel || "").includes("pro");
-  const ctx = await buildDualAiMarketPromptContext({ isProTarget });
-  const { btcPrice, btcDaily20Ma, btc4h60Ma, isHoldCash, regimeReason, nowStr, prompt } = ctx;
-  const db = getDb();
+  // 스키마 정규화 및 안전 검증
+  const allowedRegimes = ["BULL", "SIDEWAYS", "BEAR", "HIGH_VOLATILITY_SHOCK"];
+  const rawRegime = String(parsed.market_regime || "SIDEWAYS").trim().toUpperCase();
+  const marketRegime = allowedRegimes.includes(rawRegime) ? rawRegime : "SIDEWAYS";
 
-  // Gemini API 호출 (지수 백오프: 1초, 2초, 4초 재시도 + 모델 폴백)
-  const candidateModels = getDualAiCandidateModels(isProTarget, options?.preferredModel);
-  const backoffDelaysMs = [1000, 2000, 4000];
+  const allowedActions = ["NORMAL", "REDUCE_SIZE", "HALT_NEW_BUYS", "EMERGENCY_CLOSE_ALL"];
+  const rawAction = String(parsed.recommended_action || "NORMAL").trim().toUpperCase();
+  const recommendedAction = allowedActions.includes(rawAction) ? rawAction : "NORMAL";
+
+  const rawScore = Number(parsed.sentiment_score ?? 0);
+  const sentimentScore = Number.isFinite(rawScore) ? Math.min(1.0, Math.max(-1.0, Number(rawScore.toFixed(2)))) : 0.0;
+
+  const riskAlert = Boolean(parsed.risk_alert);
+  const rawMult = Number(parsed.position_size_multiplier ?? 1.0);
+  const multiplier =
+    riskAlert || recommendedAction === "HALT_NEW_BUYS" || recommendedAction === "EMERGENCY_CLOSE_ALL"
+      ? 0.0
+      : [0, 0.5, 1].includes(rawMult)
+      ? rawMult
+      : rawMult < 0.25
+      ? 0.0
+      : rawMult < 0.75
+      ? 0.5
+      : 1.0;
+
+  const defaultOverrides = {};
+  if (riskAlert || recommendedAction === "HALT_NEW_BUYS" || recommendedAction === "EMERGENCY_CLOSE_ALL") {
+    for (const key of ALL_BOT_IDS) {
+      defaultOverrides[key] = "BLOCK";
+    }
+  } else {
+    const normalized = normalizeBotOverrides(parsed.bot_overrides);
+    Object.assign(defaultOverrides, normalized);
+  }
+
+  // 업비트 원화 마켓 티커(KRW-*) 정규화
+  const blacklistTickers = Array.isArray(parsed.blacklist_tickers)
+    ? Array.from(
+        new Set(
+          parsed.blacklist_tickers
+            .map((t) => String(t).trim().toUpperCase())
+            .filter(Boolean)
+            .map((t) => {
+              if (t.startsWith("KRW-")) return t;
+              if (t.includes("-")) return `KRW-${t.split("-").pop()}`;
+              return `KRW-${t}`;
+            })
+        )
+      ).sort()
+    : [];
+
+  return {
+    provider: "ollama",
+    model: modelName,
+    model_tier: "OLLAMA_QWEN3_30M",
+    latencyMs: Date.now() - startedAt,
+    sentiment_score: sentimentScore,
+    market_regime: marketRegime,
+    risk_alert: riskAlert,
+    recommended_action: recommendedAction,
+    position_size_multiplier: multiplier,
+    bot_overrides: defaultOverrides,
+    blacklist_tickers: blacklistTickers,
+    reason: String(parsed.reason || "로컬 Ollama(qwen3-news) 30분 암호화폐 뉴스·시황 분석 완료").trim(),
+  };
+}
+
+function buildOllamaMarketBriefingMarkdown(ollamaRes, marketContext = {}, activeBots = []) {
+  const score = Number(ollamaRes?.sentiment_score || 0);
+  const scoreStr = `${score >= 0 ? "+" : ""}${score.toFixed(2)}`;
+  const multPct = Math.round(Number(ollamaRes?.position_size_multiplier ?? 1) * 100);
+  const overrides = normalizeBotOverrides(ollamaRes?.bot_overrides);
+  const allowBots = ALL_BOT_IDS.filter((id) => overrides[id] === "ALLOW").map(
+    (id) => `${id}(${BOT_STRATEGY_GUIDE[id]?.name || id})`
+  );
+  const blockBots = ALL_BOT_IDS.filter((id) => overrides[id] === "BLOCK").map(
+    (id) => `${id}(${BOT_STRATEGY_GUIDE[id]?.name || id})`
+  );
+  const btcPriceTxt = marketContext.btcPrice ? `${Number(marketContext.btcPrice).toLocaleString("ko-KR")}원` : "수신 중";
+  const ma20Txt = marketContext.btcDaily20Ma ? `${Math.floor(Number(marketContext.btcDaily20Ma)).toLocaleString("ko-KR")}원` : "-";
+  const ma4hTxt = marketContext.btc4h60Ma ? `${Math.floor(Number(marketContext.btc4h60Ma)).toLocaleString("ko-KR")}원` : "-";
+  const liveNames =
+    Array.isArray(activeBots) && activeBots.length > 0
+      ? activeBots.map((b) => `${b.bot_id}(${b.nickname || b.name || b.bot_id})`).join(", ")
+      : "전체 10대 봇";
+
+  return [
+    `## ⚡ Flash 단기 진단 (로컬 Ollama \`${ollamaRes.model}\` · ${ollamaRes.latencyMs}ms)`,
+    `- **시장 체제**: \`${ollamaRes.market_regime}\` | **권고 액션**: \`${ollamaRes.recommended_action}\` | **투입 비중**: **${multPct}%**`,
+    `- **단기 뉴스 감성 점수**: **${scoreStr}** | **돌발 리스크 경보**: ${ollamaRes.risk_alert ? "🔴 경보 발령 (신규 매수 전면 차단)" : "🟢 정상 (특이 돌발 쇼크 없음)"}`,
+    `- **블랙리스트 진입 제한 종목**: ${ollamaRes.blacklist_tickers?.length ? ollamaRes.blacklist_tickers.join(", ") : "없음"}`,
+    ``,
+    `## 🧠 단기 시황 · 뉴스 감성 판단 근거`,
+    `${ollamaRes.reason}`,
+    ``,
+    `## 🤖 10대 봇 신규 진입 게이트웨이 (ALLOW / BLOCK)`,
+    `- **실전 가동 대상**: ${liveNames}`,
+    `- **신규 매수 허용(ALLOW · ${allowBots.length}개)**: ${allowBots.length ? allowBots.join(", ") : "없음"}`,
+    `- **신규 매수 보류(BLOCK · ${blockBots.length}개)**: ${blockBots.length ? blockBots.join(", ") : "없음"}`,
+    `- **포지션 보호 원칙**: \`BLOCK\`은 신규 매수만 보류하며, 기존 보유 코인은 각 봇의 익절/손절/트레일링 스탑 로직으로 끝까지 감시·청산됩니다.`,
+    ``,
+    `## 💡 실시간 기술 지표 참고 (KRW-BTC)`,
+    `- **KRW-BTC 현재가**: ${btcPriceTxt}${marketContext.btcChangePct !== null && marketContext.btcChangePct !== undefined ? ` (24h ${marketContext.btcChangePct >= 0 ? "+" : ""}${marketContext.btcChangePct}%)` : ""}`,
+    `- **일봉 20MA**: ${ma20Txt} | **4시간봉 60MA**: ${ma4hTxt}`,
+    `- **공포·탐욕 지수**: ${marketContext.fngValue ?? "N/A"} (${marketContext.fngClass ?? "N/A"})`,
+  ].join("\n");
+}
+
+function buildOllamaNewsBriefingMarkdown(ollamaRes, statsContext = {}) {
+  const { totalNews = 0, bullCount = 0, bearCount = 0, neutCount = 0, topNews = [], marketContext = {} } = statsContext;
+  const score = Number(ollamaRes?.sentiment_score || 0);
+  const scoreStr = `${score >= 0 ? "+" : ""}${score.toFixed(2)}`;
+  const multPct = Math.round(Number(ollamaRes?.position_size_multiplier ?? 1) * 100);
+  const overrides = normalizeBotOverrides(ollamaRes?.bot_overrides);
+  const allowBots = ALL_BOT_IDS.filter((id) => overrides[id] === "ALLOW");
+  const blockBots = ALL_BOT_IDS.filter((id) => overrides[id] === "BLOCK");
+  const headlinesPreview = (topNews || [])
+    .slice(0, 5)
+    .map((n, idx) => `${idx + 1}. [${n.sentiment || "NEUTRAL"}] ${n.title} (${n.source || "NEWS"})`)
+    .join("\n");
+
+  return [
+    `## 1. 📰 실시간 뉴스 핵심 쟁점 및 센티먼트 종합 진단 (로컬 Ollama \`${ollamaRes.model}\`)`,
+    `- **분석 엔진**: 맥북 프로 로컬 Ollama (\`${ollamaRes.model}\`, 응답시간 ${ollamaRes.latencyMs}ms, API 비용 0원)`,
+    `- **수집 통계**: 총 ${totalNews}건 (호재 ${bullCount}건 · 악재 ${bearCount}건 · 중립 ${neutCount}건)`,
+    `- **단기 감성 점수**: **${scoreStr}** | **판단 체제**: \`${ollamaRes.market_regime}\` | **리스크 경보**: ${ollamaRes.risk_alert ? "🔴 ON" : "🟢 OFF"}`,
+    `- **핵심 요약**: ${ollamaRes.reason}`,
+    ``,
+    `## 2. ⚖️ 시장 충격도 & 단기 시황 전망`,
+    `- **BTC 현재가**: ${marketContext.btcPrice ? Number(marketContext.btcPrice).toLocaleString("ko-KR") + "원" : "수신 중"} (일봉 20MA: ${marketContext.btcDaily20Ma ? Math.floor(Number(marketContext.btcDaily20Ma)).toLocaleString("ko-KR") + "원" : "-"} / 4시간 60MA: ${marketContext.btc4h60Ma ? Math.floor(Number(marketContext.btc4h60Ma)).toLocaleString("ko-KR") + "원" : "-"})`,
+    `- **블랙리스트 지정 종목**: ${ollamaRes.blacklist_tickers?.length ? ollamaRes.blacklist_tickers.join(", ") : "특이 악재 종목 없음"}`,
+    headlinesPreview ? `\n**최근 반영 주요 헤드라인 (상위 5건)**:\n${headlinesPreview}` : "",
+    ``,
+    `## 3. 🎯 퀀트 트레이딩 봇 운용 및 리스크 관리 전략`,
+    `- **권고 액션**: \`${ollamaRes.recommended_action}\` (**권장 투입 비중: ${multPct}%**)`,
+    `- **ALLOW 봇 (${allowBots.length}개)**: ${allowBots.length ? allowBots.join(", ") : "없음"}`,
+    `- **BLOCK 봇 (${blockBots.length}개)**: ${blockBots.length ? blockBots.join(", ") : "없음"}`,
+    `- **리스크 가드**: 돌발 악재 미감지 시에도 급등 추격 매수를 지양하고, 기존 보유 포지션은 각 봇의 고유 청산 알고리즘으로 안전 관리합니다.`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function streamTextAsSseChunks(res, req, fullText, chunkSize = 12, delayMs = 4) {
+  const text = String(fullText || "");
+  for (let i = 0; i < text.length; i += chunkSize) {
+    if (res.writableEnded || req?.destroyed) break;
+    const piece = text.slice(i, i + chunkSize);
+    res.write(`data: ${JSON.stringify({ type: "chunk", text: piece })}\n\n`);
+    if (delayMs > 0 && i + chunkSize < text.length) {
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+}
+
+async function callGeminiGenerateWithBackoff({
+  apiKey,
+  candidateModels,
+  prompt,
+  temperature = 0.25,
+  timeoutMs = 30000,
+  backoffDelaysMs = [1000, 2000, 4000],
+  logTag = "Gemini API",
+}) {
   let chosenModel = candidateModels[0];
   let analysisText = "";
   let lastErrorMsg = "";
@@ -2477,7 +3266,7 @@ async function generateAiMarketAnalysis(options = {}) {
           apiKey
         )}`;
         const controller = new AbortController();
-        timeoutTimer = setTimeout(() => controller.abort(), 30000);
+        timeoutTimer = setTimeout(() => controller.abort(), timeoutMs);
         const response = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2485,7 +3274,7 @@ async function generateAiMarketAnalysis(options = {}) {
           body: JSON.stringify({
             contents: [{ parts: [{ text: prompt }] }],
             generationConfig: {
-              temperature: 0.25,
+              temperature,
               maxOutputTokens: 8192,
             },
           }),
@@ -2504,7 +3293,7 @@ async function generateAiMarketAnalysis(options = {}) {
           const errText = await response.text();
           if (response.status === 429) quota429Count += 1;
           if (response.status === 404 || response.status === 400) unavailable404Models.add(model);
-          console.warn(`[Gemini API] Model ${model} failed (HTTP ${response.status}, attempt ${attempt + 1}):`, errText.slice(0, 200));
+          console.warn(`[${logTag}] Model ${model} failed (HTTP ${response.status}, attempt ${attempt + 1}):`, errText.slice(0, 200));
           try {
             const errJson = JSON.parse(errText);
             lastErrorMsg = errJson?.error?.message || `HTTP ${response.status}`;
@@ -2514,155 +3303,36 @@ async function generateAiMarketAnalysis(options = {}) {
         }
       } catch (reqErr) {
         if (timeoutTimer) clearTimeout(timeoutTimer);
-        console.warn(`[Gemini API] Request exception for model ${model} (attempt ${attempt + 1}):`, reqErr.message);
+        console.warn(`[${logTag}] Request exception for model ${model} (attempt ${attempt + 1}):`, reqErr.message);
         lastErrorMsg = reqErr.message;
       }
     }
 
     if (!analysisText && unavailable404Models.size < candidateModels.length && attempt < backoffDelaysMs.length) {
       const waitMs = backoffDelaysMs[attempt];
-      console.log(`[Gemini API] Waiting ${waitMs / 1000}s exponential backoff before retry...`);
+      console.log(`[${logTag}] Waiting ${waitMs / 1000}s exponential backoff before retry...`);
       await new Promise((r) => setTimeout(r, waitMs));
     }
   }
 
-  if (!analysisText) {
-    // AI 호출 실패 또는 쿼터 초과 시 BTC 일봉 20MA 기반 기계적 Fallback 적용
-    try {
-      const fallbackDecision = buildMechanicalFallbackRegime({
-        btcPrice,
-        btcDaily20Ma,
-        btc4h60Ma,
-        label: isProTarget ? "Pro Fallback" : "Flash Fallback",
-      });
-      await updateMarketRegimeFilterFromAnalysis({
-        isPro: isProTarget,
-        btcPrice,
-        btcDaily20Ma,
-        btc4h60Ma,
-        isHoldCash: fallbackDecision.recommended_action === "HALT_NEW_BUYS",
-        regimeReason: fallbackDecision.reason,
-        decision: fallbackDecision,
-        isFallback: true,
-      });
-    } catch (fbErr) {
-      console.warn("[Gemini Fallback] updateMarketRegimeFilter error:", fbErr.message);
-    }
-
-    if (quota429Count === candidateModels.length && triggerType === "MANUAL") {
-      const exhaustedQuota = await markGeminiManualQuotaExhausted();
-      return {
-        success: false,
-        error: "DAILY_QUOTA_EXCEEDED",
-        message: "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
-        quota: exhaustedQuota,
-      };
-    }
-    return {
-      success: false,
-      error: "API_CALL_FAILED",
-      message: `Gemini API 호출 실패 (BTC 20MA 기계적 Fallback 적용): ${lastErrorMsg || "응답 텍스트를 생성하지 못했습니다."}`,
-      quota: await getGeminiQuotaStatus(),
-    };
-  }
-
-  const { cleanText, structured } = extractStructuredRegimeFromLlmText(analysisText);
-  const briefingMarkdown = cleanText || analysisText;
-
-  // 듀얼 AI 필터 테이블(market_regime_filter) 원자적 갱신
-  const updatedRegime = await updateMarketRegimeFilterFromAnalysis({
-    isPro: isProTarget,
-    btcPrice,
-    btcDaily20Ma,
-    btc4h60Ma,
-    isHoldCash,
-    regimeReason,
-    analysisText,
-    decision: structured,
-  });
-
-  // DB 저장 및 쿼터 차감
-  const insertStmt = await db.prepare(`
-    INSERT INTO ai_market_briefings (
-      provider, model, btc_price, btc_daily_20ma, btc_4h_60ma, regime_status, briefing_text, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const info = insertStmt.run(
-    "gemini",
-    chosenModel,
-    btcPrice,
-    btcDaily20Ma,
-    btc4h60Ma,
-    updatedRegime?.recommended_action === "HALT_NEW_BUYS" ? "HOLD_CASH" : updatedRegime?.market_regime || "NORMAL",
-    briefingMarkdown,
-    nowStr
-  );
-
-  await db.prepare(
-    "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('ai_briefing_last_trigger_type', ?, ?)"
-  ).run(triggerType, nowStr);
-  if (triggerType === "AUTO" && slotKey && !isProTarget) {
-    await db.prepare(
-      "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('ai_briefing_last_auto_slot', ?, ?)"
-    ).run(slotKey, nowStr);
-  }
-  const updatedQuota = await consumeGeminiQuota(triggerType);
-
   return {
-    success: true,
-    trigger_type: triggerType,
-    quota: updatedQuota,
-    regime_filter: updatedRegime,
-    briefing: {
-      id: info.lastInsertRowid,
-      provider: "gemini",
-      model: chosenModel,
-      btc_price: btcPrice,
-      btc_daily_20ma: btcDaily20Ma,
-      btc_4h_60ma: btc4h60Ma,
-      regime_status: updatedRegime?.recommended_action === "HALT_NEW_BUYS" ? "HOLD_CASH" : updatedRegime?.market_regime || "NORMAL",
-      briefing_text: briefingMarkdown,
-      created_at: nowStr,
-      trigger_type: triggerType,
-    },
+    chosenModel,
+    analysisText,
+    lastErrorMsg,
+    quota429Count,
+    allQuota429: quota429Count === candidateModels.length,
   };
 }
 
-async function generateAiMarketAnalysisStream(req, res) {
-  const apiKey = await getGeminiApiKey();
-  if (!apiKey) {
-    res.writeHead(400, { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" });
-    res.end(
-      JSON.stringify({
-        success: false,
-        error: "NO_API_KEY",
-        message: "Gemini API 키가 등록되지 않았습니다. config/upbit_config.json 파일의 gemini_api_key 항목에 키를 입력하시거나 웹 화면에서 등록해주세요.",
-        quota: await getGeminiQuotaStatus(),
-      })
-    );
-    return;
-  }
-
-  const quotaBefore = await getGeminiQuotaStatus();
-  if (quotaBefore.remaining_calls <= 0) {
-    res.writeHead(429, { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" });
-    res.end(
-      JSON.stringify({
-        success: false,
-        error: "DAILY_QUOTA_EXCEEDED",
-        message: "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
-        quota: quotaBefore,
-      })
-    );
-    return;
-  }
-
-  const ctx = await buildDualAiMarketPromptContext({ isProTarget: false });
-  const { btcPrice, btcDaily20Ma, btc4h60Ma, isHoldCash, regimeReason, nowStr, prompt } = ctx;
-  const db = getDb();
-
-  const candidateModels = getDualAiCandidateModels(false);
-  const backoffDelaysMs = [1000, 2000, 4000];
+async function callGeminiStreamWithBackoff({
+  apiKey,
+  candidateModels,
+  prompt,
+  temperature = 0.25,
+  timeoutMs = 30000,
+  backoffDelaysMs = [1000, 2000, 4000],
+  logTag = "Gemini Stream",
+}) {
   let geminiResp = null;
   let chosenModel = candidateModels[0];
   let quota429Count = 0;
@@ -2678,7 +3348,7 @@ async function generateAiMarketAnalysisStream(req, res) {
           apiKey
         )}`;
         const controller = new AbortController();
-        timeoutTimer = setTimeout(() => controller.abort(), 30000);
+        timeoutTimer = setTimeout(() => controller.abort(), timeoutMs);
         const resp = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2686,7 +3356,7 @@ async function generateAiMarketAnalysisStream(req, res) {
           body: JSON.stringify({
             contents: [{ parts: [{ text: prompt }] }],
             generationConfig: {
-              temperature: 0.25,
+              temperature,
               maxOutputTokens: 8192,
             },
           }),
@@ -2700,11 +3370,11 @@ async function generateAiMarketAnalysisStream(req, res) {
           const errTxt = await resp.text();
           if (resp.status === 429) quota429Count += 1;
           if (resp.status === 404 || resp.status === 400) unavailable404Models.add(model);
-          console.warn(`[Gemini Stream] Model ${model} failed (HTTP ${resp.status}, attempt ${attempt + 1}):`, errTxt.slice(0, 200));
+          console.warn(`[${logTag}] Model ${model} failed (HTTP ${resp.status}, attempt ${attempt + 1}):`, errTxt.slice(0, 200));
         }
       } catch (e) {
         if (timeoutTimer) clearTimeout(timeoutTimer);
-        console.warn(`[Gemini Stream] Exception with model ${model} (attempt ${attempt + 1}):`, e.message);
+        console.warn(`[${logTag}] Exception with model ${model} (attempt ${attempt + 1}):`, e.message);
       }
     }
     if (!geminiResp && unavailable404Models.size < candidateModels.length && attempt < backoffDelaysMs.length) {
@@ -2712,58 +3382,564 @@ async function generateAiMarketAnalysisStream(req, res) {
     }
   }
 
-  if (!geminiResp) {
-    // 기계적 Fallback 적용
+  return {
+    geminiResp,
+    chosenModel,
+    quota429Count,
+    allQuota429: quota429Count === candidateModels.length,
+  };
+}
+
+async function applyTier3MechanicalFallback({ isPro = false, btcPrice = 0, btcDaily20Ma = 0, btc4h60Ma = 0, label = "Mechanical Fallback" } = {}) {
+  try {
+    const fbDecision = buildMechanicalFallbackRegime({ btcPrice, btcDaily20Ma, btc4h60Ma, label });
+    return await updateMarketRegimeFilterFromAnalysis({
+      isPro,
+      btcPrice,
+      btcDaily20Ma,
+      btc4h60Ma,
+      isHoldCash: fbDecision.recommended_action === "HALT_NEW_BUYS",
+      regimeReason: fbDecision.reason,
+      decision: fbDecision,
+      isFallback: true,
+    });
+  } catch (fbErr) {
+    console.warn("[Tier3 Mechanical Fallback] updateMarketRegimeFilter error:", fbErr.message);
+    return null;
+  }
+}
+
+async function consumeGeminiSseBody(geminiResp, res) {
+  const reader = geminiResp.body.getReader();
+  const decoder = new TextDecoder();
+  let fullText = "";
+  let sseBuffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    sseBuffer += decoder.decode(value, { stream: true });
+
+    const lines = sseBuffer.split("\n");
+    sseBuffer = lines.pop() || "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("data:")) {
+        const jsonStr = trimmed.slice(5).trim();
+        if (!jsonStr || jsonStr === "[DONE]") continue;
+        try {
+          const parsed = JSON.parse(jsonStr);
+          const delta = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (delta) {
+            fullText += delta;
+            res.write(`data: ${JSON.stringify({ type: "chunk", text: delta })}\n\n`);
+          }
+        } catch {}
+      }
+    }
+  }
+
+  if (sseBuffer.trim().startsWith("data:")) {
+    const jsonStr = sseBuffer.trim().slice(5).trim();
     try {
-      const fbDecision = buildMechanicalFallbackRegime({ btcPrice, btcDaily20Ma, btc4h60Ma, label: "Stream Fallback" });
-      await updateMarketRegimeFilterFromAnalysis({
-        isPro: false,
+      const parsed = JSON.parse(jsonStr);
+      const delta = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (delta) {
+        fullText += delta;
+        res.write(`data: ${JSON.stringify({ type: "chunk", text: delta })}\n\n`);
+      }
+    } catch {}
+  }
+
+  return fullText;
+}
+
+async function persistMarketBriefingAndUpdateRegime({
+  db,
+  provider,
+  model,
+  isProTarget,
+  btcPrice,
+  btcDaily20Ma,
+  btc4h60Ma,
+  isHoldCash,
+  regimeReason,
+  analysisText,
+  briefingMarkdown,
+  decision,
+  nowStr,
+  triggerType,
+  slotKey,
+  consumeQuota = false,
+}) {
+  const updatedRegime = await updateMarketRegimeFilterFromAnalysis({
+    isPro: isProTarget,
+    btcPrice,
+    btcDaily20Ma,
+    btc4h60Ma,
+    isHoldCash,
+    regimeReason,
+    analysisText,
+    decision,
+  });
+
+  const regimeStatus =
+    updatedRegime?.recommended_action === "HALT_NEW_BUYS" ? "HOLD_CASH" : updatedRegime?.market_regime || "NORMAL";
+
+  const insertStmt = await db.prepare(`
+    INSERT INTO ai_market_briefings (
+      provider, model, btc_price, btc_daily_20ma, btc_4h_60ma, regime_status, briefing_text, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const info = await insertStmt.run(
+    provider,
+    model,
+    btcPrice,
+    btcDaily20Ma,
+    btc4h60Ma,
+    regimeStatus,
+    briefingMarkdown,
+    nowStr
+  );
+
+  await db
+    .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('ai_briefing_last_trigger_type', ?, ?)")
+    .run(triggerType, nowStr);
+  if (triggerType === "AUTO" && slotKey && !isProTarget) {
+    await db
+      .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('ai_briefing_last_auto_slot', ?, ?)")
+      .run(slotKey, nowStr);
+  }
+  const updatedQuota = consumeQuota ? await consumeGeminiQuota(triggerType) : await getGeminiQuotaStatus();
+
+  return {
+    updatedRegime,
+    regimeStatus,
+    briefingId: info.lastInsertRowid,
+    updatedQuota,
+  };
+}
+
+async function generateAiMarketAnalysis(options = {}) {
+  const triggerType = options?.triggerType === "AUTO" ? "AUTO" : "MANUAL";
+  const slotKey = options?.slotKey || null;
+  const isProTarget = options?.modelType === "pro" || String(options?.preferredModel || "").includes("pro");
+  const db = getDb();
+  const nowStr = nowKSTString();
+
+  const ollamaCfg = await getOllamaRuntimeConfig(options);
+  const useLocalOllama =
+    !isProTarget &&
+    (options?.useLocalOllama !== undefined ? Boolean(options.useLocalOllama) : ollamaCfg.enabled);
+
+  // 1순위: 30분 단기 시황·뉴스 분석(FLASH_30M) -> 맥북 프로 로컬 Ollama(qwen3-news) 호출
+  let ollamaAttempted = false;
+  let ollamaFallbackReason = "";
+  let cachedOllamaContext = null;
+
+  if (useLocalOllama) {
+    ollamaAttempted = true;
+    try {
+      const [recentNews, ollamaCtxPack] = await Promise.all([
+        getRecentNewsForAiAnalysis(db, 12),
+        fetchLiveMarketContextForOllama(db, null, options),
+      ]);
+      cachedOllamaContext = ollamaCtxPack;
+
+      const ollamaRes = await callLocalOllamaCoinNewsAnalyzer(
+        recentNews,
+        ollamaCtxPack.marketContext,
+        ollamaCtxPack.activeBots,
+        {
+          baseUrl: options?.ollamaBaseUrl || ollamaCfg.baseUrl,
+          model: options?.ollamaModel || ollamaCfg.model,
+          timeoutMs: options?.ollamaTimeoutMs || ollamaCfg.timeoutMs,
+        }
+      );
+
+      const btcPrice = Number(ollamaCtxPack.marketContext.btcPrice || 0);
+      const btcDaily20Ma = Number(ollamaCtxPack.marketContext.btcDaily20Ma || 0);
+      const btc4h60Ma = Number(ollamaCtxPack.marketContext.btc4h60Ma || 0);
+      const briefingMarkdown = buildOllamaMarketBriefingMarkdown(
+        ollamaRes,
+        ollamaCtxPack.marketContext,
+        ollamaCtxPack.activeBots
+      );
+
+      const saved = await persistMarketBriefingAndUpdateRegime({
+        db,
+        provider: "ollama",
+        model: ollamaRes.model,
+        isProTarget: false,
         btcPrice,
         btcDaily20Ma,
         btc4h60Ma,
-        isHoldCash: fbDecision.recommended_action === "HALT_NEW_BUYS",
-        regimeReason: fbDecision.reason,
-        decision: fbDecision,
-        isFallback: true,
+        isHoldCash: ollamaRes.recommended_action === "HALT_NEW_BUYS" || ollamaRes.recommended_action === "EMERGENCY_CLOSE_ALL",
+        regimeReason: ollamaRes.reason,
+        analysisText: briefingMarkdown,
+        briefingMarkdown,
+        decision: ollamaRes,
+        nowStr,
+        triggerType,
+        slotKey,
+        consumeQuota: false,
       });
-    } catch {}
 
-    if (quota429Count === candidateModels.length) {
-      const exhaustedQuota = await markGeminiManualQuotaExhausted();
-      res.writeHead(429, { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" });
-      res.end(
-        JSON.stringify({
-          success: false,
-          error: "DAILY_QUOTA_EXCEEDED",
-          message: "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
-          quota: exhaustedQuota,
-        })
-      );
-      return;
+      return {
+        success: true,
+        provider: "ollama",
+        fallback_used: false,
+        trigger_type: triggerType,
+        quota: saved.updatedQuota,
+        ollama: await checkOllamaStatus(options),
+        regime_filter: saved.updatedRegime,
+        briefing: {
+          id: saved.briefingId,
+          provider: "ollama",
+          model: ollamaRes.model,
+          btc_price: btcPrice,
+          btc_daily_20ma: btcDaily20Ma,
+          btc_4h_60ma: btc4h60Ma,
+          regime_status: saved.regimeStatus,
+          briefing_text: briefingMarkdown,
+          created_at: nowStr,
+          trigger_type: triggerType,
+        },
+      };
+    } catch (ollamaErr) {
+      ollamaFallbackReason = ollamaErr.message;
+      console.warn(`[OllamaFallback] 로컬 맥북 Ollama 연결 실패 (${ollamaErr.message}) -> Gemini Flash 백업 엔진 전환`);
     }
-    res.writeHead(502, { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" });
-    res.end(
-      JSON.stringify({
-        success: false,
-        error: "API_CALL_FAILED",
-        message: "사용 가능한 Gemini 스트리밍 모델 연결에 실패하여 BTC 20MA 기계적 Fallback이 적용되었습니다.",
-        quota: await getGeminiQuotaStatus(),
-      })
-    );
-    return;
   }
 
-  // 수동 스트리밍 호출 성공 시 즉시 수동 쿼터 1회 차감 및 트리거 기록
-  await db.prepare(
-    "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('ai_briefing_last_trigger_type', 'MANUAL', ?)"
-  ).run(nowStr);
+  // 2순위: Gemini API (지수 백오프 1초, 2초, 4초 포함)
+  const ctx = await buildDualAiMarketPromptContext({ isProTarget });
+  const { btcPrice, btcDaily20Ma, btc4h60Ma, isHoldCash, regimeReason, prompt } = ctx;
+  const apiKey = await getGeminiApiKey();
+
+  if (!apiKey) {
+    const fbRegime = await applyTier3MechanicalFallback({
+      isPro: isProTarget,
+      btcPrice,
+      btcDaily20Ma,
+      btc4h60Ma,
+      label: isProTarget ? "Pro Fallback" : "Flash Fallback",
+    });
+    return {
+      success: false,
+      error: "NO_API_KEY",
+      fallback_tier: "MECHANICAL_20MA",
+      regime_filter: fbRegime,
+      message: ollamaAttempted
+        ? `로컬 Ollama 연결 실패(${ollamaFallbackReason}) 및 Gemini API 키 미등록으로 BTC 20MA/60MA 기계적 Fallback이 적용되었습니다.`
+        : "Gemini API 키가 등록되지 않았습니다. config/upbit_config.json 파일의 gemini_api_key 항목에 키를 입력하시거나 웹 화면에서 등록해주세요.",
+      quota: await getGeminiQuotaStatus(),
+    };
+  }
+
+  const quotaBefore = await getGeminiQuotaStatus();
+  if (triggerType === "MANUAL" && quotaBefore.remaining_calls <= 0) {
+    const fbRegime = await applyTier3MechanicalFallback({
+      isPro: isProTarget,
+      btcPrice,
+      btcDaily20Ma,
+      btc4h60Ma,
+      label: isProTarget ? "Pro Quota Fallback" : "Flash Quota Fallback",
+    });
+    return {
+      success: false,
+      error: "DAILY_QUOTA_EXCEEDED",
+      fallback_tier: "MECHANICAL_20MA",
+      regime_filter: fbRegime,
+      message: "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
+      quota: quotaBefore,
+    };
+  }
+
+  const candidateModels = getDualAiCandidateModels(isProTarget, options?.preferredModel);
+  const geminiRes = await callGeminiGenerateWithBackoff({
+    apiKey,
+    candidateModels,
+    prompt,
+    temperature: 0.25,
+    timeoutMs: 30000,
+    backoffDelaysMs: options?.backoffDelaysMs || [1000, 2000, 4000],
+    logTag: "Gemini API",
+  });
+
+  if (!geminiRes.analysisText) {
+    // 3순위: BTC 일봉 20MA / 4시간 60MA 기반 기계적 Fallback 적용
+    const fbRegime = await applyTier3MechanicalFallback({
+      isPro: isProTarget,
+      btcPrice,
+      btcDaily20Ma,
+      btc4h60Ma,
+      label: isProTarget ? "Pro Fallback" : "Flash Fallback",
+    });
+
+    if (geminiRes.allQuota429 && triggerType === "MANUAL") {
+      const exhaustedQuota = await markGeminiManualQuotaExhausted();
+      return {
+        success: false,
+        error: "DAILY_QUOTA_EXCEEDED",
+        fallback_tier: "MECHANICAL_20MA",
+        regime_filter: fbRegime,
+        message: "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
+        quota: exhaustedQuota,
+      };
+    }
+    return {
+      success: false,
+      error: "API_CALL_FAILED",
+      fallback_tier: "MECHANICAL_20MA",
+      regime_filter: fbRegime,
+      message: `Gemini API 호출 실패 (BTC 20MA 기계적 Fallback 적용): ${geminiRes.lastErrorMsg || "응답 텍스트를 생성하지 못했습니다."}`,
+      quota: await getGeminiQuotaStatus(),
+    };
+  }
+
+  const { cleanText, structured } = extractStructuredRegimeFromLlmText(geminiRes.analysisText);
+  const briefingMarkdown = cleanText || geminiRes.analysisText;
+
+  const saved = await persistMarketBriefingAndUpdateRegime({
+    db,
+    provider: "gemini",
+    model: geminiRes.chosenModel,
+    isProTarget,
+    btcPrice,
+    btcDaily20Ma,
+    btc4h60Ma,
+    isHoldCash,
+    regimeReason,
+    analysisText: geminiRes.analysisText,
+    briefingMarkdown,
+    decision: structured,
+    nowStr,
+    triggerType,
+    slotKey,
+    consumeQuota: true,
+  });
+
+  return {
+    success: true,
+    provider: "gemini",
+    fallback_used: ollamaAttempted,
+    trigger_type: triggerType,
+    quota: saved.updatedQuota,
+    regime_filter: saved.updatedRegime,
+    briefing: {
+      id: saved.briefingId,
+      provider: "gemini",
+      model: geminiRes.chosenModel,
+      btc_price: btcPrice,
+      btc_daily_20ma: btcDaily20Ma,
+      btc_4h_60ma: btc4h60Ma,
+      regime_status: saved.regimeStatus,
+      briefing_text: briefingMarkdown,
+      created_at: nowStr,
+      trigger_type: triggerType,
+    },
+  };
+}
+
+async function generateAiMarketAnalysisStream(req, res) {
+  const db = getDb();
+  const nowStr = nowKSTString();
+  const ollamaCfg = await getOllamaRuntimeConfig();
+
+  // 1순위: 로컬 Ollama(qwen3-news) 호출 후 SSE 타이프라이터 청크 스트리밍
+  let ollamaAttempted = false;
+  let ollamaFallbackReason = "";
+  if (ollamaCfg.enabled) {
+    ollamaAttempted = true;
+    try {
+      const [recentNews, ollamaCtxPack] = await Promise.all([
+        getRecentNewsForAiAnalysis(db, 12),
+        fetchLiveMarketContextForOllama(db),
+      ]);
+
+      const ollamaRes = await callLocalOllamaCoinNewsAnalyzer(
+        recentNews,
+        ollamaCtxPack.marketContext,
+        ollamaCtxPack.activeBots,
+        {
+          baseUrl: ollamaCfg.baseUrl,
+          model: ollamaCfg.model,
+          timeoutMs: ollamaCfg.timeoutMs,
+        }
+      );
+
+      const btcPrice = Number(ollamaCtxPack.marketContext.btcPrice || 0);
+      const btcDaily20Ma = Number(ollamaCtxPack.marketContext.btcDaily20Ma || 0);
+      const btc4h60Ma = Number(ollamaCtxPack.marketContext.btc4h60Ma || 0);
+      const briefingMarkdown = buildOllamaMarketBriefingMarkdown(
+        ollamaRes,
+        ollamaCtxPack.marketContext,
+        ollamaCtxPack.activeBots
+      );
+
+      const saved = await persistMarketBriefingAndUpdateRegime({
+        db,
+        provider: "ollama",
+        model: ollamaRes.model,
+        isProTarget: false,
+        btcPrice,
+        btcDaily20Ma,
+        btc4h60Ma,
+        isHoldCash: ollamaRes.recommended_action === "HALT_NEW_BUYS" || ollamaRes.recommended_action === "EMERGENCY_CLOSE_ALL",
+        regimeReason: ollamaRes.reason,
+        analysisText: briefingMarkdown,
+        briefingMarkdown,
+        decision: ollamaRes,
+        nowStr,
+        triggerType: "MANUAL",
+        slotKey: null,
+        consumeQuota: false,
+      });
+
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        ...(res.__corsHeaders || {}),
+      });
+
+      res.write(
+        `data: ${JSON.stringify({
+          type: "meta",
+          btc_price: btcPrice,
+          btc_daily_20ma: btcDaily20Ma,
+          btc_4h_60ma: btc4h60Ma,
+          regime_status: saved.regimeStatus,
+          provider: "ollama",
+          model: ollamaRes.model,
+          engine: "ollama",
+          created_at: nowStr,
+          trigger_type: "MANUAL",
+          regime_filter: saved.updatedRegime,
+          quota: saved.updatedQuota,
+        })}\n\n`
+      );
+
+      await streamTextAsSseChunks(res, req, briefingMarkdown, 12, 4);
+
+      res.write(
+        `data: ${JSON.stringify({
+          type: "done",
+          id: saved.briefingId,
+          provider: "ollama",
+          model: ollamaRes.model,
+          engine: "ollama",
+          full_text: briefingMarkdown,
+          created_at: nowStr,
+          trigger_type: "MANUAL",
+          regime_filter: saved.updatedRegime,
+          quota: saved.updatedQuota,
+        })}\n\n`
+      );
+      res.end();
+      return;
+    } catch (ollamaErr) {
+      ollamaFallbackReason = ollamaErr.message;
+      console.warn(`[OllamaFallback] 로컬 맥북 Ollama 연결 실패 (${ollamaErr.message}) -> Gemini Flash 백업 엔진 전환`);
+    }
+  }
+
+  // 2순위: Gemini Flash 스트리밍 백업 엔진
+  const ctx = await buildDualAiMarketPromptContext({ isProTarget: false });
+  const { btcPrice, btcDaily20Ma, btc4h60Ma, isHoldCash, regimeReason, prompt } = ctx;
+  const apiKey = await getGeminiApiKey();
+
+  if (!apiKey) {
+    const fbRegime = await applyTier3MechanicalFallback({
+      isPro: false,
+      btcPrice,
+      btcDaily20Ma,
+      btc4h60Ma,
+      label: "Stream Fallback",
+    });
+    return sendJson(res, 400, {
+      success: false,
+      error: "NO_API_KEY",
+      fallback_tier: "MECHANICAL_20MA",
+      regime_filter: fbRegime,
+      message: ollamaAttempted
+        ? `로컬 Ollama 연결 실패(${ollamaFallbackReason}) 및 Gemini API 키 미등록으로 BTC 20MA 기계적 Fallback이 적용되었습니다.`
+        : "Gemini API 키가 등록되지 않았습니다. config/upbit_config.json 파일의 gemini_api_key 항목에 키를 입력하시거나 웹 화면에서 등록해주세요.",
+      quota: await getGeminiQuotaStatus(),
+    });
+  }
+
+  const quotaBefore = await getGeminiQuotaStatus();
+  if (quotaBefore.remaining_calls <= 0) {
+    const fbRegime = await applyTier3MechanicalFallback({
+      isPro: false,
+      btcPrice,
+      btcDaily20Ma,
+      btc4h60Ma,
+      label: "Stream Quota Fallback",
+    });
+    return sendJson(res, 429, {
+      success: false,
+      error: "DAILY_QUOTA_EXCEEDED",
+      fallback_tier: "MECHANICAL_20MA",
+      regime_filter: fbRegime,
+      message: "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
+      quota: quotaBefore,
+    });
+  }
+
+  const candidateModels = getDualAiCandidateModels(false);
+  const streamRes = await callGeminiStreamWithBackoff({
+    apiKey,
+    candidateModels,
+    prompt,
+    temperature: 0.25,
+    timeoutMs: 30000,
+    logTag: "Gemini Stream",
+  });
+
+  if (!streamRes.geminiResp) {
+    const fbRegime = await applyTier3MechanicalFallback({
+      isPro: false,
+      btcPrice,
+      btcDaily20Ma,
+      btc4h60Ma,
+      label: "Stream Fallback",
+    });
+
+    if (streamRes.allQuota429) {
+      const exhaustedQuota = await markGeminiManualQuotaExhausted();
+      return sendJson(res, 429, {
+        success: false,
+        error: "DAILY_QUOTA_EXCEEDED",
+        fallback_tier: "MECHANICAL_20MA",
+        regime_filter: fbRegime,
+        message: "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
+        quota: exhaustedQuota,
+      });
+    }
+    return sendJson(res, 502, {
+      success: false,
+      error: "API_CALL_FAILED",
+      fallback_tier: "MECHANICAL_20MA",
+      regime_filter: fbRegime,
+      message: "사용 가능한 Gemini 스트리밍 모델 연결에 실패하여 BTC 20MA 기계적 Fallback이 적용되었습니다.",
+      quota: await getGeminiQuotaStatus(),
+    });
+  }
+
+  await db
+    .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('ai_briefing_last_trigger_type', 'MANUAL', ?)")
+    .run(nowStr);
   const updatedQuota = await consumeGeminiQuota("MANUAL");
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
-    "Connection": "keep-alive",
-    "Access-Control-Allow-Origin": "*",
+    Connection: "keep-alive",
+    ...(res.__corsHeaders || {}),
   });
 
   let regimeRow = null;
@@ -2778,8 +3954,10 @@ async function generateAiMarketAnalysisStream(req, res) {
       btc_daily_20ma: btcDaily20Ma,
       btc_4h_60ma: btc4h60Ma,
       regime_status: isHoldCash ? "HOLD_CASH" : "NORMAL",
-      model: chosenModel,
+      provider: "gemini",
+      model: streamRes.chosenModel,
       engine: "dual",
+      fallback_used: ollamaAttempted,
       created_at: nowStr,
       trigger_type: "MANUAL",
       regime_filter: regimeRow,
@@ -2787,92 +3965,42 @@ async function generateAiMarketAnalysisStream(req, res) {
     })}\n\n`
   );
 
-  const reader = geminiResp.body.getReader();
-  const decoder = new TextDecoder();
-  let fullText = "";
-  let sseBuffer = "";
-
   try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      sseBuffer += decoder.decode(value, { stream: true });
-
-      const lines = sseBuffer.split("\n");
-      sseBuffer = lines.pop();
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith("data:")) {
-          const jsonStr = trimmed.slice(5).trim();
-          if (!jsonStr || jsonStr === "[DONE]") continue;
-          try {
-            const parsed = JSON.parse(jsonStr);
-            const delta = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
-            if (delta) {
-              fullText += delta;
-              res.write(`data: ${JSON.stringify({ type: "chunk", text: delta })}\n\n`);
-            }
-          } catch {}
-        }
-      }
-    }
-
-    if (sseBuffer.trim().startsWith("data:")) {
-      const jsonStr = sseBuffer.trim().slice(5).trim();
-      try {
-        const parsed = JSON.parse(jsonStr);
-        const delta = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (delta) {
-          fullText += delta;
-          res.write(`data: ${JSON.stringify({ type: "chunk", text: delta })}\n\n`);
-        }
-      } catch {}
-    }
-
+    const fullText = await consumeGeminiSseBody(streamRes.geminiResp, res);
     const { cleanText, structured } = extractStructuredRegimeFromLlmText(fullText);
     const briefingMarkdown = cleanText || fullText;
 
-    let updatedRegime = null;
-    try {
-      updatedRegime = await updateMarketRegimeFilterFromAnalysis({
-        isPro: false,
-        btcPrice,
-        btcDaily20Ma,
-        btc4h60Ma,
-        isHoldCash,
-        regimeReason,
-        analysisText: fullText,
-        decision: structured,
-      });
-    } catch {}
-
-    const insertStmt = await db.prepare(`
-      INSERT INTO ai_market_briefings (
-        provider, model, btc_price, btc_daily_20ma, btc_4h_60ma, regime_status, briefing_text, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const info = insertStmt.run(
-      "gemini",
-      chosenModel,
+    const saved = await persistMarketBriefingAndUpdateRegime({
+      db,
+      provider: "gemini",
+      model: streamRes.chosenModel,
+      isProTarget: false,
       btcPrice,
       btcDaily20Ma,
       btc4h60Ma,
-      updatedRegime?.recommended_action === "HALT_NEW_BUYS" ? "HOLD_CASH" : updatedRegime?.market_regime || "NORMAL",
+      isHoldCash,
+      regimeReason,
+      analysisText: fullText,
       briefingMarkdown,
-      nowStr
-    );
+      decision: structured,
+      nowStr,
+      triggerType: "MANUAL",
+      slotKey: null,
+      consumeQuota: false,
+    });
 
     res.write(
       `data: ${JSON.stringify({
         type: "done",
-        id: info.lastInsertRowid,
-        model: chosenModel,
+        id: saved.briefingId,
+        provider: "gemini",
+        model: streamRes.chosenModel,
         engine: "dual",
+        fallback_used: ollamaAttempted,
         full_text: briefingMarkdown,
         created_at: nowStr,
         trigger_type: "MANUAL",
-        regime_filter: updatedRegime || regimeRow,
+        regime_filter: saved.updatedRegime || regimeRow,
         quota: updatedQuota,
       })}\n\n`
     );
@@ -2884,67 +4012,14 @@ async function generateAiMarketAnalysisStream(req, res) {
   }
 }
 
-async function generateAiNewsAnalysis(options = {}) {
-  const triggerType = options?.triggerType === "AUTO" ? "AUTO" : "MANUAL";
-  const slotKey = options?.slotKey || null;
-  const apiKey = await getGeminiApiKey();
-  if (!apiKey) {
-    return {
-      success: false,
-      error: "NO_API_KEY",
-      message: "Gemini API 키가 등록되지 않았습니다. 설정 화면에서 API 키를 등록해주세요.",
-      quota: await getGeminiQuotaStatus(),
-    };
-  }
+async function buildNewsAnalysisPromptAndStats(db, options = {}) {
+  const [topNews, stats, tickerSummary] = await Promise.all([
+    getRecentNewsForAiAnalysis(db, 25),
+    getNewsSentimentStats(db),
+    fetchUpbitTickersSummary(["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP"], options),
+  ]);
 
-  const quotaBefore = await getGeminiQuotaStatus();
-  if (triggerType === "MANUAL" && quotaBefore.remaining_calls <= 0) {
-    return {
-      success: false,
-      error: "DAILY_QUOTA_EXCEEDED",
-      message: "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
-      quota: quotaBefore,
-    };
-  }
-
-  const db = getDb();
-  const topNews = await db
-    .prepare(
-      "SELECT title, source, published_at, sentiment, keywords, summary FROM crypto_news ORDER BY published_at DESC, id DESC LIMIT 25"
-    )
-    .all();
-
-  const countRow = await db.prepare(`
-    SELECT
-      COUNT(*) AS total,
-      SUM(CASE WHEN sentiment = 'BULLISH' THEN 1 ELSE 0 END) AS bull,
-      SUM(CASE WHEN sentiment = 'BEARISH' THEN 1 ELSE 0 END) AS bear,
-      SUM(CASE WHEN sentiment = 'NEUTRAL' THEN 1 ELSE 0 END) AS neut
-    FROM crypto_news
-  `).get();
-
-  const totalNews = Number(countRow?.total || 0);
-  const bullCount = Number(countRow?.bull || 0);
-  const bearCount = Number(countRow?.bear || 0);
-  const neutCount = Number(countRow?.neut || 0);
-
-  let tickerInfo = "";
-  try {
-    const targetMarkets = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP"];
-    const tResp = await fetch(`https://api.upbit.com/v1/ticker?markets=${targetMarkets.join(",")}`);
-    if (tResp.ok) {
-      const tickers = await tResp.json();
-      tickerInfo = tickers
-        .map(
-          (t) =>
-            `- ${t.market}: 현재가 ${Number(t.trade_price).toLocaleString("ko-KR")}원 (전일대비 ${(
-              Number(t.signed_change_rate) * 100
-            ).toFixed(2)}%)`
-        )
-        .join("\n");
-    }
-  } catch {}
-
+  const { totalNews, bullCount, bearCount, neutCount } = stats;
   const newsSummaryList = topNews
     .map(
       (n, i) =>
@@ -2966,7 +4041,7 @@ async function generateAiNewsAnalysis(options = {}) {
 - 중립(시황) 감성: ${neutCount}건 (${totalNews > 0 ? ((neutCount / totalNews) * 100).toFixed(1) : 0}%)
 
 2. 주요 코인 실시간 시세:
-${tickerInfo || "- 시세 수신 중"}
+${tickerSummary.tickerLines || "- 시세 수신 중"}
 
 3. 최근 주요 뉴스 헤드라인 (상위 25건):
 ${newsSummaryList}
@@ -2990,87 +4065,40 @@ ${newsSummaryList}
 
 문장은 신뢰감 있고 가독성 높게, 적절한 불릿포인트와 이모지를 활용해주세요.`;
 
-  const candidateModels = getDualAiCandidateModels(false);
+  return {
+    topNews,
+    totalNews,
+    bullCount,
+    bearCount,
+    neutCount,
+    nowStr,
+    prompt,
+  };
+}
 
-  let chosenModel = candidateModels[0];
-  let analysisText = "";
-  let lastErrorMsg = "";
-  let quota429Count = 0;
-
-  for (const model of candidateModels) {
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
-        apiKey
-      )}`;
-      const controller = new AbortController();
-      const timeoutTimer = setTimeout(() => controller.abort(), 60000);
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: controller.signal,
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: 0.3,
-            maxOutputTokens: 8192,
-          },
-        }),
-      });
-      clearTimeout(timeoutTimer);
-
-      if (response.ok) {
-        const resJson = await response.json();
-        const text = resJson.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (text) {
-          chosenModel = model;
-          analysisText = text;
-          break;
-        }
-      } else {
-        const errText = await response.text();
-        if (response.status === 429) {
-          quota429Count += 1;
-        }
-        console.warn(`[Gemini News API] Model ${model} failed (HTTP ${response.status}):`, errText);
-        try {
-          const errJson = JSON.parse(errText);
-          lastErrorMsg = errJson?.error?.message || `HTTP ${response.status}`;
-        } catch {
-          lastErrorMsg = `HTTP ${response.status}: ${errText}`;
-        }
-      }
-    } catch (reqErr) {
-      console.warn(`[Gemini News API] Request exception for model ${model}:`, reqErr.message);
-      lastErrorMsg = reqErr.message;
-    }
-  }
-
-  if (!analysisText) {
-    if (quota429Count === candidateModels.length && triggerType === "MANUAL") {
-      const exhaustedQuota = await markGeminiManualQuotaExhausted();
-      return {
-        success: false,
-        error: "DAILY_QUOTA_EXCEEDED",
-        message: "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
-        quota: exhaustedQuota,
-      };
-    }
-    return {
-      success: false,
-      error: "API_CALL_FAILED",
-      message: `Gemini 뉴스 AI 분석 실패: ${lastErrorMsg || "응답 텍스트를 생성하지 못했습니다."}`,
-      quota: await getGeminiQuotaStatus(),
-    };
-  }
-
+async function persistNewsBriefingAndNotify({
+  db,
+  provider,
+  model,
+  totalNews,
+  bullCount,
+  bearCount,
+  neutCount,
+  analysisText,
+  nowStr,
+  triggerType,
+  slotKey,
+  consumeQuota = false,
+  pushType = "news_analysis_done",
+}) {
   const insertStmt = await db.prepare(`
     INSERT INTO ai_news_briefings (
       provider, model, news_count, bullish_count, bearish_count, neutral_count, briefing_text, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  const info = insertStmt.run(
-    "gemini",
-    chosenModel,
+  const info = await insertStmt.run(
+    provider,
+    model,
     totalNews,
     bullCount,
     bearCount,
@@ -3079,22 +4107,22 @@ ${newsSummaryList}
     nowStr
   );
 
-  await db.prepare(
-    "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('ai_news_briefing_last_trigger_type', ?, ?)"
-  ).run(triggerType, nowStr);
+  await db
+    .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('ai_news_briefing_last_trigger_type', ?, ?)")
+    .run(triggerType, nowStr);
   if (triggerType === "AUTO" && slotKey) {
-    await db.prepare(
-      "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('ai_news_briefing_last_auto_slot', ?, ?)"
-    ).run(slotKey, nowStr);
+    await db
+      .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('ai_news_briefing_last_auto_slot', ?, ?)")
+      .run(slotKey, nowStr);
   }
-  const updatedQuota = await consumeGeminiQuota(triggerType);
 
-  // 뉴스 분석 완료 시 웹푸시 알림 발송
+  const updatedQuota = consumeQuota ? await consumeGeminiQuota(triggerType) : await getGeminiQuotaStatus();
+
   broadcastWebPushNotification({
     title: "AI 뉴스 분석 완료",
     body: "ai 분석이 완료되었습니다",
     data: {
-      type: "news_analysis_done",
+      type: pushType,
       trigger_type: triggerType,
       briefing_id: info.lastInsertRowid,
       timestamp: Date.now(),
@@ -3104,18 +4132,217 @@ ${newsSummaryList}
   });
 
   return {
+    briefingId: info.lastInsertRowid,
+    updatedQuota,
+  };
+}
+
+async function generateAiNewsAnalysis(options = {}) {
+  const triggerType = options?.triggerType === "AUTO" ? "AUTO" : "MANUAL";
+  const slotKey = options?.slotKey || null;
+  const db = getDb();
+
+  const { topNews, totalNews, bullCount, bearCount, neutCount, nowStr, prompt } =
+    await buildNewsAnalysisPromptAndStats(db, options);
+
+  const ollamaCfg = await getOllamaRuntimeConfig(options);
+  const useLocalOllama = options?.useLocalOllama !== undefined ? Boolean(options.useLocalOllama) : ollamaCfg.enabled;
+
+  // 1순위: 맥북 프로 로컬 Ollama(qwen3-news) 뉴스 감성 분석
+  let ollamaAttempted = false;
+  let ollamaFallbackReason = "";
+  let cachedMarketCtx = null;
+
+  if (useLocalOllama) {
+    ollamaAttempted = true;
+    try {
+      const ollamaCtxPack = await fetchLiveMarketContextForOllama(db, null, options);
+      cachedMarketCtx = ollamaCtxPack.marketContext;
+
+      const ollamaRes = await callLocalOllamaCoinNewsAnalyzer(
+        topNews,
+        ollamaCtxPack.marketContext,
+        ollamaCtxPack.activeBots,
+        {
+          baseUrl: options?.ollamaBaseUrl || ollamaCfg.baseUrl,
+          model: options?.ollamaModel || ollamaCfg.model,
+          timeoutMs: options?.ollamaTimeoutMs || ollamaCfg.timeoutMs,
+        }
+      );
+
+      const btcPrice = Number(ollamaCtxPack.marketContext.btcPrice || 0);
+      const btcDaily20Ma = Number(ollamaCtxPack.marketContext.btcDaily20Ma || 0);
+      const btc4h60Ma = Number(ollamaCtxPack.marketContext.btc4h60Ma || 0);
+
+      const updatedRegime = await updateMarketRegimeFilterFromAnalysis({
+        isPro: false,
+        btcPrice,
+        btcDaily20Ma,
+        btc4h60Ma,
+        isHoldCash: ollamaRes.recommended_action === "HALT_NEW_BUYS" || ollamaRes.recommended_action === "EMERGENCY_CLOSE_ALL",
+        regimeReason: ollamaRes.reason,
+        decision: ollamaRes,
+      });
+
+      const newsMarkdown = buildOllamaNewsBriefingMarkdown(ollamaRes, {
+        totalNews,
+        bullCount,
+        bearCount,
+        neutCount,
+        topNews,
+        marketContext: ollamaCtxPack.marketContext,
+      });
+
+      const saved = await persistNewsBriefingAndNotify({
+        db,
+        provider: "ollama",
+        model: ollamaRes.model,
+        totalNews,
+        bullCount,
+        bearCount,
+        neutCount,
+        analysisText: newsMarkdown,
+        nowStr,
+        triggerType,
+        slotKey,
+        consumeQuota: false,
+        pushType: "news_analysis_done",
+      });
+
+      return {
+        success: true,
+        provider: "ollama",
+        fallback_used: false,
+        trigger_type: triggerType,
+        quota: saved.updatedQuota,
+        ollama: await checkOllamaStatus(options),
+        regime_filter: updatedRegime,
+        briefing: {
+          id: saved.briefingId,
+          provider: "ollama",
+          model: ollamaRes.model,
+          news_count: totalNews,
+          bullish_count: bullCount,
+          bearish_count: bearCount,
+          neutral_count: neutCount,
+          briefing_text: newsMarkdown,
+          created_at: nowStr,
+          trigger_type: triggerType,
+        },
+      };
+    } catch (ollamaErr) {
+      ollamaFallbackReason = ollamaErr.message;
+      console.warn(`[OllamaFallback] 로컬 맥북 Ollama 연결 실패 (${ollamaErr.message}) -> Gemini Flash 백업 엔진 전환`);
+    }
+  }
+
+  // 2순위: Gemini Flash API 백업 엔진 (지수 백오프 1초, 2초, 4초 포함)
+  const applyMechanicalNewsGuard = async (label) => {
+    const ctxPack = cachedMarketCtx
+      ? { marketContext: cachedMarketCtx }
+      : await fetchLiveMarketContextForOllama(db, null, options).catch(() => ({ marketContext: {} }));
+    return await applyTier3MechanicalFallback({
+      isPro: false,
+      btcPrice: Number(ctxPack.marketContext?.btcPrice || 0),
+      btcDaily20Ma: Number(ctxPack.marketContext?.btcDaily20Ma || 0),
+      btc4h60Ma: Number(ctxPack.marketContext?.btc4h60Ma || 0),
+      label,
+    });
+  };
+
+  const apiKey = await getGeminiApiKey();
+  if (!apiKey) {
+    const fbRegime = await applyMechanicalNewsGuard("News Flash Fallback");
+    return {
+      success: false,
+      error: "NO_API_KEY",
+      fallback_tier: "MECHANICAL_20MA",
+      regime_filter: fbRegime,
+      message: ollamaAttempted
+        ? `로컬 Ollama 연결 실패(${ollamaFallbackReason}) 및 Gemini API 키 미등록으로 BTC 20MA 기계적 Fallback이 적용되었습니다.`
+        : "Gemini API 키가 등록되지 않았습니다. 설정 화면에서 API 키를 등록해주세요.",
+      quota: await getGeminiQuotaStatus(),
+    };
+  }
+
+  const quotaBefore = await getGeminiQuotaStatus();
+  if (triggerType === "MANUAL" && quotaBefore.remaining_calls <= 0) {
+    const fbRegime = await applyMechanicalNewsGuard("News Quota Fallback");
+    return {
+      success: false,
+      error: "DAILY_QUOTA_EXCEEDED",
+      fallback_tier: "MECHANICAL_20MA",
+      regime_filter: fbRegime,
+      message: "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
+      quota: quotaBefore,
+    };
+  }
+
+  const candidateModels = getDualAiCandidateModels(false);
+  const geminiRes = await callGeminiGenerateWithBackoff({
+    apiKey,
+    candidateModels,
+    prompt,
+    temperature: 0.3,
+    timeoutMs: 60000,
+    backoffDelaysMs: options?.backoffDelaysMs || [1000, 2000, 4000],
+    logTag: "Gemini News API",
+  });
+
+  if (!geminiRes.analysisText) {
+    const fbRegime = await applyMechanicalNewsGuard("News API Fallback");
+    if (geminiRes.allQuota429 && triggerType === "MANUAL") {
+      const exhaustedQuota = await markGeminiManualQuotaExhausted();
+      return {
+        success: false,
+        error: "DAILY_QUOTA_EXCEEDED",
+        fallback_tier: "MECHANICAL_20MA",
+        regime_filter: fbRegime,
+        message: "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
+        quota: exhaustedQuota,
+      };
+    }
+    return {
+      success: false,
+      error: "API_CALL_FAILED",
+      fallback_tier: "MECHANICAL_20MA",
+      regime_filter: fbRegime,
+      message: `Gemini 뉴스 AI 분석 실패 (BTC 20MA 기계적 Fallback 적용): ${geminiRes.lastErrorMsg || "응답 텍스트를 생성하지 못했습니다."}`,
+      quota: await getGeminiQuotaStatus(),
+    };
+  }
+
+  const saved = await persistNewsBriefingAndNotify({
+    db,
+    provider: "gemini",
+    model: geminiRes.chosenModel,
+    totalNews,
+    bullCount,
+    bearCount,
+    neutCount,
+    analysisText: geminiRes.analysisText,
+    nowStr,
+    triggerType,
+    slotKey,
+    consumeQuota: true,
+    pushType: "news_analysis_done",
+  });
+
+  return {
     success: true,
+    provider: "gemini",
+    fallback_used: ollamaAttempted,
     trigger_type: triggerType,
-    quota: updatedQuota,
+    quota: saved.updatedQuota,
     briefing: {
-      id: info.lastInsertRowid,
+      id: saved.briefingId,
       provider: "gemini",
-      model: chosenModel,
+      model: geminiRes.chosenModel,
       news_count: totalNews,
       bullish_count: bullCount,
       bearish_count: bearCount,
       neutral_count: neutCount,
-      briefing_text: analysisText,
+      briefing_text: geminiRes.analysisText,
       created_at: nowStr,
       trigger_type: triggerType,
     },
@@ -3123,201 +4350,215 @@ ${newsSummaryList}
 }
 
 async function generateAiNewsAnalysisStream(req, res) {
+  const db = getDb();
+  const { topNews, totalNews, bullCount, bearCount, neutCount, nowStr, prompt } =
+    await buildNewsAnalysisPromptAndStats(db);
+
+  const ollamaCfg = await getOllamaRuntimeConfig();
+
+  // 1순위: 로컬 Ollama(qwen3-news) 호출 후 SSE 타이프라이터 청크 스트리밍
+  let ollamaAttempted = false;
+  let ollamaFallbackReason = "";
+  let cachedMarketCtx = null;
+
+  if (ollamaCfg.enabled) {
+    ollamaAttempted = true;
+    try {
+      const ollamaCtxPack = await fetchLiveMarketContextForOllama(db);
+      cachedMarketCtx = ollamaCtxPack.marketContext;
+
+      const ollamaRes = await callLocalOllamaCoinNewsAnalyzer(
+        topNews,
+        ollamaCtxPack.marketContext,
+        ollamaCtxPack.activeBots,
+        {
+          baseUrl: ollamaCfg.baseUrl,
+          model: ollamaCfg.model,
+          timeoutMs: ollamaCfg.timeoutMs,
+        }
+      );
+
+      const updatedRegime = await updateMarketRegimeFilterFromAnalysis({
+        isPro: false,
+        btcPrice: Number(ollamaCtxPack.marketContext.btcPrice || 0),
+        btcDaily20Ma: Number(ollamaCtxPack.marketContext.btcDaily20Ma || 0),
+        btc4h60Ma: Number(ollamaCtxPack.marketContext.btc4h60Ma || 0),
+        isHoldCash: ollamaRes.recommended_action === "HALT_NEW_BUYS" || ollamaRes.recommended_action === "EMERGENCY_CLOSE_ALL",
+        regimeReason: ollamaRes.reason,
+        decision: ollamaRes,
+      });
+
+      const fullText = buildOllamaNewsBriefingMarkdown(ollamaRes, {
+        totalNews,
+        bullCount,
+        bearCount,
+        neutCount,
+        topNews,
+        marketContext: ollamaCtxPack.marketContext,
+      });
+
+      const saved = await persistNewsBriefingAndNotify({
+        db,
+        provider: "ollama",
+        model: ollamaRes.model,
+        totalNews,
+        bullCount,
+        bearCount,
+        neutCount,
+        analysisText: fullText,
+        nowStr,
+        triggerType: "MANUAL",
+        slotKey: null,
+        consumeQuota: false,
+        pushType: "news_briefing",
+      });
+
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        ...(res.__corsHeaders || {}),
+      });
+
+      res.write(
+        `data: ${JSON.stringify({
+          type: "meta",
+          provider: "ollama",
+          model: ollamaRes.model,
+          engine: "ollama",
+          news_count: totalNews,
+          bullish_count: bullCount,
+          bearish_count: bearCount,
+          neutral_count: neutCount,
+          created_at: nowStr,
+          trigger_type: "MANUAL",
+          regime_filter: updatedRegime,
+          quota: saved.updatedQuota,
+        })}\n\n`
+      );
+
+      await streamTextAsSseChunks(res, req, fullText, 12, 4);
+
+      res.write(
+        `data: ${JSON.stringify({
+          type: "done",
+          id: saved.briefingId,
+          provider: "ollama",
+          model: ollamaRes.model,
+          engine: "ollama",
+          news_count: totalNews,
+          bullish_count: bullCount,
+          bearish_count: bearCount,
+          neutral_count: neutCount,
+          full_text: fullText,
+          created_at: nowStr,
+          trigger_type: "MANUAL",
+          regime_filter: updatedRegime,
+          quota: saved.updatedQuota,
+        })}\n\n`
+      );
+      res.end();
+      return;
+    } catch (ollamaErr) {
+      ollamaFallbackReason = ollamaErr.message;
+      console.warn(`[OllamaFallback] 로컬 맥북 Ollama 연결 실패 (${ollamaErr.message}) -> Gemini Flash 백업 엔진 전환`);
+    }
+  }
+
+  // 2순위: Gemini Flash 스트리밍 백업 엔진 (지수 백오프 1초, 2초, 4초 포함)
+  const applyMechanicalNewsStreamGuard = async (label) => {
+    const ctxPack = cachedMarketCtx
+      ? { marketContext: cachedMarketCtx }
+      : await fetchLiveMarketContextForOllama(db).catch(() => ({ marketContext: {} }));
+    return await applyTier3MechanicalFallback({
+      isPro: false,
+      btcPrice: Number(ctxPack.marketContext?.btcPrice || 0),
+      btcDaily20Ma: Number(ctxPack.marketContext?.btcDaily20Ma || 0),
+      btc4h60Ma: Number(ctxPack.marketContext?.btc4h60Ma || 0),
+      label,
+    });
+  };
+
   const apiKey = await getGeminiApiKey();
   if (!apiKey) {
-    res.writeHead(400, { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" });
-    res.end(
-      JSON.stringify({
-        success: false,
-        error: "NO_API_KEY",
-        message: "Gemini API 키가 등록되지 않았습니다. 설정 화면에서 API 키를 등록해주세요.",
-        quota: await getGeminiQuotaStatus(),
-      })
-    );
-    return;
+    const fbRegime = await applyMechanicalNewsStreamGuard("News Stream Fallback");
+    return sendJson(res, 400, {
+      success: false,
+      error: "NO_API_KEY",
+      fallback_tier: "MECHANICAL_20MA",
+      regime_filter: fbRegime,
+      message: ollamaAttempted
+        ? `로컬 Ollama 연결 실패(${ollamaFallbackReason}) 및 Gemini API 키 미등록으로 BTC 20MA 기계적 Fallback이 적용되었습니다.`
+        : "Gemini API 키가 등록되지 않았습니다. 설정 화면에서 API 키를 등록해주세요.",
+      quota: await getGeminiQuotaStatus(),
+    });
   }
 
   const quotaBefore = await getGeminiQuotaStatus();
   if (quotaBefore.remaining_calls <= 0) {
-    res.writeHead(429, { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" });
-    res.end(
-      JSON.stringify({
-        success: false,
-        error: "DAILY_QUOTA_EXCEEDED",
-        message: "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
-        quota: quotaBefore,
-      })
-    );
-    return;
+    const fbRegime = await applyMechanicalNewsStreamGuard("News Stream Quota Fallback");
+    return sendJson(res, 429, {
+      success: false,
+      error: "DAILY_QUOTA_EXCEEDED",
+      fallback_tier: "MECHANICAL_20MA",
+      regime_filter: fbRegime,
+      message: "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
+      quota: quotaBefore,
+    });
   }
-
-  const db = getDb();
-  const topNews = await db
-    .prepare(
-      "SELECT title, source, published_at, sentiment, keywords, summary FROM crypto_news ORDER BY published_at DESC, id DESC LIMIT 25"
-    )
-    .all();
-
-  const countRow = await db.prepare(`
-    SELECT
-      COUNT(*) AS total,
-      SUM(CASE WHEN sentiment = 'BULLISH' THEN 1 ELSE 0 END) AS bull,
-      SUM(CASE WHEN sentiment = 'BEARISH' THEN 1 ELSE 0 END) AS bear,
-      SUM(CASE WHEN sentiment = 'NEUTRAL' THEN 1 ELSE 0 END) AS neut
-    FROM crypto_news
-  `).get();
-
-  const totalNews = Number(countRow?.total || 0);
-  const bullCount = Number(countRow?.bull || 0);
-  const bearCount = Number(countRow?.bear || 0);
-  const neutCount = Number(countRow?.neut || 0);
-
-  // 주요 코인 실시간 시세
-  let tickerInfo = "";
-  try {
-    const targetMarkets = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP"];
-    const tResp = await fetch(`https://api.upbit.com/v1/ticker?markets=${targetMarkets.join(",")}`);
-    if (tResp.ok) {
-      const tickers = await tResp.json();
-      tickerInfo = tickers
-        .map(
-          (t) =>
-            `- ${t.market}: 현재가 ${Number(t.trade_price).toLocaleString("ko-KR")}원 (전일대비 ${(
-              Number(t.signed_change_rate) * 100
-            ).toFixed(2)}%)`
-        )
-        .join("\n");
-    }
-  } catch {}
-
-  const newsSummaryList = topNews
-    .map(
-      (n, i) =>
-        `${i + 1}. [${n.sentiment}] ${n.title} (출처: ${n.source}, 일시: ${n.published_at})${
-          n.keywords ? ` [태그: ${n.keywords}]` : ""
-        }`
-    )
-    .join("\n");
-
-  const nowStr = nowKSTString();
-  const prompt = `당신은 대한민국 최고 수준의 가상자산 퀀트 투자 시스템 'Upbit AutoCoinTrade'의 수석 AI 뉴스 & 센티먼트 애널리스트입니다.
-아래는 ${nowStr} 기준, 시스템이 국내외 주요 암호화폐 언론사(Google News, TokenPost 등)로부터 실시간 수집한 최신 뉴스 및 시장 통계 데이터입니다.
-
-### [실시간 수집 뉴스 데이터 및 시장 통계]
-1. 뉴스 감성 통계:
-- 총 수집 뉴스: ${totalNews}건
-- 호재(상승) 감성: ${bullCount}건 (${totalNews > 0 ? ((bullCount / totalNews) * 100).toFixed(1) : 0}%)
-- 악재(하락) 감성: ${bearCount}건 (${totalNews > 0 ? ((bearCount / totalNews) * 100).toFixed(1) : 0}%)
-- 중립(시황) 감성: ${neutCount}건 (${totalNews > 0 ? ((neutCount / totalNews) * 100).toFixed(1) : 0}%)
-
-2. 주요 코인 실시간 시세:
-${tickerInfo || "- 시세 수신 중"}
-
-3. 최근 주요 뉴스 헤드라인 (상위 25건):
-${newsSummaryList}
-
----
-
-### [작성 요청 가이드라인]
-위 수집된 실시간 뉴스와 감성 데이터를 정밀 분석하여, 투자자가 현재 시장의 핵심 쟁점과 향후 가격 방향성을 한눈에 파악할 수 있도록 마크다운(Markdown) 서식으로 다음 3개 섹션을 명확하고 전문적으로 작성해주세요:
-
-## 1. 📰 실시간 뉴스 핵심 쟁점 및 센티먼트 종합 진단
-- 현재 수집된 뉴스에서 가장 지배적인 이슈(예: 특정 거래소 이슈, 규제/정책, ETF 동향 등)를 명확히 짚어주세요.
-- 호재와 악재의 비중 및 시장 참여자들의 심리(탐욕 vs 공포) 상태를 분석해주세요.
-
-## 2. ⚖️ 시장 충격도 & 단기 시황 전망
-- 수집된 뉴스가 비트코인(BTC) 및 메이저 알트코인에 미치는 실제 파급력(일시적 노이즈 vs 중장기 추세 영향)을 진단해주세요.
-- 단기적으로 주목해야 할 지지선 및 변동성 확대 가능성을 제시해주세요.
-
-## 3. 🎯 퀀트 트레이딩 봇 운용 및 리스크 관리 전략
-- 현재와 같은 뉴스 환경에서 3개 자동매매 봇(변동성 돌파, 듀얼 모멘텀, 볼린저 역추세)이 어떤 포지션을 취해야 하는지 구체적인 가이드를 제공해주세요.
-- 무리한 추격 매수를 자제하고 리스크를 방어해야 하는 이유와 실전 투자 조언을 전달해주세요.
-
-문장은 신뢰감 있고 가독성 높게, 적절한 불릿포인트와 이모지를 활용해주세요.`;
 
   const candidateModels = getDualAiCandidateModels(false);
+  const streamRes = await callGeminiStreamWithBackoff({
+    apiKey,
+    candidateModels,
+    prompt,
+    temperature: 0.3,
+    timeoutMs: 60000,
+    logTag: "Gemini News Stream",
+  });
 
-  let geminiResp = null;
-  let chosenModel = candidateModels[0];
-  let sawQuota429 = false;
-
-  for (const model of candidateModels) {
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${encodeURIComponent(
-        apiKey
-      )}`;
-      const resp = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: 0.3,
-            maxOutputTokens: 8192,
-          },
-        }),
-      });
-      if (resp.ok) {
-        geminiResp = resp;
-        chosenModel = model;
-        break;
-      } else {
-        const errTxt = await resp.text();
-        if (resp.status === 429) {
-          sawQuota429 = true;
-        }
-        console.warn(`[Gemini News Stream] Model ${model} failed (HTTP ${resp.status}):`, errTxt);
-      }
-    } catch (e) {
-      console.warn(`[Gemini News Stream] Exception with model ${model}:`, e.message);
-    }
-  }
-
-  if (!geminiResp) {
-    if (sawQuota429) {
+  if (!streamRes.geminiResp) {
+    const fbRegime = await applyMechanicalNewsStreamGuard("News Stream API Fallback");
+    if (streamRes.allQuota429) {
       const exhaustedQuota = await markGeminiManualQuotaExhausted();
-      res.writeHead(429, { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" });
-      res.end(
-        JSON.stringify({
-          success: false,
-          error: "DAILY_QUOTA_EXCEEDED",
-          message: "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
-          quota: exhaustedQuota,
-        })
-      );
-      return;
-    }
-    res.writeHead(502, { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" });
-    res.end(
-      JSON.stringify({
+      return sendJson(res, 429, {
         success: false,
-        error: "API_CALL_FAILED",
-        message: "사용 가능한 Gemini 스트리밍 모델 연결에 실패했습니다.",
-        quota: await getGeminiQuotaStatus(),
-      })
-    );
-    return;
+        error: "DAILY_QUOTA_EXCEEDED",
+        fallback_tier: "MECHANICAL_20MA",
+        regime_filter: fbRegime,
+        message: "금일 무료 api 호출 한도에 도달했습니다. 내일 다시 시도해주세요",
+        quota: exhaustedQuota,
+      });
+    }
+    return sendJson(res, 502, {
+      success: false,
+      error: "API_CALL_FAILED",
+      fallback_tier: "MECHANICAL_20MA",
+      regime_filter: fbRegime,
+      message: "사용 가능한 Gemini 스트리밍 모델 연결에 실패하여 BTC 20MA 기계적 Fallback이 적용되었습니다.",
+      quota: await getGeminiQuotaStatus(),
+    });
   }
 
-  // 수동 뉴스 AI 분석 호출 시에도 수동 쿼터 1회 차감 및 트리거 기록
-  await db.prepare(
-    "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('ai_news_briefing_last_trigger_type', 'MANUAL', ?)"
-  ).run(nowStr);
+  await db
+    .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('ai_news_briefing_last_trigger_type', 'MANUAL', ?)")
+    .run(nowStr);
   const updatedQuota = await consumeGeminiQuota("MANUAL");
 
-  // SSE 헤더 전송
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
-    "Connection": "keep-alive",
-    "Access-Control-Allow-Origin": "*",
+    Connection: "keep-alive",
+    ...(res.__corsHeaders || {}),
   });
 
-  // 메타데이터 이벤트 전송
   res.write(
     `data: ${JSON.stringify({
       type: "meta",
-      model: chosenModel,
+      provider: "gemini",
+      model: streamRes.chosenModel,
+      engine: "dual",
+      fallback_used: ollamaAttempted,
       news_count: totalNews,
       bullish_count: bullCount,
       bearish_count: bearCount,
@@ -3328,84 +4569,32 @@ ${newsSummaryList}
     })}\n\n`
   );
 
-  const reader = geminiResp.body.getReader();
-  const decoder = new TextDecoder();
-  let fullText = "";
-  let sseBuffer = "";
-
   try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      sseBuffer += decoder.decode(value, { stream: true });
-
-      const lines = sseBuffer.split("\n");
-      sseBuffer = lines.pop();
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith("data:")) {
-          const jsonStr = trimmed.slice(5).trim();
-          if (!jsonStr || jsonStr === "[DONE]") continue;
-          try {
-            const parsed = JSON.parse(jsonStr);
-            const delta = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
-            if (delta) {
-              fullText += delta;
-              res.write(`data: ${JSON.stringify({ type: "chunk", text: delta })}\n\n`);
-            }
-          } catch {}
-        }
-      }
-    }
-
-    if (sseBuffer.trim().startsWith("data:")) {
-      const jsonStr = sseBuffer.trim().slice(5).trim();
-      try {
-        const parsed = JSON.parse(jsonStr);
-        const delta = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (delta) {
-          fullText += delta;
-          res.write(`data: ${JSON.stringify({ type: "chunk", text: delta })}\n\n`);
-        }
-      } catch {}
-    }
-
-    // DB 저장
-    const insertStmt = await db.prepare(`
-      INSERT INTO ai_news_briefings (
-        provider, model, news_count, bullish_count, bearish_count, neutral_count, briefing_text, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const info = insertStmt.run(
-      "gemini",
-      chosenModel,
+    const fullText = await consumeGeminiSseBody(streamRes.geminiResp, res);
+    const saved = await persistNewsBriefingAndNotify({
+      db,
+      provider: "gemini",
+      model: streamRes.chosenModel,
       totalNews,
       bullCount,
       bearCount,
       neutCount,
-      fullText,
-      nowStr
-    );
-
-    // 웹푸시 알림 발송: 뉴스 분석 완료
-    broadcastWebPushNotification({
-      title: "AI 뉴스 분석 완료",
-      body: "ai 분석이 완료되었습니다",
-      data: {
-        type: "news_briefing",
-        briefing_id: info.lastInsertRowid,
-        trigger_type: "MANUAL",
-      },
-    }).catch((pushErr) => {
-      console.warn("[WebPush] Failed to broadcast stream news briefing push:", pushErr.message);
+      analysisText: fullText,
+      nowStr,
+      triggerType: "MANUAL",
+      slotKey: null,
+      consumeQuota: false,
+      pushType: "news_briefing",
     });
 
     res.write(
       `data: ${JSON.stringify({
         type: "done",
-        id: info.lastInsertRowid,
-        model: chosenModel,
+        id: saved.briefingId,
+        provider: "gemini",
+        model: streamRes.chosenModel,
+        engine: "dual",
+        fallback_used: ollamaAttempted,
         news_count: totalNews,
         bullish_count: bullCount,
         bearish_count: bearCount,
@@ -3765,22 +4954,72 @@ async function runLlmWeeklyBotSelection(force = false) {
 
     const arenaLeaderboard = await getArenaLeaderboard(db);
     const regimeFilter = await checkMarketRegimeFilter();
+    const rotConfig = await getAutoRotationConfig(db);
+    const isSingleBotMode = rotConfig.allocation_mode === "SINGLE_MARKET_FIT_100";
+    const rotEvaluation = await evaluateWeeklyStrategyChampions(db, {
+      minWeeklyTrades: rotConfig.min_weekly_trades,
+      allocationMode: rotConfig.allocation_mode,
+      marketRegime: {
+        market_regime: regimeFilter.marketRegime,
+        recommended_action: regimeFilter.finalAction,
+        final_bot_overrides_json: JSON.stringify(regimeFilter.botOverrides || {}),
+      },
+    });
     const btcPrice = Number(regimeFilter.btcPrice || 0);
     const btcDaily20Ma = Number(regimeFilter.ma20Day || 0);
     const btc4h60Ma = Number(regimeFilter.ma60_4h || 0);
-    const isBearish = regimeFilter.allowBuy === false;
+    const isBearish =
+      regimeFilter.allowBuy === false ||
+      regimeFilter.belowMa20Day === true ||
+      regimeFilter.marketRegime === "BEAR" ||
+      regimeFilter.marketRegime === "HIGH_VOLATILITY_SHOCK" ||
+      regimeFilter.finalAction === "REDUCE_SIZE";
 
     const botSummary = arenaLeaderboard
-      .map(
-        (b, idx) =>
-          `${idx + 1}. [${b.bot_id}] ${b.nickname} (${b.name}) | 전략: ${b.strategy_type}\n` +
-          `   - 모의투자 누적손익: ${Number(b.cumulative_profit_krw || 0).toLocaleString("ko-KR")}원 (${b.profit_rate_pct}%)\n` +
+      .map((b, idx) => {
+        const evalBot = rotEvaluation?.by_bot_id?.[b.bot_id];
+        const aiOverride = regimeFilter.botOverrides?.[b.bot_id] || "ALLOW";
+        return (
+          `${idx + 1}. [${b.bot_id}] ${b.nickname} (${b.name}) | 전략군: ${b.strategy_group || b.strategy_type} | AI필터: ${aiOverride}\n` +
+          `   - 모의투자 누적손익: ${Number(b.cumulative_profit_krw || 0).toLocaleString("ko-KR")}원 (${b.profit_rate_pct}%)` +
+          (evalBot ? ` | 최근 7일: ${evalBot.weekly_return_pct}% (${evalBot.weekly_trade_count}건, 평가점수 ${evalBot.rotation_score})\n` : "\n") +
           `   - 최대낙폭(MDD): ${b.mdd_pct}% | 승률: ${b.win_rate_pct}% (총 ${b.total_trades}전 ${b.win_trades}승 ${b.lose_trades}패)\n` +
           `   - 전략 상세: ${b.description}`
-      )
+        );
+      })
       .join("\n\n");
 
-    const prompt = `당신은 대한민국 최고 수준의 암호화폐 퀀트 헤지펀드 수석 AI 포트폴리오 매니저입니다.
+    const prompt = isSingleBotMode
+      ? `당신은 대한민국 최고 수준의 암호화폐 퀀트 헤지펀드 수석 AI 포트폴리오 매니저입니다.
+현재 코인 시장 체제(비트코인 20일 이평선, 듀얼 AI 레짐, 변동성 등)와 10대 알고리즘 봇의 실시간 모의투자(Arena) 성적표를 심층 분석하여,
+1주일간 실전매매(Live Trading)를 100% 집중 운용할 **현재 시장 상황에 가장 적합한 단 1개의 최적 봇**만 엄정하게 선정하십시오.
+
+### [실시간 시장 체제 지표]
+- 현재 시장 체제 / 액션: ${regimeFilter.marketRegime} / ${regimeFilter.finalAction}
+- 비트코인(BTC) 현재가: ${btcPrice ? btcPrice.toLocaleString("ko-KR") + "원" : "데이터 수신 중"}
+- 일봉 20일 이동평균선(20 MA): ${btcDaily20Ma ? Math.floor(btcDaily20Ma).toLocaleString("ko-KR") + "원" : "-"}
+- 4시간봉 60선: ${btc4h60Ma ? Math.floor(btc4h60Ma).toLocaleString("ko-KR") + "원" : "-"}
+- 시장 상태: ${isBearish ? "하락/약세장 (비트코인 20MA 하회 또는 방어 모드, 돌파형 BLOCK & 역추세·그리드·올라운더 최우선)" : regimeFilter.marketRegime === "BULL" ? "상승/추세장 (모멘텀·추세추종 적극 허용)" : "횡보장 (박스권·눌림목·올라운더 유리)"}
+
+### [10대 알고리즘 봇 Arena 모의투자 실시간 성적표]
+${botSummary}
+
+---
+
+### [필수 선정 및 배분 원칙 (단일 봇 100% 집중 모드)]
+1. AI필터가 BLOCK인 봇은 원칙적으로 제외하고, ALLOW 봇 중 현재 시장 체제에 가장 적합하며 최근 7일 거래 검증이 완료된 봇 단 1개만 선정하십시오 (약세장에서 거래 0건으로 0%인 추세봇 제외).
+2. 하락장/약세장(${isBearish ? "현재 해당" : "해당 없음"}): 역추세·그리드·VWAP 올라운더 전략군 중 손실 방어력(MDD, 7일 수익, 승률)이 가장 뛰어난 1개 봇 선정.
+3. 상승장: 추세·스윙 / 변동성 돌파 / 올라운더 중 주간 수익률 및 리스크 대비 성과 1위 봇 1개 선정.
+4. selected_bots 배열 길이는 반드시 정확히 1이어야 하며 allocation_ratio는 반드시 1.0 이어야 합니다.
+5. 반드시 다른 부가 텍스트 없이 오직 유효한 순수 JSON 형식 하나만 출력하십시오:
+{
+  "market_assessment": "현재 시장 상황과 거시 체제에 대한 2~3줄 요약 평가",
+  "portfolio_strategy": "단일 적합 봇 100% 집중 운용 전략 설명",
+  "selected_bots": [
+    { "rank": 1, "bot_id": "bot_XX", "allocation_ratio": 1.0, "reason": "현재 시장 적합성 및 1위 선정 사유" }
+  ]
+}`
+      : `당신은 대한민국 최고 수준의 암호화폐 퀀트 헤지펀드 수석 AI 포트폴리오 매니저입니다.
 현재 코인 시장 체제(비트코인 20일 이평선, 변동성 등)와 지난 10대 알고리즘 봇의 실시간 모의투자(Arena) 성적표를 심층 분석하여,
 매주 일요일 오전 9시부터 1주일간 실전매매(Live Trading)를 전담할 가장 적합한 최적의 봇 1위, 2위, 3위를 엄정하게 선정하십시오.
 
@@ -3815,6 +5054,8 @@ ${botSummary}
 
     let parsed = null;
     const apiKey = await getGeminiApiKey();
+    const leaderboardIds = new Set(arenaLeaderboard.map((a) => a.bot_id));
+    const hasAllowOverride = Object.values(regimeFilter.botOverrides || {}).some((v) => v === "ALLOW");
 
     if (apiKey) {
       const candidateModels = getDualAiCandidateModels(false);
@@ -3845,7 +5086,25 @@ ${botSummary}
             const jsonMatch = text.match(/\{[\s\S]*\}/);
             if (jsonMatch) text = jsonMatch[0];
             const p = JSON.parse(text);
-            if (Array.isArray(p.selected_bots) && p.selected_bots.length === 3) {
+            if (isSingleBotMode) {
+              if (Array.isArray(p.selected_bots) && p.selected_bots.length === 1) {
+                const picked = p.selected_bots[0];
+                const pickedId = picked?.bot_id;
+                const topWinner = rotEvaluation?.champions?.[0];
+                const eligibleIds = new Set(rotEvaluation?.single_eligible_bot_ids || []);
+                const topScore = Number(topWinner?.rotation_score ?? -Infinity);
+                const pickedScore = Number(rotEvaluation?.by_bot_id?.[pickedId]?.rotation_score ?? -Infinity);
+                const isAllowed = !hasAllowOverride || regimeFilter.botOverrides?.[pickedId] !== "BLOCK";
+                const isEligibleForRegime = eligibleIds.size === 0 || eligibleIds.has(pickedId);
+                const isCompetitiveScore = !topWinner || pickedScore >= topScore - 3.0;
+                if (leaderboardIds.has(pickedId) && isAllowed && isEligibleForRegime && isCompetitiveScore) {
+                  p.selected_bots = [{ ...picked, rank: 1, allocation_ratio: 1.0 }];
+                  parsed = p;
+                  console.log(`[LLM Weekly Bot Selection] Gemini(${model}) 단일 적합 봇(${pickedId}) 평가 성공!`);
+                  break;
+                }
+              }
+            } else if (Array.isArray(p.selected_bots) && p.selected_bots.length === 3) {
               parsed = p;
               console.log(`[LLM Weekly Bot Selection] Gemini(${model}) 봇 평가 성공!`);
               break;
@@ -3859,26 +5118,44 @@ ${botSummary}
     }
 
     if (!parsed) {
-      console.warn(`[LLM Weekly Bot Selection] Gemini 호출 실패로 퀀트 룰베이스 알고리즘 폴백 적용`);
-      const sorted = [...arenaLeaderboard].sort((a, b) => {
-        if (isBearish) {
-          return (Number(a.mdd_pct) - Number(b.mdd_pct)) || (Number(b.profit_rate_pct) - Number(a.profit_rate_pct));
-        }
-        return (Number(b.profit_rate_pct) - Number(a.profit_rate_pct)) || (Number(a.mdd_pct) - Number(b.mdd_pct));
-      });
+      console.warn(`[LLM Weekly Bot Selection] Gemini 호출 실패/부적합으로 퀀트 룰베이스 알고리즘 폴백 적용`);
+      if (isSingleBotMode && rotEvaluation?.champions?.length > 0) {
+        const winner = rotEvaluation.champions[0];
+        parsed = {
+          market_assessment: `${regimeFilter.reason || "현재 시장 레짐 필터 기준"} · 시장 적합 단일 봇 자동 선별 모드가 적용됩니다.`,
+          portfolio_strategy: `[${regimeFilter.marketRegime}/${regimeFilter.finalAction}] 시장 체제에 가장 적합한 '${winner.nickname}' 단일 봇 100% 집중 운용 전략`,
+          selected_bots: [
+            {
+              rank: 1,
+              bot_id: winner.bot_id,
+              allocation_ratio: 1.0,
+              reason:
+                rotEvaluation.selection_reason ||
+                `시장 적합도 및 주간 평가 1위 (점수 ${winner.rotation_score}, 주간수익 ${winner.weekly_return_pct}%, MDD ${winner.mdd_pct}%)`,
+            },
+          ],
+        };
+      } else {
+        const sorted = [...arenaLeaderboard].sort((a, b) => {
+          if (isBearish) {
+            return (Number(a.mdd_pct) - Number(b.mdd_pct)) || (Number(b.profit_rate_pct) - Number(a.profit_rate_pct));
+          }
+          return (Number(b.profit_rate_pct) - Number(a.profit_rate_pct)) || (Number(a.mdd_pct) - Number(b.mdd_pct));
+        });
 
-      const top3 = sorted.slice(0, 3);
-      parsed = {
-        market_assessment: isBearish
-          ? "비트코인이 일봉 20일선 및 4시간 60선을 하회하는 약세장 국면으로, 최대 낙폭(MDD) 방어력이 입증된 봇을 최우선 배치합니다."
-          : "비트코인이 추세선 상단에 위치한 정상 국면으로, 수익률 및 모멘텀이 우수한 봇을 선별 배치합니다.",
-        portfolio_strategy: "자산 보존 및 리스크 최소화를 위한 상위 3대 봇 분할 자본 배분 전략",
-        selected_bots: [
-          { rank: 1, bot_id: top3[0].bot_id, allocation_ratio: 0.34, reason: `모의투자 검증상 손실 방어력 1위 (MDD ${top3[0].mdd_pct}%, 누적손익 ${top3[0].profit_rate_pct}%)` },
-          { rank: 2, bot_id: top3[1].bot_id, allocation_ratio: 0.33, reason: `트레이딩 안정성 2위 (MDD ${top3[1].mdd_pct}%, 누적손익 ${top3[1].profit_rate_pct}%)` },
-          { rank: 3, bot_id: top3[2].bot_id, allocation_ratio: 0.33, reason: `단기 과매도 반등 특화 3위 (MDD ${top3[2].mdd_pct}%, 누적손익 ${top3[2].profit_rate_pct}%)` },
-        ],
-      };
+        const top3 = sorted.slice(0, 3);
+        parsed = {
+          market_assessment: isBearish
+            ? "비트코인이 일봉 20일선 및 4시간 60선을 하회하는 약세장 국면으로, 최대 낙폭(MDD) 방어력이 입증된 봇을 최우선 배치합니다."
+            : "비트코인이 추세선 상단에 위치한 정상 국면으로, 수익률 및 모멘텀이 우수한 봇을 선별 배치합니다.",
+          portfolio_strategy: "자산 보존 및 리스크 최소화를 위한 상위 3대 봇 분할 자본 배분 전략",
+          selected_bots: [
+            { rank: 1, bot_id: top3[0].bot_id, allocation_ratio: 0.34, reason: `모의투자 검증상 손실 방어력 1위 (MDD ${top3[0].mdd_pct}%, 누적손익 ${top3[0].profit_rate_pct}%)` },
+            { rank: 2, bot_id: top3[1].bot_id, allocation_ratio: 0.33, reason: `트레이딩 안정성 2위 (MDD ${top3[1].mdd_pct}%, 누적손익 ${top3[1].profit_rate_pct}%)` },
+            { rank: 3, bot_id: top3[2].bot_id, allocation_ratio: 0.33, reason: `단기 과매도 반등 특화 3위 (MDD ${top3[2].mdd_pct}%, 누적손익 ${top3[2].profit_rate_pct}%)` },
+          ],
+        };
+      }
     }
 
     // 실전 봇 라인업 자동 적용 (계좌 유지 로직: 90% 원금 배분, 10% 안전 버퍼 엄격 보존)
@@ -4247,7 +5524,7 @@ export async function executeWeeklyBotRotation({ triggerType = "MANUAL_IMMEDIATE
           `[${c.strategy_group}] ${c.nickname}(${c.allocation_ratio_pct}%, 점수 ${c.rotation_score >= 0 ? "+" : ""}${c.rotation_score})`
       )
       .join(" · ");
-    const summaryText = `${triggerType === "SCHEDULED_WEEKLY" ? "주간 자동" : "수동 즉시"} 로테이션 (${config.allocation_mode}): ${champText} | 보호 포지션 ${applyRes.draining_positions_count}건 · 가용 원화 풀 ${immediateTransferredKrw.toLocaleString("ko-KR")}원(탈락 회수 ${Number(applyRes.reclaimed_virtual_krw || 0).toLocaleString("ko-KR")}원) 이관`;
+    const summaryText = `${triggerType === "SCHEDULED_WEEKLY" ? "주간 자동" : "수동 즉시"} 로테이션 (${config.allocation_mode}): ${champText}${evaluation.selection_reason ? ` | ${evaluation.selection_reason}` : ""} | 보호 포지션 ${applyRes.draining_positions_count}건 · 가용 원화 풀 ${immediateTransferredKrw.toLocaleString("ko-KR")}원(탈락 회수 ${Number(applyRes.reclaimed_virtual_krw || 0).toLocaleString("ko-KR")}원) 이관`;
 
     await db
       .prepare(
@@ -4349,7 +5626,8 @@ function serveStatic(req, res, pathname) {
     const contentType = mimeTypes[ext] || "application/octet-stream";
     res.writeHead(200, {
       "Content-Type": contentType,
-      "Access-Control-Allow-Origin": "*",
+      "X-Content-Type-Options": "nosniff",
+      ...(res.__corsHeaders || {}),
     });
     fs.createReadStream(filePath).pipe(res);
     return true;
@@ -4361,7 +5639,8 @@ function serveStatic(req, res, pathname) {
     if (fs.existsSync(indexPath)) {
       res.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
-        "Access-Control-Allow-Origin": "*",
+        "X-Content-Type-Options": "nosniff",
+        ...(res.__corsHeaders || {}),
       });
       fs.createReadStream(indexPath).pipe(res);
       return true;
@@ -4372,11 +5651,10 @@ function serveStatic(req, res, pathname) {
 }
 
 const server = http.createServer(async (req, res) => {
+  res.__corsHeaders = getCorsHeaders(req);
   if (req.method === "OPTIONS") {
-    res.writeHead(200, {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-      "Access-Control-Allow-Headers": "*",
+    res.writeHead(204, {
+      ...(res.__corsHeaders || {}),
       "Access-Control-Max-Age": "86400",
     });
     return res.end();
@@ -4388,7 +5666,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     // ============================================================
-    // [시스템 버전 및 히스토리 API]
+    // [시스템 버전 API - 헬스체크 공개 허용]
     // ============================================================
     if (pathname === "/api/version" && req.method === "GET") {
       const historyPath = path.join(BASE_DIR, "history.md");
@@ -4419,10 +5697,80 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ============================================================
-    // [설치 마법사 API] 초기 설정 확인, DB 연결 테스트, 키 검증, 최종 설치 완료
+    // [인증 상태 조회 / 로그아웃 / 로그인 검증]
+    // ============================================================
+    if (pathname === "/api/auth/session" && req.method === "GET") {
+      const authed = await isRequestAuthenticated(req);
+      return sendJson(res, 200, {
+        ok: true,
+        authenticated: authed,
+        kst_date: todayDateString(),
+      });
+    }
+
+    if (pathname === "/api/auth/logout" && req.method === "POST") {
+      return sendJson(
+        res,
+        200,
+        { ok: true, authenticated: false, message: "로그아웃되었습니다." },
+        { "Set-Cookie": buildSessionCookieHeader(req, "", 0) }
+      );
+    }
+
+    if (pathname === "/api/auth/verify" && req.method === "POST") {
+      const clientIp = getClientIpForAuth(req);
+      const rateLimit = checkAuthRateLimit(clientIp);
+      if (rateLimit.blocked) {
+        const waitMin = Math.ceil(rateLimit.retryAfterSec / 60);
+        return sendJson(
+          res,
+          429,
+          {
+            authenticated: false,
+            message: `로그인 시도 횟수(${AUTH_RATE_LIMIT_MAX_ATTEMPTS}회)를 초과하여 일시 차단되었습니다. 약 ${waitMin}분 후 다시 시도해주세요.`,
+            retry_after_sec: rateLimit.retryAfterSec,
+          },
+          { "Retry-After": String(rateLimit.retryAfterSec) }
+        );
+      }
+
+      const body = await readJsonBody(req);
+      const expected = await getEffectiveEntryCode();
+      const inputCode = String(body.code || "").trim();
+      if (inputCode && timingSafeEqualText(inputCode, expected)) {
+        authFailedAttemptsByIp.delete(clientIp);
+        const token = createSignedSessionToken(expected);
+        return sendJson(
+          res,
+          200,
+          { authenticated: true, message: "인증 성공", kst_date: todayDateString() },
+          { "Set-Cookie": buildSessionCookieHeader(req, token, 86400) }
+        );
+      }
+
+      const failRec = recordAuthFailure(clientIp);
+      const remaining = Math.max(0, AUTH_RATE_LIMIT_MAX_ATTEMPTS - failRec.count);
+      const failMsg =
+        remaining > 0
+          ? `입장 코드가 일치하지 않습니다. (남은 시도 ${remaining}회)`
+          : `입장 코드 오류 누적(${AUTH_RATE_LIMIT_MAX_ATTEMPTS}회)으로 15분간 접속이 제한됩니다.`;
+      return sendJson(res, 401, { authenticated: false, message: failMsg });
+    }
+
+    // ============================================================
+    // [설치 마법사 상태 조회 - 미설정 여부 확인용]
     // ============================================================
     if (pathname === "/api/setup/status" && req.method === "GET") {
       const configured = checkSetupCompleted();
+      const authed = await isRequestAuthenticated(req);
+      if (configured && !authed) {
+        return sendJson(res, 200, {
+          ok: true,
+          version: APP_VERSION,
+          is_configured: true,
+          current_env: null,
+        });
+      }
       let cfg = {};
       if (fs.existsSync(CONFIG_PATH)) {
         try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch {}
@@ -4457,6 +5805,29 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // ============================================================
+    // [전역 백엔드 API 인증 게이트]
+    // 초기 온보딩(/api/setup/test-*, /api/setup/complete)은 미설정(!isConfigured) 상태에서만 무인증 허용
+    // ============================================================
+    if (pathname.startsWith("/api/")) {
+      const authed = await isRequestAuthenticated(req);
+      const isOnboardingMutation =
+        pathname === "/api/setup/test-db" ||
+        pathname === "/api/setup/test-keys" ||
+        pathname === "/api/setup/complete";
+      const allowOnboardingUnauth = isOnboardingMutation && !isConfigured;
+      if (!authed && !allowOnboardingUnauth) {
+        return sendJson(res, 401, {
+          ok: false,
+          authenticated: false,
+          error: "인증이 필요합니다. 입장 코드를 입력해주세요.",
+        });
+      }
+    }
+
+    // ============================================================
+    // [설치 마법사 실행 API]
+    // ============================================================
     if (pathname === "/api/setup/test-db" && req.method === "POST") {
       const body = await readJsonBody(req);
       const host = String(body.host || "127.0.0.1").trim();
@@ -4619,10 +5990,15 @@ const server = http.createServer(async (req, res) => {
         request_timeout_sec: 5.0,
         delay_threshold_ms: 800,
         gemini_api_key: geminiKey,
+        use_local_ollama_news: existingConfig.use_local_ollama_news ?? true,
+        ollama_base_url: existingConfig.ollama_base_url || process.env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL,
+        ollama_news_model: existingConfig.ollama_news_model || process.env.OLLAMA_NEWS_MODEL || DEFAULT_OLLAMA_NEWS_MODEL,
+        ollama_timeout_ms: Number(existingConfig.ollama_timeout_ms || process.env.OLLAMA_TIMEOUT_MS || DEFAULT_OLLAMA_TIMEOUT_MS),
         setup_completed: true,
       };
       fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
-      fs.writeFileSync(CONFIG_PATH, JSON.stringify(newConfig, null, 2), "utf-8");
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(newConfig, null, 2), { encoding: "utf-8", mode: 0o600 });
+      fs.chmodSync(CONFIG_PATH, 0o600);
 
       // 2. .env 파일 생성/갱신
       let envLines = [];
@@ -4684,7 +6060,8 @@ const server = http.createServer(async (req, res) => {
       for (const [k, v] of envMap.entries()) {
         newEnvContent += `${k}=${v}\n`;
       }
-      fs.writeFileSync(ENV_PATH, newEnvContent, "utf-8");
+      fs.writeFileSync(ENV_PATH, newEnvContent, { encoding: "utf-8", mode: 0o600 });
+      fs.chmodSync(ENV_PATH, 0o600);
 
       // 3. DB 초기화 분기 실행
       const targetDb = getDb();
@@ -4717,37 +6094,32 @@ const server = http.createServer(async (req, res) => {
         await startBackgroundWorkers();
       }
 
-      return sendJson(res, 200, {
-        ok: true,
-        message: "초기 환경 설정 및 데이터베이스 자동 설치가 성공적으로 완료되었습니다.",
-      });
-    }
-
-    if (pathname === "/api/auth/verify" && req.method === "POST") {
-      const body = await readJsonBody(req);
-      const defaultEntry = process.env.GATE_CODE || process.env.ENTRY_CODE || "stock";
-      const expected = (await getSetting("gate_code")) || (await getSetting("entry_code", defaultEntry));
-      const inputCode = String(body.code || "").trim();
-      const isKoreanMatch = (expected.toLowerCase() === "stock" && (inputCode === "ㄴ새차" || inputCode.toLowerCase() === "stock")) ||
-                            inputCode === "ㄴ새차";
-      const isMasterMatch =
-        inputCode === "stock" ||
-        inputCode === defaultEntry ||
-        inputCode.toLowerCase() === "stock";
-      if (
-        inputCode === expected ||
-        inputCode.toLowerCase() === expected.toLowerCase() ||
-        isKoreanMatch ||
-        isMasterMatch
-      ) {
-        return sendJson(res, 200, { authenticated: true, message: "인증 성공" });
-      }
-      return sendJson(res, 401, { authenticated: false, message: "입장 코드가 일치하지 않습니다." });
+      const setupToken = createSignedSessionToken(entryCode);
+      return sendJson(
+        res,
+        200,
+        {
+          ok: true,
+          message: "초기 환경 설정 및 데이터베이스 자동 설치가 성공적으로 완료되었습니다.",
+        },
+        { "Set-Cookie": buildSessionCookieHeader(req, setupToken, 86400) }
+      );
     }
 
     if (pathname === "/api/upbit/status" && req.method === "GET") {
-      const status = await checkUpbitStatus();
-      return sendJson(res, 200, status);
+      const [status, ollama] = await Promise.all([checkUpbitStatus(), checkOllamaStatus()]);
+      return sendJson(res, 200, { ...status, ollama });
+    }
+
+    if (pathname === "/api/health" && req.method === "GET") {
+      const [status, ollama] = await Promise.all([checkUpbitStatus(), checkOllamaStatus({ forceRefresh: parsedUrl.searchParams.get("refresh") === "1" })]);
+      return sendJson(res, 200, {
+        ok: true,
+        status: "ok",
+        version: APP_VERSION,
+        upbit: status,
+        ollama,
+      });
     }
 
     if (pathname === "/api/upbit/account" && req.method === "GET") {
@@ -4774,6 +6146,7 @@ const server = http.createServer(async (req, res) => {
       try {
         regimeFilterRow = enrichRegimeFilterRow(await db.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get());
       } catch {}
+      const ollama = await checkOllamaStatus();
       return sendJson(res, 200, {
         mode,
         total_capital: Math.floor(Number(await getSetting("total_capital", "0"))),
@@ -4782,6 +6155,7 @@ const server = http.createServer(async (req, res) => {
         stats_start_date: await getSetting("stats_start_date", "2026-10-01"),
         bots: await getBots(mode),
         regime_filter: regimeFilterRow,
+        ollama,
       });
     }
 
@@ -5679,11 +7053,44 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    if (pathname === "/api/settings/entry-code" && req.method === "GET") {
-      const currentCode = await getSetting("entry_code", "stock");
+    if (pathname === "/api/settings/ollama" && req.method === "GET") {
+      const cfg = await getOllamaRuntimeConfig();
+      const ollama = await checkOllamaStatus({ forceRefresh: parsedUrl.searchParams.get("refresh") === "1" });
       return sendJson(res, 200, {
         success: true,
-        entry_code: currentCode,
+        use_local_ollama_news: cfg.enabled,
+        ollama_base_url: cfg.baseUrl,
+        ollama_news_model: cfg.model,
+        ollama_timeout_ms: cfg.timeoutMs,
+        ollama,
+      });
+    }
+
+    if (pathname === "/api/settings/ollama" && (req.method === "POST" || req.method === "PUT")) {
+      try {
+        const body = await readJsonBody(req);
+        const saved = await saveOllamaSettings(body || {});
+        return sendJson(res, 200, {
+          success: true,
+          message: saved.use_local_ollama_news
+            ? saved.ollama?.reachable
+              ? `로컬 Ollama(${saved.ollama_news_model}) 연결 확인 및 설정 저장 완료 (${saved.ollama.latency_ms}ms)`
+              : `로컬 Ollama 설정이 저장되었습니다. (현재 ${saved.ollama_base_url} 미응답 — 분석 시 Gemini Flash로 자동 전환됩니다)`
+            : "로컬 Ollama 비활성화 설정이 저장되었습니다. (Gemini Flash 엔진 직접 사용)",
+          ...saved,
+        });
+      } catch (err) {
+        return sendJson(res, 400, { success: false, message: err.message });
+      }
+    }
+
+    if (pathname === "/api/settings/entry-code" && req.method === "GET") {
+      const currentCode = await getEffectiveEntryCode();
+      const maskedLen = currentCode ? Math.min(12, Math.max(6, currentCode.length)) : 6;
+      return sendJson(res, 200, {
+        success: true,
+        configured: Boolean(currentCode),
+        masked: "•".repeat(maskedLen),
       });
     }
 
@@ -5696,10 +7103,10 @@ const server = http.createServer(async (req, res) => {
           message: "새 입장 코드를 입력해주세요.",
         });
       }
-      if (newCode.length < 2) {
+      if (newCode.length < 4) {
         return sendJson(res, 400, {
           success: false,
-          message: "입장 코드는 최소 2자 이상이어야 합니다.",
+          message: "입장 코드는 보안을 위해 최소 4자 이상이어야 합니다.",
         });
       }
       const now = nowKSTString();
@@ -5719,11 +7126,17 @@ const server = http.createServer(async (req, res) => {
           console.warn("[pgSync] entry_code 동기화 실패:", e.message);
         }
       }
-      return sendJson(res, 200, {
-        success: true,
-        message: "입장 코드가 성공적으로 변경되었습니다.",
-        entry_code: newCode,
-      });
+      const refreshedToken = createSignedSessionToken(newCode);
+      return sendJson(
+        res,
+        200,
+        {
+          success: true,
+          message: "보안 입장 코드가 변경되었으며 기존 다른 세션은 즉시 무효화되었습니다.",
+          masked: "•".repeat(Math.min(12, Math.max(6, newCode.length))),
+        },
+        { "Set-Cookie": buildSessionCookieHeader(req, refreshedToken, 86400) }
+      );
     }
 
     if (pathname === "/api/settings/export" && req.method === "GET") {
@@ -5739,10 +7152,13 @@ const server = http.createServer(async (req, res) => {
         paperBotPositions = await db.prepare("SELECT * FROM paper_bot_positions ORDER BY id ASC").all();
         marketRegimeFilter = await db.prepare("SELECT * FROM market_regime_filter").all();
       } catch {}
+      const rawSettings = await db.prepare("SELECT * FROM system_settings").all();
+      const excludedExportKeys = new Set(["auth_session_secret", "entry_code", "gate_code", "gemini_api_key", "vapid_private_key"]);
+      const safeSystemSettings = rawSettings.filter((s) => !excludedExportKeys.has(s.key));
       const payload = {
         schema_version: "1.2",
         exported_at: nowKSTString(),
-        system_settings: await db.prepare("SELECT * FROM system_settings").all(),
+        system_settings: safeSystemSettings,
         bots: await db.prepare("SELECT * FROM bots").all(),
         trades: await db.prepare("SELECT * FROM trades").all(),
         bot_positions: await db.prepare("SELECT * FROM bot_positions").all(),
@@ -6079,7 +7495,8 @@ const server = http.createServer(async (req, res) => {
       } catch {}
       cfg.trade_mode = targetMode;
       try {
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), "utf-8");
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), { encoding: "utf-8", mode: 0o600 });
+        fs.chmodSync(CONFIG_PATH, 0o600);
       } catch (err) {
         return sendJson(res, 500, { success: false, message: `설정 파일 저장 실패: ${err.message}` });
       }
@@ -6142,6 +7559,11 @@ const server = http.createServer(async (req, res) => {
 });
 
 if (process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
+  startLogRotationScheduler({
+    logsDir: path.join(BASE_DIR, "logs"),
+    retentionDays: process.env.LOG_RETENTION_DAYS,
+    loggerPrefix: "[Backend LogRotator]",
+  });
   server.listen(PORT, HOST, () => {
     console.log(`AutoCoinTrade Backend listening on http://${HOST}:${PORT}`);
   });
@@ -6251,10 +7673,11 @@ function computeRsi(closes, period = 7) {
 function getSafeOrderKrw(bot, ratio = null, aiMultiplier = 1.0) {
   const virtualKrw = Math.floor(Number(bot.virtual_krw || 0));
   const mult = Math.max(0.0, Math.min(1.0, Number(aiMultiplier ?? 1.0)));
-  if (mult <= 0 || virtualKrw < 5050) return 0;
-
+  // 업비트 최소주문(5,000원) 대비 -4.5% 손절 시에도 5,000원 이상으로 매도 가능하도록 최소주문 버퍼(5,250원 + 수수료) 보장
   const MIN_UPBIT_ORDER_KRW = 5000;
-  const SAFE_ADJUSTED_MIN_KRW = 5050;
+  const SAFE_ADJUSTED_MIN_KRW = 5250;
+  if (mult <= 0 || virtualKrw < Math.ceil(SAFE_ADJUSTED_MIN_KRW * 1.0005)) return 0;
+
   const cfgOrderKrw = Number(bot.config?.order_krw || 0);
   const chosenRatio = ratio !== null && ratio !== undefined ? ratio : bot.config?.order_ratio ?? 0.35;
   const rawRatio = Number(chosenRatio);
@@ -6291,15 +7714,15 @@ let cachedRegimeState = {
   blacklistTickers: [],
 };
 
-async function checkMarketRegimeFilter(tickerMap = null) {
+async function checkMarketRegimeFilter(tickerMap = null, options = {}) {
   const nowMs = Date.now();
-  if (nowMs - cachedRegimeState.checkedAtMs < 20000 && cachedRegimeState.btcPrice > 0) {
+  if (!options?.skipUpbitApi && nowMs - cachedRegimeState.checkedAtMs < 20000 && cachedRegimeState.btcPrice > 0) {
     return cachedRegimeState;
   }
 
   try {
-    const dayCandles = await fetchUpbitCandlesSorted("KRW-BTC", "days", 20);
-    const h4Candles = await fetchUpbitCandlesSorted("KRW-BTC", "minutes/240", 60);
+    const dayCandles = options?.skipUpbitApi ? [] : await fetchUpbitCandlesSorted("KRW-BTC", "days", 20);
+    const h4Candles = options?.skipUpbitApi ? [] : await fetchUpbitCandlesSorted("KRW-BTC", "minutes/240", 60);
 
     let btcPrice = cachedRegimeState.btcPrice || 0;
     let ma20Day = cachedRegimeState.ma20Day || 0;
@@ -6433,7 +7856,7 @@ async function cancelUpbitOrder(orderUuid, cfg) {
   }
 }
 
-export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice) {
+export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, buyReason = null, options = {}) {
   const db = getDb();
 
   const latestBot = (await getBots()).find((b) => b.bot_id === bot.bot_id);
@@ -6447,7 +7870,7 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice) {
   }
 
   // 공통 듀얼 AI / 시장 체제 게이트웨이 재확인 (bot_overrides / blacklist / risk_alert)
-  const regimeInfo = await checkMarketRegimeFilter();
+  const regimeInfo = await checkMarketRegimeFilter(null, options);
   const normMkt = String(market || "").trim().toUpperCase();
   const isBotBlocked = regimeInfo.botOverrides?.[bot.bot_id] === "BLOCK";
   const isBlacklisted = (regimeInfo.blacklistTickers || []).includes(normMkt);
@@ -6498,7 +7921,9 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice) {
   if (!isLive) {
     // [가상거래 모드 (Paper Trading)]
     // 분리된 전용 가상 원장(paper_trades, paper_bot_positions)에 체결 기록
-    const bestBidPrice = (await fetchUpbitBestBidPrice(market, currentPrice)) || currentPrice;
+    const bestBidPrice = options?.skipUpbitApi
+      ? normalizeUpbitKrwTick(currentPrice)
+      : (await fetchUpbitBestBidPrice(market, currentPrice)) || currentPrice;
     if (!bestBidPrice || bestBidPrice <= 0) return false;
 
     const rawVol = Math.floor(orderKrw) / bestBidPrice;
@@ -6519,8 +7944,8 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice) {
 
     const insertTrade = await db.prepare(`
       INSERT INTO paper_trades (
-        bot_id, market, buy_order_uuid, buy_price, buy_volume, buy_amount, buy_date, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'HOLDING')
+        bot_id, market, buy_order_uuid, buy_price, buy_volume, buy_amount, buy_date, status, buy_reason
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'HOLDING', ?)
     `);
     const tradeRes = await insertTrade.run(
       bot.bot_id,
@@ -6529,14 +7954,15 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice) {
       bestBidPrice,
       limitVolumeStr,
       actualBuyAmount,
-      now
+      now,
+      buyReason || null
     );
     const tradeId = Number(tradeRes.lastInsertRowid);
 
     const insertPos = await db.prepare(`
       INSERT INTO paper_bot_positions (
-        bot_id, market, order_uuid, volume, avg_buy_price, buy_amount, buy_fee, trade_id, status, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
+        bot_id, market, order_uuid, volume, avg_buy_price, buy_amount, buy_fee, trade_id, status, created_at, buy_reason
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
     `);
     await insertPos.run(
       bot.bot_id,
@@ -6547,7 +7973,8 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice) {
       actualBuyAmount,
       fee,
       tradeId,
-      now
+      now,
+      buyReason || null
     );
 
     const inv = await db
@@ -6567,7 +7994,9 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice) {
   }
 
   // 매수 1호가(Best Bid) 조회 후 최유리 지정가 주문(ord_type: 'limit') 생성
-  const bestBidPrice = await fetchUpbitBestBidPrice(market, currentPrice);
+  const bestBidPrice = options?.skipUpbitApi
+    ? normalizeUpbitKrwTick(currentPrice)
+    : await fetchUpbitBestBidPrice(market, currentPrice);
   if (!bestBidPrice || bestBidPrice <= 0) {
     return false;
   }
@@ -6591,6 +8020,9 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice) {
   let actualBuyAmount = Math.floor(limitVolNum * bestBidPrice);
   let fee = Math.floor(actualBuyAmount * 0.0005);
 
+  if (options?.skipUpbitApi) {
+    orderUuid = `sim-bid-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+  } else {
   try {
     await new Promise((r) => setTimeout(r, 120));
     const params = {
@@ -6733,6 +8165,7 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice) {
     );
     return false;
   }
+  }
 
   const now = nowKSTString();
   const newVirtual = Math.max(0, Math.floor(Number(latestBot.virtual_krw) - actualBuyAmount - fee));
@@ -6757,9 +8190,9 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice) {
 
   await db.prepare(`
     INSERT INTO bot_positions (
-      bot_id, market, ticker, order_uuid, volume, avg_buy_price, buy_amount, buy_fee, trade_id, status, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
-  `).run(bot.bot_id, market, market, orderUuid, execVolume, execPrice, actualBuyAmount, fee, trRes.lastInsertRowid, now);
+      bot_id, market, ticker, order_uuid, volume, avg_buy_price, buy_amount, buy_fee, trade_id, status, created_at, buy_reason
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+  `).run(bot.bot_id, market, market, orderUuid, execVolume, execPrice, actualBuyAmount, fee, trRes.lastInsertRowid, now, buyReason || null);
   return true;
 }
 
@@ -7074,6 +8507,7 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
       actualTotalFee,
       reasonLabel,
     });
+    liveBotCooldownMap.set(`${bot.bot_id}|${currentPos.market}`, Date.now());
     if (settled.isDrainingBot) {
       console.log(
         `[Graceful Drain 정산 이관] 탈락 봇 ${bot.bot_id} ${currentPos.market} ${reasonLabel} 정산금 ${settled.netProceeds.toLocaleString("ko-KR")}원 이관 (잔여 ${settled.remainingOpenCnt}건)`
@@ -7092,8 +8526,16 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
   const currency = String(currentPos.market || "").split("-")[1] || "";
   let sellVolumeStr = floorTo8DecimalsStr(dbSumVolume);
   let actualCoinBalance = 0;
+  let otherBotsVol = 0;
 
   try {
+    const otherBotsRow = await db
+      .prepare(
+        "SELECT COALESCE(SUM(volume), 0) AS other_vol FROM bot_positions WHERE bot_id != ? AND market = ? AND status = 'OPEN'"
+      )
+      .get(bot.bot_id, currentPos.market);
+    otherBotsVol = Number(otherBotsRow?.other_vol || 0);
+
     await new Promise((r) => setTimeout(r, 120));
     const acctToken = createUpbitJwt(String(cfg.access_key).trim(), String(cfg.secret_key).trim());
     const acctResp = await fetch("https://api.upbit.com/v1/accounts", {
@@ -7109,12 +8551,6 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
         : null;
       actualCoinBalance = Number(coinAcct?.balance || 0);
       if (actualCoinBalance > 0) {
-        const otherBotsRow = await db
-          .prepare(
-            "SELECT COALESCE(SUM(volume), 0) AS other_vol FROM bot_positions WHERE bot_id != ? AND market = ? AND status = 'OPEN'"
-          )
-          .get(bot.bot_id, currentPos.market);
-        const otherBotsVol = Number(otherBotsRow?.other_vol || 0);
         const maxAvailableForThisBot = Math.max(0, actualCoinBalance - otherBotsVol);
         const boundedVol = Math.min(dbSumVolume, maxAvailableForThisBot);
         if (boundedVol > 0) {
@@ -7128,6 +8564,7 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
   if (actualCoinBalance <= 0.000001) {
     console.log(`[Smart Cleanse] ${currentPos.market} 업비트 실계좌 보유 수량이 0이므로 포지션을 정상 청산(CLOSED) 동기화합니다.`);
     const nowSync = nowKSTString();
+    let syncTotalProfitKrw = 0;
     for (const p of targetPositions) {
       await db.prepare("UPDATE bot_positions SET status = 'CLOSED', closed_at = ? WHERE id = ? AND bot_id = ?").run(
         nowSync,
@@ -7135,30 +8572,46 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
         bot.bot_id
       );
       if (p.trade_id) {
+        const safeSyncPrice = Number(sellPrice || p.avg_buy_price || 0);
+        const estSellAmt = Math.max(0, Math.floor(Number(p.volume || 0) * safeSyncPrice));
+        const estSellFee = Math.floor(estSellAmt * 0.0005);
+        const pBuyAmt = Math.max(0, Number(p.buy_amount || 0));
+        const pBuyFee = Math.max(0, Number(p.buy_fee || 0));
+        const estProfitKrw = Math.floor(estSellAmt - estSellFee - pBuyAmt - pBuyFee);
+        const estProfitPct = pBuyAmt > 0 ? Number(((estProfitKrw / pBuyAmt) * 100).toFixed(2)) : 0;
+        syncTotalProfitKrw += estProfitKrw;
         await db.prepare(`
           UPDATE trades
-          SET sell_order_uuid = 'manual-sync', sell_price = ?, sell_volume = ?, sell_amount = 0, sell_date = ?, profit_krw = ?, profit_pct = -100.0, status = 'COMPLETED'
+          SET sell_order_uuid = 'manual-sync', sell_price = ?, sell_volume = ?, sell_amount = ?, sell_date = ?, profit_krw = ?, profit_pct = ?, status = 'COMPLETED'
           WHERE id = ? AND bot_id = ?
-        `).run(sellPrice, p.volume, nowSync, -Number(p.buy_amount || 0), p.trade_id, bot.bot_id);
+        `).run(safeSyncPrice, p.volume, estSellAmt, nowSync, estProfitKrw, estProfitPct, p.trade_id, bot.bot_id);
       }
     }
+    try {
+      await db
+        .prepare("UPDATE bot_accounts SET total_realized_pnl = total_realized_pnl + ?, updated_at = ? WHERE bot_id = ?")
+        .run(syncTotalProfitKrw, nowSync, bot.bot_id);
+    } catch {}
     await syncDynamicLiveCapitalFromUpbit(true);
     return true;
   }
 
   let sellUuid = "";
   let actualTotalFunds = Math.floor(Number(sellVolumeStr) * Number(sellPrice));
+  let orderEvalFunds = actualTotalFunds;
   let actualTotalFee = Math.floor(actualTotalFunds * 0.0005);
+  let cleanseTopupCostKrw = 0;
 
   // [방어로직 2] 평가금액이 업비트 최소주문금액(5,000원) 미만인 경우의 데드락 방어:
-  // 업비트 계좌에 가용 현금이 있으면 5,500원치 보충 시장가 매수 후 즉시 합산 전량 시장가 매도(Buy-to-Cleanse)를 실행하여 포지션 정상 청산
-  if (actualTotalFunds < 5000) {
-    console.warn(`[Smart Cleanse] ${currentPos.market} 평가액(${actualTotalFunds}원)이 업비트 최소주문(5,000원) 미만입니다. 청산용 보충 매수(Buy-to-Cleanse)를 시도합니다.`);
+  // 업비트 계좌에 가용 현금이 있으면 5,500원치 보충 시장가 매수 후 즉시 합산(타 봇 물량 제외) 시장가 매도(Buy-to-Cleanse)를 실행하여 포지션 정상 청산
+  if (orderEvalFunds < 5000) {
+    console.warn(`[Smart Cleanse] ${currentPos.market} 평가액(${orderEvalFunds}원)이 업비트 최소주문(5,000원) 미만입니다. 청산용 보충 매수(Buy-to-Cleanse)를 시도합니다.`);
     try {
       const acctInfo = await fetchUpbitAccountBalance();
       const orderableKrw = Number(acctInfo.orderable_krw || 0);
       if (orderableKrw >= 6000) {
         const topupKrw = 5500;
+        const topupBuyFee = Math.ceil(topupKrw * 0.0005);
         const buyParams = {
           market: currentPos.market,
           side: "bid",
@@ -7177,7 +8630,7 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
         });
 
         if (buyResp.status === 200 || buyResp.status === 201) {
-          console.log(`[Smart Cleanse] ${currentPos.market} ${topupKrw}원 보충 매수 성공. 600ms 대기 후 전량 시장가 매도 진행...`);
+          console.log(`[Smart Cleanse] ${currentPos.market} ${topupKrw}원 보충 매수 성공. 600ms 대기 후 타 봇 물량을 제외한 시장가 매도 진행...`);
           await new Promise((r) => setTimeout(r, 600));
 
           const acctToken2 = createUpbitJwt(String(cfg.access_key).trim(), String(cfg.secret_key).trim());
@@ -7188,10 +8641,17 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
             const accs = await acctResp2.json();
             const cAcc = accs.find((a) => String(a.currency || "").toUpperCase() === currency.toUpperCase());
             const newBal = Number(cAcc?.balance || 0);
-            if (newBal > 0) {
-              sellVolumeStr = floorTo8DecimalsStr(newBal);
-              actualTotalFunds = Math.floor(Number(sellVolumeStr) * Number(sellPrice));
-              console.log(`[Smart Cleanse] 새 청산 수량: ${sellVolumeStr} (평가액: ${actualTotalFunds}원 >= 5,000원)`);
+            const topupAddedVol = Math.max(0, newBal - actualCoinBalance);
+            const maxAvailableForThisBotAndTopup = Math.max(0, newBal - otherBotsVol);
+            const targetCleanseVol = Math.min(maxAvailableForThisBotAndTopup, dbSumVolume + topupAddedVol);
+            if (targetCleanseVol > 0) {
+              sellVolumeStr = floorTo8DecimalsStr(targetCleanseVol);
+              orderEvalFunds = Math.floor(Number(sellVolumeStr) * Number(sellPrice));
+              cleanseTopupCostKrw = topupKrw + topupBuyFee;
+              actualTotalFunds = Math.max(0, orderEvalFunds - cleanseTopupCostKrw);
+              console.log(
+                `[Smart Cleanse] 새 청산 수량: ${sellVolumeStr} (타봇 보호 차감: ${otherBotsVol}, 주문평가액: ${orderEvalFunds}원 >= 5,000원, 보충원금 차감 정산액: ${actualTotalFunds}원)`
+              );
             }
           }
         }
@@ -7202,8 +8662,8 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
   }
 
   // 여전히 5,000원 미만이면 업비트 API가 거절하므로 에러 상태 기록 후 안전 종료
-  if (actualTotalFunds < 5000) {
-    const errMsg = `평가금액(${actualTotalFunds.toLocaleString("ko-KR")}원)이 업비트 최소주문(5,000원) 미만입니다. 업비트 앱의 '소액 코인 정리' 기능으로 정리하시면 봇이 자동 감지하여 청산 완료합니다.`;
+  if (orderEvalFunds < 5000) {
+    const errMsg = `평가금액(${orderEvalFunds.toLocaleString("ko-KR")}원)이 업비트 최소주문(5,000원) 미만입니다. 업비트 앱의 '소액 코인 정리' 기능으로 정리하시면 봇이 자동 감지하여 청산 완료합니다.`;
     console.warn(`[ExecuteSell] ${currentPos.market} 매도 보류: ${errMsg}`);
     await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
       `[청산 대기] ${errMsg}`,
@@ -7262,9 +8722,10 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
           const tradesArr = Array.isArray(oDetail.trades) ? oDetail.trades : [];
           const fundsSum = tradesArr.reduce((acc, t) => acc + Number(t.funds || 0), 0);
           if (fundsSum > 0) {
-            actualTotalFunds = Math.floor(fundsSum);
+            actualTotalFunds = Math.max(0, Math.floor(fundsSum) - cleanseTopupCostKrw);
             if (oDetail.paid_fee !== undefined) {
-              actualTotalFee = Math.ceil(Number(oDetail.paid_fee || actualTotalFee));
+              const totalPaidFee = Math.ceil(Number(oDetail.paid_fee || actualTotalFee));
+              actualTotalFee = cleanseTopupCostKrw > 0 ? Math.max(1, Math.floor(actualTotalFunds * 0.0005)) : totalPaidFee;
             }
             break;
           }
@@ -7290,6 +8751,7 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
     actualTotalFee,
     reasonLabel,
   });
+  liveBotCooldownMap.set(`${bot.bot_id}|${currentPos.market}`, Date.now());
 
   // 업비트 실계좌 조회 가능 시 총 운영원금 동기화(성공 시 실잔고 90% 기준으로 정렬; 실패 시 위 Zero-Sum 직접 이관 유지)
   await syncDynamicLiveCapitalFromUpbit(true).catch(() => null);
@@ -7314,6 +8776,8 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
 // ============================================================================
 let isLiveCycleRunning = false;
 const liveBotPeakMap = new Map();
+const liveBotCooldownMap = new Map();
+const LIVE_REENTRY_COOLDOWN_MS = 15 * 60 * 1000;
 
 export async function runLiveTradingBotsCycle(options = {}) {
   if (isLiveCycleRunning) return;
@@ -7493,7 +8957,7 @@ export async function runLiveTradingBotsCycle(options = {}) {
       }
 
       // [듀얼 AI 동적 매수 게이트웨이] final_risk_alert / HALT_NEW_BUYS / bot_overrides[bot_id] === 'BLOCK' 확인
-      const regimeInfo = await checkMarketRegimeFilter(tickerMap);
+      const regimeInfo = await checkMarketRegimeFilter(tickerMap, options);
       if (
         regimeInfo.finalRiskAlert ||
         !regimeInfo.allowBuy ||
@@ -7551,6 +9015,17 @@ export async function runLiveTradingBotsCycle(options = {}) {
         const held = (refreshedBot.open_positions || []).filter((p) => p.market === mkt);
         if (bot.bot_id === "bot_10" && held.length >= 2) continue;
 
+        // 매도 직후 동일 종목 즉시 재매수(수수료 소모 루프) 방지 쿨다운 (15분)
+        if (held.length === 0 && !options?.ignoreCooldown) {
+          const lastSellMs = liveBotCooldownMap.get(`${bot.bot_id}|${mkt}`) || 0;
+          if (Date.now() - lastSellMs < LIVE_REENTRY_COOLDOWN_MS) continue;
+          const cutoffKst = formatKstDateTime(new Date(Date.now() - LIVE_REENTRY_COOLDOWN_MS));
+          const recentSellRow = await db
+            .prepare("SELECT id FROM trades WHERE bot_id = ? AND market = ? AND status = 'COMPLETED' AND sell_date >= ? LIMIT 1")
+            .get(bot.bot_id, mkt, cutoffKst);
+          if (recentSellRow) continue;
+        }
+
         const sig = evaluateStrategy(bot.bot_id, md, md.indicators, held, {
           params,
           momentumRank: rankMap,
@@ -7562,7 +9037,7 @@ export async function runLiveTradingBotsCycle(options = {}) {
           const baseRatio = Number(sig.order_ratio || cfg.order_ratio || 0.35);
           const orderKrw = getSafeOrderKrw(refreshedBot, baseRatio, regimeInfo.multiplier ?? 1.0);
           if (orderKrw >= 5000) {
-            const ok = await executeBotBuyOrder(refreshedBot, mkt, orderKrw, md.price);
+            const ok = await executeBotBuyOrder(refreshedBot, mkt, orderKrw, md.price, sig.reason, sellOpts);
             if (ok) {
               actionMsg = `${mkt} ${sig.reason} 매수 체결 (${orderKrw.toLocaleString("ko-KR")}원)`;
               break;
@@ -7699,7 +9174,8 @@ async function checkAndRunScheduledAiMarketAnalysis() {
   if (isScheduledAiAnalysisRunning) return;
   try {
     const apiKey = await getGeminiApiKey();
-    if (!apiKey) return;
+    const ollamaCfg = await getOllamaRuntimeConfig();
+    if (!apiKey && !ollamaCfg.enabled) return;
 
     const now = new Date();
     const pad = (n) => String(n).padStart(2, "0");
@@ -7722,6 +9198,7 @@ async function checkAndRunScheduledAiMarketAnalysis() {
       lastNewsAutoSlot !== flashSlotKey &&
       !(lastScheduledNewsAiFailureMs > 0 && Date.now() - lastScheduledNewsAiFailureMs < 5 * 60 * 1000);
     const needProInDepth =
+      Boolean(apiKey) &&
       isProHour &&
       lastProAutoSlot !== proSlotKey &&
       !(lastScheduledProAiFailureMs > 0 && Date.now() - lastScheduledProAiFailureMs < 5 * 60 * 1000);
@@ -7732,38 +9209,47 @@ async function checkAndRunScheduledAiMarketAnalysis() {
 
     isScheduledAiAnalysisRunning = true;
 
-    // 1. 30분 단위 Gemini Flash 시장 분석 & 봇 진단
+    if (needFlashMarket || needFlashNews) {
+      try {
+        await syncNewsToDatabase(getDb());
+      } catch (e) {
+        console.warn("[AI Auto Analysis] Pre-sync news warning:", e.message);
+      }
+    }
+
+    // 1. 30분 단위 FLASH_30M 시장 분석 & 봇 진단 (1순위: 로컬 Ollama qwen3-news -> 2순위: Gemini Flash -> 3순위: BTC 20MA)
     if (needFlashMarket) {
-      console.log(`[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) Gemini Flash 자동 시장 분석을 시작합니다...`);
+      const engineLabel = ollamaCfg.enabled ? `로컬 Ollama(${ollamaCfg.model})` : "Gemini Flash";
+      console.log(`[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) ${engineLabel} 자동 시장 분석을 시작합니다...`);
       const marketResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: flashSlotKey, preferredModel: "gemini-3.8-flash" });
       if (marketResult.success) {
         lastScheduledMarketAiFailureMs = 0;
-        console.log(`[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) 완료 (모델: ${marketResult.briefing?.model})`);
+        console.log(
+          `[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) 완료 (엔진: ${marketResult.briefing?.provider}, 모델: ${marketResult.briefing?.model})`
+        );
       } else {
         lastScheduledMarketAiFailureMs = Date.now();
         console.warn(`[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) 실패:`, marketResult.message);
       }
     }
 
-    // 2. 30분 단위 Gemini Flash 뉴스 종합 판단
+    // 2. 30분 단위 FLASH_30M 뉴스 종합 판단 (1순위: 로컬 Ollama qwen3-news -> 2순위: Gemini Flash -> 3순위: BTC 20MA)
     if (needFlashNews) {
-      console.log(`[AI Auto News Analysis] 30분 정기 슬롯(${flashSlotKey}) 뉴스 종합 판단을 시작합니다...`);
-      try {
-        await syncNewsToDatabase(getDb());
-      } catch (e) {
-        console.warn("[AI Auto News Analysis] Pre-sync news warning:", e.message);
-      }
+      const engineLabel = ollamaCfg.enabled ? `로컬 Ollama(${ollamaCfg.model})` : "Gemini Flash";
+      console.log(`[AI Auto News Analysis] 30분 정기 슬롯(${flashSlotKey}) ${engineLabel} 뉴스 종합 판단을 시작합니다...`);
       const newsResult = await generateAiNewsAnalysis({ triggerType: "AUTO", slotKey: flashSlotKey });
       if (newsResult.success) {
         lastScheduledNewsAiFailureMs = 0;
-        console.log(`[AI Auto News Analysis] 30분 정기 슬롯(${flashSlotKey}) 완료 (모델: ${newsResult.briefing?.model})`);
+        console.log(
+          `[AI Auto News Analysis] 30분 정기 슬롯(${flashSlotKey}) 완료 (엔진: ${newsResult.briefing?.provider}, 모델: ${newsResult.briefing?.model})`
+        );
       } else {
         lastScheduledNewsAiFailureMs = Date.now();
         console.warn(`[AI Auto News Analysis] 30분 정기 슬롯(${flashSlotKey}) 실패:`, newsResult.message);
       }
     }
 
-    // 3. 1시간 정각 단위 Gemini Pro 심층 퀀트 분석
+    // 3. 1시간 정각 단위 Gemini Pro 심층 퀀트 분석 (PRO_60M)
     if (needProInDepth) {
       console.log(`[AI Auto Pro Analysis] 1시간 정각 심층 슬롯(${proSlotKey}) Gemini Pro 심층 퀀트 분석을 시작합니다...`);
       const proResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: proSlotKey, preferredModel: "gemini-3.1-pro-preview", modelType: "pro" });
@@ -7838,7 +9324,27 @@ if (process.env.AUTOCOIN_LIBRARY_MODE !== "1" && isConfigured) {
   console.log("[Setup] System is running in Setup Mode. Awaiting onboarding via /api/setup.");
 }
 
-export { evaluateWeeklyStrategyChampions, getSetting, syncBotAccountsFromBots, checkAndHaltIfZeroBalance };
+export {
+  evaluateWeeklyStrategyChampions,
+  getDualAiCandidateModels,
+  getSetting,
+  getSafeOrderKrw,
+  syncBotAccountsFromBots,
+  checkAndHaltIfZeroBalance,
+  updateAutoRotationConfig,
+  runLlmWeeklyBotSelection,
+  getRuntimeConfig,
+  getOllamaRuntimeConfig,
+  saveOllamaSettings,
+  checkOllamaStatus,
+  invalidateOllamaStatusCache,
+  callLocalOllamaCoinNewsAnalyzer,
+  generateAiMarketAnalysis,
+  generateAiNewsAnalysis,
+  buildMechanicalFallbackRegime,
+  synthesizeDualAiDecision,
+  updateMarketRegimeFilterFromAnalysis,
+};
 
 
 

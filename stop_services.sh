@@ -86,7 +86,7 @@ kill_port "$FRONTEND_PORT" "프론트엔드"
 
 # 3. 본 저장소 경로 기준 잔여 백엔드/프론트/Python 워커 프로세스 정리
 if command -v pgrep >/dev/null 2>&1; then
-    for pattern in "${PROJECT_ROOT}/backend/node_server.mjs" "${PROJECT_ROOT}/main_orchestrator.py" "${PROJECT_ROOT}/llm_filter_worker.py"; do
+    for pattern in "${PROJECT_ROOT}/backend/node_server.mjs" "${PROJECT_ROOT}/frontend/server.mjs" "${PROJECT_ROOT}/main_orchestrator.py" "${PROJECT_ROOT}/llm_filter_worker.py"; do
         for wp in $(pgrep -f "$pattern" 2>/dev/null || true); do
             if [ -n "$wp" ] && [ "$wp" != "$$" ] && kill -0 "$wp" 2>/dev/null; then
                 echo "잔여 워커 프로세스 종료 ($pattern) [PID: $wp]..."

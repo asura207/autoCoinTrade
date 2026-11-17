@@ -30,7 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger("init_db")
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-ENV_PATH = PROJECT_ROOT / ".env"
+ENV_PATH = Path(os.getenv("AUTOCOIN_ENV_PATH") or str(PROJECT_ROOT / ".env"))
 DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_SQLITE_PATH = str(DATA_DIR / "auto_coin_trade.db")
 DEFAULT_DB_PATH = DEFAULT_SQLITE_PATH
@@ -786,6 +786,17 @@ def init_database(db_path: Optional[str] = None) -> None:
         )
         now_kst = _now_kst_str()
         next_rot = _compute_next_rotation_kst(1, 9)
+        ollama_defaults = (
+            ("use_local_ollama_news", os.getenv("USE_LOCAL_OLLAMA_NEWS", "true")),
+            ("ollama_base_url", os.getenv("OLLAMA_BASE_URL", "http://192.168.0.100:11434")),
+            ("ollama_news_model", os.getenv("OLLAMA_NEWS_MODEL", "qwen3-news")),
+            ("ollama_timeout_ms", os.getenv("OLLAMA_TIMEOUT_MS", "25000")),
+        )
+        for s_key, s_val in ollama_defaults:
+            conn.execute(
+                "INSERT OR IGNORE INTO system_settings (key, value, updated_at) VALUES (?, ?, ?);",
+                (s_key, str(s_val), now_kst),
+            )
         conn.execute(
             """
             INSERT OR IGNORE INTO auto_rotation_config (

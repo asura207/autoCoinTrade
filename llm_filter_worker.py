@@ -18,7 +18,9 @@ import re
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import pyupbit
 import requests
@@ -33,7 +35,134 @@ from init_db import (
 )
 from market_hub import get_cached_ohlcv
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+ENV_PATH = Path(os.getenv("AUTOCOIN_ENV_PATH") or str(BASE_DIR / ".env"))
+load_dotenv(dotenv_path=ENV_PATH)
+
+CONFIG_PATH = Path(os.getenv("AUTOCOIN_CONFIG_PATH") or str(BASE_DIR / "config" / "upbit_config.json"))
+EXAMPLE_CONFIG_PATH = BASE_DIR / "config" / "upbit_config.example.json"
+KST_TZ = timezone(timedelta(hours=9))
+DEFAULT_OLLAMA_BASE_URL = "http://192.168.0.100:11434"
+DEFAULT_OLLAMA_NEWS_MODEL = "qwen3-news"
+DEFAULT_OLLAMA_TIMEOUT_MS = 25000
+
+
+def _now_kst_str() -> str:
+    return datetime.now(KST_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_bool_flag(val: Any, default: bool = True) -> bool:
+    if val is None or val == "":
+        return default
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off"):
+        return False
+    return default
+
+
+def _load_runtime_config() -> Dict[str, Any]:
+    target = CONFIG_PATH if CONFIG_PATH.exists() else EXAMPLE_CONFIG_PATH
+    try:
+        if target.exists():
+            with open(target, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _get_system_setting(key: str, default: str = "", db_path: Optional[str] = None) -> str:
+    conn = None
+    try:
+        conn = get_db_connection(db_path)
+        row = conn.execute("SELECT value FROM system_settings WHERE key = ?;", (key,)).fetchone()
+        if row is not None:
+            return str(dict(row).get("value") or "")
+    except Exception:
+        pass
+    finally:
+        if conn is not None:
+            conn.close()
+    return default
+
+
+def get_gemini_api_key(db_path: Optional[str] = None) -> str:
+    cfg = _load_runtime_config()
+    cfg_key = str(cfg.get("gemini_api_key") or "").strip()
+    if cfg_key and cfg_key != "YOUR_GEMINI_API_KEY_HERE":
+        return cfg_key
+    db_key = _get_system_setting("gemini_api_key", "", db_path=db_path).strip()
+    if db_key:
+        return db_key
+    return os.getenv("GEMINI_API_KEY", "").strip()
+
+
+def get_ollama_runtime_config(db_path: Optional[str] = None) -> Dict[str, Any]:
+    cfg = _load_runtime_config() if CONFIG_PATH.exists() else {}
+    ui_configured = _get_system_setting("ollama_ui_configured", "", db_path=db_path)
+    db_use_local = _get_system_setting("use_local_ollama_news", "", db_path=db_path)
+    db_base_url = _get_system_setting("ollama_base_url", "", db_path=db_path)
+    db_model = _get_system_setting("ollama_news_model", "", db_path=db_path)
+    db_timeout = _get_system_setting("ollama_timeout_ms", "", db_path=db_path)
+
+    env_override = os.getenv("AUTOCOIN_LIBRARY_MODE", "").strip() == "1"
+
+    if env_override and os.getenv("USE_LOCAL_OLLAMA_NEWS") is not None:
+        enabled = _parse_bool_flag(os.getenv("USE_LOCAL_OLLAMA_NEWS"), True)
+    elif ui_configured == "1" and db_use_local != "":
+        enabled = _parse_bool_flag(db_use_local, True)
+    elif "use_local_ollama_news" in cfg:
+        enabled = _parse_bool_flag(cfg.get("use_local_ollama_news"), True)
+    elif os.getenv("USE_LOCAL_OLLAMA_NEWS") is not None:
+        enabled = _parse_bool_flag(os.getenv("USE_LOCAL_OLLAMA_NEWS"), True)
+    elif db_use_local != "":
+        enabled = _parse_bool_flag(db_use_local, True)
+    else:
+        enabled = True
+
+    raw_url = (
+        (os.getenv("OLLAMA_BASE_URL") if env_override else "")
+        or (db_base_url if ui_configured == "1" else "")
+        or str(cfg.get("ollama_base_url") or "")
+        or os.getenv("OLLAMA_BASE_URL", "")
+        or db_base_url
+        or DEFAULT_OLLAMA_BASE_URL
+    )
+    base_url = str(raw_url).strip().rstrip("/") or DEFAULT_OLLAMA_BASE_URL
+
+    model_name = (
+        (os.getenv("OLLAMA_NEWS_MODEL") if env_override else "")
+        or (db_model if ui_configured == "1" else "")
+        or str(cfg.get("ollama_news_model") or "")
+        or os.getenv("OLLAMA_NEWS_MODEL", "")
+        or db_model
+        or DEFAULT_OLLAMA_NEWS_MODEL
+    ).strip() or DEFAULT_OLLAMA_NEWS_MODEL
+
+    raw_timeout = (
+        (os.getenv("OLLAMA_TIMEOUT_MS") if env_override else "")
+        or (db_timeout if ui_configured == "1" else "")
+        or cfg.get("ollama_timeout_ms")
+        or os.getenv("OLLAMA_TIMEOUT_MS")
+        or db_timeout
+        or DEFAULT_OLLAMA_TIMEOUT_MS
+    )
+    try:
+        timeout_ms = max(3000, min(120000, int(float(raw_timeout))))
+    except Exception:
+        timeout_ms = DEFAULT_OLLAMA_TIMEOUT_MS
+
+    return {
+        "enabled": enabled,
+        "base_url": base_url,
+        "model": model_name,
+        "timeout_ms": timeout_ms,
+    }
 
 logging.basicConfig(
     level=logging.INFO,
@@ -416,6 +545,49 @@ def fetch_recent_crypto_news(hours: int = 4, limit: int = 15, db_path: Optional[
     return collected[:limit]
 
 
+def fetch_recent_crypto_news_items(hours: int = 1, limit: int = 12, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    로컬 Ollama(qwen3-news) 및 뉴스 브리핑 저장을 위해 DB crypto_news에서
+    구조화된 뉴스(title, summary, sentiment, source, published_at) 목록을 조회합니다.
+    """
+    items: List[Dict[str, Any]] = []
+    conn = None
+    try:
+        conn = get_db_connection(db_path)
+        rows = conn.execute(
+            "SELECT title, source, sentiment, summary, published_at FROM crypto_news ORDER BY published_at DESC, id DESC LIMIT ?;",
+            (max(limit, 12),),
+        ).fetchall()
+        for r in rows:
+            rd = dict(r)
+            title = str(rd.get("title") or "").strip()
+            if not title:
+                continue
+            items.append({
+                "title": title,
+                "source": str(rd.get("source") or "NEWS").strip(),
+                "sentiment": str(rd.get("sentiment") or "NEUTRAL").strip().upper(),
+                "summary": str(rd.get("summary") or "").strip(),
+                "published_at": str(rd.get("published_at") or "").strip(),
+            })
+    except Exception as exc:
+        logger.debug("DB structured crypto_news fetch skipped: %s", exc)
+    finally:
+        if conn is not None:
+            conn.close()
+
+    if not items:
+        for h in fetch_recent_crypto_news(hours=hours, limit=limit, db_path=db_path):
+            items.append({
+                "title": str(h),
+                "source": "RSS",
+                "sentiment": "NEUTRAL",
+                "summary": "",
+                "published_at": "",
+            })
+    return items[:limit]
+
+
 def fetch_open_positions_tickers(db_path: Optional[str] = None) -> List[str]:
     """
     bot_positions(OPEN) 및 trades(HOLDING) 테이블에서 현재 보유 중인 포지션 티커 목록을 조회합니다.
@@ -547,29 +719,34 @@ def fetch_live_context(db_path: Optional[str] = None) -> Dict[str, Any]:
 
 def make_fallback_regime(btc_summary: Dict[str, Any], label: str = "Fallback") -> Dict[str, Any]:
     """
-    API 키가 없거나 장애 발생 시 발동하는 BTC 일봉 20MA 기반 기계적 룰베이스 폴백 로직
-    - BTC가 일봉 20MA 상단: 10대 봇 전체 ALLOW, position_size_multiplier = 1.0 (정상 운용)
-    - BTC가 일봉 20MA 하단: 추세/돌파 봇(bot_01,02,03,04,07,09) BLOCK, 역추세/그리드(bot_05,06,08,10) ALLOW, 비중 0.5
+    API 키가 없거나 장애 발생 시 발동하는 BTC 일봉 20MA / 4시간봉 60MA 기반 기계적 룰베이스 폴백 로직
+    - BTC가 일봉 20MA 및 4시간 60MA 상단: 10대 봇 전체 ALLOW, position_size_multiplier = 1.0 (정상 운용)
+    - BTC가 일봉 20MA 또는 4시간 60MA 하단: 추세/돌파 봇(bot_01,02,03,04,07,09) BLOCK, 역추세/그리드(bot_05,06,08,10) ALLOW, 비중 0.5
     """
-    is_above = bool(btc_summary.get("is_above_ma20", True))
+    is_above_ma20 = bool(btc_summary.get("is_above_ma20", True))
+    is_above_ma60_4h = bool(btc_summary.get("is_above_ma60_4h", True))
+    is_above = is_above_ma20 and is_above_ma60_4h
+    regime = "BULL" if is_above else ("BEAR" if not is_above_ma20 else "SIDEWAYS")
     multiplier = 1.0 if is_above else 0.5
-    regime = "BULL" if is_above else "BEAR"
     disparity = btc_summary.get("disparity_pct", 0.0)
+    disparity_4h = btc_summary.get("disparity_4h_pct", 0.0)
 
     if is_above:
         bot_overrides = {bot_id: "ALLOW" for bot_id in ALL_BOT_IDS}
-        reason = f"{label}: BTC가 일봉 20MA 상단(이격도: {disparity}%) -> 10대 봇 전체 신규 매수 허용(1.0x)"
+        reason = f"{label}: BTC가 일봉 20MA({disparity}%)·4시간 60MA({disparity_4h}%) 상단 -> 10대 봇 전체 신규 매수 허용(1.0x)"
     else:
         bot_overrides = {
             bot_id: ("BLOCK" if bot_id in TREND_BREAKOUT_BOT_IDS else "ALLOW")
             for bot_id in ALL_BOT_IDS
         }
         reason = (
-            f"{label}: BTC가 일봉 20MA 하단(이격도: {disparity}%) -> 추세·돌파 봇(bot_01,02,03,04,07,09) 신규 진입 차단, "
-            "역추세·그리드·눌림목 봇(bot_05,06,08,10) 0.5x 보수적 허용"
+            f"{label}: BTC 지표 방어(일봉 20MA {disparity}% / 4시간 60MA {disparity_4h}%) 하단 -> "
+            "추세·돌파 봇(bot_01,02,03,04,07,09) 신규 진입 차단, 역추세·그리드·눌림목 봇(bot_05,06,08,10) 0.5x 보수적 허용"
         )
 
     return {
+        "provider": "fallback",
+        "model": "mechanical-btc-20ma",
         "sentiment_score": 0.2 if is_above else -0.3,
         "market_regime": regime,
         "risk_alert": False,
@@ -585,20 +762,22 @@ def make_fallback_regime(btc_summary: Dict[str, Any], label: str = "Fallback") -
 # 3. LLM API 호출 및 지수 백오프(Exponential Backoff: 1초, 2초, 4초) 로직
 # ==============================================================================
 
-def call_gemini_api_with_retry(
+def _call_gemini_api_with_model(
     system_prompt: str,
     user_prompt: str,
     candidate_models: List[str],
     gemini_key: str,
     max_retries: int = 4,
-) -> Optional[str]:
+) -> Tuple[Optional[str], str]:
     """
-    Gemini API를 지수 백오프(1초 -> 2초 -> 4초)와 함께 호출합니다.
-    429, 503, 타임아웃 등 일시적 장애 시 대기 시간을 늘려가며 재시도합니다.
+    Gemini API를 지수 백오프(1초 -> 2초 -> 4초)와 함께 호출하고 (응답텍스트, 선택된모델명)을 반환합니다.
     """
     backoff_delays = (1.0, 2.0, 4.0)
+    unavailable_404 = set()
     for attempt in range(max_retries):
         for model in candidate_models:
+            if model in unavailable_404:
+                continue
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key}"
             payload = {
                 "contents": [
@@ -624,7 +803,10 @@ def call_gemini_api_with_retry(
                             raw_text = parts[0].get("text", "")
                             if raw_text:
                                 logger.info("Gemini API call succeeded with model: %s", model)
-                                return raw_text
+                                return raw_text, model
+                elif resp.status_code in (400, 404):
+                    unavailable_404.add(model)
+                    logger.warning("Gemini model %s unavailable (%s): %s", model, resp.status_code, resp.text[:120])
                 elif resp.status_code in (429, 503):
                     logger.warning("Gemini model %s busy/throttled (%s). Attempt %d/%d", model, resp.status_code, attempt + 1, max_retries)
                 else:
@@ -632,12 +814,25 @@ def call_gemini_api_with_retry(
             except Exception as exc:
                 logger.warning("Gemini model %s request exception (attempt %d/%d): %s", model, attempt + 1, max_retries, exc)
 
-        if attempt < max_retries - 1:
+        if attempt < max_retries - 1 and len(unavailable_404) < len(candidate_models):
             delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
             logger.info("Waiting %.1f seconds before retrying Gemini API...", delay)
             time.sleep(delay)
 
-    return None
+    return None, (candidate_models[0] if candidate_models else "gemini-3.8-flash")
+
+
+def call_gemini_api_with_retry(
+    system_prompt: str,
+    user_prompt: str,
+    candidate_models: List[str],
+    gemini_key: str,
+    max_retries: int = 4,
+) -> Optional[str]:
+    raw_text, _ = _call_gemini_api_with_model(
+        system_prompt, user_prompt, candidate_models, gemini_key, max_retries=max_retries
+    )
+    return raw_text
 
 
 def call_openai_api_with_retry(
@@ -725,6 +920,11 @@ def parse_and_validate_llm_json(raw_text: Optional[str], default_reason: str = "
         if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
             cleaned = cleaned[first_brace : last_brace + 1]
         parsed = json.loads(cleaned)
+        if not isinstance(parsed, dict) or not any(
+            k in parsed for k in ("sentiment_score", "market_regime", "recommended_action", "bot_overrides")
+        ):
+            logger.error("LLM JSON missing required decision keys: %s", (raw_text or "")[:200])
+            return None
 
         sentiment_score = float(parsed.get("sentiment_score", 0.0))
         sentiment_score = max(-1.0, min(1.0, sentiment_score))
@@ -740,7 +940,9 @@ def parse_and_validate_llm_json(raw_text: Optional[str], default_reason: str = "
             action = "NORMAL"
 
         multiplier = float(parsed.get("position_size_multiplier", 1.0))
-        if multiplier <= 0.0:
+        if risk_alert or action in ("HALT_NEW_BUYS", "EMERGENCY_CLOSE_ALL"):
+            multiplier = 0.0
+        elif multiplier <= 0.0:
             multiplier = 0.0
         elif multiplier < 0.75:
             multiplier = 0.5
@@ -752,12 +954,18 @@ def parse_and_validate_llm_json(raw_text: Optional[str], default_reason: str = "
             bot_overrides = {bot_id: "BLOCK" for bot_id in ALL_BOT_IDS}
 
         raw_blacklist = parsed.get("blacklist_tickers", [])
-        blacklist: List[str] = []
+        blacklist_set = set()
         if isinstance(raw_blacklist, list):
             for item in raw_blacklist:
                 t = str(item or "").strip().upper()
                 if t:
-                    blacklist.append(t if "-" in t else f"KRW-{t}")
+                    if t.startswith("KRW-"):
+                        blacklist_set.add(t)
+                    elif "-" in t:
+                        blacklist_set.add(f"KRW-{t.split('-')[-1]}")
+                    else:
+                        blacklist_set.add(f"KRW-{t}")
+        blacklist = sorted(blacklist_set)
 
         reason = str(parsed.get("reason", default_reason))
 
@@ -777,28 +985,172 @@ def parse_and_validate_llm_json(raw_text: Optional[str], default_reason: str = "
 
 
 # ==============================================================================
-# 4. Flash 30분 빠른 분석 & Pro 1시간 심층 퀀트 분석 개별 실행기
+# 4. Flash 30분 빠른 분석(1순위: 맥북 로컬 Ollama qwen3-news) & Pro 1시간 심층 퀀트 분석 개별 실행기
 # ==============================================================================
+
+def call_local_ollama_coin_news_analyzer(
+    btc_summary: Dict[str, Any],
+    news_items: List[Any],
+    open_positions: List[str],
+    live_bots: Optional[List[Dict[str, Any]]] = None,
+    fng: Optional[Dict[str, Any]] = None,
+    base_url: Optional[str] = None,
+    model_name: Optional[str] = None,
+    timeout_ms: Optional[int] = None,
+    db_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    맥북 프로 로컬 Ollama(qwen3-news) API를 호출하여 최근 30분 암호화폐 뉴스 감성 및 업비트 10대 봇 제어 상태를 JSON으로 분석합니다.
+    필수 옵션: stream=False, think=False, format='json', timeout=25초
+    """
+    cfg = get_ollama_runtime_config(db_path=db_path)
+    target_url = (base_url or cfg["base_url"]).strip().rstrip("/")
+    target_model = (model_name or cfg["model"]).strip() or DEFAULT_OLLAMA_NEWS_MODEL
+    target_timeout_sec = max(3.0, min(120.0, float(timeout_ms or cfg["timeout_ms"]) / 1000.0))
+
+    compact_lines: List[str] = []
+    for idx, item in enumerate((news_items or [])[:12], start=1):
+        if isinstance(item, dict):
+            sent = str(item.get("sentiment") or "NEUTRAL").upper()
+            sent_tag = "호재" if sent == "BULLISH" else ("악재" if sent == "BEARISH" else "중립")
+            title = str(item.get("title") or "").strip()
+            snippet = re.sub(r"\s+", " ", str(item.get("summary") or "")).strip()[:150]
+            compact_lines.append(f"{idx}. [{sent_tag}] {title}{f' - {snippet}' if snippet else ''}")
+        else:
+            compact_lines.append(f"{idx}. {re.sub(r'\s+', ' ', str(item or '')).strip()[:180]}")
+
+    compact_news_text = "\n".join(compact_lines) if compact_lines else "특이 신규 속보 없음 (보합세)"
+    active_bot_desc = (
+        ", ".join(f"{b.get('bot_id')}({b.get('name') or b.get('bot_id')})" for b in live_bots)
+        if live_bots
+        else "bot_01 ~ bot_10"
+    )
+    fng_val = (fng or {}).get("value", "N/A")
+    fng_cls = (fng or {}).get("classification", "N/A")
+
+    user_prompt = f"""다음 최근 30분 업비트 암호화폐 시황 지표와 뉴스 헤드라인을 분석해 반드시 지정된 JSON 스키마로만 응답하라.
+
+[1. 현재 암호화폐 시장 기술적 요약]
+- KRW-BTC 현재가: {btc_summary.get('current_price', 'N/A')}원 (24h 변동률: {btc_summary.get('change_rate_24h', 'N/A')}%)
+- KRW-BTC 일봉 20MA: {btc_summary.get('ma20', 'N/A')}원 | 4시간봉 60MA: {btc_summary.get('ma60_4h', 'N/A')}원
+- 크립토 공포·탐욕 지수: {fng_val} ({fng_cls})
+- 현재 실전 가동 봇: {active_bot_desc}
+- 현재 보유 오픈 포지션: {', '.join(open_positions) if open_positions else '없음'}
+
+[2. 최근 수집된 주요 암호화폐 뉴스]
+{compact_news_text}
+
+[출력 JSON 스키마]
+{{
+  "sentiment_score": -1.0에서 1.0 사이의 소수점 첫째 자리 실수,
+  "market_regime": "BULL | SIDEWAYS | BEAR | HIGH_VOLATILITY_SHOCK",
+  "risk_alert": true 또는 false (거래소 해킹, 디페깅, 상장폐지, 거시 쇼크 시 true),
+  "recommended_action": "NORMAL | REDUCE_SIZE | HALT_NEW_BUYS | EMERGENCY_CLOSE_ALL",
+  "position_size_multiplier": 0.0, 0.5, 1.0 중 택1,
+  "bot_overrides": {{
+    "bot_01": "ALLOW | BLOCK",
+    "bot_02": "ALLOW | BLOCK",
+    "bot_03": "ALLOW | BLOCK",
+    "bot_04": "ALLOW | BLOCK",
+    "bot_05": "ALLOW | BLOCK",
+    "bot_06": "ALLOW | BLOCK",
+    "bot_07": "ALLOW | BLOCK",
+    "bot_08": "ALLOW | BLOCK",
+    "bot_09": "ALLOW | BLOCK",
+    "bot_10": "ALLOW | BLOCK"
+  }},
+  "blacklist_tickers": ["해킹·유의종목 지정 등 치명적 악재가 발생한 업비트 원화마켓 티커(예: KRW-XRP), 없으면 []"],
+  "reason": "암호화폐 단기 시황, 뉴스 감성 및 봇 진입 제어 판단 근거 한국어 2~3문장 요약"
+}}"""
+
+    started_ms = int(time.time() * 1000)
+    resp = requests.post(
+        f"{target_url}/api/chat",
+        json={
+            "model": target_model,
+            "stream": False,
+            "think": False,
+            "format": "json",
+            "messages": [{"role": "user", "content": user_prompt}],
+        },
+        timeout=target_timeout_sec,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Ollama HTTP {resp.status_code}: {resp.text[:200]}")
+
+    data = resp.json()
+    raw_content = str((data.get("message") or {}).get("content") or data.get("response") or "").strip()
+    if not raw_content:
+        raise RuntimeError("Ollama returned empty message content")
+
+    parsed = parse_and_validate_llm_json(raw_content, "로컬 Ollama(qwen3-news) 30분 암호화폐 뉴스·시황 분석 완료")
+    if not parsed:
+        raise ValueError("Ollama response failed JSON schema validation")
+
+    parsed["provider"] = "ollama"
+    parsed["model"] = target_model
+    parsed["model_tier"] = "OLLAMA_QWEN3_30M"
+    parsed["latency_ms"] = max(1, int(time.time() * 1000) - started_ms)
+    return parsed
+
 
 def call_flash_fast_analysis(
     btc_summary: Dict[str, Any],
-    news_headlines: List[str],
+    news_headlines: List[Any],
     open_positions: List[str],
     previous_state: Optional[Dict[str, Any]] = None,
     live_bots: Optional[List[Dict[str, Any]]] = None,
     open_positions_detail: Optional[List[Dict[str, Any]]] = None,
+    db_path: Optional[str] = None,
+    fng: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Gemini Flash(30분 주기): 최근 30분~1시간 뉴스, 업비트 공지, 단기 급등락 지표를 분석해
-    돌발 악재 시 즉각 BLOCK / 블랙리스트 오버라이드를 수행합니다.
+    FLASH_30M 30분 단기 시황·뉴스 분석 (3중 무중단 Fallback):
+    - 1순위: 맥북 프로 로컬 Ollama(qwen3-news) API
+    - 2순위: Gemini Flash API (지수 백오프 1초, 2초, 4초 포함)
+    - 3순위: 직전 유효 캐시 유지 또는 KRW-BTC 일봉 20MA / 4시간봉 60MA 기반 기계적 안전 모드
     """
-    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    ollama_cfg = get_ollama_runtime_config(db_path=db_path)
+
+    # 1순위: 로컬 맥북 Ollama(qwen3-news)
+    if ollama_cfg.get("enabled", True):
+        try:
+            ollama_res = call_local_ollama_coin_news_analyzer(
+                btc_summary=btc_summary,
+                news_items=news_headlines,
+                open_positions=open_positions,
+                live_bots=live_bots,
+                fng=fng,
+                base_url=ollama_cfg["base_url"],
+                model_name=ollama_cfg["model"],
+                timeout_ms=ollama_cfg["timeout_ms"],
+                db_path=db_path,
+            )
+            if ollama_res:
+                logger.info(
+                    "Local Ollama (%s) 30m analysis succeeded in %dms.",
+                    ollama_res.get("model"),
+                    ollama_res.get("latency_ms", 0),
+                )
+                return ollama_res
+        except Exception as exc:
+            logger.warning("[OllamaFallback] 로컬 맥북 Ollama 연결 실패 (%s) -> Gemini Flash 백업 엔진 전환", exc)
+
+    # 2순위: Gemini Flash / OpenAI 백업 엔진
+    gemini_key = get_gemini_api_key(db_path=db_path)
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
 
     if not gemini_key and not openai_key:
-        logger.info("No LLM API keys for Flash analysis. Using fallback rule.")
+        logger.info("No LLM API keys for Flash fallback. Applying mechanical/cache fallback.")
+        if previous_state:
+            previous_state["bot_overrides"] = normalize_bot_overrides(previous_state.get("bot_overrides"))
+            return previous_state
         return make_fallback_regime(btc_summary, "Flash Fallback")
 
+    headline_strings = [
+        (f"[{h.get('source', 'NEWS')}] {h.get('title', '')}" if isinstance(h, dict) else str(h))
+        for h in (news_headlines or [])
+    ]
     live_ctx_text = _format_live_context_for_prompt(open_positions, live_bots, open_positions_detail)
     user_prompt = f"""[Flash 단기 30분 시황·공지·변동성 리포트]
 1. 비트코인(BTC) 단기 기술적 지표:
@@ -809,7 +1161,7 @@ def call_flash_fast_analysis(
 2. 실전 봇 & 오픈 포지션 컨텍스트:
 {live_ctx_text}
 3. 최근 30분~1시간 이내 뉴스·공지 헤드라인:
-{chr(10).join(f"- {h}" for h in news_headlines) if news_headlines else '- 최근 특이 속보 없음'}
+{chr(10).join(f"- {h}" for h in headline_strings) if headline_strings else '- 최근 특이 속보 없음'}
 
 [판단 지침]
 - 단기 돌발 악재(해킹, 디페깅, 전쟁 속보, 패닉 투매, 업비트 유의종목/상장폐지 공시)가 없으면 거시 기조를 유지하되 단기 휩소 위험 봇만 조정하십시오.
@@ -817,8 +1169,10 @@ def call_flash_fast_analysis(
 - 보유 포지션 강제 청산이 아닌 신규 매수 게이트(bot_01~bot_10)만 JSON으로 반환하십시오."""
 
     raw_response = None
+    chosen_model = FLASH_MODELS[0]
+    chosen_provider = "gemini"
     if gemini_key:
-        raw_response = call_gemini_api_with_retry(
+        raw_response, chosen_model = _call_gemini_api_with_model(
             FLASH_SYSTEM_PROMPT, user_prompt, FLASH_MODELS, gemini_key, max_retries=4
         )
 
@@ -826,11 +1180,17 @@ def call_flash_fast_analysis(
         raw_response = call_openai_api_with_retry(
             FLASH_SYSTEM_PROMPT, user_prompt, "gpt-4o-mini", openai_key
         )
+        if raw_response:
+            chosen_provider = "openai"
+            chosen_model = "gpt-4o-mini"
 
     parsed = parse_and_validate_llm_json(raw_response, "Flash 30m fast analysis completed")
     if parsed:
+        parsed["provider"] = chosen_provider
+        parsed["model"] = chosen_model
         return parsed
 
+    # 3순위: 직전 유효 캐시 유지 또는 BTC 일봉 20MA / 4시간봉 60MA 기계적 안전 모드
     if previous_state:
         logger.warning("Flash API call failed; keeping previous Flash state.")
         previous_state["bot_overrides"] = normalize_bot_overrides(previous_state.get("bot_overrides"))
@@ -847,12 +1207,13 @@ def call_pro_indepth_analysis(
     previous_state: Optional[Dict[str, Any]] = None,
     live_bots: Optional[List[Dict[str, Any]]] = None,
     open_positions_detail: Optional[List[Dict[str, Any]]] = None,
+    db_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Gemini Pro(1시간 주기): BTC 일봉 20MA / 4시간 60MA, 공포·탐욕 지수, 최근 4시간 뉴스를 종합 분석해
     장세(market_regime)와 10대 봇(bot_01~bot_10) 각각의 ALLOW/BLOCK 스위치를 결정합니다.
     """
-    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    gemini_key = get_gemini_api_key(db_path=db_path)
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
 
     if not gemini_key and not openai_key:
@@ -875,8 +1236,10 @@ def call_pro_indepth_analysis(
 거시 장세(BULL/BEAR/SIDEWAYS/HIGH_VOLATILITY_SHOCK)와 bot_01~bot_10 전략군(추세·돌파 vs 역추세·그리드·눌림목) 각각의 신규 진입 ALLOW/BLOCK 스위치를 JSON으로 출력하십시오."""
 
     raw_response = None
+    chosen_model = PRO_MODELS[0]
+    chosen_provider = "gemini"
     if gemini_key:
-        raw_response = call_gemini_api_with_retry(
+        raw_response, chosen_model = _call_gemini_api_with_model(
             PRO_SYSTEM_PROMPT, user_prompt, PRO_MODELS, gemini_key, max_retries=4
         )
 
@@ -884,9 +1247,14 @@ def call_pro_indepth_analysis(
         raw_response = call_openai_api_with_retry(
             PRO_SYSTEM_PROMPT, user_prompt, "gpt-4o", openai_key
         )
+        if raw_response:
+            chosen_provider = "openai"
+            chosen_model = "gpt-4o"
 
     parsed = parse_and_validate_llm_json(raw_response, "Pro 1h in-depth quantitative analysis completed")
     if parsed:
+        parsed["provider"] = chosen_provider
+        parsed["model"] = chosen_model
         return parsed
 
     if previous_state:
@@ -1055,14 +1423,27 @@ def synthesize_dual_decisions(
     }
 
 
-def update_market_regime_filter_table(synthesized: Dict[str, Any], db_path: Optional[str] = None) -> None:
+def update_market_regime_filter_table(
+    synthesized: Dict[str, Any],
+    db_path: Optional[str] = None,
+    update_flash_ts: bool = True,
+    update_pro_ts: bool = True,
+) -> None:
     """
     market_regime_filter 테이블(id=1 단일 행)을 원자적으로 갱신합니다.
     기존 컬럼과 신규 확장 컬럼(flash_*, pro_*, final_*)을 모두 저장하여 완벽한 하위 호환성을 제공합니다.
     """
     conn = get_db_connection(db_path)
+    now_kst = _now_kst_str()
     try:
         conn.execute("BEGIN IMMEDIATE;")
+        existing_row = conn.execute(
+            "SELECT flash_updated_at, pro_updated_at FROM market_regime_filter WHERE id = 1;"
+        ).fetchone()
+        existing_dict = dict(existing_row) if existing_row is not None else {}
+        flash_ts = now_kst if update_flash_ts else str(existing_dict.get("flash_updated_at") or now_kst)
+        pro_ts = now_kst if update_pro_ts else str(existing_dict.get("pro_updated_at") or now_kst)
+
         conn.execute(
             """
             UPDATE market_regime_filter
@@ -1074,13 +1455,13 @@ def update_market_regime_filter_table(synthesized: Dict[str, Any], db_path: Opti
                 bot_overrides_json = %s,
                 blacklist_tickers_json = %s,
                 reason = %s,
-                updated_at = CURRENT_TIMESTAMP,
+                updated_at = %s,
                 flash_sentiment_score = %s,
                 flash_recommended_action = %s,
-                flash_updated_at = CURRENT_TIMESTAMP,
+                flash_updated_at = %s,
                 pro_sentiment_score = %s,
                 pro_recommended_action = %s,
-                pro_updated_at = CURRENT_TIMESTAMP,
+                pro_updated_at = %s,
                 final_risk_alert = %s,
                 final_position_multiplier = %s,
                 final_bot_overrides_json = %s
@@ -1095,10 +1476,13 @@ def update_market_regime_filter_table(synthesized: Dict[str, Any], db_path: Opti
                 json.dumps(synthesized["bot_overrides"], ensure_ascii=False),
                 json.dumps(synthesized["blacklist_tickers"], ensure_ascii=False),
                 synthesized["reason"],
+                now_kst,
                 synthesized["flash_sentiment_score"],
                 synthesized["flash_recommended_action"],
+                flash_ts,
                 synthesized["pro_sentiment_score"],
                 synthesized["pro_recommended_action"],
+                pro_ts,
                 1 if synthesized["final_risk_alert"] else 0,
                 synthesized["final_position_multiplier"],
                 json.dumps(synthesized["final_bot_overrides"], ensure_ascii=False),
@@ -1121,6 +1505,107 @@ def update_market_regime_filter_table(synthesized: Dict[str, Any], db_path: Opti
         conn.close()
 
 
+def save_ai_briefings_to_db(
+    flash_res: Optional[Dict[str, Any]],
+    pro_res: Optional[Dict[str, Any]],
+    synthesized: Dict[str, Any],
+    btc_summary: Dict[str, Any],
+    news_items: List[Any],
+    db_path: Optional[str] = None,
+    save_market: bool = True,
+    save_news: bool = True,
+) -> None:
+    """
+    ai_market_briefings 및 ai_news_briefings 테이블에 분석 내역을 기록합니다.
+    로컬 Ollama 응답 시 provider='ollama', model='qwen3-news'로, Gemini 응답 시 provider='gemini'로 저장합니다.
+    """
+    now_kst = _now_kst_str()
+    conn = get_db_connection(db_path)
+    try:
+        active_flash = flash_res or {}
+        active_pro = pro_res or {}
+        flash_provider = str(active_flash.get("provider") or "fallback")
+        flash_model = str(active_flash.get("model") or "mechanical-btc-20ma")
+        pro_provider = str(active_pro.get("provider") or "fallback")
+        pro_model = str(active_pro.get("model") or "mechanical-btc-20ma")
+
+        btc_price = float(btc_summary.get("current_price") or 0.0)
+        btc_ma20 = float(btc_summary.get("ma20") or 0.0)
+        btc_4h60 = float(btc_summary.get("ma60_4h") or 0.0)
+        regime_status = (
+            "HOLD_CASH"
+            if synthesized.get("recommended_action") in ("HALT_NEW_BUYS", "EMERGENCY_CLOSE_ALL")
+            else str(synthesized.get("market_regime") or "SIDEWAYS")
+        )
+
+        if save_market and (flash_provider in ("ollama", "gemini", "openai") or pro_provider in ("ollama", "gemini", "openai")):
+            primary_provider = flash_provider if flash_provider in ("ollama", "gemini", "openai") else pro_provider
+            primary_model = flash_model if flash_provider in ("ollama", "gemini", "openai") else pro_model
+            overrides = synthesized.get("final_bot_overrides") or {}
+            allow_bots = [bid for bid in ALL_BOT_IDS if overrides.get(bid) == "ALLOW"]
+            block_bots = [bid for bid in ALL_BOT_IDS if overrides.get(bid) == "BLOCK"]
+            market_md = "\n".join([
+                f"## ⚡ 단기·거시 AI 시황 분석 ({primary_provider} · `{primary_model}`)",
+                f"- **시장 체제**: `{synthesized.get('market_regime')}` | **권고 액션**: `{synthesized.get('recommended_action')}` | **투입 비중**: **{int(round(float(synthesized.get('final_position_multiplier', 1.0)) * 100))}%**",
+                f"- **블랙리스트**: {', '.join(synthesized.get('blacklist_tickers') or []) or '없음'}",
+                "",
+                "## 🧠 판단 근거",
+                str(synthesized.get("reason") or ""),
+                "",
+                "## 🤖 10대 봇 게이트웨이",
+                f"- **ALLOW**: {', '.join(allow_bots) if allow_bots else '없음'}",
+                f"- **BLOCK**: {', '.join(block_bots) if block_bots else '없음'}",
+            ])
+            conn.execute(
+                """
+                INSERT INTO ai_market_briefings (
+                    provider, model, btc_price, btc_daily_20ma, btc_4h_60ma, regime_status, briefing_text, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (primary_provider, primary_model, btc_price, btc_ma20, btc_4h60, regime_status, market_md, now_kst),
+            )
+
+        if save_news and flash_provider in ("ollama", "gemini", "openai"):
+            stats_row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN sentiment = 'BULLISH' THEN 1 ELSE 0 END) AS bull,
+                    SUM(CASE WHEN sentiment = 'BEARISH' THEN 1 ELSE 0 END) AS bear,
+                    SUM(CASE WHEN sentiment = 'NEUTRAL' THEN 1 ELSE 0 END) AS neut
+                FROM crypto_news;
+                """
+            ).fetchone()
+            st = dict(stats_row) if stats_row is not None else {}
+            total_news = int(st.get("total") or len(news_items or []))
+            bull_cnt = int(st.get("bull") or 0)
+            bear_cnt = int(st.get("bear") or 0)
+            neut_cnt = int(st.get("neut") or 0)
+            news_md = "\n".join([
+                f"## 1. 📰 실시간 뉴스 핵심 쟁점 및 센티먼트 ({flash_provider} · `{flash_model}`)",
+                f"- **단기 감성 점수**: `{float(active_flash.get('sentiment_score', 0.0)):+.2f}` | **체제**: `{active_flash.get('market_regime', 'SIDEWAYS')}`",
+                f"- **판단 근거**: {active_flash.get('reason', '')}",
+                "",
+                "## 2. 🎯 퀀트 봇 제어 요약",
+                f"- **권고 액션**: `{active_flash.get('recommended_action', 'NORMAL')}` | **블랙리스트**: {', '.join(active_flash.get('blacklist_tickers') or []) or '없음'}",
+            ])
+            conn.execute(
+                """
+                INSERT INTO ai_news_briefings (
+                    provider, model, news_count, bullish_count, bearish_count, neutral_count, briefing_text, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (flash_provider, flash_model, total_news, bull_cnt, bear_cnt, neut_cnt, news_md, now_kst),
+            )
+
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        logger.warning("Failed to save ai_market_briefings/ai_news_briefings: %s", exc)
+    finally:
+        conn.close()
+
+
 # ==============================================================================
 # 6. 메인 워커 프로세스 루프 (30분 Flash & 1시간 Pro 독립 타이머 제어)
 # ==============================================================================
@@ -1128,9 +1613,9 @@ def update_market_regime_filter_table(synthesized: Dict[str, Any], db_path: Opti
 def run_llm_sentiment_worker(stop_event, bot_id: str = "bot_llm_filter", db_path: Optional[str] = None) -> None:
     """
     듀얼 AI 워커 메인 프로세스:
-    - 30분(1800초) 단위 Gemini Flash 빠른 분석 실행
+    - 30분(1800초) 단위 FLASH_30M 분석 실행 (1순위: 맥북 로컬 Ollama qwen3-news -> 2순위: Gemini Flash -> 3순위: BTC 20MA)
     - 1시간(3600초) 단위 Gemini Pro 심층 퀀트 분석 실행
-    - 단기/심층 분석 결과 교차 검증 및 market_regime_filter 단일 행 상태 갱신
+    - 단기/심층 분석 결과 교차 검증 및 market_regime_filter / ai_*_briefings 갱신
     """
     logger.info("Dual AI Engine Worker [%s] started. Flash=30m(1800s), Pro=1h(3600s).", bot_id)
     flash_interval_sec = int(os.getenv("FLASH_FILTER_INTERVAL_SEC", "1800"))
@@ -1214,11 +1699,12 @@ def run_llm_sentiment_worker(stop_event, bot_id: str = "bot_llm_filter", db_path
                 open_pos = live_ctx.get("open_tickers", [])
                 live_bots = live_ctx.get("live_bots", [])
                 open_pos_detail = live_ctx.get("open_positions_detail", [])
+                fng = fetch_fear_and_greed_index()
+                flash_news_items: List[Dict[str, Any]] = []
 
                 # 1. Pro 1시간 심층 퀀트 분석 실행
                 if should_run_pro:
                     logger.info("[%s] Starting Gemini Pro 1-Hour In-Depth Quantitative Analysis...", bot_id)
-                    fng = fetch_fear_and_greed_index()
                     pro_news = fetch_recent_crypto_news(hours=4, limit=15, db_path=db_path)
                     pro_res = call_pro_indepth_analysis(
                         btc_summary,
@@ -1228,6 +1714,7 @@ def run_llm_sentiment_worker(stop_event, bot_id: str = "bot_llm_filter", db_path
                         current_pro_result,
                         live_bots=live_bots,
                         open_positions_detail=open_pos_detail,
+                        db_path=db_path,
                     )
                     if pro_res:
                         current_pro_result = pro_res
@@ -1237,24 +1724,31 @@ def run_llm_sentiment_worker(stop_event, bot_id: str = "bot_llm_filter", db_path
                             bot_id, pro_res["market_regime"], pro_res["recommended_action"], pro_res["sentiment_score"]
                         )
 
-                # 2. Flash 30분 단기 시황 분석 실행
+                # 2. Flash 30분 단기 시황 분석 실행 (1순위: 로컬 Ollama qwen3-news)
                 if should_run_flash:
-                    logger.info("[%s] Starting Gemini Flash 30-Minute Fast-Response Analysis...", bot_id)
-                    flash_news = fetch_recent_crypto_news(hours=1, limit=8, db_path=db_path)
+                    logger.info("[%s] Starting FLASH_30M 30-Minute Fast-Response Analysis...", bot_id)
+                    flash_news_items = fetch_recent_crypto_news_items(hours=1, limit=12, db_path=db_path)
                     flash_res = call_flash_fast_analysis(
                         btc_summary,
-                        flash_news,
+                        flash_news_items,
                         open_pos,
                         current_flash_result,
                         live_bots=live_bots,
                         open_positions_detail=open_pos_detail,
+                        db_path=db_path,
+                        fng=fng,
                     )
                     if flash_res:
                         current_flash_result = flash_res
                         last_flash_run = now
                         logger.info(
-                            "[%s] Gemini Flash Analysis Complete: Action=%s, Alert=%s, Score=%.2f",
-                            bot_id, flash_res["recommended_action"], flash_res["risk_alert"], flash_res["sentiment_score"]
+                            "[%s] FLASH_30M Analysis Complete (%s/%s): Action=%s, Alert=%s, Score=%.2f",
+                            bot_id,
+                            flash_res.get("provider", "fallback"),
+                            flash_res.get("model", "rule"),
+                            flash_res["recommended_action"],
+                            flash_res["risk_alert"],
+                            flash_res["sentiment_score"],
                         )
 
                 # 3. 폴백 보완
@@ -1265,7 +1759,22 @@ def run_llm_sentiment_worker(stop_event, bot_id: str = "bot_llm_filter", db_path
 
                 # 4. 다중 모델 교차 검증 종합 판단 및 DB 원자적 반영
                 synthesized = synthesize_dual_decisions(current_flash_result, current_pro_result)
-                update_market_regime_filter_table(synthesized, db_path)
+                update_market_regime_filter_table(
+                    synthesized,
+                    db_path,
+                    update_flash_ts=should_run_flash,
+                    update_pro_ts=should_run_pro,
+                )
+                save_ai_briefings_to_db(
+                    current_flash_result,
+                    current_pro_result,
+                    synthesized,
+                    btc_summary,
+                    flash_news_items,
+                    db_path=db_path,
+                    save_market=should_run_flash or should_run_pro,
+                    save_news=should_run_flash,
+                )
 
             except Exception as loop_exc:
                 logger.error("[%s] Error during dual AI cycle: %s", bot_id, loop_exc, exc_info=True)
@@ -1284,17 +1793,19 @@ if __name__ == "__main__":
     test_stop = threading.Event()
     btc = fetch_btc_technical_summary()
     fng = fetch_fear_and_greed_index()
-    news = fetch_recent_crypto_news(hours=4, limit=8)
+    news_items = fetch_recent_crypto_news_items(hours=4, limit=12)
+    news_strs = [f"[{n.get('source', 'NEWS')}] {n.get('title', '')}" for n in news_items]
     live_ctx = fetch_live_context()
     open_p = live_ctx.get("open_tickers", [])
 
-    print("[1/3] Testing Flash 30m Fast Analysis...")
+    print("[1/3] Testing Flash 30m Fast Analysis (Local Ollama -> Gemini Flash Fallback)...")
     flash_out = call_flash_fast_analysis(
         btc,
-        news,
+        news_items,
         open_p,
         live_bots=live_ctx.get("live_bots"),
         open_positions_detail=live_ctx.get("open_positions_detail"),
+        fng=fng,
     )
     print("Flash Result:", json.dumps(flash_out, indent=2, ensure_ascii=False))
 
@@ -1302,7 +1813,7 @@ if __name__ == "__main__":
     pro_out = call_pro_indepth_analysis(
         btc,
         fng,
-        news,
+        news_strs,
         open_p,
         live_bots=live_ctx.get("live_bots"),
         open_positions_detail=live_ctx.get("open_positions_detail"),
@@ -1314,4 +1825,5 @@ if __name__ == "__main__":
     print("Synthesized Result:", json.dumps(synth_out, indent=2, ensure_ascii=False))
 
     update_market_regime_filter_table(synth_out)
+    save_ai_briefings_to_db(flash_out, pro_out, synth_out, btc, news_items)
     print("\nStandalone test cycle successfully finished!")

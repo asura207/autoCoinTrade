@@ -31,6 +31,7 @@ const runBackendBat = [
   '    call npm install --silent',
   ')',
   '',
+  '"%NODE_EXE%" backend\\common\\log_rotator.mjs --startup >nul 2>&1',
   '"%NODE_EXE%" backend/node_server.mjs >> logs\\backend.log 2>&1',
   ''
 ].join('\r\n');
@@ -44,7 +45,7 @@ const runFrontendBat = [
   'if not exist "..\\logs" mkdir "..\\logs"',
   '',
   'set "FRONTEND_PORT=9000"',
-  'set "FRONTEND_HOST=0.0.0.0"',
+  'set "FRONTEND_HOST=127.0.0.1"',
   'if exist "..\\.env" (',
   '    for /f "usebackq eol=# tokens=1,* delims==" %%A in ("..\\.env") do (',
   '        if /I "%%~A"=="FRONTEND_PORT" set "FRONTEND_PORT=%%~B"',
@@ -58,11 +59,16 @@ const runFrontendBat = [
   'if "%NODE_EXE%"=="" if exist "D:\\dev\\tools\\nodejs\\node.exe" set "NODE_EXE=D:\\dev\\tools\\nodejs\\node.exe"',
   'if "%NODE_EXE%"=="" set "NODE_EXE=node"',
   '',
-  'if not exist "node_modules\\vite" (',
+  'if not exist "node_modules" (',
   '  echo [Frontend] Installing dependencies...',
   '  call npm install',
   ')',
-  '"%NODE_EXE%" node_modules\\vite\\bin\\vite.js --port %FRONTEND_PORT% --host %FRONTEND_HOST% >> ..\\logs\\frontend.log 2>&1',
+  'if not exist "dist\\index.html" (',
+  '  echo [Frontend] Building production static bundle...',
+  '  call npm run build',
+  ')',
+  '"%NODE_EXE%" ..\\backend\\common\\log_rotator.mjs --startup >nul 2>&1',
+  '"%NODE_EXE%" server.mjs >> ..\\logs\\frontend.log 2>&1',
   ''
 ].join('\r\n');
 fs.writeFileSync(path.join(scriptsDir, 'run_frontend.bat'), runFrontendBat, 'utf8');
@@ -160,7 +166,7 @@ const stopBatContent = [
   '    taskkill /F /T /PID %%a >nul 2>&1',
   ')',
   '',
-  'powershell -NoProfile -Command "$root=\'%CD%\'; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ($_.CommandLine -like \'*node_server.mjs*\' -or $_.CommandLine -like \'*main_orchestrator.py*\' -or $_.CommandLine -like \'*llm_filter_worker.py*\') -and $_.CommandLine -like (\'*\' + $root + \'*\') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1',
+  'powershell -NoProfile -Command "$root=\'%CD%\'; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ($_.CommandLine -like \'*node_server.mjs*\' -or $_.CommandLine -like \'*server.mjs*\' -or $_.CommandLine -like \'*main_orchestrator.py*\' -or $_.CommandLine -like \'*llm_filter_worker.py*\') -and $_.CommandLine -like (\'*\' + $root + \'*\') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1',
   '',
   'echo ===================================================',
   'echo [완료] 백엔드, 웹 UI 및 워커 서비스가 안전하게 중지되었습니다.',

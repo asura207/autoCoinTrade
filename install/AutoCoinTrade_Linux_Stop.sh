@@ -71,7 +71,7 @@ kill_port "$FRONTEND_PORT"
 
 # 3. 패키지 내부 잔여 워커 정리
 if command -v pgrep >/dev/null 2>&1; then
-    for pattern in "${APP_DIR}/backend/node_server.mjs" "${APP_DIR}/main_orchestrator.py" "${APP_DIR}/llm_filter_worker.py"; do
+    for pattern in "${APP_DIR}/backend/node_server.mjs" "${APP_DIR}/frontend/server.mjs" "${APP_DIR}/main_orchestrator.py" "${APP_DIR}/llm_filter_worker.py"; do
         for wp in $(pgrep -f "$pattern" 2>/dev/null || true); do
             if [ -n "$wp" ] && [ "$wp" != "$$" ] && kill -0 "$wp" 2>/dev/null; then
                 kill -TERM "$wp" >/dev/null 2>&1 || true

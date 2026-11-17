@@ -32,7 +32,15 @@ echo "[Upbit AutoCoinTrade] 외부 인터넷 접속 보안 터널 시작 중..."
 echo "==================================================="
 
 LOG_FILE="$PROJECT_ROOT/logs/tunnel.log"
-rm -f "$LOG_FILE"
+if command -v node >/dev/null 2>&1; then
+    node "$PROJECT_ROOT/backend/common/log_rotator.mjs" --startup >/dev/null 2>&1 || true
+fi
+
+START_BYTES=0
+if [ -f "$LOG_FILE" ]; then
+    START_BYTES=$(wc -c < "$LOG_FILE" 2>/dev/null | tr -d '[:space:]' || echo 0)
+    START_BYTES="${START_BYTES:-0}"
+fi
 
 # IPv4(127.0.0.1) 명시적 바인딩 및 자동 업데이트로 인한 돌발 종료 방지(--no-autoupdate) 적용
 setsid cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:${FRONTEND_PORT}" </dev/null >> "$LOG_FILE" 2>&1 &
@@ -43,7 +51,7 @@ echo "공개 HTTPS 주소 발급 대기 중..."
 PUBLIC_URL=""
 for i in {1..20}; do
     if [ -f "$LOG_FILE" ]; then
-        PUBLIC_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" "$LOG_FILE" | head -n 1 || true)
+        PUBLIC_URL=$(tail -c +"$((START_BYTES + 1))" "$LOG_FILE" 2>/dev/null | grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" | head -n 1 || true)
         if [ -n "$PUBLIC_URL" ]; then
             break
         fi

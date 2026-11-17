@@ -286,3 +286,52 @@ export async function queryNewsList(db, { page = 1, limit = 50, keyword = "", st
   };
 }
 
+/**
+ * AI 분석용 최신 암호화폐 뉴스 목록을 조회합니다.
+ */
+export async function getRecentNewsForAiAnalysis(db, limit = 12) {
+  const safeLimit = Math.min(50, Math.max(1, Math.floor(Number(limit) || 12)));
+  try {
+    return await db
+      .prepare(
+        "SELECT title, source, published_at, sentiment, keywords, summary FROM crypto_news ORDER BY published_at DESC, id DESC LIMIT ?"
+      )
+      .all(safeLimit);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 수집된 암호화폐 뉴스의 전체 건수 및 호재/악재/중립 감성 통계를 반환합니다.
+ */
+export async function getNewsSentimentStats(db) {
+  try {
+    const countRow = await db
+      .prepare(
+        `
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN sentiment = 'BULLISH' THEN 1 ELSE 0 END) AS bull,
+          SUM(CASE WHEN sentiment = 'BEARISH' THEN 1 ELSE 0 END) AS bear,
+          SUM(CASE WHEN sentiment = 'NEUTRAL' THEN 1 ELSE 0 END) AS neut
+        FROM crypto_news
+        `
+      )
+      .get();
+    return {
+      totalNews: Number(countRow?.total || 0),
+      bullCount: Number(countRow?.bull || 0),
+      bearCount: Number(countRow?.bear || 0),
+      neutCount: Number(countRow?.neut || 0),
+    };
+  } catch {
+    return {
+      totalNews: 0,
+      bullCount: 0,
+      bearCount: 0,
+      neutCount: 0,
+    };
+  }
+}
+

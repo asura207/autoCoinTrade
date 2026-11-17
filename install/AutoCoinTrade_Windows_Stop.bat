@@ -44,7 +44,7 @@ for /f "tokens=5" %%a in ('netstat -aon ^| findstr ":!FRONTEND_PORT! " ^| findst
 )
 
 :: 3. 패키지 내부 node/python 워커 추가 점검
-powershell -NoProfile -Command "$app='%APP_DIR%'; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ($_.CommandLine -like '*node_server.mjs*' -or $_.CommandLine -like '*main_orchestrator.py*' -or $_.CommandLine -like '*llm_filter_worker.py*') -and $_.CommandLine -like ('*' + $app + '*') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+powershell -NoProfile -Command "$app='%APP_DIR%'; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ($_.CommandLine -like '*node_server.mjs*' -or $_.CommandLine -like '*server.mjs*' -or $_.CommandLine -like '*main_orchestrator.py*' -or $_.CommandLine -like '*llm_filter_worker.py*') -and $_.CommandLine -like ('*' + $app + '*') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
 
 echo.
 echo ==============================================================

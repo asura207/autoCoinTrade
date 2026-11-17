@@ -38,7 +38,7 @@ for /f "tokens=5" %%a in ('netstat -aon ^| findstr ":%FRONTEND_PORT% " ^| findst
     taskkill /F /T /PID %%a >nul 2>&1
 )
 
-powershell -NoProfile -Command "$root='%CD%'; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ($_.CommandLine -like '*node_server.mjs*' -or $_.CommandLine -like '*main_orchestrator.py*' -or $_.CommandLine -like '*llm_filter_worker.py*') -and $_.CommandLine -like ('*' + $root + '*') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+powershell -NoProfile -Command "$root='%CD%'; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ($_.CommandLine -like '*node_server.mjs*' -or $_.CommandLine -like '*server.mjs*' -or $_.CommandLine -like '*main_orchestrator.py*' -or $_.CommandLine -like '*llm_filter_worker.py*') -and $_.CommandLine -like ('*' + $root + '*') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
 
 echo ===================================================
 echo [완료] 백엔드, 웹 UI 및 워커 서비스가 안전하게 중지되었습니다.

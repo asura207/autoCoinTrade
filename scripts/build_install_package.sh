@@ -30,7 +30,11 @@ cp "$PROJECT_ROOT/backend/common/"*.mjs "$APP_DIR/backend/common/"
 # 3. 프론트엔드 파일 복사
 echo "[2/6] 프론트엔드 소스 및 설정 복사 중..."
 cp "$PROJECT_ROOT/frontend/package.json" "$APP_DIR/frontend/"
+if [ -f "$PROJECT_ROOT/frontend/package-lock.json" ]; then
+    cp "$PROJECT_ROOT/frontend/package-lock.json" "$APP_DIR/frontend/"
+fi
 cp "$PROJECT_ROOT/frontend/vite.config.js" "$APP_DIR/frontend/"
+cp "$PROJECT_ROOT/frontend/server.mjs" "$APP_DIR/frontend/"
 cp "$PROJECT_ROOT/frontend/index.html" "$APP_DIR/frontend/"
 cp "$PROJECT_ROOT/frontend/src/"* "$APP_DIR/frontend/src/"
 if [ -d "$PROJECT_ROOT/frontend/public" ]; then

@@ -1,6 +1,6 @@
 {
   "name": "auto-coin-trade-frontend",
-  "version": "0.0.24",
+  "version": "0.0.26",
   "description": "autoCoinTrade React 18 & Vite Frontend Dashboard",
   "keywords": [
     "react",
@@ -18,6 +18,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "start": "node server.mjs",
     "build": "vite build",
     "preview": "vite preview"
   },
@@ -26,7 +27,7 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^4.3.1",
-    "vite": "^5.4.6"
+    "@vitejs/plugin-react": "^6.3.0",
+    "vite": "^8.3.8"
   }
 }

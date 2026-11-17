@@ -26,6 +26,10 @@ process.env.AUTOCOIN_LIBRARY_MODE = "1";
 process.env.AUTOCOIN_FORCE_LIVE_MODE = "1";
 
 const {
+  evaluateStrategy,
+} = await import("../backend/common/algo_lab_service.mjs");
+
+const {
   getDb,
   initializeDatabase,
   getBots,
@@ -606,7 +610,205 @@ async function runTests() {
       status: "PASS",
     });
 
-    console.log("\n=== All 7 Weekly Auto-Rotation & Graceful Drain Edge-Case Verification Results ===");
+    // =========================================================================
+    // Scenario 8: 시장 상황 맞춤 단일 봇(SINGLE_MARKET_FIT_100) 선정 및 Graceful Drain 유지
+    // =========================================================================
+    await seedDefaultWeeklyChampionsScenario(db);
+    const allBots10 = ["bot_01", "bot_02", "bot_03", "bot_04", "bot_05", "bot_06", "bot_07", "bot_08", "bot_09", "bot_10"];
+    const bearOverrides = Object.fromEntries(
+      allBots10.map((id) => [id, ["bot_05", "bot_06", "bot_08", "bot_10"].includes(id) ? "ALLOW" : "BLOCK"])
+    );
+    const bullOverrides = Object.fromEntries(allBots10.map((id) => [id, "ALLOW"]));
+
+    // 8-A. BULL(상승장)에서는 전 전략군 1위인 bot_03(TREND_SWING)이 100% 단일 선출되어야 함
+    const bullSingleEval = await evaluateWeeklyStrategyChampions(db, {
+      minWeeklyTrades: 2,
+      allocationMode: "SINGLE_MARKET_FIT_100",
+      marketRegime: {
+        market_regime: "BULL",
+        recommended_action: "NORMAL",
+        bot_overrides: bullOverrides,
+      },
+    });
+    assert.equal(bullSingleEval.champions.length, 1, "BULL single-bot mode must elect exactly 1 champion");
+    assert.equal(bullSingleEval.champions[0].bot_id, "bot_03", "BULL single-bot mode should elect top performer bot_03");
+    assert.equal(bullSingleEval.champions[0].recommended_ratio, 100, "Single champion ratio must be 100");
+
+    // 8-B. BEAR(약세장)에서 0거래 bot_08이나 BLOCK된 추세/돌파봇 대신 REVERSAL_GRID 1위 bot_10 단독 선출 (음수 수익률이어도 0거래 봇에 밀리지 않음)
+    await db.prepare("DELETE FROM paper_trades WHERE bot_id = 'bot_08'").run();
+    await db
+      .prepare("UPDATE bots SET paper_mdd_pct = 0 WHERE bot_id = 'bot_08'")
+      .run();
+    const bearRecentTs = new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString().replace("T", " ").slice(0, 19);
+    await db.prepare("DELETE FROM paper_trades WHERE bot_id IN ('bot_05', 'bot_06', 'bot_10')").run();
+    for (const [bid, pnl] of [
+      ["bot_10", -500],
+      ["bot_10", -400],
+      ["bot_06", -4000],
+      ["bot_06", -4200],
+      ["bot_05", -9000],
+      ["bot_05", -9500],
+    ]) {
+      await db
+        .prepare(
+          `INSERT INTO paper_trades (bot_id, market, buy_order_uuid, sell_order_uuid, buy_price, buy_volume, buy_amount, buy_date, sell_price, sell_volume, sell_amount, sell_date, profit_krw, profit_pct, status)
+           VALUES (?, 'KRW-BTC', ?, ?, 100000, '1', 100000, ?, 99000, '1', ?, ?, ?, -1.0, 'COMPLETED')`
+        )
+        .run(
+          bid,
+          `sc8-buy-${bid}-${Math.random()}`,
+          `sc8-sell-${bid}-${Math.random()}`,
+          bearRecentTs,
+          100000 + pnl,
+          bearRecentTs,
+          pnl
+        );
+    }
+
+    await db
+      .prepare(
+        `INSERT OR REPLACE INTO market_regime_filter (id, market_regime, recommended_action, final_position_multiplier, position_size_multiplier, final_bot_overrides_json, bot_overrides_json)
+         VALUES (1, 'BEAR', 'REDUCE_SIZE', 0.5, 0.5, ?, ?)`
+      )
+      .run(JSON.stringify(bearOverrides), JSON.stringify(bearOverrides));
+
+    await db
+      .prepare("UPDATE auto_rotation_config SET allocation_mode = 'SINGLE_MARKET_FIT_100', is_enabled = 1 WHERE id = 1")
+      .run();
+
+    // 기존 3개 봇 운영 중 bot_06이 미청산 포지션을 보유한 상태에서 단일 봇 로테이션 실행
+    await applyLiveBotsSelection(
+      [
+        { bot_id: "bot_05", allocation_ratio: 0.25 },
+        { bot_id: "bot_06", allocation_ratio: 0.35 },
+        { bot_id: "bot_10", allocation_ratio: 0.4 },
+      ],
+      [],
+      1000000,
+      { skipLiveAccountSync: true }
+    );
+    const sc8PosTs = new Date().toISOString().replace("T", " ").slice(0, 19);
+    await db
+      .prepare("UPDATE bots SET virtual_krw = virtual_krw - 150000 WHERE bot_id = 'bot_06'")
+      .run();
+    await db
+      .prepare(
+        `INSERT INTO bot_positions (bot_id, market, order_uuid, volume, avg_buy_price, buy_amount, buy_fee, trade_id, status, created_at)
+         VALUES ('bot_06', 'KRW-ETH', 'sc8-drain-eth', '0.05', 3000000, 150000, 75, 0, 'OPEN', ?)`
+      )
+      .run(sc8PosTs);
+
+    const sc8RotRes = await executeWeeklyBotRotation({
+      triggerType: "MANUAL_IMMEDIATE",
+      skipLiveAccountSync: true,
+    });
+    assert.equal(sc8RotRes.success, true, "Single-bot BEAR rotation must succeed");
+    assert.equal(sc8RotRes.elected_bots.length, 1, "BEAR single-bot rotation must elect exactly 1 bot");
+    assert.equal(sc8RotRes.elected_bots[0].bot_id, "bot_10", "BEAR single-bot rotation must elect bot_10");
+    assert.equal(sc8RotRes.elected_bots[0].allocation_ratio_pct, 100, "bot_10 must receive 100% allocation");
+    assert.equal(sc8RotRes.status.evaluation.champions.length, 1, "Status evaluation champions must have length 1");
+
+    const sc8BotsAfter = await getBots("live");
+    const sc8Selected = sc8BotsAfter.filter((b) => Number(b.is_selected_for_live) === 1);
+    const sc8Bot10 = sc8BotsAfter.find((b) => b.bot_id === "bot_10");
+    const sc8Bot06 = sc8BotsAfter.find((b) => b.bot_id === "bot_06");
+    assert.equal(sc8Selected.length, 1, "Exactly 1 bot must remain selected for live");
+    assert.equal(sc8Selected[0].bot_id, "bot_10", "Selected live bot must be bot_10");
+    assert.equal(Number(sc8Bot10.allocation_ratio), 100, "bot_10 DB allocation_ratio must be 100");
+    assert.equal(Number(sc8Bot10.is_running), 1, "bot_10 must be running");
+    assert.equal(Number(sc8Bot06.is_selected_for_live), 0, "bot_06 must be unselected");
+    assert.equal(Number(sc8Bot06.used_capital), 150000, "bot_06 open position must remain in Graceful Drain");
+    const sc8TotalEq = sc8BotsAfter.reduce((acc, b) => acc + Number(b.virtual_krw || 0) + Number(b.used_capital || 0), 0);
+    assert.equal(sc8TotalEq, 1000000, "Zero-Sum equity (virtual_krw + draining used_capital) must remain 1,000,000");
+
+    reportRows.push({
+      scenario: "Scenario 8",
+      check: "Single Market-Fit Bot (BEAR->bot_10, BULL->bot_03) + Drain",
+      detail: `BULL=${bullSingleEval.champions[0].bot_id}(100%), BEAR=${sc8Selected[0].bot_id}(100%), DrainUsed=${sc8Bot06.used_capital}, Eq=${sc8TotalEq.toLocaleString()}`,
+      status: "PASS",
+    });
+
+    // =========================================================================
+    // Scenario 9: bot_10 매수 직후 즉시 매도(LRC 중심선/상단 0% 익절) 방지 회귀 검증
+    // =========================================================================
+    const mkBot10Ind = ({ price, lrcLower, lrcMid, lrcUpper, lrcSlope = -1.0, vwap = 1015 }) => ({
+      price,
+      kellogg: {
+        today_open: 1000,
+        prev_close: 1000,
+        prev_high: 1020,
+        prev_low: 930,
+        vwap,
+        vwap_disparity_pct: ((price - vwap) / vwap) * 100,
+        lrc: { lower: lrcLower, mid: lrcMid, upper: lrcUpper, slope: lrcSlope },
+        rvol: 2.5,
+        recent_high_20: 980,
+        recent_low_20: lrcLower,
+        cur: { opening_price: 945, high_price: Math.max(price, 962), low_price: 938, trade_price: price },
+        closed: { opening_price: 950, high_price: 955, low_price: 939, trade_price: 944 },
+        curBullish: true,
+        closedBullish: false,
+      },
+    });
+
+    // 9-A. Setup B에서 이미 LRC 중심선(956) 이상(960) 도달 상태면 매수 금지 (기존 4초 즉시매도 원인 차단)
+    const blockAboveMid = evaluateStrategy(
+      "bot_10",
+      { market: "KRW-SUI", price: 960 },
+      mkBot10Ind({ price: 960, lrcLower: 940, lrcMid: 956, lrcUpper: 972 }),
+      [],
+      { isLive: true }
+    );
+    assert.equal(blockAboveMid.signal, "HOLD", "Setup B must NOT buy when price >= LRC mid (960 >= 956)");
+
+    // 9-B. LRC 중심선까지 기대 여지가 0.6% 미만(953 -> 956 = +0.31%)이어도 매수 금지
+    const blockThinRoom = evaluateStrategy(
+      "bot_10",
+      { market: "KRW-SUI", price: 953 },
+      mkBot10Ind({ price: 953, lrcLower: 940, lrcMid: 956, lrcUpper: 972 }),
+      [],
+      { isLive: true }
+    );
+    assert.equal(blockThinRoom.signal, "HOLD", "Setup B must NOT buy when upside room to LRC mid < 0.6%");
+
+    // 9-C. LRC 하단 반등 초입(944 -> 956 = +1.27% 여유)에서는 정상 Setup B 매수
+    const validSetupB = evaluateStrategy(
+      "bot_10",
+      { market: "KRW-SUI", price: 944 },
+      mkBot10Ind({ price: 944, lrcLower: 940, lrcMid: 956, lrcUpper: 972 }),
+      [],
+      { isLive: true }
+    );
+    assert.equal(validSetupB.signal, "BUY", "Setup B should still buy valid dip below LRC mid with >= 0.6% room");
+
+    // 9-D. 보유 중인 포지션이 LRC 중심선/상단 이상이더라도 수익률이 최소 기준(+0.6%) 미만(+0.1%)이면 매도 금지
+    const holdThinProfit = evaluateStrategy(
+      "bot_10",
+      { market: "KRW-SUI", price: 961 },
+      mkBot10Ind({ price: 961, lrcLower: 940, lrcMid: 956, lrcUpper: 960 }),
+      [{ id: 1, market: "KRW-SUI", avg_buy_price: 960, buy_amount: 5049, volume: "5.259375", buy_reason: validSetupB.reason }],
+      { isLive: true, peakPrice: 961 }
+    );
+    assert.equal(holdThinProfit.signal, "HOLD", "Must NOT sell on LRC mid/upper when profit (+0.1%) < 0.6%");
+
+    // 9-E. 수익률 >= +0.6%(944 -> 956 = +1.27%)이고 LRC 중심선 도달 시 정상 익절
+    const sellValidProfit = evaluateStrategy(
+      "bot_10",
+      { market: "KRW-SUI", price: 956 },
+      mkBot10Ind({ price: 956, lrcLower: 940, lrcMid: 956, lrcUpper: 972 }),
+      [{ id: 1, market: "KRW-SUI", avg_buy_price: 944, buy_amount: 5049, volume: "5.348516", buy_reason: validSetupB.reason }],
+      { isLive: true, peakPrice: 956 }
+    );
+    assert.equal(sellValidProfit.signal, "SELL", "Should take LRC mid profit when gain >= 0.6% (+1.27%)");
+
+    reportRows.push({
+      scenario: "Scenario 9",
+      check: "bot_10 No Instant Buy->Sell Churn Guard",
+      detail: "Blocks LRC>=mid / <0.6% room entry, holds <0.6% thin LRC exit, sells at >=0.6% (+1.27%)",
+      status: "PASS",
+    });
+
+    console.log("\n=== All 9 Weekly Auto-Rotation & Graceful Drain Edge-Case Verification Results ===");
     console.table(reportRows);
   } finally {
     try {

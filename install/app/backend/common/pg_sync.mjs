@@ -712,6 +712,106 @@ export class PgSyncManager {
       // 11. auto_rotation_config & auto_rotation_history
       try {
         await this.pool.query(`
+          CREATE TABLE IF NOT EXISTS ai_market_briefings (
+            id BIGSERIAL PRIMARY KEY,
+            provider TEXT NOT NULL DEFAULT 'gemini',
+            model TEXT NOT NULL DEFAULT 'gemini-1.5-flash',
+            btc_price DOUBLE PRECISION,
+            btc_daily_20ma DOUBLE PRECISION,
+            btc_4h_60ma DOUBLE PRECISION,
+            regime_status TEXT,
+            briefing_text TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS ai_news_briefings (
+            id BIGSERIAL PRIMARY KEY,
+            provider TEXT NOT NULL DEFAULT 'gemini',
+            model TEXT NOT NULL DEFAULT 'gemini-3.5-flash-lite',
+            news_count INTEGER NOT NULL DEFAULT 0,
+            bullish_count INTEGER NOT NULL DEFAULT 0,
+            bearish_count INTEGER NOT NULL DEFAULT 0,
+            neutral_count INTEGER NOT NULL DEFAULT 0,
+            briefing_text TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          );
+        `);
+
+        const marketBriefings = sqliteDb
+          .prepare("SELECT * FROM ai_market_briefings ORDER BY id DESC LIMIT 100")
+          .all();
+        for (const b of marketBriefings) {
+          await this.pool.query(
+            `INSERT INTO ai_market_briefings (
+               id, provider, model, btc_price, btc_daily_20ma, btc_4h_60ma, regime_status, briefing_text, created_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (id) DO UPDATE SET
+               provider = EXCLUDED.provider,
+               model = EXCLUDED.model,
+               btc_price = EXCLUDED.btc_price,
+               btc_daily_20ma = EXCLUDED.btc_daily_20ma,
+               btc_4h_60ma = EXCLUDED.btc_4h_60ma,
+               regime_status = EXCLUDED.regime_status,
+               briefing_text = EXCLUDED.briefing_text,
+               created_at = EXCLUDED.created_at`,
+            [
+              b.id,
+              b.provider || "gemini",
+              b.model || "gemini-1.5-flash",
+              b.btc_price !== null && b.btc_price !== undefined ? Number(b.btc_price) : null,
+              b.btc_daily_20ma !== null && b.btc_daily_20ma !== undefined ? Number(b.btc_daily_20ma) : null,
+              b.btc_4h_60ma !== null && b.btc_4h_60ma !== undefined ? Number(b.btc_4h_60ma) : null,
+              b.regime_status || null,
+              b.briefing_text || "",
+              b.created_at || "",
+            ]
+          );
+        }
+        if (marketBriefings.length > 0) {
+          await this.pool.query(
+            "SELECT setval(pg_get_serial_sequence('ai_market_briefings', 'id'), COALESCE((SELECT MAX(id) FROM ai_market_briefings), 1))"
+          );
+        }
+
+        const newsBriefings = sqliteDb
+          .prepare("SELECT * FROM ai_news_briefings ORDER BY id DESC LIMIT 100")
+          .all();
+        for (const n of newsBriefings) {
+          await this.pool.query(
+            `INSERT INTO ai_news_briefings (
+               id, provider, model, news_count, bullish_count, bearish_count, neutral_count, briefing_text, created_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (id) DO UPDATE SET
+               provider = EXCLUDED.provider,
+               model = EXCLUDED.model,
+               news_count = EXCLUDED.news_count,
+               bullish_count = EXCLUDED.bullish_count,
+               bearish_count = EXCLUDED.bearish_count,
+               neutral_count = EXCLUDED.neutral_count,
+               briefing_text = EXCLUDED.briefing_text,
+               created_at = EXCLUDED.created_at`,
+            [
+              n.id,
+              n.provider || "gemini",
+              n.model || "gemini-3.5-flash-lite",
+              Number(n.news_count || 0),
+              Number(n.bullish_count || 0),
+              Number(n.bearish_count || 0),
+              Number(n.neutral_count || 0),
+              n.briefing_text || "",
+              n.created_at || "",
+            ]
+          );
+        }
+        if (newsBriefings.length > 0) {
+          await this.pool.query(
+            "SELECT setval(pg_get_serial_sequence('ai_news_briefings', 'id'), COALESCE((SELECT MAX(id) FROM ai_news_briefings), 1))"
+          );
+        }
+      } catch {}
+
+      // 11. auto_rotation_config & auto_rotation_history
+      try {
+        await this.pool.query(`
           CREATE TABLE IF NOT EXISTS auto_rotation_config (
             id INT PRIMARY KEY,
             is_enabled INT DEFAULT 1,

@@ -20,4 +20,5 @@ if not exist "node_modules" if exist "package.json" (
     call npm install --silent
 )
 
+"%NODE_EXE%" backend\common\log_rotator.mjs --startup >nul 2>&1
 "%NODE_EXE%" backend/node_server.mjs >> logs\backend.log 2>&1

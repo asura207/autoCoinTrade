@@ -10,7 +10,9 @@
 
 | 버전 (Version) | 릴리즈 일시 | 커밋 해시 | 주요 수정 내용 요약 |
 | :--- | :--- | :--- | :--- |
-| **v0.0.24** | 2026-11-14 | - | 주간 TOP 1 로테이션 & Graceful Drain 자금 이관 7대 엣지 케이스 검증 및 결함 수정: Zero-Sum(`1원` 자투리 #1 봇 귀속) 불변식·`order_uuid` 독립 청산·AI `BLOCK`/잔고부족 시 매도 감시 유지·`drain_handoff_logs` 감사 원장·동시성 뮤텍스/신규 DB 마이그레이션 버그 수정 및 7대 시나리오 자동 검증 통과 |
+| **v0.0.26** | 2026-11-17 | - | 30분 단기 뉴스·시황 분석기(`FLASH_30M`) 맥북 프로 로컬 Ollama(`qwen3-news`) 1순위 연동 및 3중 무중단 Fallback(로컬 Ollama → Gemini Flash 지수 백오프 → 직전 캐시/BTC 20MA·4h 60MA 기계적 안전 모드) 구축, 백엔드·Python 워커(`think: false`, `format: json`, `25,000ms` 타임아웃)·PostgreSQL(`pg_sync.mjs`) AI 브리핑 동기화·설정 UI/SSE 스트리밍(`18ms` 타이프라이터)·통합 검증 스위트(`tests/verify_ollama_integration.mjs`) 추가 |
+| **v0.0.25** | 2026-11-15 | - | 프로덕션 정적 서버(`frontend/server.mjs`) 전환·Vite `8.3.8` 업그레이드, 백엔드 `HttpOnly` 서명 쿠키 기반 전역 `/api/*` 인증 게이트(`"stock"`/`"ㄴ새차"` 백도어·평문 코드 노출·무차별 대입·전역 CORS `*` 제거), `scripts/setup_wireguard.sh` VPN+방화벽 설정 추가, Arena 상단 버튼 단일 행(`nowrap`) 툴바 배치 |
+| **v0.0.24** | 2026-11-14 | `1a6e38e` | 주간 TOP 1 로테이션 & Graceful Drain 자금 이관 7대 엣지 케이스 검증 및 결함 수정: Zero-Sum(`1원` 자투리 #1 봇 귀속) 불변식·`order_uuid` 독립 청산·AI `BLOCK`/잔고부족 시 매도 감시 유지·`drain_handoff_logs` 감사 원장·동시성 뮤텍스/신규 DB 마이그레이션 버그 수정 및 7대 시나리오 자동 검증 통과 |
 | **v0.0.23** | 2026-11-14 | `b64dbdb` | 전수 코드 감사 5대 영역 수정: 루트·`/install` 실행/종료 스크립트 동기화 및 Node-Python 이중 실행 차단, Graceful Drain 잔고 이관·DB/PG 자동 마이그레이션·JSON Export/Import v1.2, 업비트 시세 캐시·지수 백오프·8자리 내림 주문 정합성, 프론트엔드 SSE 클린업, 문서·패키지 현행화 |
 | **v0.0.22** | 2026-11-14 | `b8bd374` | 주간 3대 전략군(추세·스윙/변동성·돌파/역추세·그리드)별 1위 봇 자동 선출(Auto-Rotation), 동적 자금 배분, 무손실 포지션 청산 대기(Graceful Drain) 및 정산금 자동 귀속 시스템 구축 |
 | **v0.0.21** | 2026-11-13 | `688eca6` | 설정 화면 내 봇별 손절/익절 기준 입력 필드 박스 영역 초과(Overflow) 현상 수정 및 반응형 그리드·인풋 너비 최적화 |
@@ -38,6 +40,40 @@
 ---
 
 ## 📝 상세 버전별 변경 내역 (Detailed Changelog)
+
+### [v0.0.26] - 2026-11-17
+#### 맥북 프로 로컬 Ollama(`qwen3-news`) 30분 단기 뉴스·시황 분석 연동 및 3중 무중단 Fallback 구축
+- **설정 및 환경변수 확장 (`.env.example`, `config/upbit_config.example.json`, `init_db.py`)**:
+  - `USE_LOCAL_OLLAMA_NEWS`, `OLLAMA_BASE_URL`(`http://192.168.0.100:11434`), `OLLAMA_NEWS_MODEL`(`qwen3-news`), `OLLAMA_TIMEOUT_MS`(`25000`) 추가 및 `system_settings` 기본값 시드(`init_db.py`), `AUTOCOIN_ENV_PATH`·`AUTOCOIN_CONFIG_PATH` 격리 오버라이드 지원
+- **Node.js 백엔드 및 DB·PG 동기화 (`backend/node_server.mjs`, `backend/common/news_service.mjs`, `backend/common/pg_sync.mjs`)**:
+  - `callLocalOllamaCoinNewsAnalyzer()` 구현: `stream: false`, `think: false`, `format: "json"`, `AbortSignal.timeout(25000)` 고정 호출 및 최신 코인 뉴스 최대 12건 압축, `KRW-*` 마켓 티커 및 `bot_01`~`bot_10` 스키마 정규화
+  - 3중 무중단 Fallback 구축: 1순위 맥북 프로 로컬 Ollama(`qwen3-news`) → 2순위 Gemini Flash API(1s·2s·4s 지수 백오프 재시도) → 3순위 `KRW-BTC` 일봉 20MA·4시간봉 60MA 기반 기계적 안전 모드(1시간 주기 `PRO_60M` Gemini Pro 보수적 교차 검증 유지)
+  - `GET /api/system/overview`, `GET /api/upbit/status`, `GET /api/health`에 `ollama` 상태 객체 추가, `GET/PUT/POST /api/settings/ollama` 엔드포인트 및 `/api/ai/stream-analyze`·`/api/ai/stream-news-analyze` 타이프라이터(`18ms`) SSE 스트리밍 지원
+  - `news_service.mjs`에 `getRecentNewsForAiAnalysis`·`getNewsSentimentStats` 추가, `pg_sync.mjs`에 `ai_market_briefings`·`ai_news_briefings` 테이블 생성 및 PostgreSQL `ON CONFLICT DO UPDATE` 동기화 추가
+- **Python 듀얼 AI 워커 (`llm_filter_worker.py`)**:
+  - `call_local_ollama_coin_news_analyzer()` 연동 및 `call_flash_fast_analysis()` 3중 Fallback(Ollama → Gemini Flash/OpenAI → 직전 캐시/BTC 20MA·4h 60MA 안전 모드), `market_regime_filter` KST 시각 갱신 및 `ai_market_briefings`·`ai_news_briefings` 저장 추가
+- **프론트엔드 UI (`frontend/src/App.jsx`)**:
+  - `⚡ 실제거래 현황` Dual AI 카드 및 `📰 뉴스` AI 영역에 `🟢 로컬 Ollama (qwen3-news)` / `🟡 Gemini Flash (Fallback)` 상태 배지 표시
+  - `[⚙️ 설정]` 화면에 `3-1. 로컬 Ollama AI (30분 단기 뉴스·시황) 연동 설정` 섹션 추가(`use_local_ollama_news`, `ollama_base_url`, `ollama_news_model`, `ollama_timeout_ms` 조회·저장 및 연결 점검)
+- **통합 검증 (`tests/verify_ollama_integration.mjs`, `package.json`)**:
+  - Node·Python 3중 Fallback, `think: false`/`format: json`, `KRW-*`·`bot_01~10` 정규화, DB/PG 메타데이터(`provider='ollama'`), HTTP/SSE 스트리밍 및 `/api/settings/ollama` 7개 스위트 자동 검증 추가 (`npm run test:ollama` 및 `npm test` 편입)
+
+### [v0.0.25] - 2026-11-15
+**프론트엔드 정적 서버 전환(Vite 취약점 차단), 백엔드 전역 세션 인증·보안 하드닝, WireGuard 스크립트 추가 및 Arena 툴바 UI 개선**
+- **프론트엔드 보안 하드닝 (`frontend/server.mjs` 신설 & Vite 8 업그레이드)**:
+  - 런타임에서 `npx vite --host 0.0.0.0` 개발 서버를 직접 띄우지 않고, 빌드된 `frontend/dist` 정적 번들 + `/api` SSE 스트리밍 리버스 프록시만 수행하는 Node.js 내장 HTTP 서버(`frontend/server.mjs`)를 도입.
+  - `/@id/__vite-browser-external:...`, `/@fs/`, `/__vite`, `.env`/dotfile, `..`/`%00`/`realpathSync` 경로 역추적 요청 및 허용되지 않은 HTTP 메서드를 404/405로 원천 차단하고, `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy: same-origin` 보안 응답 헤더 적용 (신뢰되지 않은 `X-Forwarded-For` 스푸핑 차단 포함).
+  - `frontend/vite.config.js` 개발 서버 바인딩을 `127.0.0.1`로 고정(`allowedHosts: true` 제거), `vite` `^8.3.8` / `@vitejs/plugin-react` `^6.3.0` 업그레이드(`npm audit` 0 vulnerabilities).
+  - `.env.example`, `backend/node_server.mjs`, `start_services.sh`, `stop_services.sh`, `stop_services.bat`, `scripts/run_frontend.*`, `scripts/make_scripts.mjs`, `scripts/build_install_package.sh`, `install/AutoCoinTrade_*` 실행·중지 스크립트 전수 동기화.
+- **백엔드 API 전역 인증·백도어 제거·Rate Limit·CORS 제한 (`backend/node_server.mjs`, `frontend/src/App.jsx`)**:
+  - `HMAC-SHA256` 서명된 `HttpOnly; SameSite=Lax` 세션 쿠키(`autoCoinTrade_session`, `data/.session_secret` 0600 키 서명·KST 일자 만료·입장 코드 버전 바인딩)를 도입하여 공개 헬스/인증 경로 외 모든 `/api/*` 및 설정 완료 후 `/api/setup/*` 호출 시 서버측 `401` 인증 강제.
+  - `/api/auth/verify` 내 하드코딩된 `"stock"`(`isMasterMatch`)·`"ㄴ새차"`(`isKoreanMatch`) 백도어와 프론트엔드 오프라인 폴백을 완전히 제거하고, `crypto.timingSafeEqual` 해시 비교 및 IP 기반 브루트포스 방어(10분 내 5회 실패 시 15분 `429` 차단) 적용.
+  - `GET /api/settings/entry-code` 평문 응답 및 `GET /api/settings/export` 민감 키(`entry_code`, `gate_code`, `gemini_api_key`, `vapid_private_key`) 노출을 차단하고, 입장 코드 변경 시 기존 다른 기기 세션 즉시 무효화 및 `POST /api/auth/logout` · `GET /api/auth/session` 추가.
+  - 전역 `"Access-Control-Allow-Origin": "*"`를 제거하고 동일 호스트/허용 출처(`CORS_ALLOWED_ORIGINS`)에 한해서만 자격 증명 CORS 응답 반환.
+- **WireGuard VPN 원격 접속 & 방화벽 강화 스크립트 추가 (`scripts/setup_wireguard.sh`)**:
+  - Rocky/EL/Fedora(`dnf`, `firewalld`) 및 Ubuntu/Debian(`apt`, `ufw`) 환경에서 `wg0`(`10.88.0.1/24`, UDP `51820`), PC/모바일 클라이언트 설정(`.conf`)·PresharedKey·QR 생성과 함께 TCP `9000` 포트를 LAN 및 WireGuard(`10.88.0.0/24`) 대역으로만 제한하는 원클릭 `sudo` 설정 스크립트 신설.
+- **가상거래 경쟁(Arena) 상단 컨트롤 버튼 레이아웃 개선 (`frontend/src/App.jsx`)**:
+  - 제목/설명 우측에서 줄바꿈되던 아레나 상단 액션 버튼들을 설명 하단 단일 행(`flexWrap: "nowrap"`, `overflowX: "auto"`) 툴바로 이동 배치.
 
 ### [v0.0.24] - 2026-11-14
 **주간 전략군별 TOP 1 자동 로테이션 & 미매도 포지션 청산 대기(Graceful Drain) 7대 엣지 케이스 전수 검증 및 결함 수정**
