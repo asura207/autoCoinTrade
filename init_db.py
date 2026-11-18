@@ -790,7 +790,7 @@ def init_database(db_path: Optional[str] = None) -> None:
             ("use_local_ollama_news", os.getenv("USE_LOCAL_OLLAMA_NEWS", "true")),
             ("ollama_base_url", os.getenv("OLLAMA_BASE_URL", "http://192.168.0.100:11434")),
             ("ollama_news_model", os.getenv("OLLAMA_NEWS_MODEL", "qwen3-news")),
-            ("ollama_timeout_ms", os.getenv("OLLAMA_TIMEOUT_MS", "25000")),
+            ("ollama_timeout_ms", os.getenv("OLLAMA_TIMEOUT_MS", "120000")),
         )
         for s_key, s_val in ollama_defaults:
             conn.execute(

@@ -422,6 +422,12 @@ async function runHttpE2eCheck(ollamaUrl) {
     assert.ok(newsEvents.some((e) => e.type === "chunk" && e.text.length > 0));
     assert.ok(newsEvents.some((e) => e.type === "done" && e.provider === "ollama" && e.model === "qwen3-news"));
 
+    const overviewAfterResp = await fetch(`http://127.0.0.1:${testPort}/api/system/overview`, { headers: { Cookie: cookieHeader } });
+    assert.equal(overviewAfterResp.status, 200);
+    const overviewAfter = await overviewAfterResp.json();
+    assert.equal(overviewAfter.regime_filter.flash_provider, "ollama");
+    assert.equal(overviewAfter.regime_filter.flash_model, "qwen3-news");
+
     // 4. GET/PUT /api/settings/ollama -> update to unreachable URL & verify health shows reachable: false
     const getSettingsResp = await fetch(`http://127.0.0.1:${testPort}/api/settings/ollama`, {
       headers: { Cookie: cookieHeader },
@@ -532,6 +538,8 @@ async function runTests() {
     assert.equal(marketRes.provider, "ollama");
     assert.equal(marketRes.briefing.provider, "ollama");
     assert.equal(marketRes.briefing.model, "qwen3-news");
+    assert.equal(marketRes.regime_filter.flash_provider, "ollama");
+    assert.equal(marketRes.regime_filter.flash_model, "qwen3-news");
 
     const newsRes = await generateAiNewsAnalysis({
       triggerType: "AUTO",
@@ -543,6 +551,8 @@ async function runTests() {
     assert.equal(newsRes.provider, "ollama");
     assert.equal(newsRes.briefing.provider, "ollama");
     assert.equal(newsRes.briefing.model, "qwen3-news");
+    assert.equal(newsRes.regime_filter.flash_provider, "ollama");
+    assert.equal(newsRes.regime_filter.flash_model, "qwen3-news");
 
     const mbRow = await sqliteDb.prepare("SELECT * FROM ai_market_briefings ORDER BY id DESC LIMIT 1").get();
     const nbRow = await sqliteDb.prepare("SELECT * FROM ai_news_briefings ORDER BY id DESC LIMIT 1").get();
@@ -606,6 +616,8 @@ async function runTests() {
       assert.equal(tier2Res.provider, "gemini");
       assert.equal(tier2Res.fallback_used, true);
       assert.equal(tier2Res.briefing.provider, "gemini");
+      assert.equal(tier2Res.regime_filter.flash_provider, "gemini");
+      assert.equal(tier2Res.regime_filter.flash_model, tier2Res.briefing.model);
       assert.ok(geminiMockHits >= 2, "Expected Gemini fallback retry across models");
       const rfTier2 = await sqliteDb.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get();
       assert.ok(JSON.parse(rfTier2.blacklist_tickers_json).includes("KRW-DOGE"));

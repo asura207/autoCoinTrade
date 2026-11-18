@@ -44,7 +44,7 @@ EXAMPLE_CONFIG_PATH = BASE_DIR / "config" / "upbit_config.example.json"
 KST_TZ = timezone(timedelta(hours=9))
 DEFAULT_OLLAMA_BASE_URL = "http://192.168.0.100:11434"
 DEFAULT_OLLAMA_NEWS_MODEL = "qwen3-news"
-DEFAULT_OLLAMA_TIMEOUT_MS = 25000
+DEFAULT_OLLAMA_TIMEOUT_MS = 120000
 
 
 def _now_kst_str() -> str:
@@ -153,7 +153,7 @@ def get_ollama_runtime_config(db_path: Optional[str] = None) -> Dict[str, Any]:
         or DEFAULT_OLLAMA_TIMEOUT_MS
     )
     try:
-        timeout_ms = max(3000, min(120000, int(float(raw_timeout))))
+        timeout_ms = max(3000, min(180000, int(float(raw_timeout))))
     except Exception:
         timeout_ms = DEFAULT_OLLAMA_TIMEOUT_MS
 
@@ -1006,62 +1006,34 @@ def call_local_ollama_coin_news_analyzer(
     cfg = get_ollama_runtime_config(db_path=db_path)
     target_url = (base_url or cfg["base_url"]).strip().rstrip("/")
     target_model = (model_name or cfg["model"]).strip() or DEFAULT_OLLAMA_NEWS_MODEL
-    target_timeout_sec = max(3.0, min(120.0, float(timeout_ms or cfg["timeout_ms"]) / 1000.0))
+    target_timeout_sec = max(3.0, min(180.0, float(timeout_ms or cfg["timeout_ms"]) / 1000.0))
 
+    # CPU 추론 최적화: 최신 코인 뉴스 최대 6건, 제목 90자 이내로 압축
     compact_lines: List[str] = []
-    for idx, item in enumerate((news_items or [])[:12], start=1):
+    for idx, item in enumerate((news_items or [])[:6], start=1):
         if isinstance(item, dict):
             sent = str(item.get("sentiment") or "NEUTRAL").upper()
             sent_tag = "호재" if sent == "BULLISH" else ("악재" if sent == "BEARISH" else "중립")
-            title = str(item.get("title") or "").strip()
-            snippet = re.sub(r"\s+", " ", str(item.get("summary") or "")).strip()[:150]
-            compact_lines.append(f"{idx}. [{sent_tag}] {title}{f' - {snippet}' if snippet else ''}")
+            title = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()[:90]
+            compact_lines.append(f"{idx}.[{sent_tag}]{title}")
         else:
-            compact_lines.append(f"{idx}. {re.sub(r'\s+', ' ', str(item or '')).strip()[:180]}")
+            compact_lines.append(f"{idx}.{re.sub(r'\s+', ' ', str(item or '')).strip()[:90]}")
 
-    compact_news_text = "\n".join(compact_lines) if compact_lines else "특이 신규 속보 없음 (보합세)"
+    compact_news_text = "\n".join(compact_lines) if compact_lines else "특이 속보 없음"
     active_bot_desc = (
-        ", ".join(f"{b.get('bot_id')}({b.get('name') or b.get('bot_id')})" for b in live_bots)
+        ",".join(str(b.get("bot_id")) for b in live_bots)
         if live_bots
-        else "bot_01 ~ bot_10"
+        else "bot_01~bot_10"
     )
     fng_val = (fng or {}).get("value", "N/A")
     fng_cls = (fng or {}).get("classification", "N/A")
 
-    user_prompt = f"""다음 최근 30분 업비트 암호화폐 시황 지표와 뉴스 헤드라인을 분석해 반드시 지정된 JSON 스키마로만 응답하라.
-
-[1. 현재 암호화폐 시장 기술적 요약]
-- KRW-BTC 현재가: {btc_summary.get('current_price', 'N/A')}원 (24h 변동률: {btc_summary.get('change_rate_24h', 'N/A')}%)
-- KRW-BTC 일봉 20MA: {btc_summary.get('ma20', 'N/A')}원 | 4시간봉 60MA: {btc_summary.get('ma60_4h', 'N/A')}원
-- 크립토 공포·탐욕 지수: {fng_val} ({fng_cls})
-- 현재 실전 가동 봇: {active_bot_desc}
-- 현재 보유 오픈 포지션: {', '.join(open_positions) if open_positions else '없음'}
-
-[2. 최근 수집된 주요 암호화폐 뉴스]
+    user_prompt = f"""업비트 30분 시황·뉴스 JSON 분석:
+[시황] KRW-BTC={btc_summary.get('current_price', 'N/A')}원(24h {btc_summary.get('change_rate_24h', 'N/A')}%) | 일봉20MA={btc_summary.get('ma20', 'N/A')} | 4h60MA={btc_summary.get('ma60_4h', 'N/A')} | 공포탐욕={fng_val}({fng_cls}) | 가동봇={active_bot_desc} | 보유={','.join(open_positions) if open_positions else '없음'}
+[뉴스]
 {compact_news_text}
-
-[출력 JSON 스키마]
-{{
-  "sentiment_score": -1.0에서 1.0 사이의 소수점 첫째 자리 실수,
-  "market_regime": "BULL | SIDEWAYS | BEAR | HIGH_VOLATILITY_SHOCK",
-  "risk_alert": true 또는 false (거래소 해킹, 디페깅, 상장폐지, 거시 쇼크 시 true),
-  "recommended_action": "NORMAL | REDUCE_SIZE | HALT_NEW_BUYS | EMERGENCY_CLOSE_ALL",
-  "position_size_multiplier": 0.0, 0.5, 1.0 중 택1,
-  "bot_overrides": {{
-    "bot_01": "ALLOW | BLOCK",
-    "bot_02": "ALLOW | BLOCK",
-    "bot_03": "ALLOW | BLOCK",
-    "bot_04": "ALLOW | BLOCK",
-    "bot_05": "ALLOW | BLOCK",
-    "bot_06": "ALLOW | BLOCK",
-    "bot_07": "ALLOW | BLOCK",
-    "bot_08": "ALLOW | BLOCK",
-    "bot_09": "ALLOW | BLOCK",
-    "bot_10": "ALLOW | BLOCK"
-  }},
-  "blacklist_tickers": ["해킹·유의종목 지정 등 치명적 악재가 발생한 업비트 원화마켓 티커(예: KRW-XRP), 없으면 []"],
-  "reason": "암호화폐 단기 시황, 뉴스 감성 및 봇 진입 제어 판단 근거 한국어 2~3문장 요약"
-}}"""
+[JSON 스키마]
+{{"sentiment_score":-1.0~1.0,"market_regime":"BULL|SIDEWAYS|BEAR|HIGH_VOLATILITY_SHOCK","risk_alert":false,"recommended_action":"NORMAL|REDUCE_SIZE|HALT_NEW_BUYS|EMERGENCY_CLOSE_ALL","position_size_multiplier":1.0,"bot_overrides":{{"bot_01":"ALLOW|BLOCK","bot_02":"ALLOW|BLOCK","bot_03":"ALLOW|BLOCK","bot_04":"ALLOW|BLOCK","bot_05":"ALLOW|BLOCK","bot_06":"ALLOW|BLOCK","bot_07":"ALLOW|BLOCK","bot_08":"ALLOW|BLOCK","bot_09":"ALLOW|BLOCK","bot_10":"ALLOW|BLOCK"}},"blacklist_tickers":["KRW-티커"],"reason":"한국어 1~2문장(70자이내) 요약"}}"""
 
     started_ms = int(time.time() * 1000)
     resp = requests.post(
@@ -1071,7 +1043,10 @@ def call_local_ollama_coin_news_analyzer(
             "stream": False,
             "think": False,
             "format": "json",
-            "messages": [{"role": "user", "content": user_prompt}],
+            "messages": [
+                {"role": "system", "content": "업비트 암호화폐 30분 단기 시황·뉴스 JSON 분석기. 지정 JSON 스키마만 간결히 출력."},
+                {"role": "user", "content": user_prompt},
+            ],
         },
         timeout=target_timeout_sec,
     )
@@ -1596,6 +1571,25 @@ def save_ai_briefings_to_db(
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (flash_provider, flash_model, total_news, bull_cnt, bear_cnt, neut_cnt, news_md, now_kst),
+            )
+
+        if flash_res:
+            conn.execute(
+                "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES (?, ?, ?);",
+                ("dual_ai_flash_provider", flash_provider, now_kst),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES (?, ?, ?);",
+                ("dual_ai_flash_model", flash_model, now_kst),
+            )
+        if pro_res:
+            conn.execute(
+                "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES (?, ?, ?);",
+                ("dual_ai_pro_provider", pro_provider, now_kst),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES (?, ?, ?);",
+                ("dual_ai_pro_model", pro_model, now_kst),
             )
 
         conn.commit()

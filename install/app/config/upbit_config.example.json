@@ -9,6 +9,6 @@
   "use_local_ollama_news": true,
   "ollama_base_url": "http://192.168.0.100:11434",
   "ollama_news_model": "qwen3-news",
-  "ollama_timeout_ms": 25000
+  "ollama_timeout_ms": 120000
 }
 

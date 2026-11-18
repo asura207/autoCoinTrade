@@ -10,7 +10,8 @@
 
 | 버전 (Version) | 릴리즈 일시 | 커밋 해시 | 주요 수정 내용 요약 |
 | :--- | :--- | :--- | :--- |
-| **v0.0.26** | 2026-11-17 | - | 30분 단기 뉴스·시황 분석기(`FLASH_30M`) 맥북 프로 로컬 Ollama(`qwen3-news`) 1순위 연동 및 3중 무중단 Fallback(로컬 Ollama → Gemini Flash 지수 백오프 → 직전 캐시/BTC 20MA·4h 60MA 기계적 안전 모드) 구축, 백엔드·Python 워커(`think: false`, `format: json`, `25,000ms` 타임아웃)·PostgreSQL(`pg_sync.mjs`) AI 브리핑 동기화·설정 UI/SSE 스트리밍(`18ms` 타이프라이터)·통합 검증 스위트(`tests/verify_ollama_integration.mjs`) 추가 |
+| **v0.0.27** | 2026-11-18 | - | 로컬 Ollama(`qwen3-news`) 인텔 맥북 CPU 추론 안정화 및 30분 분석 모델 UI 표기 고도화: 타임아웃 기본 `120,000ms`(최대 `180,000ms`) 상향·뉴스 6건(제목 90자) 프롬프트 경량화·코인 전용 `system` 프롬프트 오버라이드(`~41.5초` 응답), `market_regime_filter`·`system_settings`에 실제 실행된 `flash_provider`/`flash_model` 추적 저장 및 대시보드(실제거래 현황·듀얼 AI 매트릭스·뉴스 AI 헤더/본문) 실행 모델명 실시간 표기 |
+| **v0.0.26** | 2026-11-17 | `887c868` | 30분 단기 뉴스·시황 분석기(`FLASH_30M`) 맥북 프로 로컬 Ollama(`qwen3-news`) 1순위 연동 및 3중 무중단 Fallback(로컬 Ollama → Gemini Flash 지수 백오프 → 직전 캐시/BTC 20MA·4h 60MA 기계적 안전 모드) 구축, 백엔드·Python 워커(`think: false`, `format: json`, `25,000ms` 타임아웃)·PostgreSQL(`pg_sync.mjs`) AI 브리핑 동기화·설정 UI/SSE 스트리밍(`18ms` 타이프라이터)·통합 검증 스위트(`tests/verify_ollama_integration.mjs`) 추가 |
 | **v0.0.25** | 2026-11-15 | - | 프로덕션 정적 서버(`frontend/server.mjs`) 전환·Vite `8.3.8` 업그레이드, 백엔드 `HttpOnly` 서명 쿠키 기반 전역 `/api/*` 인증 게이트(`"stock"`/`"ㄴ새차"` 백도어·평문 코드 노출·무차별 대입·전역 CORS `*` 제거), `scripts/setup_wireguard.sh` VPN+방화벽 설정 추가, Arena 상단 버튼 단일 행(`nowrap`) 툴바 배치 |
 | **v0.0.24** | 2026-11-14 | `1a6e38e` | 주간 TOP 1 로테이션 & Graceful Drain 자금 이관 7대 엣지 케이스 검증 및 결함 수정: Zero-Sum(`1원` 자투리 #1 봇 귀속) 불변식·`order_uuid` 독립 청산·AI `BLOCK`/잔고부족 시 매도 감시 유지·`drain_handoff_logs` 감사 원장·동시성 뮤텍스/신규 DB 마이그레이션 버그 수정 및 7대 시나리오 자동 검증 통과 |
 | **v0.0.23** | 2026-11-14 | `b64dbdb` | 전수 코드 감사 5대 영역 수정: 루트·`/install` 실행/종료 스크립트 동기화 및 Node-Python 이중 실행 차단, Graceful Drain 잔고 이관·DB/PG 자동 마이그레이션·JSON Export/Import v1.2, 업비트 시세 캐시·지수 백오프·8자리 내림 주문 정합성, 프론트엔드 SSE 클린업, 문서·패키지 현행화 |
@@ -40,6 +41,15 @@
 ---
 
 ## 📝 상세 버전별 변경 내역 (Detailed Changelog)
+
+### [v0.0.27] - 2026-11-18
+#### 로컬 Ollama(`qwen3-news`) CPU 추론 타임아웃·프롬프트 경량화 및 30분 분석 모델 표기 개선
+- **타임아웃 상향 및 프롬프트 경량화 (`backend/node_server.mjs`, `llm_filter_worker.py`, `.env.example`, `config/upbit_config.example.json`, `init_db.py`)**:
+  - `OLLAMA_TIMEOUT_MS` 기본값을 `120,000ms`(120초, UI/설정 최대 `180,000ms`)로 상향하여 인텔 맥북 프로 CPU 추론 시 조기 Fallback 방지.
+  - `callLocalOllamaCoinNewsAnalyzer` 입력 뉴스를 최신 6건(제목 90자 이내)으로 압축하고, 코인 전용 `{ role: "system" }` 메시지를 전달해 Modelfile 기본 시스템 프롬프트(주식용)를 대체하여 추론 시간을 약 72초에서 약 41~42초대로 단축.
+- **30분 분석 실행 모델 실시간 추적 및 UI 표기 (`backend/node_server.mjs`, `llm_filter_worker.py`, `frontend/src/App.jsx`, `tests/verify_ollama_integration.mjs`)**:
+  - `dual_ai_flash_provider`, `dual_ai_flash_model`, `dual_ai_pro_provider`, `dual_ai_pro_model` 추적을 추가하고 `regime_filter` 응답(`GET /api/system/overview`, `GET /api/bots`, `GET /api/ai/briefing`, SSE `meta`/`done`)에 포함.
+  - `⚡ 실제거래 현황` 헤더 배지·메타바·듀얼 AI 30분 Flash 카드·접힌 요약 배지 및 `📰 뉴스` AI 헤더/스트리밍/완료 배지에 실제 분석을 수행한 모델명(`qwen3-news`, `gemini-3.5-flash-lite`, `mechanical-btc-20ma` 등)을 정확히 표출하도록 개선.
 
 ### [v0.0.26] - 2026-11-17
 #### 맥북 프로 로컬 Ollama(`qwen3-news`) 30분 단기 뉴스·시황 분석 연동 및 3중 무중단 Fallback 구축

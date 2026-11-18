@@ -1683,7 +1683,7 @@ export default function App() {
     use_local_ollama_news: true,
     ollama_base_url: "http://192.168.0.100:11434",
     ollama_news_model: "qwen3-news",
-    ollama_timeout_ms: 25000,
+    ollama_timeout_ms: 120000,
   });
   const [ollamaSaving, setOllamaSaving] = useState(false);
   const [ollamaSaveMsg, setOllamaSaveMsg] = useState(null);
@@ -2553,16 +2553,77 @@ export default function App() {
     }
   };
 
-  const getShortTermAiEngineMeta = useCallback((latestRecord = null, streamMetaObj = null) => {
-    const modelLabel = ollamaStatus?.model || "qwen3-news";
-    const activeProvider = streamMetaObj?.provider || latestRecord?.provider || "";
+  const getShortTermAiEngineMeta = useCallback((latestRecord = null, streamMetaObj = null, regimeObj = null) => {
+    const defaultOllamaModel = ollamaStatus?.model || "qwen3-news";
     const isEnabled = Boolean(ollamaStatus?.enabled);
     const isReachable = Boolean(ollamaStatus?.reachable);
 
-    if (isEnabled && (isReachable || (activeProvider === "ollama" && !streamMetaObj?.fallback_used))) {
+    const streamProvider = streamMetaObj?.provider || "";
+    const streamModel = streamMetaObj?.model || "";
+    const regimeProvider = regimeObj?.flash_provider || "";
+    const regimeModel = regimeObj?.flash_model || "";
+    const latestProvider = latestRecord?.provider || "";
+    const latestModel = latestRecord?.model || "";
+
+    const activeProvider =
+      streamProvider ||
+      regimeProvider ||
+      (latestModel && !String(latestModel).includes("pro") ? latestProvider : "");
+    const activeModel =
+      streamModel ||
+      regimeModel ||
+      (latestModel && !String(latestModel).includes("pro") ? latestModel : "");
+
+    if (activeProvider === "ollama") {
+      const m = activeModel || defaultOllamaModel;
       return {
         isOllama: true,
-        badgeText: `🟢 로컬 Ollama (${modelLabel})`,
+        provider: "ollama",
+        model: m,
+        badgeText: `🟢 로컬 Ollama (${m})`,
+        bg: "rgba(16, 185, 129, 0.18)",
+        color: "#34d399",
+        border: "rgba(16, 185, 129, 0.45)",
+        tooltip: `최근 30분 분석 모델: 로컬 Ollama ${m} (${ollamaStatus?.url || ""}${
+          ollamaStatus?.latency_ms ? ` · ${ollamaStatus.latency_ms}ms` : ""
+        })`,
+      };
+    }
+
+    if (activeProvider === "fallback") {
+      const m = activeModel || "mechanical-btc-20ma";
+      return {
+        isOllama: false,
+        provider: "fallback",
+        model: m,
+        badgeText: `🟠 기계적 안전모드 (${m})`,
+        bg: "rgba(249, 115, 22, 0.18)",
+        color: "#fb923c",
+        border: "rgba(249, 115, 22, 0.45)",
+        tooltip: `최근 30분 분석: BTC 20MA/60MA 기계적 안전모드 (${m})`,
+      };
+    }
+
+    if (activeProvider === "gemini" || activeProvider === "openai") {
+      const m = activeModel || "Gemini Flash";
+      return {
+        isOllama: false,
+        provider: activeProvider,
+        model: m,
+        badgeText: `🟡 Gemini Flash (${m})`,
+        bg: "rgba(234, 179, 8, 0.18)",
+        color: "#facc15",
+        border: "rgba(234, 179, 8, 0.45)",
+        tooltip: `최근 30분 분석 모델: ${m} (백업 엔진)`,
+      };
+    }
+
+    if (isEnabled && isReachable) {
+      return {
+        isOllama: true,
+        provider: "ollama",
+        model: defaultOllamaModel,
+        badgeText: `🟢 로컬 Ollama (${defaultOllamaModel})`,
         bg: "rgba(16, 185, 129, 0.18)",
         color: "#34d399",
         border: "rgba(16, 185, 129, 0.45)",
@@ -2574,6 +2635,8 @@ export default function App() {
 
     return {
       isOllama: false,
+      provider: "gemini",
+      model: "Gemini Flash",
       badgeText: "🟡 Gemini Flash (Fallback)",
       bg: "rgba(234, 179, 8, 0.18)",
       color: "#facc15",
@@ -2596,7 +2659,7 @@ export default function App() {
           use_local_ollama_news: Boolean(data.use_local_ollama_news),
           ollama_base_url: data.ollama_base_url || "http://192.168.0.100:11434",
           ollama_news_model: data.ollama_news_model || "qwen3-news",
-          ollama_timeout_ms: Number(data.ollama_timeout_ms || 25000),
+          ollama_timeout_ms: Number(data.ollama_timeout_ms || 120000),
         });
       }
     } catch (err) {
@@ -2616,7 +2679,7 @@ export default function App() {
           use_local_ollama_news: Boolean(ollamaForm.use_local_ollama_news),
           ollama_base_url: String(ollamaForm.ollama_base_url || "").trim(),
           ollama_news_model: String(ollamaForm.ollama_news_model || "").trim(),
-          ollama_timeout_ms: Number(ollamaForm.ollama_timeout_ms || 25000),
+          ollama_timeout_ms: Number(ollamaForm.ollama_timeout_ms || 120000),
         }),
       });
       const data = await resp.json();
@@ -2628,7 +2691,7 @@ export default function App() {
           use_local_ollama_news: Boolean(data.use_local_ollama_news),
           ollama_base_url: data.ollama_base_url,
           ollama_news_model: data.ollama_news_model,
-          ollama_timeout_ms: Number(data.ollama_timeout_ms || 25000),
+          ollama_timeout_ms: Number(data.ollama_timeout_ms || 120000),
         });
         setOllamaSaveMsg({
           type: data.use_local_ollama_news && !data.ollama?.reachable ? "warning" : "success",
@@ -3507,6 +3570,9 @@ export default function App() {
               if (data.type === "meta") {
                 capturedNewsMeta = data;
                 setNewsStreamingMeta(data);
+                if (data.regime_filter) {
+                  setRegimeFilter(data.regime_filter);
+                }
                 if (data.quota) {
                   setGeminiQuota(data.quota);
                   setGeminiQuotaNotice(
@@ -3520,6 +3586,9 @@ export default function App() {
                 isNewsAiBusyRef.current = false;
                 if (data.id) {
                   lastBriefingIdRef.current = Number(data.id);
+                }
+                if (data.regime_filter) {
+                  setRegimeFilter(data.regime_filter);
                 }
                 // 웹푸시 알림 발송: "ai 분석이 완료되었습니다"
                 showWebPushNotification("AI 뉴스 분석 완료", "ai 분석이 완료되었습니다", {
@@ -5105,7 +5174,7 @@ export default function App() {
                       AI 실시간 시장 분석 & 봇 진단
                     </span>
                     {(() => {
-                      const engineMeta = getShortTermAiEngineMeta(aiBriefing?.latest, streamingMeta);
+                      const engineMeta = getShortTermAiEngineMeta(aiBriefing?.latest, streamingMeta, effectiveRegimeFilter);
                       return (
                         <span
                           style={{
@@ -5162,7 +5231,8 @@ export default function App() {
                   {aiBriefing?.latest && (
                     <span style={{ fontSize: "12px", color: "#94a3b8" }}>
                       (분석 시각: {aiBriefing.latest.created_at} ·{" "}
-                      {aiBriefing?.last_trigger_type === "AUTO" ? "자동 분석" : "수동 분석"})
+                      {aiBriefing?.last_trigger_type === "AUTO" ? "자동 분석" : "수동 분석"}
+                      {aiBriefing.latest.model ? ` · 모델: ${aiBriefing.latest.model}` : ""})
                     </span>
                   )}
                   {/* 접혀있을 때 듀얼 AI 교차검증 간략 요약 뱃지 표시 */}
@@ -5192,34 +5262,34 @@ export default function App() {
                               >
                                 📊 체제: {regimeMeta.code}
                               </span>
-                              <span
-                                style={{
-                                  fontSize: "11px",
-                                  fontWeight: 700,
-                                  padding: "2px 6px",
-                                  borderRadius: "6px",
-                                  background: "rgba(56, 189, 248, 0.15)",
-                                  color: "#38bdf8",
-                                  border: "1px solid rgba(56, 189, 248, 0.35)",
-                                }}
-                                title={`Flash 30분 단기 분석: ${rf.flash_recommended_action} (점수: ${(Number(rf.flash_sentiment_score) || 0).toFixed(2)})`}
-                              >
-                                ⚡ Flash: {rf.flash_recommended_action || "NORMAL"}
-                              </span>
-                              <span
-                                style={{
-                                  fontSize: "11px",
-                                  fontWeight: 700,
-                                  padding: "2px 6px",
-                                  borderRadius: "6px",
-                                  background: "rgba(168, 85, 247, 0.15)",
-                                  color: "#c084fc",
-                                  border: "1px solid rgba(168, 85, 247, 0.35)",
-                                }}
-                                title={`Pro 1시간 심층 퀀트 분석: ${rf.pro_recommended_action} (점수: ${(Number(rf.pro_sentiment_score) || 0).toFixed(2)})`}
-                              >
-                                🧠 Pro: {rf.pro_recommended_action || "NORMAL"}
-                              </span>
+                                <span
+                                  style={{
+                                    fontSize: "11px",
+                                    fontWeight: 700,
+                                    padding: "2px 6px",
+                                    borderRadius: "6px",
+                                    background: "rgba(56, 189, 248, 0.15)",
+                                    color: "#38bdf8",
+                                    border: "1px solid rgba(56, 189, 248, 0.35)",
+                                  }}
+                                  title={`Flash 30분 단기 분석 (${rf.flash_model || (ollamaStatus?.enabled && ollamaStatus?.reachable ? ollamaStatus?.model || "qwen3-news" : "Gemini Flash")}): ${rf.flash_recommended_action} (점수: ${(Number(rf.flash_sentiment_score) || 0).toFixed(2)})`}
+                                >
+                                  ⚡ Flash: {rf.flash_recommended_action || "NORMAL"}{rf.flash_model ? ` (${rf.flash_model})` : ""}
+                                </span>
+                                <span
+                                  style={{
+                                    fontSize: "11px",
+                                    fontWeight: 700,
+                                    padding: "2px 6px",
+                                    borderRadius: "6px",
+                                    background: "rgba(168, 85, 247, 0.15)",
+                                    color: "#c084fc",
+                                    border: "1px solid rgba(168, 85, 247, 0.35)",
+                                  }}
+                                  title={`Pro 1시간 심층 퀀트 분석 (${rf.pro_model || "Gemini Pro"}): ${rf.pro_recommended_action} (점수: ${(Number(rf.pro_sentiment_score) || 0).toFixed(2)})`}
+                                >
+                                  🧠 Pro: {rf.pro_recommended_action || "NORMAL"}{rf.pro_model ? ` (${rf.pro_model})` : ""}
+                                </span>
                               <span
                                 style={{
                                   fontSize: "11px",
@@ -5640,6 +5710,15 @@ export default function App() {
                                     <span style={{ color: "#4ade80", fontWeight: 700 }}>🟢 기술 체제: 정상거래 허용 (상승추세)</span>
                                   )}
                                 </div>
+                                {currentMeta.model && (
+                                  <div style={{ fontSize: "12px", color: "#a5b4fc", fontWeight: 600 }}>
+                                    🤖 분석 모델:{" "}
+                                    <code style={{ color: "#e0e7ff" }}>
+                                      {currentMeta.provider === "ollama" ? "로컬 Ollama · " : ""}
+                                      {currentMeta.model}
+                                    </code>
+                                  </div>
+                                )}
                                 {isStreaming && (
                                   <div style={{ fontSize: "12px", color: "#38bdf8", marginLeft: "auto", display: "flex", alignItems: "center", gap: "6px" }}>
                                     <span className="spinner" style={{ width: "12px", height: "12px" }} />
@@ -5650,7 +5729,21 @@ export default function App() {
                             )}
 
                             {/* 2. 듀얼 AI 엔진 (30분 Flash & 1시간 Pro) 교차 검증 매트릭스 카드 */}
-                            {rf && (
+                            {rf && (() => {
+                              const flashMeta = getShortTermAiEngineMeta(aiBriefing?.latest, streamingMeta, rf);
+                              const flashTitle =
+                                flashMeta.provider === "ollama"
+                                  ? `🟢 로컬 Ollama (${flashMeta.model} · 30분)`
+                                  : flashMeta.provider === "fallback"
+                                  ? `🟠 BTC 20MA Fallback (${flashMeta.model} · 30분)`
+                                  : `🟡 Gemini Flash (${flashMeta.model} · 30분)`;
+                              const flashColor =
+                                flashMeta.provider === "ollama"
+                                  ? "#34d399"
+                                  : flashMeta.provider === "fallback"
+                                  ? "#fb923c"
+                                  : "#facc15";
+                              return (
                               <div
                                 style={{
                                   display: "grid",
@@ -5665,11 +5758,9 @@ export default function App() {
                               >
                                 {/* Flash 30분 단기 분석 */}
                                 <div style={{ padding: "8px 12px", background: "rgba(15, 23, 42, 0.6)", borderRadius: "6px", border: "1px solid rgba(56, 189, 248, 0.25)" }}>
-                                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
-                                    <span style={{ fontSize: "12px", fontWeight: 700, color: ollamaStatus?.enabled && ollamaStatus?.reachable ? "#34d399" : "#38bdf8" }}>
-                                      {ollamaStatus?.enabled && ollamaStatus?.reachable
-                                        ? `🟢 로컬 Ollama (${ollamaStatus?.model || "qwen3-news"} · 30분)`
-                                        : "⚡ Gemini Flash (30분 단기 · Fallback)"}
+                                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px", gap: "6px" }}>
+                                    <span style={{ fontSize: "12px", fontWeight: 700, color: flashColor }}>
+                                      {flashTitle}
                                     </span>
                                     <span
                                       style={{
@@ -5692,14 +5783,16 @@ export default function App() {
                                     </strong>
                                   </div>
                                   <div style={{ fontSize: "11px", color: "#94a3b8", marginTop: "3px" }}>
-                                    최근 갱신: {formatDateTimeKST(rf.flash_updated_at)}
+                                    분석 모델: <strong style={{ color: "#e2e8f0" }}>{flashMeta.model}</strong> · 최근 갱신: {formatDateTimeKST(rf.flash_updated_at)}
                                   </div>
                                 </div>
 
                                 {/* Pro 1시간 심층 퀀트 분석 */}
                                 <div style={{ padding: "8px 12px", background: "rgba(15, 23, 42, 0.6)", borderRadius: "6px", border: "1px solid rgba(168, 85, 247, 0.25)" }}>
                                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
-                                    <span style={{ fontSize: "12px", fontWeight: 700, color: "#c084fc" }}>🧠 Gemini Pro (1시간 심층)</span>
+                                    <span style={{ fontSize: "12px", fontWeight: 700, color: "#c084fc" }}>
+                                      🧠 Gemini Pro ({rf.pro_model || "1시간 심층"})
+                                    </span>
                                     <span
                                       style={{
                                         fontSize: "11px",
@@ -5721,7 +5814,7 @@ export default function App() {
                                     </strong>
                                   </div>
                                   <div style={{ fontSize: "11px", color: "#94a3b8", marginTop: "3px" }}>
-                                    최근 갱신: {formatDateTimeKST(rf.pro_updated_at)}
+                                    {rf.pro_model ? <>분석 모델: <strong style={{ color: "#e2e8f0" }}>{rf.pro_model}</strong> · </> : null}최근 갱신: {formatDateTimeKST(rf.pro_updated_at)}
                                   </div>
                                 </div>
 
@@ -5901,7 +5994,8 @@ export default function App() {
                                   </div>
                                 </div>
                               </div>
-                            )}
+                              );
+                            })()}
                           </div>
                         );
                       })()}
@@ -8018,52 +8112,54 @@ export default function App() {
                           fontWeight: 600,
                         }}
                       >
-                        {isNewsStreaming
-                          ? "⚡ 실시간 스트리밍 분석 중"
-                          : newsAiBriefing.latest?.model ||
+                      {isNewsStreaming
+                        ? `⚡ 스트리밍 중 (${newsStreamingMeta?.model || (ollamaStatus?.enabled && ollamaStatus?.reachable ? ollamaStatus?.model || "qwen3-news" : "Gemini Flash")})`
+                        : `모델: ${
+                            newsAiBriefing.latest?.model ||
                             (ollamaStatus?.enabled && ollamaStatus?.reachable
                               ? ollamaStatus?.model || "qwen3-news"
-                              : "Gemini Flash")}
-                      </span>
-                      <span
-                        style={{
-                          fontSize: "11px",
-                          fontWeight: 600,
-                          padding: "2px 8px",
-                          borderRadius: "12px",
-                          background: "rgba(56, 189, 248, 0.15)",
-                          color: "#38bdf8",
-                          border: "1px solid rgba(56, 189, 248, 0.35)",
-                        }}
-                        title={
-                          geminiQuota?.next_scheduled_at
-                            ? `30분 단위 뉴스 감성 & 시장 영향 종합 자동 분석 (다음 자동 분석: ${geminiQuota.next_scheduled_at})`
-                            : "30분 주기 뉴스 감성 및 시장 영향 종합 자동 갱신 (매시 00분·30분)"
-                        }
-                      >
-                        ⏰ 30분 단위 자동갱신
-                      </span>
-                      {!isNewsAiExpanded && newsAiBriefing.latest && (
-                        <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", marginLeft: "4px" }}>
-                          <span style={{ fontSize: "11px", fontWeight: 700, padding: "2px 8px", borderRadius: "6px", background: "rgba(16, 185, 129, 0.16)", color: "#34d399" }}>
-                            ▲ 호재 {newsAiBriefing.latest.bullish_count || 0}건
-                          </span>
-                          <span style={{ fontSize: "11px", fontWeight: 700, padding: "2px 8px", borderRadius: "6px", background: "rgba(239, 68, 68, 0.16)", color: "#f87171" }}>
-                            ▼ 악재 {newsAiBriefing.latest.bearish_count || 0}건
-                          </span>
-                          <span style={{ fontSize: "11px", fontWeight: 600, padding: "2px 8px", borderRadius: "6px", background: "rgba(100, 116, 139, 0.2)", color: "#cbd5e1" }}>
-                            ● 중립 {newsAiBriefing.latest.neutral_count || 0}건
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                    <p style={{ fontSize: "12px", color: "var(--text-secondary)", margin: "3px 0 0 0" }}>
-                      수집된 {newsTotal > 0 ? `${newsTotal}건` : "최신"} 암호화폐 뉴스 헤드라인과 시장 감성을 분석하여 봇 운용 및 단기/중기 시황을 진단합니다.
-                      {newsAiBriefing.latest?.created_at &&
-                        ` (분석 시각: ${newsAiBriefing.latest.created_at} · ${
-                          newsAiBriefing?.last_trigger_type === "AUTO" ? "자동 분석" : "수동 분석"
-                        })`}
-                    </p>
+                              : "Gemini Flash")
+                          }`}
+                    </span>
+                    <span
+                      style={{
+                        fontSize: "11px",
+                        fontWeight: 600,
+                        padding: "2px 8px",
+                        borderRadius: "12px",
+                        background: "rgba(56, 189, 248, 0.15)",
+                        color: "#38bdf8",
+                        border: "1px solid rgba(56, 189, 248, 0.35)",
+                      }}
+                      title={
+                        geminiQuota?.next_scheduled_at
+                          ? `30분 단위 뉴스 감성 & 시장 영향 종합 자동 분석 (다음 자동 분석: ${geminiQuota.next_scheduled_at})`
+                          : "30분 주기 뉴스 감성 및 시장 영향 종합 자동 갱신 (매시 00분·30분)"
+                      }
+                    >
+                      ⏰ 30분 단위 자동갱신
+                    </span>
+                    {!isNewsAiExpanded && newsAiBriefing.latest && (
+                      <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", marginLeft: "4px" }}>
+                        <span style={{ fontSize: "11px", fontWeight: 700, padding: "2px 8px", borderRadius: "6px", background: "rgba(16, 185, 129, 0.16)", color: "#34d399" }}>
+                          ▲ 호재 {newsAiBriefing.latest.bullish_count || 0}건
+                        </span>
+                        <span style={{ fontSize: "11px", fontWeight: 700, padding: "2px 8px", borderRadius: "6px", background: "rgba(239, 68, 68, 0.16)", color: "#f87171" }}>
+                          ▼ 악재 {newsAiBriefing.latest.bearish_count || 0}건
+                        </span>
+                        <span style={{ fontSize: "11px", fontWeight: 600, padding: "2px 8px", borderRadius: "6px", background: "rgba(100, 116, 139, 0.2)", color: "#cbd5e1" }}>
+                          ● 중립 {newsAiBriefing.latest.neutral_count || 0}건
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                  <p style={{ fontSize: "12px", color: "var(--text-secondary)", margin: "3px 0 0 0" }}>
+                    수집된 {newsTotal > 0 ? `${newsTotal}건` : "최신"} 암호화폐 뉴스 헤드라인과 시장 감성을 분석하여 봇 운용 및 단기/중기 시황을 진단합니다.
+                    {newsAiBriefing.latest?.created_at &&
+                      ` (분석 시각: ${newsAiBriefing.latest.created_at} · ${
+                        newsAiBriefing?.last_trigger_type === "AUTO" ? "자동 분석" : "수동 분석"
+                      }${newsAiBriefing.latest?.model ? ` · 모델: ${newsAiBriefing.latest.model}` : ""})`}
+                  </p>
                   </div>
                 </div>
 
@@ -8214,6 +8310,11 @@ export default function App() {
                           <span style={{ fontSize: "12px", padding: "3px 8px", borderRadius: "6px", background: "rgba(100, 116, 139, 0.2)", color: "#94a3b8" }}>
                             ● 중립: {newsStreamingMeta.neutral_count}건
                           </span>
+                          {newsStreamingMeta.model && (
+                            <span style={{ fontSize: "12px", padding: "3px 8px", borderRadius: "6px", background: "rgba(99, 102, 241, 0.15)", color: "#a5b4fc" }}>
+                              엔진: {newsStreamingMeta.provider === "ollama" ? "🟢 로컬 Ollama" : "🟡 Gemini"} ({newsStreamingMeta.model})
+                            </span>
+                          )}
                           <div style={{ fontSize: "12px", color: "#38bdf8", marginLeft: "auto", display: "flex", alignItems: "center", gap: "6px" }}>
                             <span className="spinner" style={{ width: "12px", height: "12px" }} />
                             한 자씩 실시간 타이핑 중...
@@ -10578,18 +10679,18 @@ export default function App() {
                     />
                   </div>
                   <div className="form-row" style={{ margin: 0 }}>
-                    <label>타임아웃 (ms · 기본 25000)</label>
+                    <label>타임아웃 (ms · 기본 120000)</label>
                     <input
                       type="number"
                       min="3000"
-                      max="120000"
+                      max="180000"
                       step="1000"
                       className="form-input"
                       value={ollamaForm.ollama_timeout_ms}
                       onChange={(e) =>
                         setOllamaForm((prev) => ({
                           ...prev,
-                          ollama_timeout_ms: Number(e.target.value || 25000),
+                          ollama_timeout_ms: Number(e.target.value || 120000),
                         }))
                       }
                     />

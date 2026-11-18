@@ -522,7 +522,7 @@ function extractStructuredRegimeFromLlmText(rawText) {
   return { cleanText, structured };
 }
 
-function enrichRegimeFilterRow(row) {
+function enrichRegimeFilterRow(row, modelMeta = {}) {
   if (!row) return null;
   const botOverrides = normalizeBotOverrides(row.final_bot_overrides_json || row.bot_overrides_json);
   const blacklistTickers = normalizeBlacklistTickers(row.blacklist_tickers_json);
@@ -531,7 +531,63 @@ function enrichRegimeFilterRow(row) {
     bot_overrides: normalizeBotOverrides(row.bot_overrides_json || botOverrides),
     final_bot_overrides: botOverrides,
     blacklist_tickers: blacklistTickers,
+    flash_provider: modelMeta.flash_provider || row.flash_provider || "",
+    flash_model: modelMeta.flash_model || row.flash_model || "",
+    pro_provider: modelMeta.pro_provider || row.pro_provider || "",
+    pro_model: modelMeta.pro_model || row.pro_model || "",
   };
+}
+
+async function loadDualAiModelMeta(db) {
+  const out = { flash_provider: "", flash_model: "", pro_provider: "", pro_model: "" };
+  try {
+    out.flash_provider = await getSetting("dual_ai_flash_provider", "");
+    out.flash_model = await getSetting("dual_ai_flash_model", "");
+    out.pro_provider = await getSetting("dual_ai_pro_provider", "");
+    out.pro_model = await getSetting("dual_ai_pro_model", "");
+    if (!out.flash_model) {
+      const flashRaw = await getSetting("dual_ai_flash_state_json", "");
+      if (flashRaw) {
+        const parsed = JSON.parse(flashRaw);
+        out.flash_provider = out.flash_provider || String(parsed?.provider || "");
+        out.flash_model = String(parsed?.model || "");
+      }
+    }
+    if (!out.pro_model) {
+      const proRaw = await getSetting("dual_ai_pro_state_json", "");
+      if (proRaw) {
+        const parsed = JSON.parse(proRaw);
+        out.pro_provider = out.pro_provider || String(parsed?.provider || "");
+        out.pro_model = String(parsed?.model || "");
+      }
+    }
+    if (!out.flash_model && db) {
+      const latestFlashRow =
+        (await db
+          .prepare("SELECT provider, model FROM ai_market_briefings WHERE model NOT LIKE '%pro%' ORDER BY id DESC LIMIT 1")
+          .get()
+          .catch(() => null)) ||
+        (await db
+          .prepare("SELECT provider, model FROM ai_news_briefings ORDER BY id DESC LIMIT 1")
+          .get()
+          .catch(() => null));
+      if (latestFlashRow) {
+        out.flash_provider = out.flash_provider || String(latestFlashRow.provider || "");
+        out.flash_model = String(latestFlashRow.model || "");
+      }
+    }
+    if (!out.pro_model && db) {
+      const latestProRow = await db
+        .prepare("SELECT provider, model FROM ai_market_briefings WHERE model LIKE '%pro%' ORDER BY id DESC LIMIT 1")
+        .get()
+        .catch(() => null);
+      if (latestProRow) {
+        out.pro_provider = out.pro_provider || String(latestProRow.provider || "");
+        out.pro_model = String(latestProRow.model || "");
+      }
+    }
+  } catch {}
+  return out;
 }
 
 export async function initializeDatabase() {
@@ -884,7 +940,7 @@ export async function initializeDatabase() {
   await setDefault.run("use_local_ollama_news", String(process.env.USE_LOCAL_OLLAMA_NEWS ?? "true"), now);
   await setDefault.run("ollama_base_url", String(process.env.OLLAMA_BASE_URL || "http://192.168.0.100:11434"), now);
   await setDefault.run("ollama_news_model", String(process.env.OLLAMA_NEWS_MODEL || "qwen3-news"), now);
-  await setDefault.run("ollama_timeout_ms", String(process.env.OLLAMA_TIMEOUT_MS || "25000"), now);
+  await setDefault.run("ollama_timeout_ms", String(process.env.OLLAMA_TIMEOUT_MS || "120000"), now);
 }
 
 if (process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
@@ -2075,7 +2131,7 @@ function readJsonBody(req) {
 
 const DEFAULT_OLLAMA_BASE_URL = "http://192.168.0.100:11434";
 const DEFAULT_OLLAMA_NEWS_MODEL = "qwen3-news";
-const DEFAULT_OLLAMA_TIMEOUT_MS = 25000;
+const DEFAULT_OLLAMA_TIMEOUT_MS = 120000;
 
 function parseBooleanFlag(val, defaultVal = true) {
   if (val === undefined || val === null || val === "") return defaultVal;
@@ -2191,7 +2247,7 @@ async function getOllamaRuntimeConfig(options = {}) {
 
   const parsedTimeout = Number(rawTimeout);
   const timeoutMs = Number.isFinite(parsedTimeout)
-    ? Math.min(120000, Math.max(3000, Math.floor(parsedTimeout)))
+    ? Math.min(180000, Math.max(3000, Math.floor(parsedTimeout)))
     : DEFAULT_OLLAMA_TIMEOUT_MS;
 
   return {
@@ -2220,8 +2276,8 @@ async function saveOllamaSettings(payload = {}) {
   }
 
   const rawTimeout = Number(payload.ollama_timeout_ms ?? current.timeoutMs);
-  if (!Number.isFinite(rawTimeout) || rawTimeout < 3000 || rawTimeout > 120000) {
-    throw new Error("Ollama 타임아웃은 3,000ms ~ 120,000ms 사이여야 합니다.");
+  if (!Number.isFinite(rawTimeout) || rawTimeout < 3000 || rawTimeout > 180000) {
+    throw new Error("Ollama 타임아웃은 3,000ms ~ 180,000ms 사이여야 합니다.");
   }
   const timeoutMs = Math.floor(rawTimeout);
 
@@ -2430,7 +2486,8 @@ async function getLatestAiBriefing() {
   const maskedKey = apiKey ? `${apiKey.slice(0, 6)}...${apiKey.slice(-4)}` : "";
   const quota = await getGeminiQuotaStatus();
   const ollama = await checkOllamaStatus();
-  const enrichedRegime = enrichRegimeFilterRow(regimeRow);
+  const modelMeta = await loadDualAiModelMeta(db);
+  const enrichedRegime = enrichRegimeFilterRow(regimeRow, modelMeta);
   return {
     has_key: !!apiKey,
     masked_key: maskedKey,
@@ -2462,6 +2519,8 @@ async function getLatestAiNewsBriefing() {
 
 async function updateMarketRegimeFilterFromAnalysis({
   isPro = false,
+  provider = "",
+  model = "",
   btcPrice = 0,
   btcDaily20Ma = 0,
   btc4h60Ma = 0,
@@ -2546,19 +2605,49 @@ async function updateMarketRegimeFilterFromAnalysis({
     let proState = await loadSideState("dual_ai_pro_state_json", curRow?.pro_sentiment_score, curRow?.pro_recommended_action);
     let flashUpdated = curRow?.flash_updated_at || now;
     let proUpdated = curRow?.pro_updated_at || now;
+    const resolvedProvider = String(provider || incomingDecision?.provider || (isFallback ? "fallback" : "")).trim();
+    const resolvedModel = String(model || incomingDecision?.model || (isFallback ? "mechanical-btc-20ma" : "")).trim();
 
     if (isPro) {
-      proState = incomingDecision;
+      proState = {
+        ...incomingDecision,
+        provider: resolvedProvider || proState.provider || "",
+        model: resolvedModel || proState.model || "",
+      };
       proUpdated = now;
       await db
         .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('dual_ai_pro_state_json', ?, ?)")
         .run(JSON.stringify(proState), now);
+      if (proState.provider) {
+        await db
+          .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('dual_ai_pro_provider', ?, ?)")
+          .run(proState.provider, now);
+      }
+      if (proState.model) {
+        await db
+          .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('dual_ai_pro_model', ?, ?)")
+          .run(proState.model, now);
+      }
     } else {
-      flashState = incomingDecision;
+      flashState = {
+        ...incomingDecision,
+        provider: resolvedProvider || flashState.provider || "",
+        model: resolvedModel || flashState.model || "",
+      };
       flashUpdated = now;
       await db
         .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('dual_ai_flash_state_json', ?, ?)")
         .run(JSON.stringify(flashState), now);
+      if (flashState.provider) {
+        await db
+          .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('dual_ai_flash_provider', ?, ?)")
+          .run(flashState.provider, now);
+      }
+      if (flashState.model) {
+        await db
+          .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('dual_ai_flash_model', ?, ?)")
+          .run(flashState.model, now);
+      }
     }
 
     const synthesized = synthesizeDualAiDecision(flashState, proState);
@@ -2608,11 +2697,17 @@ async function updateMarketRegimeFilterFromAnalysis({
     );
 
     cachedRegimeState.checkedAtMs = 0;
+    const modelMeta = {
+      flash_provider: flashState.provider || (await getSetting("dual_ai_flash_provider", "")),
+      flash_model: flashState.model || (await getSetting("dual_ai_flash_model", "")),
+      pro_provider: proState.provider || (await getSetting("dual_ai_pro_provider", "")),
+      pro_model: proState.model || (await getSetting("dual_ai_pro_model", "")),
+    };
     console.log(
-      `[Dual AI Update] Regime=${synthesized.market_regime}, Action=${synthesized.recommended_action}, Mult=${synthesized.final_position_multiplier}, Flash=${synthesized.flash_recommended_action}, Pro=${synthesized.pro_recommended_action}`
+      `[Dual AI Update] Regime=${synthesized.market_regime}, Action=${synthesized.recommended_action}, Mult=${synthesized.final_position_multiplier}, Flash=${synthesized.flash_recommended_action}(${modelMeta.flash_model || "-"}), Pro=${synthesized.pro_recommended_action}(${modelMeta.pro_model || "-"})`
     );
     const updatedRow = await db.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get();
-    return enrichRegimeFilterRow(updatedRow);
+    return enrichRegimeFilterRow(updatedRow, modelMeta);
   } catch (err) {
     console.error("[updateMarketRegimeFilterFromAnalysis] Error:", err.message);
     return null;
@@ -2994,59 +3089,30 @@ async function callLocalOllamaCoinNewsAnalyzer(newsList = [], marketContext = {}
       DEFAULT_OLLAMA_TIMEOUT_MS
   ) || DEFAULT_OLLAMA_TIMEOUT_MS;
 
-  // 토큰 최적화(4096 ctx 이내 유지): 최신 코인 뉴스 최대 12건, 제목 + 요약 150자 이내로 압축
+  // CPU 추론 최적화: 최신 코인 뉴스 최대 6건, 제목 90자 이내로 압축
   const compactNewsText = (Array.isArray(newsList) ? newsList : [])
-    .slice(0, 12)
+    .slice(0, 6)
     .map((n, idx) => {
       if (typeof n === "string") {
-        return `${idx + 1}. ${n.replace(/\s+/g, " ").slice(0, 180)}`;
+        return `${idx + 1}.${n.replace(/\s+/g, " ").trim().slice(0, 90)}`;
       }
       const sentimentTag = n?.sentiment === "BULLISH" ? "호재" : n?.sentiment === "BEARISH" ? "악재" : "중립";
-      const title = String(n?.title || "").trim();
-      const snippet = String(n?.summary || "").replace(/\s+/g, " ").slice(0, 150);
-      return `${idx + 1}. [${sentimentTag}] ${title}${snippet ? ` - ${snippet}` : ""}`;
+      const title = String(n?.title || "").replace(/\s+/g, " ").trim().slice(0, 90);
+      return `${idx + 1}.[${sentimentTag}]${title}`;
     })
     .join("\n");
 
   const activeBotDesc =
     Array.isArray(activeBots) && activeBots.length > 0
-      ? activeBots.map((b) => `${b.bot_id}(${b.nickname || b.name || b.bot_id})`).join(", ")
-      : "bot_01 ~ bot_10";
+      ? activeBots.map((b) => String(b.bot_id)).join(",")
+      : "bot_01~bot_10";
 
-  const userPrompt = `다음 최근 30분 업비트 암호화폐 시황 지표와 뉴스 헤드라인을 분석해 반드시 지정된 JSON 스키마로만 응답하라.
-
-[1. 현재 암호화폐 시장 기술적 요약]
-- KRW-BTC 현재가: ${marketContext.btcPrice ?? "N/A"}원 (24h 변동률: ${marketContext.btcChangePct ?? "N/A"}%)
-- KRW-BTC 일봉 20MA: ${marketContext.btcDaily20Ma ?? "N/A"}원 | 4시간봉 60MA: ${marketContext.btc4h60Ma ?? "N/A"}원
-- 크립토 공포·탐욕 지수: ${marketContext.fngValue ?? "N/A"} (${marketContext.fngClass ?? "N/A"})
-- 현재 실전 가동 봇: ${activeBotDesc}
-- 현재 보유 오픈 포지션: ${(marketContext.openTickers || []).join(", ") || "없음"}
-
-[2. 최근 수집된 주요 암호화폐 뉴스]
-${compactNewsText || "특이 신규 속보 없음 (보합세)"}
-
-[출력 JSON 스키마]
-{
-  "sentiment_score": -1.0에서 1.0 사이의 소수점 첫째 자리 실수,
-  "market_regime": "BULL | SIDEWAYS | BEAR | HIGH_VOLATILITY_SHOCK",
-  "risk_alert": true 또는 false (거래소 해킹, 디페깅, 상장폐지, 거시 쇼크 시 true),
-  "recommended_action": "NORMAL | REDUCE_SIZE | HALT_NEW_BUYS | EMERGENCY_CLOSE_ALL",
-  "position_size_multiplier": 0.0, 0.5, 1.0 중 택1,
-  "bot_overrides": {
-    "bot_01": "ALLOW | BLOCK",
-    "bot_02": "ALLOW | BLOCK",
-    "bot_03": "ALLOW | BLOCK",
-    "bot_04": "ALLOW | BLOCK",
-    "bot_05": "ALLOW | BLOCK",
-    "bot_06": "ALLOW | BLOCK",
-    "bot_07": "ALLOW | BLOCK",
-    "bot_08": "ALLOW | BLOCK",
-    "bot_09": "ALLOW | BLOCK",
-    "bot_10": "ALLOW | BLOCK"
-  },
-  "blacklist_tickers": ["해킹·유의종목 지정 등 치명적 악재가 발생한 업비트 원화마켓 티커(예: KRW-XRP), 없으면 []"],
-  "reason": "암호화폐 단기 시황, 뉴스 감성 및 봇 진입 제어 판단 근거 한국어 2~3문장 요약"
-}`;
+  const userPrompt = `업비트 30분 시황·뉴스 JSON 분석:
+[시황] KRW-BTC=${marketContext.btcPrice ?? "N/A"}원(24h ${marketContext.btcChangePct ?? "N/A"}%) | 일봉20MA=${marketContext.btcDaily20Ma ?? "N/A"} | 4h60MA=${marketContext.btc4h60Ma ?? "N/A"} | 공포탐욕=${marketContext.fngValue ?? "N/A"}(${marketContext.fngClass ?? "N/A"}) | 가동봇=${activeBotDesc} | 보유=${(marketContext.openTickers || []).join(",") || "없음"}
+[뉴스]
+${compactNewsText || "특이 속보 없음"}
+[JSON 스키마]
+{"sentiment_score":-1.0~1.0,"market_regime":"BULL|SIDEWAYS|BEAR|HIGH_VOLATILITY_SHOCK","risk_alert":false,"recommended_action":"NORMAL|REDUCE_SIZE|HALT_NEW_BUYS|EMERGENCY_CLOSE_ALL","position_size_multiplier":1.0,"bot_overrides":{"bot_01":"ALLOW|BLOCK","bot_02":"ALLOW|BLOCK","bot_03":"ALLOW|BLOCK","bot_04":"ALLOW|BLOCK","bot_05":"ALLOW|BLOCK","bot_06":"ALLOW|BLOCK","bot_07":"ALLOW|BLOCK","bot_08":"ALLOW|BLOCK","bot_09":"ALLOW|BLOCK","bot_10":"ALLOW|BLOCK"},"blacklist_tickers":["KRW-티커"],"reason":"한국어 1~2문장(70자이내) 요약"}`;
 
   const startedAt = Date.now();
   const res = await fetch(`${baseUrl}/api/chat`, {
@@ -3058,7 +3124,10 @@ ${compactNewsText || "특이 신규 속보 없음 (보합세)"}
       stream: false,
       think: false, // 필수: Qwen3 내부 추론 비활성화 (인텔 맥북 CPU 응답 속도 단축)
       format: "json", // 필수: 엄격한 JSON 출력 강제
-      messages: [{ role: "user", content: userPrompt }],
+      messages: [
+        { role: "system", content: "업비트 암호화폐 30분 단기 시황·뉴스 JSON 분석기. 지정 JSON 스키마만 간결히 출력." },
+        { role: "user", content: userPrompt },
+      ],
     }),
   });
 
@@ -3072,7 +3141,12 @@ ${compactNewsText || "특이 신규 속보 없음 (보합세)"}
   if (!rawContent) {
     throw new Error("Ollama returned empty message content");
   }
-  const cleanedJsonStr = rawContent.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
+  let cleanedJsonStr = rawContent.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
+  const firstBrace = cleanedJsonStr.indexOf("{");
+  const lastBrace = cleanedJsonStr.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    cleanedJsonStr = cleanedJsonStr.slice(firstBrace, lastBrace + 1);
+  }
   const parsed = JSON.parse(cleanedJsonStr);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("Ollama response JSON is not an object");
@@ -3395,6 +3469,8 @@ async function applyTier3MechanicalFallback({ isPro = false, btcPrice = 0, btcDa
     const fbDecision = buildMechanicalFallbackRegime({ btcPrice, btcDaily20Ma, btc4h60Ma, label });
     return await updateMarketRegimeFilterFromAnalysis({
       isPro,
+      provider: "fallback",
+      model: "mechanical-btc-20ma",
       btcPrice,
       btcDaily20Ma,
       btc4h60Ma,
@@ -3475,6 +3551,8 @@ async function persistMarketBriefingAndUpdateRegime({
 }) {
   const updatedRegime = await updateMarketRegimeFilterFromAnalysis({
     isPro: isProTarget,
+    provider,
+    model,
     btcPrice,
     btcDaily20Ma,
     btc4h60Ma,
@@ -3944,7 +4022,8 @@ async function generateAiMarketAnalysisStream(req, res) {
 
   let regimeRow = null;
   try {
-    regimeRow = enrichRegimeFilterRow(await db.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get());
+    const rawRegimeRow = await db.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get();
+    regimeRow = enrichRegimeFilterRow(rawRegimeRow, await loadDualAiModelMeta(db));
   } catch {}
 
   res.write(
@@ -4176,6 +4255,8 @@ async function generateAiNewsAnalysis(options = {}) {
 
       const updatedRegime = await updateMarketRegimeFilterFromAnalysis({
         isPro: false,
+        provider: "ollama",
+        model: ollamaRes.model,
         btcPrice,
         btcDaily20Ma,
         btc4h60Ma,
@@ -4327,6 +4408,14 @@ async function generateAiNewsAnalysis(options = {}) {
     consumeQuota: true,
     pushType: "news_analysis_done",
   });
+  await db
+    .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('dual_ai_flash_provider', 'gemini', ?)")
+    .run(nowStr)
+    .catch(() => {});
+  await db
+    .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('dual_ai_flash_model', ?, ?)")
+    .run(geminiRes.chosenModel, nowStr)
+    .catch(() => {});
 
   return {
     success: true,
@@ -4380,6 +4469,8 @@ async function generateAiNewsAnalysisStream(req, res) {
 
       const updatedRegime = await updateMarketRegimeFilterFromAnalysis({
         isPro: false,
+        provider: "ollama",
+        model: ollamaRes.model,
         btcPrice: Number(ollamaCtxPack.marketContext.btcPrice || 0),
         btcDaily20Ma: Number(ollamaCtxPack.marketContext.btcDaily20Ma || 0),
         btc4h60Ma: Number(ollamaCtxPack.marketContext.btc4h60Ma || 0),
@@ -4586,6 +4677,14 @@ async function generateAiNewsAnalysisStream(req, res) {
       consumeQuota: false,
       pushType: "news_briefing",
     });
+    await db
+      .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('dual_ai_flash_provider', 'gemini', ?)")
+      .run(nowStr)
+      .catch(() => {});
+    await db
+      .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('dual_ai_flash_model', ?, ?)")
+      .run(streamRes.chosenModel, nowStr)
+      .catch(() => {});
 
     res.write(
       `data: ${JSON.stringify({
@@ -6144,7 +6243,8 @@ const server = http.createServer(async (req, res) => {
       const haltInfo = await checkAndHaltIfZeroBalance(mode);
       let regimeFilterRow = null;
       try {
-        regimeFilterRow = enrichRegimeFilterRow(await db.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get());
+        const rawRegime = await db.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get();
+        regimeFilterRow = enrichRegimeFilterRow(rawRegime, await loadDualAiModelMeta(db));
       } catch {}
       const ollama = await checkOllamaStatus();
       return sendJson(res, 200, {
@@ -6164,7 +6264,8 @@ const server = http.createServer(async (req, res) => {
       const haltInfo = await checkAndHaltIfZeroBalance(mode);
       let regimeFilterRow = null;
       try {
-        regimeFilterRow = enrichRegimeFilterRow(await db.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get());
+        const rawRegime = await db.prepare("SELECT * FROM market_regime_filter WHERE id = 1").get();
+        regimeFilterRow = enrichRegimeFilterRow(rawRegime, await loadDualAiModelMeta(db));
       } catch {}
       return sendJson(res, 200, {
         mode,
