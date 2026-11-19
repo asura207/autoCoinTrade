@@ -24,8 +24,24 @@ const TRADE_EVENTS = new Set(["LIVE_BUY", "LIVE_SELL", "DRAIN_HANDOFF"]);
 const RISK_EVENTS = new Set(["CIRCUIT_BREAKER", "ZERO_BALANCE_HALT", "WEEKLY_ROTATION"]);
 const REPORT_EVENTS = new Set(["DAILY_SUMMARY"]);
 
+const PLACEHOLDER_NOTIFICATION_VALUES = new Set([
+  "your_telegram_bot_token_here",
+  "your_telegram_chat_id_here",
+  "your_discord_webhook_url_here",
+  "YOUR_TELEGRAM_BOT_TOKEN",
+  "YOUR_TELEGRAM_CHAT_ID",
+  "YOUR_DISCORD_WEBHOOK_URL",
+]);
+
+function sanitizeNotificationValue(val) {
+  const s = String(val || "").trim();
+  if (!s) return "";
+  if (PLACEHOLDER_NOTIFICATION_VALUES.has(s) || /^your_.*_here$/i.test(s)) return "";
+  return s;
+}
+
 export function maskSecretValue(val) {
-  const plain = safeDecryptSecret(val || "");
+  const plain = sanitizeNotificationValue(safeDecryptSecret(val || ""));
   if (!plain) return "";
   if (plain.length <= 8) return "••••••••";
   return `${plain.slice(0, 4)}••••••••${plain.slice(-4)}`;
@@ -70,9 +86,9 @@ export async function loadNotificationSettings(db, options = {}) {
   const rawTgChatId = map.telegram_chat_id ?? process.env.TELEGRAM_CHAT_ID ?? "";
   const rawDiscordUrl = map.discord_webhook_url ?? process.env.DISCORD_WEBHOOK_URL ?? "";
 
-  const telegramBotToken = safeDecryptSecret(rawTgToken).trim();
-  const telegramChatId = String(rawTgChatId || "").trim();
-  const discordWebhookUrl = safeDecryptSecret(rawDiscordUrl).trim();
+  const telegramBotToken = sanitizeNotificationValue(safeDecryptSecret(rawTgToken));
+  const telegramChatId = sanitizeNotificationValue(rawTgChatId);
+  const discordWebhookUrl = sanitizeNotificationValue(safeDecryptSecret(rawDiscordUrl));
   const telegramConfigured = Boolean(telegramBotToken && telegramChatId);
   const discordConfigured = Boolean(discordWebhookUrl);
 

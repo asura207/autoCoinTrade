@@ -72,6 +72,26 @@ try {
   await initializeDatabase();
   const db = getDb();
 
+  // 0. Placeholder values from .env.example must be treated as unconfigured
+  const prevTgTok = process.env.TELEGRAM_BOT_TOKEN;
+  const prevTgChat = process.env.TELEGRAM_CHAT_ID;
+  const prevDcUrl = process.env.DISCORD_WEBHOOK_URL;
+  process.env.TELEGRAM_BOT_TOKEN = "your_telegram_bot_token_here";
+  process.env.TELEGRAM_CHAT_ID = "your_telegram_chat_id_here";
+  process.env.DISCORD_WEBHOOK_URL = "your_discord_webhook_url_here";
+  const placeholderLoaded = await loadNotificationSettings(db, { maskSecrets: false });
+  assert.equal(placeholderLoaded.telegram_configured, false, "Placeholder Telegram env must not be treated as configured");
+  assert.equal(placeholderLoaded.telegram_enabled, false, "Placeholder Telegram env must not auto-enable");
+  assert.equal(placeholderLoaded.discord_configured, false, "Placeholder Discord env must not be treated as configured");
+  if (prevTgTok === undefined) delete process.env.TELEGRAM_BOT_TOKEN; else process.env.TELEGRAM_BOT_TOKEN = prevTgTok;
+  if (prevTgChat === undefined) delete process.env.TELEGRAM_CHAT_ID; else process.env.TELEGRAM_CHAT_ID = prevTgChat;
+  if (prevDcUrl === undefined) delete process.env.DISCORD_WEBHOOK_URL; else process.env.DISCORD_WEBHOOK_URL = prevDcUrl;
+  results.push({
+    check: "Example Placeholder Sanitization",
+    status: "PASS",
+    detail: "your_telegram_bot_token_here / your_telegram_chat_id_here treated as unconfigured",
+  });
+
   // 1. Encrypted storage & masked loading
   const fakeTgToken = "987654321:AAFakeTelegramBotTokenSecret12345";
   const fakeDiscordUrl = `${mockBase}/discord-webhook/test-secret-hook`;

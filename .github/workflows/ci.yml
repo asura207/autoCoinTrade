@@ -47,12 +47,20 @@ jobs:
 
       - name: Secret leak guard (tracked repository files)
         run: |
-          if git ls-files | grep -E '(^\.env$|^config/upbit_config\.json$|data/.*\.db$|data/\.session_secret$|data/\.vault_master_key$)'; then
+          if git ls-files | grep -E '(^\.env$|^install/app/\.env$|^config/upbit_config\.json$|^install/app/config/upbit_config\.json$|data/.*\.db$|data/\.session_secret$|data/\.vault_master_key$)'; then
             echo "ERROR: Sensitive runtime file is tracked in git!"
             exit 1
           fi
           if git grep -nE 'AIzaSy[0-9A-Za-z_-]{33}' -- ':!tests/*'; then
             echo "ERROR: Potential hardcoded Google API key found!"
+            exit 1
+          fi
+          if git grep -nE '[0-9]{8,10}:AA[0-9A-Za-z_-]{30,}' -- ':!tests/*'; then
+            echo "ERROR: Potential hardcoded Telegram Bot Token found!"
+            exit 1
+          fi
+          if git grep -nE 'https://(canary\.|ptb\.)?discord(app)?\.com/api/webhooks/[0-9]+/[0-9A-Za-z_-]+' -- ':!tests/*'; then
+            echo "ERROR: Potential hardcoded Discord Webhook URL found!"
             exit 1
           fi
           echo "Secret leak guard passed."

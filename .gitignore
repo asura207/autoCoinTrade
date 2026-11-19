@@ -46,6 +46,8 @@ config/upbit_config.json
 data/.session_secret
 data/.vault_master_key
 install/app/.env
+install/app/.env.*
+!install/app/.env.example
 install/app/config/upbit_config.json
 install/app/data/.session_secret
 install/app/data/.vault_master_key
