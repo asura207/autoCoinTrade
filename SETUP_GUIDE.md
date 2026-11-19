@@ -67,9 +67,9 @@ cd ..
 
 ---
 
-## 3. 설정 파일 안내 (`config/upbit_config.json`)
+## 3. 설정 파일 안내 (`config/upbit_config.json` & `.env`)
 
-`.gitignore`에 등록되어 있어 Git 추적에서 제외되므로, 신규 PC에서는 `config/upbit_config.example.json`을 복사하여 생성합니다.
+`.gitignore`에 등록되어 있어 Git 추적에서 제외되므로, 신규 PC에서는 `config/upbit_config.example.json`과 `.env.example`을 복사하여 생성합니다.
 
 ```json
 {
@@ -78,7 +78,19 @@ cd ..
   "trade_mode": "paper",
   "request_timeout_sec": 5.0,
   "delay_threshold_ms": 800,
-  "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE"
+  "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE",
+  "gate_code": "stock",
+  "use_local_ollama_news": true,
+  "ollama_base_url": "http://192.168.0.100:11434",
+  "ollama_news_model": "qwen3-news",
+  "ollama_timeout_ms": 120000,
+  "live_executor_owner": "node",
+  "live_lease_ttl_sec": 30,
+  "live_reentry_cooldown_sec": 900,
+  "live_min_buy_interval_sec": 60,
+  "live_max_buys_per_bot_hour": 3,
+  "live_max_buys_per_bot_day": 12,
+  "live_max_total_buys_day": 30
 }
 ```
 
@@ -86,42 +98,63 @@ cd ..
 - **`trade_mode`**:
   - `"paper"` (*기본값*): 모의투자 시뮬레이션 안전 모드. 실제 자금을 쓰지 않고 실시간 호가/시세 기반 가상 매매 및 SQLite DB 검증.
   - `"live"`: 실제 업비트 시장가 매수/매도 주문 실행.
-- **`access_key` / `secret_key`**:
-  - 업비트 Open API 키. 모의투자(`paper`) 상태에서도 시세 조회, 캔들 조회, 잔고 조회가 가능하며, 미입력 시에도 기본 모의 봇 로직은 fallback 모드로 안전하게 작동합니다.
-- **`gemini_api_key`**:
-  - Google Gemini API Key. Dual AI 시황·뉴스 브리핑 및 `bot_01`~`bot_10` 개별 진입 제어(`gemini-3.8-flash` 30분 / `gemini-3.1-pro-preview` 1시간 SSE 스트리밍)에 사용됩니다.
-  - 이 파일에 직접 입력해도 되고, **웹 화면(`http://localhost:9000`) 우측 상단의 `[⚙️ API 키 등록]` 팝업**을 통해 브라우저에서 바로 입력/저장할 수도 있습니다.
+- **`live_executor_owner` / `.env`의 `LIVE_EXECUTOR_OWNER`**:
+  - 기본값 `"node"`. 단일 실전 주문 실행 주체를 강제하며, 불일치하는 엔진(예: Python 워커)이 실전 주문 API에 진입하면 즉시 하드 차단됩니다.
+  - `LIVE_REENTRY_COOLDOWN_SEC`(900초), `LIVE_MIN_BUY_INTERVAL_SEC`(60초), `LIVE_MAX_BUYS_PER_BOT_HOUR`(3회), `LIVE_MAX_BUYS_PER_BOT_DAY`(12회), `LIVE_MAX_TOTAL_BUYS_DAY`(30회)로 연속 결제 사고를 원천 차단합니다.
+- **`access_key` / `secret_key` & AES-256-GCM 볼트**:
+  - 업비트 Open API 키 및 알림 웹훅 시크릿은 저장 시 `backend/common/crypto_vault.mjs`에 의해 자동으로 `enc:v1:...` AES-256-GCM 암호화(`chmod 600`)됩니다. 선택적으로 `.env`에 `AUTOCOIN_VAULT_KEY`를 지정하거나 자동 생성되는 `data/.vault_master_key`를 사용할 수 있습니다.
+- **로컬 Ollama (`qwen3-news`) & `gemini_api_key`**:
+  - 30분 단기 뉴스·시황 분석은 `USE_LOCAL_OLLAMA_NEWS=true` 기준 **로컬 Ollama (`qwen3-news`, `120s` 타임아웃) → Gemini Flash → BTC 20MA 기계적 안전 모드** 3중 무중단 Fallback으로 동작합니다.
+  - 1시간 정각 심층 검증(`PRO_60M`) 및 Gemini Fallback에 `gemini_api_key`가 사용되며, 웹 화면(`http://localhost:9000`) `[⚙️ 설정]`에서도 바로 등록/테스트할 수 있습니다.
 
 ---
 
 ## 4. 서비스 실행 방법 (How to Run)
 
-### 모드 1: 백그라운드 원클릭 실행 (일반 운영용)
+### 모드 1: 백그라운드 원클릭 실행 (일반 운영용 — 권장)
 
 #### Linux / macOS:
 ```bash
 ./start_services.sh
-# 또는 ./start.sh
 ```
 
 #### Windows:
 ```cmd
 .\start_services.bat
 ```
-- 백엔드(포트 `8001`)와 프론트엔드(포트 `9000`)가 백그라운드 데몬으로 자동 시작됩니다.
+- 백엔드(포트 `8001`)와 프로덕션 프론트엔드 정적 서버(`frontend/server.mjs`, 포트 `9000`)가 백그라운드 데몬으로 자동 시작됩니다(`frontend/dist` 부재 시 자동 빌드).
 - 브라우저에서 **`http://localhost:9000`** 접속
-- **외부/모바일 접속 (동일 Wi-Fi LAN)**: `http://<서버LAN_IP>:9000` (예: `http://192.168.x.x:9000`)
+- **외부/모바일 접속 (동일 Wi-Fi LAN)**: `.env`에서 `FRONTEND_HOST=0.0.0.0` 설정 시 `http://<서버LAN_IP>:9000`
 - **외부 인터넷 보안 터널 (LTE/외부망 원클릭)**:
   ```bash
   ./start_tunnel.sh
   # 생성된 https://xxxx.trycloudflare.com 주소로 외부 어디서나 접속 가능
   # 터널 종료: ./stop_tunnel.sh
   ```
-- 기본 입장 코드: **`stock`** (한글 자판 오타 `ㄴ새차` 자동 변환 지원, `⚙️ 설정` 화면 또는 `.env`에서 사용자 지정 코드로 변경 가능)
+- 기본 입장 코드: **`stock`** (`HttpOnly` 서명 세션 쿠키 인증 적용, 기본 코드 상태에서만 한글 자판 오타 `ㄴ새차` 자동 변환 지원, `⚙️ 설정` 화면 또는 `.env`에서 변경 가능)
 
 ---
 
-### 모드 2: 콘솔 포그라운드 실행 (개발 / 디버깅 / AI Agent 실시간 점검용)
+### 모드 2: Docker Compose 컨테이너 실행 (신규 서버/클라우드 권장)
+
+Node.js나 Python 로컬 설치 없이 멀티스테이지 비루트 컨테이너로 백엔드(`8001`) + 프론트엔드(`9000`)를 일괄 구동합니다.
+
+```bash
+cp .env.example .env
+cp config/upbit_config.example.json config/upbit_config.json
+docker compose up -d --build
+
+# 상태 및 헬스체크 확인
+docker compose ps
+docker compose logs -f
+
+# 컨테이너 안전 종료
+docker compose down
+```
+
+---
+
+### 모드 3: 콘솔 포그라운드 실행 (개발 / 디버깅 / AI Agent 실시간 점검용)
 
 실시간 로그 출력이나 디버깅이 필요한 경우 별도의 터미널 2개에서 각각 실행합니다.
 
@@ -131,20 +164,16 @@ node backend/node_server.mjs
 ```
 *출력 예시:*
 ```text
-[NodeServer] Server running on http://localhost:8001 (SQLite WAL session ready, Date: 2026-10-30)
+[NodeServer] Server running on http://127.0.0.1:8001 (SQLite WAL session ready)
 ```
 
 #### 터미널 2 (Frontend - Port 9000):
 ```bash
-cd frontend
-npm run dev
-```
-*출력 예시:*
-```text
-  VITE v5.4.6  ready in 250 ms
+# 프로덕션 정적 서버(권장)
+node frontend/server.mjs
 
-  ➜  Local:   http://localhost:9000/
-  ➜  Network: http://192.168.x.x:9000/
+# 또는 Vite 개발 핫리로드 서버
+cd frontend && npm run dev
 ```
 
 ---
@@ -154,14 +183,15 @@ npm run dev
 #### Linux / macOS:
 ```bash
 ./stop_services.sh
-# 또는 ./stop.sh
+# 외부 터널까지 함께 종료 시:
+./stop_services.sh --with-tunnel
 ```
 
 #### Windows:
 ```cmd
 .\stop_services.bat
 ```
-- 포트 `8001`(백엔드) 및 포트 `9000`(프론트엔드)을 점유한 프로세스를 찾아 안전하게 종료합니다.
+- PID 파일(`logs/*.pid`), 포트(`8001` / `9000`), 및 본 프로젝트 작업 경로(`/proc/<pid>/cwd`)를 점검하여 잔존 Node/Python 좀비 프로세스까지 안전하게 종료합니다.
 
 ### CLI 수동 중지 (PowerShell)
 ```powershell
@@ -172,33 +202,36 @@ Get-NetTCPConnection -LocalPort 8001,9000 -ErrorAction SilentlyContinue | ForEac
 
 ## 6. 윈도우 부팅 시 자동 시작 등록 / 해제 (선택)
 
-- **시작프로그램 자동 등록**: `install_startup.bat` 실행
-  - 윈도우 시작프로그램 폴더(`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`)에 바로가기가 생성되어 PC 재부팅 시 백그라운드로 자동 실행됩니다.
-- **자동 시작 해제**: `uninstall_startup.bat` 실행
+- **시작프로그램 자동 등록**: `scripts\install_startup.bat` 실행
+  - 윈도우 시작프로그램 폴더(`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`)에 바로가기가 생성되어 PC 재부팅 시 `start_services.bat`이 백그라운드로 자동 실행됩니다.
+- **자동 시작 해제**: `scripts\uninstall_startup.bat` 실행
 
 ---
 
-## 7. 서비스 정상 동작 확인 (Health Check for AI Agents)
+## 7. 서비스 정상 동작 확인 및 자동화 QA 검증 (Health Check for AI Agents)
 
-AI Agent가 서비스 구동 후 정상 여부를 검증할 때 사용하는 엔드포인트 목록입니다:
+AI Agent가 서비스 구동 후 정상 여부를 검증할 때 사용하는 엔드포인트 및 테스트 명령입니다:
 
 ```bash
-# 1. 백엔드 헬스체크 (인증 불필요, HTTP 200)
-curl -s http://localhost:8001/api/health
+# 1. 백엔드 헬스체크 & 버전 확인 (인증 불필요, HTTP 200)
+curl -s http://127.0.0.1:8001/api/health
+curl -s http://127.0.0.1:8001/api/version
 
-# 2. 세션 쿠키 발급 후 10대 봇 목록 조회 (기본 입장 코드: stock)
+# 2. 세션 쿠키 발급 (기본 입장 코드: stock)
 curl -s -c /tmp/act_cookie.txt -X POST -H "Content-Type: application/json" \
-  -d '{"code":"stock"}' http://localhost:8001/api/auth/verify
-curl -s -b /tmp/act_cookie.txt http://localhost:8001/api/bots
+  -d '{"code":"stock"}' http://127.0.0.1:8001/api/auth/verify
 
-# 3. 거래 현황 내역 조회 (HTTP 200)
-curl -s -b /tmp/act_cookie.txt "http://localhost:8001/api/trades?bot_id=bot_01"
+# 3. 10대 봇 · WebSocket 허브 · 5중 가드레일 상태 조회 (HTTP 200)
+curl -s -b /tmp/act_cookie.txt http://127.0.0.1:8001/api/bots
+curl -s -b /tmp/act_cookie.txt http://127.0.0.1:8001/api/upbit/status
+curl -s -b /tmp/act_cookie.txt http://127.0.0.1:8001/api/guardrail/status
 
-# 4. AI 시황 브리핑 최근 기록 확인 (HTTP 200)
-curl -s -b /tmp/act_cookie.txt http://localhost:8001/api/ai/briefing
+# 4. 프론트엔드 프로덕션 정적 서버 응답 확인 (HTTP 200)
+curl -s -I http://127.0.0.1:9000
 
-# 5. 프론트엔드 정적 웹 서버 응답 확인 (HTTP 200)
-curl -s -I http://localhost:9000
+# 5. 5중 가드레일 스트레스 테스트 및 전수 자동화 검증 스위트
+npm run test:guardrail
+npm run test:all
 ```
 
 ---
@@ -225,16 +258,18 @@ curl -s -I http://localhost:9000
 
 ## 9. 파이썬 멀티프로세싱 오케스트레이터 및 듀얼 LLM 장세 필터 실행 가이드
 
-독립된 Python 멀티프로세싱 아키텍처 기반으로 10대 전략 봇(`bot_01`~`bot_10`, `agentBot/bot_10_jack_kellogg.py` 포함), 중앙 시세 허브(`market_hub.py`) 및 듀얼 LLM 워커(`llm_filter_worker.py`)를 실행할 때 사용합니다.
-> **중복 실행 방지(Coordinated Mode)**: Node.js 백엔드(`backend/node_server.mjs`, Port `8001`)가 이미 실행 중인 경우 Python 워커(`main_orchestrator.py` / `bots.py` / `llm_filter_worker.py`)는 자동으로 동일 매매 루프의 중복 집행을 차단(Yield)하고 단일 실행 무결성을 유지합니다.
+독립된 Python 멀티프로세싱 아키텍처 기반으로 10대 전략 봇(`bot_01`~`bot_10`, `agentBot/bot_10_jack_kellogg.py` 포함), Python 전용 시세 캐시 허브(`market_hub.py`) 및 듀얼 LLM 워커(`llm_filter_worker.py`)를 실행할 때 사용합니다.
+> **단일 실전 실행권(Single Live Executor) & 중복 실행 원천 차단**:
+> - 기본값 **`LIVE_EXECUTOR_OWNER=node`** 환경에서는 Node.js 백엔드(`backend/node_server.mjs`)만 실전 주문(`POST /v1/orders`)을 실행할 수 있습니다.
+> - Python 오케스트레이터(`main_orchestrator.py` / `bots.py`)는 Node 백엔드(Port `8001`)가 가동 중이거나 `LIVE_EXECUTOR_OWNER != python`인 경우 실전 주문을 즉시 하드 차단(Yield)하며, Python 단독 실전 실행 시에도 SQLite `live_executor_lease` 리스 락과 `live_order_intents` 2단계 커밋 가드레일이 적용됩니다.
 
 ### 파일 구성
-- **`init_db.py`**: SQLite(`data/auto_coin_trade.db`, WAL 모드) 가상 원장, 주간 로테이션/포지션/듀얼 AI 컬럼 자동 마이그레이션(`ALTER TABLE`) 및 `market_regime_filter` 초기화
-- **`market_hub.py`**: 중앙 시세 브로드캐스터 (인메모리 OHLCV/티커 캐시 및 업비트 API `120ms` Rate Limit 방어)
-- **`llm_filter_worker.py`**: 듀얼 AI(30분 Gemini Flash / 1시간 Gemini Pro) 시장/뉴스 분석, `bot_01`~`bot_10` 개별 진입 제어(`ALLOW`/`BLOCK`), 룰베이스(BTC 20MA) 폴백 워커
-- **`bots.py` & `agentBot/bot_10_jack_kellogg.py`**: 공통 매수 게이트웨이(`can_enter_position`), 8자리 내림 주문(`round_down_volume_8`), Graceful Drain 청산 대기 및 잔여 원화 자동 이관, `bot_10` Jack Kellogg VWAP·선형 회귀 채널 전략
-- **`main_orchestrator.py`**: 봇/LLM 워커 상시 헬스체크, 크래시 시 자동 재기동(Auto-Restart), `logs/.orchestrator.pid` 기반 중복 실행 차단 및 Graceful Shutdown 관리
-- **`run_orchestrator.bat` / `run_orchestrator.sh`**: Windows / Linux 원클릭 실행 스크립트
+- **`init_db.py`**: SQLite(`data/auto_coin_trade.db`, WAL 모드) 전체 원장(가드레일 `live_executor_lease`·`live_order_intents`·`live_guardrail_events` 및 백테스트/로테이션/듀얼 AI 테이블 포함) 자동 초기화 및 마이그레이션
+- **`market_hub.py`**: **[Python 독립 실행 전용]** 중앙 REST 시세 캐시 및 업비트 API `120ms` Rate Limit 방어 모듈 *(Node.js 메인 백엔드의 WebSocket 스트림 허브 `backend/common/upbit_ws_hub.mjs`와는 별개이며 충돌하지 않음)*
+- **`llm_filter_worker.py`**: 로컬 Ollama(`qwen3-news`, `120s` 타임아웃) 1순위 + Gemini Dual AI(30분 Flash / 1시간 Pro) 시장/뉴스 분석, `bot_01`~`bot_10` 개별 진입 제어(`ALLOW`/`BLOCK`), BTC 20MA 기계적 안전 모드 폴백 워커
+- **`bots.py` & `agentBot/bot_10_jack_kellogg.py`**: 공통 매수 게이트웨이(`can_enter_position`), `Decimal(ROUND_DOWN)` 8자리 내림 주문, 5중 실전 가드레일(리스 락·2PC·`identifier` 정산), Graceful Drain 청산 대기 및 잔여 원화 자동 이관, `bot_10` Jack Kellogg VWAP·선형 회귀 채널 전략
+- **`main_orchestrator.py`**: 봇/LLM 워커 상시 헬스체크, 크래시 자동 재기동, `LIVE_EXECUTOR_OWNER` 안내 및 `logs/.orchestrator.pid` 기반 중복 실행 차단
+- **`run_orchestrator.bat` / `run_orchestrator.sh`**: Windows / Linux 원클릭 실행 스크립트 (`LIVE_EXECUTOR_OWNER=node` 기본 적용 및 충돌 경고 출력)
 
 ### 실행 방법
 

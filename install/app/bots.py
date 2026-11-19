@@ -10,15 +10,20 @@ bots.py - 3개 트레이딩 봇 매매 전략 및 공통 리스크 게이트웨�
 
 import datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
+import hashlib
 import json
 import logging
 import math
 import os
+import socket
 import sqlite3
+import threading
 import time
+import urllib.parse
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+import jwt
 import numpy as np
 import pandas as pd
 import pyupbit
@@ -136,6 +141,449 @@ def normalize_bot_id(raw_id: str) -> str:
         "bot_jack_kellogg": "bot_10",
     }
     return alias_map.get(raw, raw)
+
+
+# =====================================================================
+# 0. 실전 중복 주문 원천 차단 5중 하드 가드레일 (Python 측)
+# =====================================================================
+LIVE_CYCLE_STALE_WARN_SEC = 180.0
+SPLIT_ALLOWED_BOTS = {"bot_06", "bot_10"}
+_LIVE_CYCLE_MUTEX_LOCK = threading.Lock()
+_LIVE_CYCLE_STATE: Dict[str, Dict[str, Any]] = {}
+
+
+def _now_utc_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _today_start_kst_utc_iso() -> str:
+    now_kst = datetime.datetime.now(KST_TZ)
+    midnight_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight_kst.astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _build_py_buy_bucket(bot_id: str, ticker: str, step_level: int = 1) -> str:
+    now_kst = datetime.datetime.now(KST_TZ)
+    floored_min = (now_kst.minute // 15) * 15
+    candle_key = now_kst.replace(minute=floored_min, second=0, microsecond=0).strftime("%Y%m%dT%H%M")
+    return f"{normalize_bot_id(bot_id)}:{str(ticker).strip().upper()}:{candle_key}:s{max(1, int(step_level or 1))}"
+
+
+def _load_upbit_config_json() -> Dict[str, Any]:
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "upbit_config.json")
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+    return {}
+
+
+def get_live_executor_owner() -> str:
+    """
+    단일 실전 주문 실행 주체(LIVE_EXECUTOR_OWNER) 반환 (기본값: 'node').
+    'python'으로 명시되지 않은 경우 Python 측 모든 실전 주문 API(POST /v1/orders) 진입을 원천 차단합니다.
+    """
+    env_val = str(os.getenv("LIVE_EXECUTOR_OWNER") or "").strip().lower()
+    if env_val in ("node", "python"):
+        return env_val
+    cfg_val = str(_load_upbit_config_json().get("live_executor_owner") or "").strip().lower()
+    if cfg_val in ("node", "python"):
+        return cfg_val
+    return "node"
+
+
+def is_python_live_executor_authorized() -> bool:
+    return get_live_executor_owner() == "python"
+
+
+def _get_guardrail_int(conn, setting_key: str, env_key: str, default_val: int) -> int:
+    try:
+        row = conn.execute("SELECT value FROM system_settings WHERE key = ?;", (setting_key,)).fetchone()
+        if row and str(dict(row).get("value") or "").strip():
+            v = int(float(str(dict(row)["value"]).strip()))
+            if v > 0:
+                return v
+    except Exception:
+        pass
+    try:
+        raw = str(os.getenv(env_key) or "").strip()
+        if raw:
+            v = int(float(raw))
+            if v > 0:
+                return v
+    except Exception:
+        pass
+    return default_val
+
+
+def _ensure_py_guardrail_tables(conn) -> None:
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS live_executor_lease (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                owner_id TEXT NOT NULL,
+                pid INTEGER NOT NULL,
+                host TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS live_order_intents (
+                intent_id TEXT PRIMARY KEY,
+                bot_id TEXT NOT NULL,
+                market TEXT NOT NULL,
+                side TEXT NOT NULL,
+                intent_bucket TEXT NOT NULL,
+                requested_krw INTEGER DEFAULT 0,
+                requested_volume TEXT DEFAULT '0',
+                target_position_uuid TEXT,
+                upbit_order_uuid TEXT,
+                status TEXT NOT NULL,
+                refunded INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(bot_id, market, side, intent_bucket)
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS live_guardrail_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id TEXT NOT NULL,
+                market TEXT DEFAULT '',
+                side TEXT DEFAULT 'BUY',
+                block_code TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+    except Exception:
+        pass
+
+
+def _parse_iso_ts(val: str) -> float:
+    try:
+        s = str(val or "").strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return 0.0
+
+
+def acquire_live_executor_lease(db_path: Optional[str] = None, ttl_sec: int = 30) -> Tuple[bool, str]:
+    """
+    [Layer 1] SQLite BEGIN IMMEDIATE 트랜잭션으로 live_executor_lease(id=1)를 원자적 획득/갱신합니다.
+    LIVE_EXECUTOR_OWNER != 'python' 이거나 다른 유효 프로세스가 리스를 점유 중이면 즉시 거부합니다.
+    """
+    if not is_python_live_executor_authorized():
+        return False, f"LIVE_EXECUTOR_OWNER='{get_live_executor_owner()}' (Python live execution blocked)"
+    conn = get_db_connection(db_path)
+    try:
+        _ensure_py_guardrail_tables(conn)
+        owner_id = "python"
+        pid = os.getpid()
+        host = socket.gethostname()
+        now_ts = time.time()
+        now_iso = _now_utc_iso()
+        exp_iso = datetime.datetime.fromtimestamp(now_ts + max(5, int(ttl_sec)), tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+        conn.execute("BEGIN IMMEDIATE;")
+        row = conn.execute("SELECT * FROM live_executor_lease WHERE id = 1;").fetchone()
+        if row:
+            r = dict(row)
+            is_same = str(r.get("owner_id")) == owner_id and int(r.get("pid") or 0) == pid and str(r.get("host")) == host
+            is_expired = _parse_iso_ts(r.get("expires_at") or "") <= now_ts
+            if not is_same and not is_expired:
+                conn.rollback()
+                return False, f"LEASE_HELD_BY_OTHER(owner={r.get('owner_id')}, pid={r.get('pid')}, host={r.get('host')})"
+            acq = r.get("acquired_at") if is_same and r.get("acquired_at") else now_iso
+            conn.execute(
+                """
+                UPDATE live_executor_lease
+                SET owner_id = ?, pid = ?, host = ?, acquired_at = ?, heartbeat_at = ?, expires_at = ?
+                WHERE id = 1;
+                """,
+                (owner_id, pid, host, acq, now_iso, exp_iso),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO live_executor_lease (id, owner_id, pid, host, acquired_at, heartbeat_at, expires_at)
+                VALUES (1, ?, ?, ?, ?, ?, ?);
+                """,
+                (owner_id, pid, host, now_iso, now_iso, exp_iso),
+            )
+        conn.commit()
+        return True, "OK"
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, f"LEASE_ERROR: {exc}"
+    finally:
+        conn.close()
+
+
+def release_live_executor_lease(db_path: Optional[str] = None) -> None:
+    conn = get_db_connection(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE;")
+        conn.execute(
+            "DELETE FROM live_executor_lease WHERE id = 1 AND owner_id = 'python' AND pid = ? AND host = ?;",
+            (os.getpid(), socket.gethostname()),
+        )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+def acquire_live_cycle_mutex(bot_id: str) -> bool:
+    """[Phase 3] 실전 워커 비동기/루프 중첩 방지 뮤텍스 (180초 초과 고착 시 경고 후 안전 복구)"""
+    key = normalize_bot_id(bot_id)
+    now_ts = time.time()
+    with _LIVE_CYCLE_MUTEX_LOCK:
+        st = _LIVE_CYCLE_STATE.get(key)
+        if st and st.get("running"):
+            elapsed = now_ts - float(st.get("started_at") or now_ts)
+            if elapsed > LIVE_CYCLE_STALE_WARN_SEC:
+                logger.warning(
+                    "[%s][LiveCycleMutex] Previous cycle exceeded %.0fs (>180s). Performing safe recovery reset.",
+                    key,
+                    elapsed,
+                )
+            else:
+                return False
+        _LIVE_CYCLE_STATE[key] = {"running": True, "started_at": now_ts}
+        return True
+
+
+def release_live_cycle_mutex(bot_id: str) -> None:
+    key = normalize_bot_id(bot_id)
+    with _LIVE_CYCLE_MUTEX_LOCK:
+        _LIVE_CYCLE_STATE[key] = {"running": False, "started_at": 0.0}
+
+
+def _create_upbit_jwt_py(access_key: str, secret_key: str, query_params: Optional[Dict[str, Any]] = None) -> str:
+    payload: Dict[str, Any] = {
+        "access_key": access_key,
+        "nonce": str(uuid.uuid4()),
+    }
+    if query_params:
+        qs = urllib.parse.urlencode(query_params).encode("utf-8")
+        m = hashlib.sha512()
+        m.update(qs)
+        payload["query_hash"] = m.hexdigest()
+        payload["query_hash_alg"] = "SHA512"
+    token = jwt.encode(payload, secret_key, algorithm="HS256")
+    return token.decode("utf-8") if isinstance(token, bytes) else str(token)
+
+
+def _py_post_upbit_order_with_identifier(params: Dict[str, Any]) -> Tuple[int, Optional[Dict[str, Any]], Optional[str]]:
+    """
+    업비트 POST /v1/orders 직접 호출 (identifier 포함, 맹목 재시도 절대 금지).
+    Returns: (http_status, json_body_or_none, network_error_or_none)
+    """
+    if not is_python_live_executor_authorized():
+        return 403, None, f"LIVE_EXECUTOR_OWNER='{get_live_executor_owner()}' blocks Python POST /v1/orders"
+    access = os.getenv("UPBIT_ACCESS_KEY", "").strip()
+    secret = os.getenv("UPBIT_SECRET_KEY", "").strip()
+    if not access or not secret:
+        return 401, None, "Missing Upbit API keys"
+    try:
+        token = _create_upbit_jwt_py(access, secret, params)
+        resp = requests.post(
+            "https://api.upbit.com/v1/orders",
+            json=params,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=8.0,
+        )
+        try:
+            body = resp.json()
+        except Exception:
+            body = None
+        return resp.status_code, body, None
+    except Exception as exc:
+        return 0, None, str(exc)
+
+
+def _py_get_upbit_order_by_identifier(identifier: str) -> Tuple[int, Optional[Dict[str, Any]], Optional[str]]:
+    access = os.getenv("UPBIT_ACCESS_KEY", "").strip()
+    secret = os.getenv("UPBIT_SECRET_KEY", "").strip()
+    if not access or not secret:
+        return 401, None, "Missing Upbit API keys"
+    try:
+        q = {"identifier": identifier}
+        token = _create_upbit_jwt_py(access, secret, q)
+        resp = requests.get(
+            f"https://api.upbit.com/v1/order?identifier={urllib.parse.quote(identifier)}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=8.0,
+        )
+        try:
+            body = resp.json()
+        except Exception:
+            body = None
+        return resp.status_code, body, None
+    except Exception as exc:
+        return 0, None, str(exc)
+
+
+def _py_trip_kill_switch_in_tx(conn, bot_id: str, code: str, reason: str, halt_all: bool = False) -> None:
+    now_kst = _now_kst_str()
+    msg = f"[🚨 가드레일 비상 정지:{code}] {reason}"
+    targets = [bot_id]
+    if halt_all:
+        rows = conn.execute("SELECT bot_id FROM bots WHERE is_selected_for_live = 1 OR is_running = 1;").fetchall()
+        targets = list(dict.fromkeys(targets + [dict(r)["bot_id"] for r in rows]))
+    for bid in targets:
+        conn.execute(
+            "UPDATE bots SET is_running = 0, last_status_msg = ?, updated_at = ? WHERE bot_id = ?;",
+            (msg, now_kst, bid),
+        )
+    for k, v in (
+        ("guardrail_emergency_halted", "1"),
+        ("guardrail_emergency_code", code),
+        ("guardrail_emergency_reason", msg),
+        ("guardrail_emergency_at", now_kst),
+    ):
+        conn.execute(
+            "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES (?, ?, ?);",
+            (k, v, now_kst),
+        )
+
+
+def _py_record_block_in_tx(conn, bot_id: str, ticker: str, code: str, reason: str) -> None:
+    now_iso = _now_utc_iso()
+    conn.execute(
+        "INSERT INTO live_guardrail_events (bot_id, market, side, block_code, reason, created_at) VALUES (?, ?, 'BUY', ?, ?, ?);",
+        (bot_id, ticker, code, reason, now_iso),
+    )
+    win_sec = _get_guardrail_int(conn, "live_anomaly_window_sec", "LIVE_ANOMALY_WINDOW_SEC", 300)
+    thresh = _get_guardrail_int(conn, "live_anomaly_block_threshold", "LIVE_ANOMALY_BLOCK_THRESHOLD", 5)
+    cutoff_iso = datetime.datetime.fromtimestamp(time.time() - win_sec, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    cnt_row = conn.execute(
+        "SELECT COUNT(*) AS cnt FROM live_guardrail_events WHERE bot_id = ? AND side = 'BUY' AND created_at >= ?;",
+        (bot_id, cutoff_iso),
+    ).fetchone()
+    cnt = int(dict(cnt_row).get("cnt") or 0) if cnt_row else 0
+    if cnt >= thresh:
+        _py_trip_kill_switch_in_tx(
+            conn,
+            bot_id,
+            "REPEATED_BLOCK_ANOMALY",
+            f"최근 {win_sec // 60}분 내 차단 {cnt}회 누적(최근: {code})으로 자동 비상 정지",
+            halt_all=False,
+        )
+
+
+def reconcile_python_unknown_timeout_intents(db_path: Optional[str] = None) -> Dict[str, int]:
+    """[Layer 2] Python 측 미해결 UNKNOWN_TIMEOUT 인텐트를 GET /v1/order?identifier=... 로 정산합니다."""
+    summary = {"checked": 0, "confirmed": 0, "refunded": 0, "pending": 0}
+    if not is_python_live_executor_authorized():
+        return summary
+    conn = get_db_connection(db_path)
+    try:
+        _ensure_py_guardrail_tables(conn)
+        rows = conn.execute(
+            "SELECT * FROM live_order_intents WHERE status = 'UNKNOWN_TIMEOUT' ORDER BY created_at ASC;"
+        ).fetchall()
+        for row in rows:
+            it = dict(row)
+            summary["checked"] += 1
+            intent_id = it["intent_id"]
+            status_code, detail, net_err = _py_get_upbit_order_by_identifier(intent_id)
+            if status_code == 404:
+                now_iso = _now_utc_iso()
+                now_kst = _now_kst_str()
+                conn.execute("BEGIN IMMEDIATE;")
+                upd = conn.execute(
+                    """
+                    UPDATE live_order_intents
+                    SET status = 'FAILED_NOT_CREATED', refunded = 1, error_message = '404 order_not_found', updated_at = ?
+                    WHERE intent_id = ? AND refunded = 0;
+                    """,
+                    (now_iso, intent_id),
+                )
+                if upd.rowcount == 1 and it.get("side") == "BUY" and int(it.get("requested_krw") or 0) > 0:
+                    req_krw = int(it["requested_krw"])
+                    conn.execute("UPDATE bots SET virtual_krw = virtual_krw + ?, updated_at = ? WHERE bot_id = ?;", (req_krw, now_kst, it["bot_id"]))
+                    conn.execute("UPDATE bot_accounts SET virtual_krw = virtual_krw + ?, updated_at = ? WHERE bot_id = ?;", (req_krw, now_kst, it["bot_id"]))
+                elif it.get("side") == "SELL" and it.get("target_position_uuid"):
+                    conn.execute(
+                        "UPDATE bot_positions SET closing_lock = 0 WHERE order_uuid = ? AND status = 'OPEN';",
+                        (it["target_position_uuid"],),
+                    )
+                conn.commit()
+                summary["refunded"] += 1
+            elif status_code == 200 and isinstance(detail, dict):
+                filled = round_down_volume_8(detail.get("executed_volume") or 0)
+                if filled > 0 and it.get("side") == "BUY":
+                    order_uuid = str(detail.get("uuid") or f"upbit-{intent_id}")
+                    now_iso = _now_utc_iso()
+                    now_kst = _now_kst_str()
+                    conn.execute("BEGIN IMMEDIATE;")
+                    exists = conn.execute("SELECT id FROM bot_positions WHERE order_uuid = ?;", (order_uuid,)).fetchone()
+                    if not exists:
+                        trades = detail.get("trades") or []
+                        total_funds = sum(float(t.get("funds") or 0.0) for t in trades if isinstance(t, dict))
+                        exec_price = (total_funds / filled) if total_funds > 0 else float(detail.get("price") or 0.0)
+                        buy_amt = int(math.floor(total_funds if total_funds > 0 else filled * exec_price))
+                        buy_fee = float(detail.get("paid_fee") or (buy_amt * UPBIT_FEE_RATE))
+                        vol_str = format_volume_8(filled)
+                        t_cur = conn.execute(
+                            "INSERT INTO trades (bot_id, market, buy_order_uuid, buy_price, buy_volume, buy_amount, buy_date, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'HOLDING');",
+                            (it["bot_id"], it["market"], order_uuid, exec_price, vol_str, buy_amt, now_kst),
+                        )
+                        trade_id = int(getattr(t_cur.cur, "lastrowid", 0) or 0)
+                        conn.execute(
+                            """
+                            INSERT INTO bot_positions (bot_id, market, ticker, order_uuid, volume, avg_buy_price, buy_amount, buy_fee, trade_id, highest_price, step_level, status, created_at, buy_reason, closing_lock)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'OPEN', ?, '[타임아웃 정산]', 0);
+                            """,
+                            (it["bot_id"], it["market"], it["market"], order_uuid, vol_str, exec_price, buy_amt, buy_fee, trade_id, exec_price, now_kst),
+                        )
+                    upd = conn.execute(
+                        "UPDATE live_order_intents SET upbit_order_uuid = ?, status = 'CONFIRMED', refunded = 1, updated_at = ? WHERE intent_id = ? AND refunded = 0;",
+                        (order_uuid, now_iso, intent_id),
+                    )
+                    if upd.rowcount == 1:
+                        req_krw = int(it.get("requested_krw") or 0)
+                        trades = detail.get("trades") or []
+                        total_funds = sum(float(t.get("funds") or 0.0) for t in trades if isinstance(t, dict))
+                        spent = int(math.floor(total_funds + float(detail.get("paid_fee") or 0.0))) if total_funds > 0 else req_krw
+                        surplus = max(0, req_krw - spent)
+                        if surplus > 0:
+                            conn.execute("UPDATE bots SET virtual_krw = virtual_krw + ?, updated_at = ? WHERE bot_id = ?;", (surplus, now_kst, it["bot_id"]))
+                            conn.execute("UPDATE bot_accounts SET virtual_krw = virtual_krw + ?, updated_at = ? WHERE bot_id = ?;", (surplus, now_kst, it["bot_id"]))
+                    conn.commit()
+                    summary["confirmed"] += 1
+                else:
+                    summary["pending"] += 1
+            else:
+                summary["pending"] += 1
+    except Exception as exc:
+        logger.warning("[Guardrail] Python timeout reconciliation error: %s", exc)
+    finally:
+        conn.close()
+    return summary
 
 
 def check_upper_wick_and_overextension(
@@ -369,6 +817,21 @@ def can_enter_position(
             f"DEFERRED_TO_NODEJS_BACKEND: Active Node.js backend manages trading for {norm_id}",
         )
 
+    # [Phase 1 하드 가드레일] LIVE_EXECUTOR_OWNER != 'python' 인 경우 Python 실전 매수 진입 원천 차단
+    if not is_paper and not is_dry_run() and not is_python_live_executor_authorized():
+        owner = get_live_executor_owner()
+        logger.warning(
+            "[Guardrail][LIVE_EXECUTOR_OWNER=%s] Blocked Python live can_enter_position for %s (%s)",
+            owner,
+            norm_id,
+            ticker,
+        )
+        return (
+            False,
+            0.0,
+            f"LIVE_EXECUTOR_OWNER_MISMATCH: LIVE_EXECUTOR_OWNER='{owner}' blocks Python live entry",
+        )
+
     if is_paper or is_dry_run():
         fee_buffer = 1.0 - UPBIT_FEE_RATE
         raw_available_buffered = available_krw * fee_buffer
@@ -547,28 +1010,59 @@ def execute_limit_order_with_polling(
     price: float,
     volume: float,
     timeout_sec: int = 40,
+    identifier: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     시장가 슬리피지 방어를 위한 최유리 지정가 주문 및 최대 40초 폴링 래퍼.
-    미체결 시 주문 취소(cancel_order) 및 체결 수량/수수료 확인.
+    - Phase 1/2 하드 가드레일: LIVE_EXECUTOR_OWNER='python' 검증, identifier 포함, 주문 생성 맹목 재시도 금지.
+    - 미체결 시 주문 취소(cancel_order) 및 체결 수량/수수료 확인.
     """
+    if not is_dry_run() and not is_python_live_executor_authorized():
+        logger.warning(
+            "[Guardrail][LIVE_EXECUTOR_OWNER=%s] Blocked Python limit order (%s %s)",
+            get_live_executor_owner(),
+            side,
+            ticker,
+        )
+        return None
+
     vol_rounded = round_down_volume_8(volume)
     if vol_rounded <= 0:
         logger.warning("[%s %s] Rounded volume <= 0 (%s)", side, ticker, volume)
         return None
     price_val = float(price)
+    order_uuid = ""
     try:
-        if side == "bid":
-            res = retry_with_backoff(upbit.buy_limit_order, ticker, price_val, vol_rounded)
+        # 실제 pyupbit.Upbit 클라이언트이고 identifier가 주어지면 업비트 REST POST /v1/orders 로 identifier 멱등성 직접 전송 (절대 맹목 재시도 금지)
+        if identifier and isinstance(upbit, pyupbit.Upbit) and os.getenv("UPBIT_ACCESS_KEY", "").strip() and os.getenv("UPBIT_SECRET_KEY", "").strip():
+            params = {
+                "market": ticker,
+                "side": side,
+                "volume": format_volume_8(vol_rounded),
+                "price": str(price_val),
+                "ord_type": "limit",
+                "identifier": str(identifier),
+            }
+            status_code, body, net_err = _py_post_upbit_order_with_identifier(params)
+            if net_err or status_code >= 500 or status_code == 0:
+                return {"uncertain_timeout": True, "error": net_err or f"HTTP {status_code}"}
+            if status_code not in (200, 201) or not isinstance(body, dict) or "uuid" not in body:
+                logger.warning("[%s %s] Limit order rejected (HTTP %s): %s", side, ticker, status_code, body)
+                return None
+            order_uuid = str(body["uuid"])
         else:
-            res = retry_with_backoff(upbit.sell_limit_order, ticker, price_val, vol_rounded)
-        if not res or "uuid" not in res:
-            logger.warning("[%s %s] Limit order placement failed or returned no uuid: %s", side, ticker, res)
-            return None
-        order_uuid = res["uuid"]
+            # 맹목 재시도 금지: 단일 호출만 수행
+            if side == "bid":
+                res = upbit.buy_limit_order(ticker, price_val, vol_rounded)
+            else:
+                res = upbit.sell_limit_order(ticker, price_val, vol_rounded)
+            if not res or "uuid" not in res:
+                logger.warning("[%s %s] Limit order placement failed or returned no uuid: %s", side, ticker, res)
+                return None
+            order_uuid = res["uuid"]
     except Exception as exc:
-        logger.warning("[%s %s] Limit order error: %s", side, ticker, exc)
-        return None
+        logger.warning("[%s %s] Limit order error (uncertain): %s", side, ticker, exc)
+        return {"uncertain_timeout": True, "error": str(exc)}
 
     poll_start = time.time()
     filled_vol = 0.0
@@ -642,8 +1136,24 @@ def execute_buy_order(
 
     conn = get_db_connection(db_path)
     try:
+        _ensure_py_guardrail_tables(conn)
         dry = is_dry_run()
         upbit = get_upbit_client()
+
+        # [Layer 1 하드 가드레일] 실전 모드에서 LIVE_EXECUTOR_OWNER != 'python' 이면 즉시 차단
+        if not dry:
+            if not is_python_live_executor_authorized():
+                logger.warning(
+                    "[Guardrail][LIVE_EXECUTOR_OWNER=%s] HARD BLOCK Python live BUY for %s (%s)",
+                    get_live_executor_owner(),
+                    norm_bot_id,
+                    ticker,
+                )
+                return None
+            lease_ok, lease_reason = acquire_live_executor_lease(db_path=db_path)
+            if not lease_ok:
+                logger.warning("[%s] Live BUY blocked by lease lock: %s", norm_bot_id, lease_reason)
+                return None
 
         current_price = get_safe_current_price(ticker)
         if current_price <= 0:
@@ -663,11 +1173,139 @@ def execute_buy_order(
             return None
         order_uuid = f"sim-buy-{uuid.uuid4().hex[:12]}"
         executed_price = current_price
+        live_intent_id: Optional[str] = None
+        reserved_krw = 0
 
         if not dry and upbit:
-            # 1. 슬리피지 방어를 위한 최유리 지정가 주문 우선 시도 (35초 폴링)
-            limit_res = execute_limit_order_with_polling(upbit, "bid", ticker, current_price, limit_volume, timeout_sec=35)
-            if limit_res:
+            # [Step A: 5중 가드레일 원자적 BEGIN IMMEDIATE 선점 + 선차감]
+            now_ts = time.time()
+            now_iso = _now_utc_iso()
+            now_kst_claim = _now_kst_str()
+            intent_id = str(uuid.uuid4())
+            intent_bucket = _build_py_buy_bucket(norm_bot_id, ticker, step_level)
+            reserved_krw = int(math.floor(invest_krw + math.ceil(invest_krw * UPBIT_FEE_RATE)))
+            try:
+                conn.execute("BEGIN IMMEDIATE;")
+                bot_row = conn.execute("SELECT * FROM bots WHERE bot_id = ?;", (norm_bot_id,)).fetchone()
+                cur_vkrw = float(dict(bot_row).get("virtual_krw") or 0) if bot_row else 0.0
+                if cur_vkrw < 0:
+                    _py_trip_kill_switch_in_tx(conn, norm_bot_id, "NEGATIVE_VIRTUAL_KRW", f"virtual_krw={cur_vkrw} < 0")
+                    conn.commit()
+                    return None
+                to_row = conn.execute("SELECT COUNT(*) AS cnt FROM live_order_intents WHERE status = 'UNKNOWN_TIMEOUT';").fetchone()
+                to_thresh = _get_guardrail_int(conn, "live_anomaly_timeout_threshold", "LIVE_ANOMALY_TIMEOUT_THRESHOLD", 2)
+                if to_row and int(dict(to_row).get("cnt") or 0) >= to_thresh:
+                    _py_trip_kill_switch_in_tx(conn, norm_bot_id, "UNRESOLVED_TIMEOUT_ANOMALY", "미해결 UNKNOWN_TIMEOUT 임계치 도달", halt_all=True)
+                    conn.commit()
+                    return None
+                inflight = conn.execute(
+                    "SELECT intent_id FROM live_order_intents WHERE bot_id = ? AND market = ? AND side = 'BUY' AND status IN ('PENDING', 'SUBMITTED', 'UNKNOWN_TIMEOUT') LIMIT 1;",
+                    (norm_bot_id, ticker),
+                ).fetchone()
+                if inflight:
+                    _py_record_block_in_tx(conn, norm_bot_id, ticker, "INFLIGHT_OR_TIMEOUT_INTENT", "미확정 매수 인텐트 존재")
+                    conn.commit()
+                    return None
+                open_cnt_row = conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM bot_positions WHERE (bot_id = ? OR bot_id = ?) AND COALESCE(NULLIF(ticker, ''), market) = ? AND status = 'OPEN';",
+                    (bot_id, norm_bot_id, ticker),
+                ).fetchone()
+                open_cnt = int(dict(open_cnt_row).get("cnt") or 0) if open_cnt_row else 0
+                max_steps = 3 if norm_bot_id == "bot_06" else (2 if norm_bot_id == "bot_10" else 1)
+                if (norm_bot_id not in SPLIT_ALLOWED_BOTS and open_cnt > 0) or open_cnt >= max_steps or step_level > max_steps:
+                    _py_record_block_in_tx(conn, norm_bot_id, ticker, "DUPLICATE_OPEN_POSITION", f"보유 포지션 상한({max_steps}) 초과")
+                    conn.commit()
+                    return None
+                # Layer 4: 쿨다운(900s), 최소간격(60s/30s), 시간당(3), 일일(12), 전체일일(30)
+                cd_sec = _get_guardrail_int(conn, "live_reentry_cooldown_sec", "LIVE_REENTRY_COOLDOWN_SEC", 900)
+                if open_cnt == 0:
+                    cd_kst = (datetime.datetime.now(KST_TZ) - datetime.timedelta(seconds=cd_sec)).strftime("%Y-%m-%d %H:%M:%S")
+                    recent_sell = conn.execute(
+                        "SELECT id FROM trades WHERE bot_id = ? AND market = ? AND status = 'COMPLETED' AND sell_date >= ? LIMIT 1;",
+                        (norm_bot_id, ticker, cd_kst),
+                    ).fetchone()
+                    if recent_sell:
+                        _py_record_block_in_tx(conn, norm_bot_id, ticker, "REENTRY_COOLDOWN", f"청산 후 {cd_sec}초 쿨다운 미경과")
+                        conn.commit()
+                        return None
+                min_int_sec = 30 if (norm_bot_id in SPLIT_ALLOWED_BOTS and open_cnt > 0) else _get_guardrail_int(conn, "live_min_buy_interval_sec", "LIVE_MIN_BUY_INTERVAL_SEC", 60)
+                int_iso = datetime.datetime.fromtimestamp(now_ts - min_int_sec, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+                if conn.execute(
+                    "SELECT intent_id FROM live_order_intents WHERE bot_id = ? AND side = 'BUY' AND status IN ('PENDING','SUBMITTED','UNKNOWN_TIMEOUT','CONFIRMED') AND created_at >= ? LIMIT 1;",
+                    (norm_bot_id, int_iso),
+                ).fetchone():
+                    _py_record_block_in_tx(conn, norm_bot_id, ticker, "MIN_BUY_INTERVAL", f"최소 매수 간격({min_int_sec}s) 미경과")
+                    conn.commit()
+                    return None
+                hr_cap = _get_guardrail_int(conn, "live_max_buys_per_bot_hour", "LIVE_MAX_BUYS_PER_BOT_HOUR", 3)
+                hr_iso = datetime.datetime.fromtimestamp(now_ts - 3600, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+                hr_cnt = int(dict(conn.execute("SELECT COUNT(*) AS c FROM live_order_intents WHERE bot_id = ? AND side = 'BUY' AND status IN ('PENDING','SUBMITTED','UNKNOWN_TIMEOUT','CONFIRMED') AND created_at >= ?;", (norm_bot_id, hr_iso)).fetchone()).get("c") or 0)
+                if hr_cnt >= hr_cap:
+                    _py_record_block_in_tx(conn, norm_bot_id, ticker, "BOT_HOURLY_BUY_CAP", f"시간당 매수 상한({hr_cnt}/{hr_cap}) 초과")
+                    conn.commit()
+                    return None
+                day_cap = _get_guardrail_int(conn, "live_max_buys_per_bot_day", "LIVE_MAX_BUYS_PER_BOT_DAY", 12)
+                tot_cap = _get_guardrail_int(conn, "live_max_total_buys_day", "LIVE_MAX_TOTAL_BUYS_DAY", 30)
+                today_iso = _today_start_kst_utc_iso()
+                day_cnt = int(dict(conn.execute("SELECT COUNT(*) AS c FROM live_order_intents WHERE bot_id = ? AND side = 'BUY' AND status IN ('PENDING','SUBMITTED','UNKNOWN_TIMEOUT','CONFIRMED') AND created_at >= ?;", (norm_bot_id, today_iso)).fetchone()).get("c") or 0)
+                if day_cnt >= day_cap:
+                    _py_record_block_in_tx(conn, norm_bot_id, ticker, "BOT_DAILY_BUY_CAP", f"일일 매수 상한({day_cnt}/{day_cap}) 초과")
+                    conn.commit()
+                    return None
+                tot_cnt = int(dict(conn.execute("SELECT COUNT(*) AS c FROM live_order_intents WHERE side = 'BUY' AND status IN ('PENDING','SUBMITTED','UNKNOWN_TIMEOUT','CONFIRMED') AND created_at >= ?;", (today_iso,)).fetchone()).get("c") or 0)
+                if tot_cnt >= tot_cap:
+                    _py_record_block_in_tx(conn, norm_bot_id, ticker, "GLOBAL_DAILY_BUY_CAP", f"전체 일일 매수 상한({tot_cnt}/{tot_cap}) 초과")
+                    conn.commit()
+                    return None
+                if cur_vkrw < reserved_krw:
+                    conn.rollback()
+                    return None
+                conn.execute(
+                    """
+                    INSERT INTO live_order_intents (
+                        intent_id, bot_id, market, side, intent_bucket, requested_krw, requested_volume,
+                        target_position_uuid, upbit_order_uuid, status, refunded, error_message, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'BUY', ?, ?, ?, NULL, NULL, 'PENDING', 0, NULL, ?, ?);
+                    """,
+                    (intent_id, norm_bot_id, ticker, intent_bucket, reserved_krw, format_volume_8(limit_volume), now_iso, now_iso),
+                )
+                upd_b = conn.execute(
+                    "UPDATE bots SET virtual_krw = virtual_krw - ?, updated_at = ? WHERE bot_id = ? AND virtual_krw >= ?;",
+                    (reserved_krw, now_kst_claim, norm_bot_id, reserved_krw),
+                )
+                if upd_b.rowcount != 1:
+                    conn.rollback()
+                    return None
+                conn.execute(
+                    "UPDATE bot_accounts SET virtual_krw = MAX(0.0, virtual_krw - ?), updated_at = ? WHERE bot_id = ?;",
+                    (reserved_krw, now_kst_claim, norm_bot_id),
+                )
+                conn.commit()
+                live_intent_id = intent_id
+            except Exception as claim_exc:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                logger.warning("[%s] Live BUY Step A blocked/conflict (%s): %s", norm_bot_id, ticker, claim_exc)
+                return None
+
+            # [Step B] 업비트 주문 전송 (identifier 포함, 절대 맹목 재시도 금지)
+            limit_res = execute_limit_order_with_polling(
+                upbit, "bid", ticker, current_price, limit_volume, timeout_sec=35, identifier=live_intent_id
+            )
+            if isinstance(limit_res, dict) and limit_res.get("uncertain_timeout"):
+                # 타임아웃/불확실 -> 절대 즉시 환불/재주문 금지, UNKNOWN_TIMEOUT 잠금
+                conn.execute("BEGIN IMMEDIATE;")
+                conn.execute(
+                    "UPDATE live_order_intents SET status = 'UNKNOWN_TIMEOUT', error_message = ?, updated_at = ? WHERE intent_id = ?;",
+                    (str(limit_res.get("error") or "timeout")[:400], _now_utc_iso(), live_intent_id),
+                )
+                conn.commit()
+                logger.warning("[%s] Live BUY uncertain timeout; locked UNKNOWN_TIMEOUT (intent=%s)", norm_bot_id, live_intent_id)
+                return None
+
+            if limit_res and "uuid" in limit_res:
                 order_uuid = limit_res["uuid"]
                 executed_price = float(limit_res.get("executed_price") or current_price)
                 filled_vol = round_down_volume_8(limit_res.get("executed_volume") or 0)
@@ -676,39 +1314,19 @@ def execute_buy_order(
                 buy_fee = float(limit_res.get("paid_fee") or (volume * executed_price * UPBIT_FEE_RATE))
                 invest_krw = float(math.floor(volume * executed_price + buy_fee))
             else:
-                # 2. 지정가 미체결/실패 시 안전 시장가 매수 폴백
-                logger.info("[%s] Limit buy not filled; falling back to market buy for %s", norm_bot_id, ticker)
-                res = retry_with_backoff(upbit.buy_market_order, ticker, invest_krw)
-                if not res or "uuid" not in res:
-                    logger.error("[%s] Live market buy order failed for %s", norm_bot_id, ticker)
-                    return None
-                order_uuid = res["uuid"]
-                order_detail = None
-                for _attempt in range(3):
-                    time.sleep(0.5)
-                    order_detail = retry_with_backoff(upbit.get_order, order_uuid)
-                    if order_detail and str(order_detail.get("state") or "") in ("done", "cancel"):
-                        break
-                if order_detail:
-                    exec_vol = round_down_volume_8(order_detail.get("executed_volume") or 0)
-                    if exec_vol > 0:
-                        volume = exec_vol
-                    raw_fee = order_detail.get("paid_fee")
-                    if raw_fee is not None and str(raw_fee) != "":
-                        buy_fee = float(raw_fee)
-                    trades = order_detail.get("trades") or []
-                    total_funds = sum(float(t.get("funds") or 0.0) for t in trades if isinstance(t, dict))
-                    if total_funds > 0 and volume > 0:
-                        executed_price = total_funds / volume
-                        invest_krw = float(math.floor(total_funds + buy_fee))
-                    else:
-                        raw_price = order_detail.get("price")
-                        if raw_price is not None and str(raw_price) != "" and float(raw_price) > 0:
-                            # Upbit market-buy 'price' field is total KRW order amount, not unit price
-                            if volume > 0 and abs(float(raw_price) - invest_krw) < max(1000.0, invest_krw * 0.2):
-                                executed_price = float(raw_price) / volume
-                            else:
-                                executed_price = current_price
+                # 지정가 미체결/명확한 거절 시 선차감 원화 1회 안전 환불 (중복 시장가 폴백 주문 금지로 연속 결제 사고 원천 차단)
+                conn.execute("BEGIN IMMEDIATE;")
+                ref_upd = conn.execute(
+                    "UPDATE live_order_intents SET status = 'CANCELED', refunded = 1, error_message = 'limit_unfilled_or_rejected', updated_at = ? WHERE intent_id = ? AND refunded = 0;",
+                    (_now_utc_iso(), live_intent_id),
+                )
+                if ref_upd.rowcount == 1 and reserved_krw > 0:
+                    now_kst_ref = _now_kst_str()
+                    conn.execute("UPDATE bots SET virtual_krw = virtual_krw + ?, updated_at = ? WHERE bot_id = ?;", (reserved_krw, now_kst_ref, norm_bot_id))
+                    conn.execute("UPDATE bot_accounts SET virtual_krw = virtual_krw + ?, updated_at = ? WHERE bot_id = ?;", (reserved_krw, now_kst_ref, norm_bot_id))
+                conn.commit()
+                logger.info("[%s] Live limit buy unfilled/canceled; refunded %d KRW safely.", norm_bot_id, reserved_krw)
+                return None
 
         now_kst = _now_kst_str()
         vol_str = format_volume_8(volume)
@@ -765,25 +1383,42 @@ def execute_buy_order(
                 ),
             )
 
-            # bot_accounts 및 bots의 virtual_krw 동시 차감
-            conn.execute(
-                """
-                UPDATE bot_accounts
-                SET virtual_krw = MAX(0.0, virtual_krw - ?),
-                    updated_at = ?
-                WHERE bot_id = ?;
-                """,
-                (invest_krw, now_kst, norm_bot_id),
-            )
-            conn.execute(
-                """
-                UPDATE bots
-                SET virtual_krw = MAX(0, virtual_krw - ?),
-                    updated_at = ?
-                WHERE bot_id = ?;
-                """,
-                (math.floor(invest_krw), now_kst, norm_bot_id),
-            )
+            # bot_accounts 및 bots의 virtual_krw 정산 (실전 2PC 선차감 시 차액만 환불/정산, DRY_RUN은 차감)
+            if live_intent_id:
+                upd_i = conn.execute(
+                    "UPDATE live_order_intents SET upbit_order_uuid = ?, status = 'CONFIRMED', refunded = 1, updated_at = ? WHERE intent_id = ? AND refunded = 0;",
+                    (order_uuid, _now_utc_iso(), live_intent_id),
+                )
+                if upd_i.rowcount == 1:
+                    diff_krw = int(reserved_krw) - int(math.floor(invest_krw))
+                    if diff_krw != 0:
+                        conn.execute(
+                            "UPDATE bot_accounts SET virtual_krw = MAX(0.0, virtual_krw + ?), updated_at = ? WHERE bot_id = ?;",
+                            (diff_krw, now_kst, norm_bot_id),
+                        )
+                        conn.execute(
+                            "UPDATE bots SET virtual_krw = MAX(0, virtual_krw + ?), updated_at = ? WHERE bot_id = ?;",
+                            (diff_krw, now_kst, norm_bot_id),
+                        )
+            else:
+                conn.execute(
+                    """
+                    UPDATE bot_accounts
+                    SET virtual_krw = MAX(0.0, virtual_krw - ?),
+                        updated_at = ?
+                    WHERE bot_id = ?;
+                    """,
+                    (invest_krw, now_kst, norm_bot_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE bots
+                    SET virtual_krw = MAX(0, virtual_krw - ?),
+                        updated_at = ?
+                    WHERE bot_id = ?;
+                    """,
+                    (math.floor(invest_krw), now_kst, norm_bot_id),
+                )
 
             conn.commit()
             logger.info(
@@ -828,8 +1463,23 @@ def execute_sell_order(
 
     conn = get_db_connection(db_path)
     try:
+        _ensure_py_guardrail_tables(conn)
         dry = is_dry_run()
         upbit = get_upbit_client()
+
+        # [Layer 1 하드 가드레일] 실전 모드에서 LIVE_EXECUTOR_OWNER != 'python' 이면 즉시 차단
+        if not dry:
+            if not is_python_live_executor_authorized():
+                logger.warning(
+                    "[Guardrail][LIVE_EXECUTOR_OWNER=%s] HARD BLOCK Python live SELL for pos=%d",
+                    get_live_executor_owner(),
+                    position_id,
+                )
+                return None
+            lease_ok, lease_reason = acquire_live_executor_lease(db_path=db_path)
+            if not lease_ok:
+                logger.warning("[pos=%d] Live SELL blocked by lease lock: %s", position_id, lease_reason)
+                return None
 
         pos_row = conn.execute("SELECT * FROM bot_positions WHERE id = ? AND status = 'OPEN';", (position_id,)).fetchone()
         if not pos_row:
@@ -873,11 +1523,73 @@ def execute_sell_order(
         executed_sell_price = current_price
         is_partial_fill = False
         remaining_vol = 0.0
+        sell_intent_id: Optional[str] = None
+        target_pos_uuid = str(pos.get("order_uuid") or f"pos-{position_id}")
 
         if not dry and upbit:
-            # 엄격하게 본인 bot_positions에 기록된 volume 수량만 지정하여 최유리 지정가 매도 우선 시도
-            limit_res = execute_limit_order_with_polling(upbit, "ask", ticker, current_price, volume, timeout_sec=35)
-            if limit_res:
+            # [Layer 3] 동일 order_uuid 중복 매도 차단: closing_lock=1 + live_order_intents(sell:<order_uuid>) 원자적 선점
+            # (Graceful Drain / 매수 쿨다운 / 매수 상한에는 절대 차단되지 않음)
+            sell_intent_id = str(uuid.uuid4())
+            sell_bucket = f"sell:{target_pos_uuid}"
+            try:
+                conn.execute("BEGIN IMMEDIATE;")
+                lock_upd = conn.execute(
+                    "UPDATE bot_positions SET closing_lock = 1 WHERE id = ? AND status = 'OPEN' AND COALESCE(closing_lock, 0) = 0;",
+                    (position_id,),
+                )
+                if lock_upd.rowcount != 1:
+                    conn.rollback()
+                    logger.warning("[%s] Duplicate live sell blocked by closing_lock for pos %d (%s)", norm_bot_id, position_id, target_pos_uuid)
+                    return None
+                now_iso = _now_utc_iso()
+                conn.execute(
+                    """
+                    INSERT INTO live_order_intents (
+                        intent_id, bot_id, market, side, intent_bucket, requested_krw, requested_volume,
+                        target_position_uuid, upbit_order_uuid, status, refunded, error_message, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'SELL', ?, 0, ?, ?, NULL, 'PENDING', 0, NULL, ?, ?);
+                    """,
+                    (sell_intent_id, norm_bot_id, ticker, sell_bucket, format_volume_8(volume), target_pos_uuid, now_iso, now_iso),
+                )
+                conn.commit()
+            except Exception as sl_exc:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                logger.warning("[%s] Duplicate live sell blocked for pos %d (%s): %s", norm_bot_id, position_id, target_pos_uuid, sl_exc)
+                return None
+
+            def _release_py_sell_lock(next_status: str, err_msg: str) -> None:
+                try:
+                    conn.execute("BEGIN IMMEDIATE;")
+                    archived_bucket = f"{sell_bucket}:{next_status.lower()}:{sell_intent_id[:8]}"
+                    conn.execute(
+                        "UPDATE live_order_intents SET status = ?, intent_bucket = ?, error_message = ?, updated_at = ? WHERE intent_id = ?;",
+                        (next_status, archived_bucket, err_msg[:400], _now_utc_iso(), sell_intent_id),
+                    )
+                    conn.execute("UPDATE bot_positions SET closing_lock = 0 WHERE id = ? AND status = 'OPEN';", (position_id,))
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+
+            # 엄격하게 본인 bot_positions에 기록된 volume 수량만 지정하여 최유리 지정가 매도 우선 시도 (identifier 포함)
+            limit_res = execute_limit_order_with_polling(
+                upbit, "ask", ticker, current_price, volume, timeout_sec=35, identifier=sell_intent_id
+            )
+            if isinstance(limit_res, dict) and limit_res.get("uncertain_timeout"):
+                conn.execute("BEGIN IMMEDIATE;")
+                conn.execute(
+                    "UPDATE live_order_intents SET status = 'UNKNOWN_TIMEOUT', error_message = ?, updated_at = ? WHERE intent_id = ?;",
+                    (str(limit_res.get("error") or "sell_timeout")[:400], _now_utc_iso(), sell_intent_id),
+                )
+                conn.commit()
+                return None
+
+            if limit_res and "uuid" in limit_res:
                 sell_order_uuid = limit_res["uuid"]
                 executed_sell_price = float(limit_res.get("executed_price") or current_price)
                 filled_vol = round_down_volume_8(limit_res.get("executed_volume") or 0)
@@ -899,10 +1611,42 @@ def execute_sell_order(
                     realized_pnl = net_sell_amount - buy_amount
                     pnl_pct = (realized_pnl / buy_amount) * 100.0 if buy_amount > 0 else 0.0
             else:
-                logger.info("[%s] Limit sell not filled; falling back to market sell for pos %d (%s, vol=%.8f)", bot_id, position_id, ticker, volume)
-                res = retry_with_backoff(upbit.sell_market_order, ticker, volume)
+                logger.info("[%s] Limit sell not filled; falling back to single market sell for pos %d (%s, vol=%.8f)", bot_id, position_id, ticker, volume)
+                # 절대 맹목 재시도(retry_with_backoff) 금지: 단일 호출만 수행 (Mock Upbit 테스트 시 외부 네트워크 미호출 보장)
+                try:
+                    if isinstance(upbit, pyupbit.Upbit) and os.getenv("UPBIT_ACCESS_KEY", "").strip() and os.getenv("UPBIT_SECRET_KEY", "").strip():
+                        mkt_id = str(uuid.uuid4())
+                        m_status, m_body, m_err = _py_post_upbit_order_with_identifier(
+                            {
+                                "market": ticker,
+                                "side": "ask",
+                                "volume": format_volume_8(volume),
+                                "ord_type": "market",
+                                "identifier": mkt_id,
+                            }
+                        )
+                        if m_err or m_status >= 500 or m_status == 0:
+                            conn.execute("BEGIN IMMEDIATE;")
+                            conn.execute(
+                                "UPDATE live_order_intents SET status = 'UNKNOWN_TIMEOUT', error_message = ?, updated_at = ? WHERE intent_id = ?;",
+                                (str(m_err or f"HTTP {m_status}")[:400], _now_utc_iso(), sell_intent_id),
+                            )
+                            conn.commit()
+                            return None
+                        res = m_body if m_status in (200, 201) else None
+                    else:
+                        res = upbit.sell_market_order(ticker, volume)
+                except Exception as ms_exc:
+                    conn.execute("BEGIN IMMEDIATE;")
+                    conn.execute(
+                        "UPDATE live_order_intents SET status = 'UNKNOWN_TIMEOUT', error_message = ?, updated_at = ? WHERE intent_id = ?;",
+                        (str(ms_exc)[:400], _now_utc_iso(), sell_intent_id),
+                    )
+                    conn.commit()
+                    return None
                 if not res or "uuid" not in res:
                     logger.error("[%s] Live market sell failed for pos %d (%s, vol=%.8f)", bot_id, position_id, ticker, volume)
+                    _release_py_sell_lock("FAILED_NOT_CREATED", "Live market sell rejected")
                     return None
                 sell_order_uuid = res["uuid"]
                 order_detail = None
@@ -948,7 +1692,8 @@ def execute_sell_order(
                     UPDATE bot_positions
                     SET volume = ?,
                         buy_amount = ?,
-                        sell_order_uuid = ?
+                        sell_order_uuid = ?,
+                        closing_lock = 0
                     WHERE id = ? AND status = 'OPEN';
                     """,
                     (format_volume_8(remaining_vol), rem_buy_amount, sell_order_uuid, position_id),
@@ -958,7 +1703,7 @@ def execute_sell_order(
                     logger.warning("[%s] Position %d already modified/closed concurrently.", norm_bot_id, position_id)
                     return None
             else:
-                # 1. bot_positions 상태 업데이트 (CLOSED, 원자적 OPEN 가드)
+                # 1. bot_positions 상태 업데이트 (CLOSED, 원자적 OPEN 가드 + closing_lock 해제)
                 upd = conn.execute(
                     """
                     UPDATE bot_positions
@@ -969,7 +1714,8 @@ def execute_sell_order(
                         sell_fee = ?,
                         realized_pnl = ?,
                         pnl_pct = ?,
-                        closed_at = ?
+                        closed_at = ?,
+                        closing_lock = 0
                     WHERE id = ? AND status = 'OPEN';
                     """,
                     (
@@ -987,6 +1733,11 @@ def execute_sell_order(
                     conn.rollback()
                     logger.warning("[%s] Position %d already closed concurrently; skipping duplicate settlement.", norm_bot_id, position_id)
                     return None
+            if sell_intent_id:
+                conn.execute(
+                    "UPDATE live_order_intents SET upbit_order_uuid = ?, status = 'CONFIRMED', updated_at = ? WHERE intent_id = ?;",
+                    (sell_order_uuid, _now_utc_iso(), sell_intent_id),
+                )
 
                 trade_id_val = int(pos.get("trade_id") or 0)
                 if trade_id_val > 0:
@@ -1283,11 +2034,22 @@ def run_bot_vb(stop_event, bot_id: str = "bot_01", db_path: Optional[str] = None
     target_tickers = ["KRW-BTC", "KRW-ETH"]
 
     while not stop_event.is_set():
+        if not acquire_live_cycle_mutex(norm_id):
+            if stop_event.wait(timeout=2):
+                break
+            continue
         try:
-            if is_backend_running():
+            if is_backend_running() or (not is_dry_run() and not is_python_live_executor_authorized()):
                 if stop_event.wait(timeout=10):
                     break
                 continue
+            if not is_dry_run():
+                lease_ok, _ = acquire_live_executor_lease(db_path=db_path)
+                if not lease_ok:
+                    if stop_event.wait(timeout=10):
+                        break
+                    continue
+                reconcile_python_unknown_timeout_intents(db_path=db_path)
 
             conn = get_db_connection(db_path)
             allow_new_buys = True
@@ -1418,6 +2180,8 @@ def run_bot_vb(stop_event, bot_id: str = "bot_01", db_path: Optional[str] = None
 
         except Exception as loop_exc:
             logger.error("[%s] Unexpected error in loop: %s", bot_id, loop_exc, exc_info=True)
+        finally:
+            release_live_cycle_mutex(norm_id)
 
         if stop_event.wait(timeout=10):
             break
@@ -1443,11 +2207,22 @@ def run_bot_momentum(stop_event, bot_id: str = "bot_03", db_path: Optional[str] 
     MAX_POSITIONS = 2
 
     while not stop_event.is_set():
+        if not acquire_live_cycle_mutex(norm_id):
+            if stop_event.wait(timeout=2):
+                break
+            continue
         try:
-            if is_backend_running():
+            if is_backend_running() or (not is_dry_run() and not is_python_live_executor_authorized()):
                 if stop_event.wait(timeout=10):
                     break
                 continue
+            if not is_dry_run():
+                lease_ok, _ = acquire_live_executor_lease(db_path=db_path)
+                if not lease_ok:
+                    if stop_event.wait(timeout=10):
+                        break
+                    continue
+                reconcile_python_unknown_timeout_intents(db_path=db_path)
 
             conn = get_db_connection(db_path)
             allow_new_buys = True
@@ -1592,6 +2367,8 @@ def run_bot_momentum(stop_event, bot_id: str = "bot_03", db_path: Optional[str] 
 
         except Exception as loop_exc:
             logger.error("[%s] Unexpected error in loop: %s", bot_id, loop_exc, exc_info=True)
+        finally:
+            release_live_cycle_mutex(norm_id)
 
         if stop_event.wait(timeout=15):
             break
@@ -1618,11 +2395,22 @@ def run_bot_bb(stop_event, bot_id: str = "bot_05", db_path: Optional[str] = None
     target_tickers = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP"]
 
     while not stop_event.is_set():
+        if not acquire_live_cycle_mutex(norm_id):
+            if stop_event.wait(timeout=2):
+                break
+            continue
         try:
-            if is_backend_running():
+            if is_backend_running() or (not is_dry_run() and not is_python_live_executor_authorized()):
                 if stop_event.wait(timeout=10):
                     break
                 continue
+            if not is_dry_run():
+                lease_ok, _ = acquire_live_executor_lease(db_path=db_path)
+                if not lease_ok:
+                    if stop_event.wait(timeout=10):
+                        break
+                    continue
+                reconcile_python_unknown_timeout_intents(db_path=db_path)
 
             conn = get_db_connection(db_path)
             allow_new_buys = True
@@ -1804,6 +2592,8 @@ def run_bot_bb(stop_event, bot_id: str = "bot_05", db_path: Optional[str] = None
 
         except Exception as loop_exc:
             logger.error("[%s] Unexpected error in loop: %s", bot_id, loop_exc, exc_info=True)
+        finally:
+            release_live_cycle_mutex(norm_id)
 
         if stop_event.wait(timeout=10):
             break

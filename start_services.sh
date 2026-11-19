@@ -9,6 +9,19 @@ cd "$PROJECT_ROOT"
 
 export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
 
+# 0. Node.js 런타임 버전 확인 (>= 22.5.0)
+if ! command -v node >/dev/null 2>&1; then
+    echo "[ERROR] Node.js가 설치되어 있지 않습니다. Node.js 22.5.0 이상을 설치해주세요." >&2
+    exit 1
+fi
+node -e "
+const [major, minor] = process.versions.node.split('.').map(Number);
+if (major < 22 || (major === 22 && minor < 5)) {
+    console.error('[ERROR] Node.js >= 22.5.0 required. Current: ' + process.version);
+    process.exit(1);
+}
+"
+
 # .env 환경 설정 로드
 if [ -f "$PROJECT_ROOT/.env" ]; then
     set -a
@@ -21,10 +34,15 @@ BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8001}"
 FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
 FRONTEND_PORT="${FRONTEND_PORT:-9000}"
+export LIVE_EXECUTOR_OWNER="${LIVE_EXECUTOR_OWNER:-node}"
+USE_LOCAL_OLLAMA_NEWS="${USE_LOCAL_OLLAMA_NEWS:-true}"
+OLLAMA_NEWS_MODEL="${OLLAMA_NEWS_MODEL:-qwen3-news}"
 
 echo "==================================================="
 echo "[Upbit AutoCoinTrade] 서비스 시작 중..."
 echo "==================================================="
+echo "  - LIVE_EXECUTOR_OWNER : ${LIVE_EXECUTOR_OWNER}"
+echo "  - Local Ollama News   : ${USE_LOCAL_OLLAMA_NEWS} (${OLLAMA_NEWS_MODEL})"
 
 mkdir -p logs data
 
@@ -111,7 +129,8 @@ echo "==================================================="
 echo "- 웹 대시보드 : http://localhost:${FRONTEND_PORT}"
 echo "- 기본 입장 코드 : stock"
 echo "- 백엔드 API   : http://localhost:${BACKEND_PORT}"
-echo "- 서비스 중지  : ./stop_services.sh (또는 ./stop.sh)"
+echo "- 실전 실행 주체 : ${LIVE_EXECUTOR_OWNER}"
+echo "- 서비스 중지  : ./stop_services.sh"
 echo "- 로그 확인    : tail -f logs/backend.log logs/frontend.log"
 echo "==================================================="
 echo ""

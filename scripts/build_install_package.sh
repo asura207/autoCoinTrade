@@ -48,16 +48,11 @@ if [ -d "$PROJECT_ROOT/frontend/dist" ]; then
     cp -r "$PROJECT_ROOT/frontend/dist" "$APP_DIR/frontend/dist"
 fi
 
-# 4. 설정 템플릿 복사 (실제 키가 포함된 파일은 절대 복사하지 않음)
+# 4. 설정 템플릿 복사 (실제 API 키/비밀값이 포함된 .env 및 upbit_config.json은 절대 복사하지 않음)
 echo "[4/6] 설정 템플릿 복사 중..."
 cp "$PROJECT_ROOT/config/upbit_config.example.json" "$APP_DIR/config/"
-if [ ! -f "$APP_DIR/config/upbit_config.json" ]; then
-    cp "$PROJECT_ROOT/config/upbit_config.example.json" "$APP_DIR/config/upbit_config.json"
-fi
 cp "$PROJECT_ROOT/.env.example" "$APP_DIR/.env.example"
-if [ ! -f "$APP_DIR/.env" ]; then
-    cp "$PROJECT_ROOT/.env.example" "$APP_DIR/.env"
-fi
+rm -f "$APP_DIR/.env" "$APP_DIR/config/upbit_config.json" "$APP_DIR/data/"*.db* "$APP_DIR/data/.session_secret" "$APP_DIR/data/.vault_master_key" 2>/dev/null || true
 
 # 5. 파이썬 봇 모듈 및 메인 오케스트레이터 복사
 echo "[5/6] 봇 알고리즘 및 오케스트레이터 복사 중..."

@@ -19,6 +19,7 @@ const runBackendBat = [
   '        if not "%%~A"=="" set "%%~A=%%~B"',
   '    )',
   ')',
+  'if "%LIVE_EXECUTOR_OWNER%"=="" set "LIVE_EXECUTOR_OWNER=node"',
   '',
   'set "NODE_EXE="',
   'where node >nul 2>&1',
@@ -87,101 +88,14 @@ const vbsContent = [
 ].join('\r\n');
 fs.writeFileSync(path.join(scriptsDir, 'start_silent.vbs'), vbsContent, 'utf8');
 
-// 4. scripts/start_services.bat
+// 4. scripts/start_services.bat (루트 표준 진입점 start_services.bat 위임)
 const startBatContent = [
   '@echo off',
-  'chcp 65001 >nul',
-  'setlocal',
-  'title Upbit AutoCoinTrade Services Launcher',
-  '',
-  'cd /d "%~dp0.."',
-  'set "BACKEND_PORT=8001"',
-  'set "FRONTEND_PORT=9000"',
-  'if exist ".env" (',
-  '    for /f "usebackq eol=# tokens=1,* delims==" %%A in (".env") do (',
-  '        if /I "%%~A"=="BACKEND_PORT" set "BACKEND_PORT=%%~B"',
-  '        if /I "%%~A"=="FRONTEND_PORT" set "FRONTEND_PORT=%%~B"',
-  '    )',
-  ')',
-  '',
-  'echo ===================================================',
-  'echo [Upbit AutoTrade] 서비스 시작 중...',
-  'echo ===================================================',
-  '',
-  'if exist "%~dp0..\\stop_services.bat" (',
-  '    call "%~dp0..\\stop_services.bat" >nul 2>&1',
-  ')',
-  '',
-  'wscript.exe "%~dp0start_silent.vbs"',
-  '',
-  'echo.',
-  'echo [안내] 백엔드(Port %BACKEND_PORT%) 및 웹 UI(Port %FRONTEND_PORT%)가 백그라운드에서 실행되었습니다.',
-  'echo [접속 주소] http://localhost:%FRONTEND_PORT%',
-  'echo [입장 코드] stock',
-  'echo.',
-  'ping 127.0.0.1 -n 3 >nul',
+  'REM 표준 루트 실행 진입점(start_services.bat)으로 위임',
+  'call "%~dp0..\\start_services.bat" %*',
   ''
 ].join('\r\n');
 fs.writeFileSync(path.join(scriptsDir, 'start_services.bat'), startBatContent, 'utf8');
 
-// 5. stop_services.bat (root)
-const stopBatContent = [
-  '@echo off',
-  'chcp 65001 >nul',
-  'setlocal enabledelayedexpansion',
-  'title Upbit AutoCoinTrade Services Stopper',
-  '',
-  'cd /d "%~dp0"',
-  'set "BACKEND_PORT=8001"',
-  'set "FRONTEND_PORT=9000"',
-  'if exist ".env" (',
-  '    for /f "usebackq eol=# tokens=1,* delims==" %%A in (".env") do (',
-  '        if /I "%%~A"=="BACKEND_PORT" set "BACKEND_PORT=%%~B"',
-  '        if /I "%%~A"=="FRONTEND_PORT" set "FRONTEND_PORT=%%~B"',
-  '    )',
-  ')',
-  '',
-  'echo ===================================================',
-  'echo [Upbit AutoTrade] 서비스 안전 중지 중... (Port %BACKEND_PORT%, %FRONTEND_PORT%)',
-  'echo ===================================================',
-  '',
-  'for %%F in ("logs\\.backend.pid" "logs\\.frontend.pid" "logs\\.orchestrator.pid") do (',
-  '    if exist %%~F (',
-  '        set /p TARGET_PID=<%%~F',
-  '        if defined TARGET_PID (',
-  '            echo PID 파일 기반 프로세스 종료 [PID: !TARGET_PID!]...',
-  '            taskkill /F /T /PID !TARGET_PID! >nul 2>&1',
-  '        )',
-  '        del /f /q %%~F >nul 2>&1',
-  '    )',
-  ')',
-  '',
-  'for /f "tokens=5" %%a in (\'netstat -aon ^| findstr ":%BACKEND_PORT% " ^| findstr "LISTENING"\') do (',
-  '    echo Port %BACKEND_PORT% 백엔드 프로세스 종료 [PID: %%a]...',
-  '    taskkill /F /T /PID %%a >nul 2>&1',
-  ')',
-  '',
-  'for /f "tokens=5" %%a in (\'netstat -aon ^| findstr ":%FRONTEND_PORT% " ^| findstr "LISTENING"\') do (',
-  '    echo Port %FRONTEND_PORT% 웹 UI 프로세스 종료 [PID: %%a]...',
-  '    taskkill /F /T /PID %%a >nul 2>&1',
-  ')',
-  '',
-  'powershell -NoProfile -Command "$root=\'%CD%\'; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ($_.CommandLine -like \'*node_server.mjs*\' -or $_.CommandLine -like \'*server.mjs*\' -or $_.CommandLine -like \'*main_orchestrator.py*\' -or $_.CommandLine -like \'*llm_filter_worker.py*\') -and $_.CommandLine -like (\'*\' + $root + \'*\') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1',
-  '',
-  'echo ===================================================',
-  'echo [완료] 백엔드, 웹 UI 및 워커 서비스가 안전하게 중지되었습니다.',
-  'echo ===================================================',
-  'ping 127.0.0.1 -n 3 >nul',
-  ''
-].join('\r\n');
-fs.writeFileSync(path.join(projectDir, 'stop_services.bat'), stopBatContent, 'utf8');
-
-// 6. start_services.bat (root)
-const rootStartBatContent = [
-  '@echo off',
-  'call "%~dp0scripts\\start_services.bat"',
-  ''
-].join('\r\n');
-fs.writeFileSync(path.join(projectDir, 'start_services.bat'), rootStartBatContent, 'utf8');
-
-console.log('All launcher and runner scripts updated successfully.');
+console.log('Helper runner scripts (scripts/run_backend.bat, run_frontend.bat, start_silent.vbs, scripts/start_services.bat) updated successfully.');
+console.log('Note: Root start_services.bat / stop_services.bat are maintained directly in project root.');

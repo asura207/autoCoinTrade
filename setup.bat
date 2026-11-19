@@ -94,9 +94,9 @@ echo.
 echo ===================================================
 echo [SUCCESS] Environment setup completed successfully!
 echo ===================================================
-echo - Start services : start_services.bat ^(or start.bat^)
-echo - Stop services  : stop_services.bat ^(or stop.bat^)
-echo - Orchestrator   : run_orchestrator.bat ^(standalone Python mode^)
+echo - Start services : start_services.bat
+echo - Stop services  : stop_services.bat
+echo - Orchestrator   : run_orchestrator.bat ^(Python 보조/독립 모드 · LIVE_EXECUTOR_OWNER 확인^)
 echo - Web Dashboard  : http://localhost:%FRONTEND_PORT%
 echo - Entry Code     : stock
 echo - Backend API    : http://localhost:%BACKEND_PORT%

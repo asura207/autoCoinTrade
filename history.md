@@ -10,7 +10,9 @@
 
 | 버전 (Version) | 릴리즈 일시 | 커밋 해시 | 주요 수정 내용 요약 |
 | :--- | :--- | :--- | :--- |
-| **v0.0.29** | 2026-11-19 | - | 5대 기관급 퀀트 아키텍처 고도화 일괄 구현 및 자동화 검증 스위트 5종 추가: ① 업비트 WebSocket(`wss://api.upbit.com/websocket/v1`) 실시간 스트림 허브·REST 자동 폴백·틱 반응형 즉시 스마트 청산(`1,500ms` 디바운스) 및 사이드바 `WS 실시간`/`REST 폴백` 배지, ② Zero Look-Ahead Bias 과거 캔들 백테스팅·Walk-Forward(70/30) 검증 엔진(`historical_candles`, `backtest_runs`)·SVG 자산 곡선 및 원클릭 파라미터 반영 모달, ③ 호가창 불균형(OBI)·스프레드 가드·MTF(60m/240m) 역추세 차단·ATR 변동성 역가중 포지션 사이징(`5,250원` 하한 보장)·슬리피지(`slippage_bps`) 원장·통계 UI, ④ Telegram/Discord/WebPush 멀티채널 알림 허브(AES-256-GCM 암호화 저장·이벤트 토글) 및 인터랙티브 캔들스틱+VWAP/LRC/20MA+BUY/SELL 타점 마커 차트 모달, ⑤ Node.js↔Python 호환 AES-256-GCM API 키 암호화 볼트(`crypto_vault.mjs`)·멀티스테이지 `Dockerfile`·`docker-compose.yml`·GitHub Actions CI(`.github/workflows/ci.yml`) |
+| **v0.0.31** | 2026-11-19 | - | 초기 커밋(`720f8de`) 잔존 구버전 루트 스크립트 통폐합(`start.sh/.bat`, `stop.sh/.bat` 제거, `install_startup.bat`/`uninstall_startup.bat` → `scripts/` 이동), Windows↔Linux 실행/종료/오케스트레이터/터널 스크립트 100% 대칭화(`start_services.bat` 전면 현행화·`LIVE_EXECUTOR_OWNER=node` 기본 반영·프로젝트 CWD 기준 좀비 정리), `market_hub.py`(Python 독립 전용) vs `upbit_ws_hub.mjs`(Node 메인 WebSocket 허브) 역할 명시, 전체 마크다운 문서(`README.md`, `howtorun.md`, `initRule.md`, `SETUP_GUIDE.md`, `prompt.md`, `install/README.md`, `history.md`) 전수 동기화, `/install` 원클릭 배포 패키지 재동기화(시크릿/DB 완전 제외) 및 `0.0.X` 버전 체계 마감 |
+| **v0.0.30** | 2026-11-19 | `fcc1635` | 실전 업비트 계좌 연속 결제(중복 매수·중복 매도) 원천 차단을 위한 **5중 하드 가드레일(Hard Guardrail)** 탑재 및 7대 장애 스트레스 테스트(`tests/verify_duplicate_order_guard.mjs`) 구축: ① 단일 실전 실행 주체(`LIVE_EXECUTOR_OWNER=node`) 강제 + SQLite `live_executor_lease`(TTL 30초, `BEGIN IMMEDIATE`) 원자적 프로세스 리스 락, ② `live_order_intents` 2단계 커밋(`PENDING` 선점 + `virtual_krw` 원자적 선차감 + 업비트 `identifier` UUID 멱등성 + 타임아웃 `GET /v1/order?identifier=...` 정산 및 이중 환불 방지), ③ `(bot_id, market)` Async Mutex 직렬화, ④ 재진입 `900초` 쿨다운·봇 매수 간격 `60초`·시간/일일 매수 횟수 하드 캡, ⑤ 5분 내 차단 5회 또는 타임아웃 2회 시 실전 신규 매수 자동 비상 정지(청산 매도·가상 Arena는 정상 유지) + `GET /api/guardrail/status` · `POST /api/guardrail/reset-emergency` 및 UI 헤더 보호 배지/모달 추가 |
+| **v0.0.29** | 2026-11-19 | `2e82235` | 5대 기관급 퀀트 아키텍처 고도화 일괄 구현 및 자동화 검증 스위트 5종 추가: ① 업비트 WebSocket(`wss://api.upbit.com/websocket/v1`) 실시간 스트림 허브·REST 자동 폴백·틱 반응형 즉시 스마트 청산(`1,500ms` 디바운스) 및 사이드바 `WS 실시간`/`REST 폴백` 배지, ② Zero Look-Ahead Bias 과거 캔들 백테스팅·Walk-Forward(70/30) 검증 엔진(`historical_candles`, `backtest_runs`)·SVG 자산 곡선 및 원클릭 파라미터 반영 모달, ③ 호가창 불균형(OBI)·스프레드 가드·MTF(60m/240m) 역추세 차단·ATR 변동성 역가중 포지션 사이징(`5,250원` 하한 보장)·슬리피지(`slippage_bps`) 원장·통계 UI, ④ Telegram/Discord/WebPush 멀티채널 알림 허브(AES-256-GCM 암호화 저장·이벤트 토글) 및 인터랙티브 캔들스틱+VWAP/LRC/20MA+BUY/SELL 타점 마커 차트 모달, ⑤ Node.js↔Python 호환 AES-256-GCM API 키 암호화 볼트(`crypto_vault.mjs`)·멀티스테이지 `Dockerfile`·`docker-compose.yml`·GitHub Actions CI(`.github/workflows/ci.yml`) |
 | **v0.0.28** | 2026-11-19 | `a134f92` | 전수 QA 체크리스트(`docs/QA_CHECKLIST.md`) 및 자동화 검증 스위트(`tests/qa_full_verification.mjs`, `tests/qa_python_verification.py`) 구축 및 발견된 치명·주요 결함 전면 수정: 실전 매도 원장 정합성(활성 봇 원금 이중 가산·`accounts` 오류 시 포지션 유실·타 봇 코인 침범·더스트 정화 무한 루프·`<1원` 소수점 코인 단가 0원화·SQLite 중첩 트랜잭션 충돌), 다단계 분할봇(`bot_06`/`bot_10`) 9초 무한 회전, 듀얼 AI Ollama 단독 `BLOCK` 영구 잠금(Sticky Latch) 및 BTC 장애 Fail-Safe, Python `Decimal ROUND_DOWN`·`drain_handoff_logs` NameError·`highest_price` 미커밋·KST Time-Stop 왜곡, 프론트엔드 초기 마법사 자동 표시·KST 인증 만료·주간 편성 카드 갱신·한국식 손익 색상(빨강/파랑)·설정 파라미터 ID 정규화 일괄 해결 |
 | **v0.0.27** | 2026-11-18 | `d2f60e1` | 로컬 Ollama(`qwen3-news`) 인텔 맥북 CPU 추론 안정화 및 30분 분석 모델 UI 표기 고도화: 타임아웃 기본 `120,000ms`(최대 `180,000ms`) 상향·뉴스 6건(제목 90자) 프롬프트 경량화·코인 전용 `system` 프롬프트 오버라이드(`~41.5초` 응답), `market_regime_filter`·`system_settings`에 실제 실행된 `flash_provider`/`flash_model` 추적 저장 및 대시보드(실제거래 현황·듀얼 AI 매트릭스·뉴스 AI 헤더/본문) 실행 모델명 실시간 표기 |
 | **v0.0.26** | 2026-11-17 | `887c868` | 30분 단기 뉴스·시황 분석기(`FLASH_30M`) 맥북 프로 로컬 Ollama(`qwen3-news`) 1순위 연동 및 3중 무중단 Fallback(로컬 Ollama → Gemini Flash 지수 백오프 → 직전 캐시/BTC 20MA·4h 60MA 기계적 안전 모드) 구축, 백엔드·Python 워커(`think: false`, `format: json`, `25,000ms` 타임아웃)·PostgreSQL(`pg_sync.mjs`) AI 브리핑 동기화·설정 UI/SSE 스트리밍(`18ms` 타이프라이터)·통합 검증 스위트(`tests/verify_ollama_integration.mjs`) 추가 |
@@ -43,6 +45,37 @@
 ---
 
 ## 📝 상세 버전별 변경 내역 (Detailed Changelog)
+
+### [v0.0.31] - 2026-11-19
+#### 구버전 루트 스크립트 통폐합·OS 대칭화, 전체 문서 전수 동기화, `/install` 재패키징 및 `0.0.X` 버전 마감
+- **초기 커밋(`720f8de`) 잔존 레거시 루트 스크립트 정리 및 Windows↔Linux 100% 대칭화**:
+  - 중복 레거시 래퍼(`start.bat`, `start.sh`, `stop.bat`, `stop.sh`)를 루트에서 삭제하고, Windows 시작프로그램 스크립트(`install_startup.bat`, `uninstall_startup.bat`)를 `scripts/`로 이관하여 공식 진입점을 `setup.sh/.bat`, `start_services.sh/.bat`, `stop_services.sh/.bat`, `run_orchestrator.sh/.bat`, `start_tunnel.sh`/`stop_tunnel.sh`, `docker-compose.yml`, `/install`로 단일화.
+  - `start_services.bat`을 최신 `start_services.sh`와 100% 대칭 구조로 재작성(`chcp 65001`, Node `>= 22.5.0` 검증, `.env` 및 `LIVE_EXECUTOR_OWNER=node`·Ollama 설정 파싱, 중복 기동 방지, `frontend/dist` 자동 빌드, 로그 로테이션, 헬스체크).
+  - `stop_services.sh`/`stop_services.bat`/`stop_tunnel.sh`에 프로젝트 CWD(`/proc/<pid>/cwd`) 기반 안전 종료·Graceful `SIGTERM` 대기·`--with-tunnel`/`--nopause` 옵션을 보강하여 타 프로젝트 간섭 없이 좀비 프로세스 완전 차단.
+  - `run_orchestrator.sh`/`.bat`, `setup.sh`/`.bat`, `scripts/install_shortcut.ps1`, `scripts/run_backend.*`, `scripts/make_scripts.mjs`, `install/AutoCoinTrade_*`에 `LIVE_EXECUTOR_OWNER=node` 기본 규칙 및 충돌 경고 배너 반영.
+  - `market_hub.py` 상단 문서화를 보강하여 Node.js 메인 백엔드 `backend/common/upbit_ws_hub.mjs`와 분리된 Python 독립 실행 전용 REST 캐시 모듈임을 명확화.
+- **전체 문서 전수 동기화 및 `/install` 패키지 재동기화**:
+  - `README.md`, `howtorun.md`, `initRule.md`, `SETUP_GUIDE.md`, `prompt.md`, `install/README.md`, `history.md`에 v0.0.29 5대 퀀트 고도화, v0.0.30 5중 실전 가드레일, 로컬 Ollama 3중 Fallback, Docker Compose, 통합 진입점 스크립트 및 최신 21개 DB 테이블·API 명세를 빠짐없이 반영.
+  - `scripts/build_install_package.sh` 실행으로 `/install/app/` 및 `/install/history.md`를 최신 `v0.0.31` 소스·`frontend/dist`로 동기화(실제 `.env`, `config/upbit_config.json`, `data/*.db*`, 비밀 키 파일 원천 배제 검증).
+  - 프로젝트 버전 규칙(`0.0.X`, 커밋당 +1)에 따라 `package.json`, `frontend/package.json`, `backend/node_server.mjs`, `frontend/src/App.jsx`, `history.md`를 `v0.0.29` (`2e82235`) → `v0.0.30` (`fcc1635`) → `v0.0.31`로 정확히 마감.
+
+### [v0.0.30] - 2026-11-19
+#### 실전 연속 결제(중복 주문) 원천 차단 5중 하드 가드레일(Hard Guardrail) 탑재 및 7대 장애 스트레스 테스트 구축 (`fcc1635`)
+- **[Phase 1] 단일 실전 실행 주체 강제 & 원자적 프로세스 리스 락 (`backend/common/live_order_guardrail.mjs`, `backend/node_server.mjs`, `bots.py`, `main_orchestrator.py`, `.env.example`, `config/upbit_config.example.json`)**:
+  - `LIVE_EXECUTOR_OWNER`(기본값: `"node"`) 설정을 도입하여 불일치 엔진의 실전 주문 API(`POST /v1/orders`) 진입 즉시 하드 차단.
+  - SQLite `live_executor_lease` 단일 행(`id = 1`, TTL `30초`) 테이블 및 `BEGIN IMMEDIATE` 기반 원자적 리스 획득/하트비트 갱신을 구현하여 좀비·중복 기동 프로세스의 이중 결제 원천 봉쇄.
+- **[Phase 2] 2단계 커밋(`PENDING` 선차감) + 업비트 `identifier` UUID 멱등성 + 타임아웃 정산 (`live_order_intents`, `init_db.py`, `backend/common/pg_sync.mjs`)**:
+  - 매수 API 호출 전 `BEGIN IMMEDIATE` 트랜잭션으로 `live_order_intents` `PENDING` 선점 및 `virtual_krw` 원자적 선차감, 업비트 주문 요청 시 `identifier = intent_id` 전달.
+  - 네트워크 타임아웃/5xx 발생 시 무조건 환불·재시도를 금지하고 `UNKNOWN_TIMEOUT` 상태로 격리한 뒤 백그라운드 정산 워커(`GET /v1/order?identifier=...`)로 실제 생성 여부를 확인하여 확정 미생성(`FAILED_NOT_CREATED`) 시에만 1회(`refunded = 1`) 안전 환불.
+  - 매도 시 동일 `order_uuid`에 대해 `intent_bucket = sell:<order_uuid>` 유니크 제약으로 중복 매도 원천 차단.
+- **[Phase 3] 프로세스 내 `(bot_id, market)` Async Mutex 직렬화**:
+  - `inFlightLiveOrderMutex`로 10초 주기 루프, 틱 반응형 즉시 청산, 수동 API 요청 간 동시 진입 경합을 단일 슬롯으로 직렬화.
+- **[Phase 4] 쿨다운 · 빈도 하드 캡 · 이상 감지 자동 비상 정지 및 대시보드 제어 (`live_guardrail_events`, `frontend/src/App.jsx`)**:
+  - 종목 재매수 `900초` 쿨다운, 봇 매수 간격 `60초`, 봇별 시간당 `3회`/일 `12회`, 전체 일 `30회` 하드 캡 적용.
+  - 5분 내 가드레일 차단 5회 이상 또는 타임아웃 2회 이상 발생 시 실전 신규 매수 자동 비상 정지(보유 포지션 청산 및 가상 Arena는 정상 유지) 및 Telegram/Discord/WebPush 알림 발송.
+  - `GET /api/guardrail/status`, `POST /api/guardrail/reset-emergency` API 및 대시보드 상단 `🛡️ 가드레일` 상태 배지/상세 모달 추가.
+- **[Phase 5] 7대 장애 시나리오 자동 스트레스 테스트 (`tests/verify_duplicate_order_guard.mjs`, `package.json`)**:
+  - 동시 10회 `Promise.all` 매수 경합(1회 체결/9회 차단), 타임아웃 직후 `GET /v1/order?identifier=...` 정산(실제 체결 확인 vs 미생성 1회 환불), 중복 매도 경합, `LIVE_EXECUTOR_OWNER` 교차 프로세스 차단, SQLite 리스 락 점유 충돌, 쿨다운/빈도 캡 초과 및 이상 감지 자동 비상 정지·수동 해제 7개 시나리오 100% 통과 (`npm run test:guardrail`).
 
 ### [v0.0.29] - 2026-11-19
 #### 5대 기관급 퀀트 고도화 과제(P0/P1) 일괄 구현 및 검증 스위트 5종 완비

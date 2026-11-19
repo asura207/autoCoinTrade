@@ -19,6 +19,7 @@ if [ -f "$PROJECT_ROOT/.env" ]; then
 fi
 
 BACKEND_PORT="${BACKEND_PORT:-8001}"
+export LIVE_EXECUTOR_OWNER="${LIVE_EXECUTOR_OWNER:-node}"
 
 NODE_BIN=$(command -v node 2>/dev/null || true)
 if [ -z "$NODE_BIN" ]; then

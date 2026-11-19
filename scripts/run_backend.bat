@@ -8,6 +8,7 @@ if exist ".env" (
         if not "%%~A"=="" set "%%~A=%%~B"
     )
 )
+if "%LIVE_EXECUTOR_OWNER%"=="" set "LIVE_EXECUTOR_OWNER=node"
 
 set "NODE_EXE="
 where node >nul 2>&1

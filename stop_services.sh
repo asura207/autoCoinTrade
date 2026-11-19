@@ -84,20 +84,49 @@ kill_port() {
 kill_port "$BACKEND_PORT" "백엔드"
 kill_port "$FRONTEND_PORT" "프론트엔드"
 
-# 3. 본 저장소 경로 기준 잔여 백엔드/프론트/Python 워커 프로세스 정리
+# 3. 본 저장소 경로 및 작업 디렉토리(CWD) 기준 잔여 백엔드/프론트/Python 워커 프로세스 안전 정리
+#    (타 프로젝트 프로세스는 CWD 비교를 통해 100% 보호)
+stop_pid_graceful() {
+    local wp=$1
+    local label=$2
+    if [ -n "$wp" ] && [ "$wp" != "$$" ] && kill -0 "$wp" 2>/dev/null; then
+        echo "잔여 워커 프로세스 안전 종료 ($label) [PID: $wp]..."
+        kill -TERM "$wp" 2>/dev/null || true
+        local i
+        for i in $(seq 1 8); do
+            if ! kill -0 "$wp" 2>/dev/null; then
+                break
+            fi
+            sleep 0.5
+        done
+        if kill -0 "$wp" 2>/dev/null; then
+            kill -9 "$wp" 2>/dev/null || true
+        fi
+    fi
+}
+
 if command -v pgrep >/dev/null 2>&1; then
     for pattern in "${PROJECT_ROOT}/backend/node_server.mjs" "${PROJECT_ROOT}/frontend/server.mjs" "${PROJECT_ROOT}/main_orchestrator.py" "${PROJECT_ROOT}/llm_filter_worker.py"; do
         for wp in $(pgrep -f "$pattern" 2>/dev/null || true); do
-            if [ -n "$wp" ] && [ "$wp" != "$$" ] && kill -0 "$wp" 2>/dev/null; then
-                echo "잔여 워커 프로세스 종료 ($pattern) [PID: $wp]..."
-                kill -TERM "$wp" 2>/dev/null || true
-                sleep 0.5
-                if kill -0 "$wp" 2>/dev/null; then
-                    kill -9 "$wp" 2>/dev/null || true
+            stop_pid_graceful "$wp" "$pattern"
+        done
+    done
+    # 상대 경로(node backend/node_server.mjs 등)로 기동된 잔여 프로세스도 /proc/<pid>/cwd 일치 시에만 안전 종료
+    for rel_pat in "backend/node_server.mjs" "frontend/server.mjs" "main_orchestrator.py" "llm_filter_worker.py"; do
+        for wp in $(pgrep -f "$rel_pat" 2>/dev/null || true); do
+            if [ -n "$wp" ] && [ "$wp" != "$$" ] && [ -L "/proc/${wp}/cwd" ]; then
+                wp_cwd=$(readlink -f "/proc/${wp}/cwd" 2>/dev/null || true)
+                if [ "$wp_cwd" = "$PROJECT_ROOT" ]; then
+                    stop_pid_graceful "$wp" "$rel_pat"
                 fi
             fi
         done
     done
+fi
+
+# 옵션: --with-tunnel 전달 시 Cloudflare 보안 터널도 함께 종료
+if [ "${1:-}" = "--with-tunnel" ] && [ -x "$PROJECT_ROOT/stop_tunnel.sh" ]; then
+    "$PROJECT_ROOT/stop_tunnel.sh" >/dev/null 2>&1 || true
 fi
 
 echo "==================================================="

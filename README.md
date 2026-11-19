@@ -1,6 +1,6 @@
 # Upbit AutoCoinTrade (업비트 다중 전략 자동매매 & 실시간 AI 퀀트 시스템)
 
-[![Version](https://img.shields.io/badge/version-v0.0.29-green.svg)](history.md)
+[![Version](https://img.shields.io/badge/version-v0.0.31-green.svg)](history.md)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 > 업비트(Upbit) Open API를 기반으로 선택형(1~3개) 퀀트 실전 봇을 동시에 운용하고, 10대 알고리즘 상시 가상 경쟁(Always-On Arena)과 실시간 뉴스 인텔리전스, 그리고 듀얼 AI 스트리밍 시황 분석(30분 로컬 Ollama `qwen3-news` 1순위 ➔ Gemini Flash 백업 ➔ BTC 20MA 기계적 안전 모드 / 1시간 Gemini Pro 심층 교차 검증)을 결합한 통합 가상자산 퀀트 트레이딩 플랫폼입니다.
@@ -49,15 +49,18 @@
   ```
 *(Node.js >= 22.5.0 및 Python 가상환경 검증, logs/data 생성, config 파일 생성, frontend npm install을 자동으로 수행합니다.)*
 
-### 2단계: 서비스 시작
+### 2단계: 서비스 시작 (표준 진입점)
 - **Linux / macOS**:
   ```bash
   ./start_services.sh
-  # 또는 ./start.sh
   ```
 - **Windows**:
   ```cmd
   .\start_services.bat
+  ```
+- **Docker Compose (컨테이너 운영)**:
+  ```bash
+  docker compose up -d --build
   ```
 - **웹 대시보드 로컬 접속**: [http://localhost:9000](http://localhost:9000)
 - **모바일/사내 LAN 접속**: `http://<서버내부IP>:9000` (예: `http://192.168.x.x:9000`)
@@ -73,12 +76,15 @@
 - **Linux / macOS**:
   ```bash
   ./stop_services.sh
-  # 또는 ./stop.sh
-  # 터널 종료: ./stop_tunnel.sh
+  # 터널 동시 종료: ./stop_services.sh --with-tunnel (또는 ./stop_tunnel.sh)
   ```
 - **Windows**:
   ```cmd
   .\stop_services.bat
+  ```
+- **Docker Compose**:
+  ```bash
+  docker compose down
   ```
 
 ---
@@ -191,6 +197,28 @@
 
 ---
 
+## 🛡️ 5중 실전 중복 주문 차단 하드 가드레일 (Hard Guardrail, `v0.0.30` / `fcc1635`)
+
+전략 버그, 네트워크 타임아웃, 비동기 루프 중첩, 또는 Node.js↔Python 좀비 프로세스 동시 기동 같은 장애 상황에서도 **실전 업비트 계좌의 연속 결제(중복 매수·중복 매도) 사고를 원천 봉쇄**하기 위해 주문 실행 최하단에 5중 하드 가드레일을 강제 적용했습니다(`backend/common/live_order_guardrail.mjs`, `backend/node_server.mjs`, `bots.py`, `main_orchestrator.py`):
+
+1. **Layer 1 — 단일 실전 실행 주체(`LIVE_EXECUTOR_OWNER`) & 원자적 프로세스 리스 락(`live_executor_lease`)**:
+   - 기본값 `LIVE_EXECUTOR_OWNER=node` 고정: 일치하지 않는 프로세스(예: Python 워커)는 `POST /v1/orders` 진입 즉시 하드 차단.
+   - SQLite `BEGIN IMMEDIATE` 트랜잭션 기반 단일 행 리스(`TTL 30초`, `owner_id + pid + host`) 미보유 프로세스(좀비·중복 터미널)는 실전 주문을 절대 실행 불가.
+2. **Layer 2 — 2단계 커밋(2PC) 선차감 + 업비트 `identifier` 멱등성 + 타임아웃 정산(`live_order_intents`)**:
+   - API 호출 전 `BEGIN IMMEDIATE`로 `live_order_intents(status='PENDING')` 버킷 선점 및 `bots.virtual_krw` 원자적 선차감.
+   - 모든 실전 `POST /v1/orders`에 `identifier: intent_id`(UUID)를 전송하여 거래소 레벨 중복 주문 차단.
+   - 네트워크 타임아웃/`5xx` 시 **절대 맹목 재시도·조기 환불 금지** ➔ `UNKNOWN_TIMEOUT` 잠금 후 다음 정산 사이클에서 `GET /v1/order?identifier={intent_id}`로 체결 확정 또는 `404 order_not_found` 확인 시 `WHERE refunded = 0` 조건으로 정확히 1회 안전 환불.
+3. **Layer 3 — 비동기 루프 중첩 방지(Re-entrancy Mutex) & 중복 매도 차단(`closing_lock` + `sell:<uuid>`)**:
+   - `isLiveCycleRunning` + 시작 타임스탬프 뮤텍스(180초 초과 고착 시 경고 후 안전 복구)로 지정가 폴링 중 루프 중첩 차단.
+   - 동일 `order_uuid` 포지션 동시 중복 매도 차단(단, 보유 포지션 청산 및 **Graceful Drain** 매도는 매수 쿨다운·상한·비상 정지에 절대 차단되지 않음).
+4. **Layer 4 — 최후 하드 상한 (쿨다운 · 빈도 · 일일 캡)**:
+   - 청산 후 재진입 쿨다운 `900초`(15분), 봇별 최소 매수 간격 `60초`(`bot_06`/`bot_10` 분할 추가 차수 `30초`), 봇별 시간당 `3회` · 일일 `12회`(00:00 KST), 전체 실전 풀 일일 `30회` 하드 캡 강제.
+5. **Layer 5 — 이상 감지 자동 비상 정지(Auto Kill-Switch) & UI 경보 + 7대 장애 스트레스 테스트**:
+   - 5분 내 동일 봇 차단 `5회` 이상 누적, `virtual_krw < 0`, 또는 미해결 `UNKNOWN_TIMEOUT` `2건` 이상 감지 시 즉시 `is_running = 0` 자동 비상 정지(10대 가상 Arena는 비간섭 유지) 및 `⚡ 실제거래 현황` 경고 배지·비상 정지 모달 팝업 노출(`GET /api/guardrail/status`).
+   - 격리 임시 DB + Mock 업비트 API 기반 7대 장애 시나리오 자동 검증: `npm run test:guardrail` (`node tests/verify_duplicate_order_guard.mjs`).
+
+---
+
 ## 🛡️ 가상거래 vs 실거래 원장 분리 및 퀀트 안전 설계
 
 | 구분 | 실거래 (Live Trading) | 가상거래 (Paper Trading) |
@@ -213,65 +241,91 @@
 
 ```text
 autoCoinTrade/
-├── install/                     # [원클릭 무설치 배포 패키지] 비개발자용 독립 실행 폴더
+├── .github/workflows/
+│   └── ci.yml                       # GitHub Actions 자동 문법·단위·가드레일·빌드 CI
+├── install/                         # [원클릭 무설치 배포 패키지] 비개발자용 독립 실행 폴더
 │   ├── AutoCoinTrade_Windows_Start.bat # Windows 원클릭 설치·실행 런처
 │   ├── AutoCoinTrade_Windows_Stop.bat  # Windows 원클릭 전체 종료 스크립트
 │   ├── AutoCoinTrade_Linux_Start.sh    # Linux 원클릭 설치·실행 런처
 │   ├── AutoCoinTrade_Linux_Stop.sh     # Linux 원클릭 전체 종료 스크립트
-│   └── README.md                # 비개발자를 위한 원클릭 상세 설치 매뉴얼
+│   ├── app/                         # 패키징된 최신 소스 및 프론트엔드 정적 번들 (비밀키 제외)
+│   └── README.md                    # 비개발자를 위한 원클릭 상세 설치 매뉴얼
 ├── backend/
-│   ├── node_server.mjs          # [메인 백엔드] Node.js + PostgreSQL/SQLite + Upbit API + Gemini AI + REST API + SSE
+│   ├── node_server.mjs              # [메인 백엔드] Node.js 22 + SQLite/PG + Upbit API + Dual AI(Ollama/Gemini) + REST/SSE
 │   └── common/
-│       ├── algo_lab_service.mjs # 10대 알고리즘 가상 경쟁(Arena) 시뮬레이션 및 실시간 랭킹 엔진
-│       ├── news_service.mjs     # 구글 뉴스 & 토큰포스트 RSS 파싱, 감성 분석, 태그 추출
-│       ├── pg_db.mjs            # PostgreSQL 비동기 풀 및 SQL 변환 레이어
-│       └── pg_sync.mjs          # PostgreSQL 16 실시간 데이터 동기화 매니저
+│       ├── algo_lab_service.mjs     # 10대 알고리즘 상시 가상 경쟁(Arena) 및 주간 TOP 1 로테이션 엔진
+│       ├── backtest_service.mjs     # Zero Look-Ahead 과거 캔들 백테스팅 & Walk-Forward(70/30) 엔진
+│       ├── crypto_vault.mjs         # Node↔Python 호환 AES-256-GCM API 키 암호화 볼트
+│       ├── execution_quality_service.mjs # 호가 불균형(OBI)·스프레드 가드·MTF·ATR 사이징·슬리피지 원장
+│       ├── live_order_guardrail.mjs # 5중 실전 중복 주문 차단 하드 가드레일(리스·2PC·identifier 정산·Hard Cap·Kill-Switch)
+│       ├── log_rotator.mjs          # KST 일일 로그 로테이션 및 7일 자동 정리
+│       ├── news_service.mjs         # 구글 뉴스 & 토큰포스트 RSS 파싱, 감성 분석, 태그 추출
+│       ├── notification_hub.mjs     # Telegram · Discord · WebPush 멀티채널 알림 허브
+│       ├── pg_db.mjs                # PostgreSQL 비동기 풀 및 SQL 변환 레이어
+│       ├── pg_sync.mjs              # PostgreSQL 16 실시간 데이터 동기화 매니저
+│       ├── sqlite_db.mjs            # SQLite 3 (WAL 모드, busy_timeout 5000ms) 어댑터
+│       └── upbit_ws_hub.mjs         # [메인 시세 허브] 업비트 WebSocket 멀티플렉서 + 틱 반응형 청산 + REST 폴백
 ├── agentBot/
-│   └── bot_10_jack_kellogg.py     # [Python 전략 모듈] Jack Kellogg VWAP + 선형 회귀 채널 봇 (`bot_10`)
-├── market_hub.py                # [중앙 시세 브로드캐스터] 인메모리 캐시 및 업비트 API 120ms Rate Limit 방어
-├── bots.py                      # [Python CLI] 10대 전략 실전 봇 루프 & Graceful Drain 이관 (Node 백엔드 미실행 시 독립 가동)
-├── llm_filter_worker.py         # [Python CLI] 듀얼 AI (Flash 30분 / Pro 1시간) bot_01~bot_10 개별 제어 워커
-├── main_orchestrator.py         # [Python CLI] 멀티프로세싱 슈퍼바이저 오케스트레이터 (이중 실행 방지)
-├── run_orchestrator.sh / .bat   # Python 멀티프로세싱 오케스트레이터 원클릭 실행 스크립트
-├── init_db.py                   # DB 스키마 및 자동 마이그레이션(주간 로테이션 · 듀얼 AI · 포지션 컬럼) 초기화
+│   └── bot_10_jack_kellogg.py       # [Python 전략 모듈] Jack Kellogg VWAP + 선형 회귀 채널 봇 (`bot_10`)
+├── market_hub.py                    # [Python 독립 전용 시세 캐시] Python 오케스트레이터 전용 (Node `upbit_ws_hub.mjs`와 분리)
+├── bots.py                          # [Python CLI] 10대 전략 봇 & 5중 가드레일 (LIVE_EXECUTOR_OWNER=python 시 독립 가동)
+├── llm_filter_worker.py             # [Python CLI] 로컬 Ollama/Gemini Dual AI 10대 봇 개별 제어 워커
+├── main_orchestrator.py             # [Python CLI] 멀티프로세싱 슈퍼바이저 오케스트레이터 (이중 실행 원천 차단)
+├── init_db.py                       # DB 스키마 및 자동 마이그레이션(가드레일·백테스트·로테이션·듀얼 AI)
 ├── config/
-│   ├── upbit_config.json        # 업비트 및 Gemini API 키 설정 파일 (Git 추적 제외)
-│   └── upbit_config.example.json# 설정 파일 템플릿
+│   ├── upbit_config.json            # 업비트·Gemini·알림 설정 파일 (Git 추적 제외, AES-256-GCM 암호화 저장)
+│   └── upbit_config.example.json    # 설정 파일 템플릿 (LIVE_EXECUTOR_OWNER·Ollama·가드레일 기본값 포함)
 ├── data/
-│   └── auto_coin_trade.db       # 로컬 SQLite 데이터베이스 (WAL 모드)
+│   └── auto_coin_trade.db           # 로컬 SQLite 데이터베이스 (WAL 모드, Git 추적 제외)
+├── docs/
+│   ├── QA_CHECKLIST.md              # 전수 QA 체크리스트 및 결함 수정 보고서
+│   └── ENHANCEMENT_PROMPTS.md       # 퀀트 고도화 아키텍처 설계 프롬프트
 ├── frontend/
+│   ├── server.mjs                   # 보안 강화 정적 파일 + /api 리버스 프록시 서버 (Port 9000)
 │   ├── src/
-│   │   ├── App.jsx              # 프론트엔드 메인 React 컴포넌트 (5대 메뉴, AI 스트리밍, 페이지네이션)
-│   │   ├── main.jsx             # React 엔트리포인트
-│   │   └── styles.css           # 다크 테마, 2:8 레이아웃, 모바일 반응형, 48px 고정 테이블 스타일
+│   │   ├── App.jsx                  # 프론트엔드 메인 React 컴포넌트 (5대 메뉴, 가드레일 배지/모달, 백테스트, 타점 차트)
+│   │   ├── main.jsx                 # React 엔트리포인트
+│   │   └── styles.css               # 다크 테마, 2:8 레이아웃, 모바일 반응형, 48px 고정 테이블 스타일
 │   ├── index.html
 │   ├── package.json
-│   └── vite.config.js           # 0.0.0.0 바인딩, allowedHosts, /api 프록시 설정
+│   └── vite.config.js               # 0.0.0.0 바인딩, allowedHosts, /api 프록시 설정
 ├── scripts/
-│   ├── setup_postgresql.sh      # PostgreSQL 16 계정 및 데이터베이스 자동 설치/설정 스크립트
-│   ├── migrate_sqlite_to_pg.py  # SQLite -> PostgreSQL 전체 데이터 마이그레이션 스크립트
-│   ├── run_backend.sh           # [Linux] 백엔드 단독 구동 스크립트
-│   ├── run_frontend.sh          # [Linux] 프론트엔드 단독 구동 스크립트
-│   ├── run_backend.bat          # [Windows] 백엔드 백그라운드 구동 스크립트
-│   ├── run_frontend.bat         # [Windows] 프론트엔드 백그라운드 구동 스크립트
-│   └── start_silent.vbs         # [Windows] 콘솔 창 없는 무음 백그라운드 런처
-├── setup.sh                     # [초기 설정 - Linux] 원클릭 환경 검증 및 패키지 설치
-├── setup.bat                    # [초기 설정 - Windows]
-├── start_services.sh            # [서비스 시작 - Linux] 백엔드(8001) 및 프론트엔드(9000) 백그라운드 실행
-├── start_services.bat           # [서비스 시작 - Windows]
-├── stop_services.sh             # [서비스 중지 - Linux] 포트 8001 & 9000 안전 프로세스 종료
-├── stop_services.bat            # [서비스 중지 - Windows]
-├── start_tunnel.sh              # [외부 접속 터널 - Linux] Cloudflare HTTPS 보안 주소 자동 발급
-├── stop_tunnel.sh               # [외부 접속 터널 종료 - Linux]
-├── .env.example                 # 환경 변수 템플릿 파일 (실제 .env는 Git 추적 제외 명시)
-├── .env                         # 환경 설정 파일 (Git 추적 제외: LOCATION, PostgreSQL 접속 정보, API 키 등)
-├── LICENSE                      # Apache-2.0 오픈소스 라이선스
-├── package.json                 # 프로젝트 루트 npm 패키지 메타데이터
-├── README.md                    # 프로젝트 종합 안내서 (본 파일)
-├── SETUP_GUIDE.md               # [환경 세팅] 다른 PC 및 AI Agent 전용 실행 가이드
-├── howtorun.md                  # 상세 사용자 가이드
-├── initRule.md                  # 프로젝트 초기 요구사항 명세
-└── prompt.md                    # 시스템 복원 및 타 Agent 구현용 마스터 프롬프트
+│   ├── build_install_package.sh     # `/install` 원클릭 배포 패키지 자동 동기화 스크립트
+│   ├── setup_postgresql.sh          # PostgreSQL 16 계정 및 데이터베이스 자동 설치/설정
+│   ├── setup_wireguard.sh           # WireGuard VPN + 방화벽 보안 접속 설정
+│   ├── migrate_sqlite_to_pg.py      # SQLite -> PostgreSQL 전체 데이터 마이그레이션
+│   ├── run_backend.sh / .bat        # 백엔드 단독 구동 스크립트
+│   ├── run_frontend.sh / .bat       # 프론트엔드 단독 구동 스크립트
+│   ├── install_startup.bat / uninstall_startup.bat # [Windows] 부팅 자동 시작 등록/해제
+│   └── start_silent.vbs             # [Windows] 콘솔 창 없는 무음 백그라운드 런처
+├── tests/                           # 격리 임시 DB + Mock API 자동화 검증 스위트 (`npm run test:all`)
+│   ├── verify_duplicate_order_guard.mjs # 5중 중복 주문 가드레일 7대 장애 스트레스 테스트
+│   ├── verify_rotation_drain_edge_cases.mjs # 주간 로테이션 & Graceful Drain Zero-Sum 검증
+│   ├── verify_all_bots_and_execution.mjs    # 10대 봇 실전/가상 체결 E2E 검증
+│   ├── verify_upbit_ws_hub.mjs      # WebSocket 허브·폴백·틱 청산 검증
+│   ├── verify_backtest_engine.mjs   # 백테스트 & Walk-Forward 검증
+│   ├── verify_execution_quality_and_sizing.mjs # OBI/MTF/ATR 사이징·슬리피지 검증
+│   ├── verify_notification_hub_and_journal.mjs # 멀티채널 알림·타점 차트 마커 검증
+│   ├── verify_crypto_vault.mjs      # AES-256-GCM 암호화 볼트(Node↔Python) 검증
+│   ├── verify_ollama_integration.mjs# 로컬 Ollama 3중 Fallback 검증
+│   ├── verify_log_rotation.mjs      # KST 일일 로그 로테이션 검증
+│   ├── qa_full_verification.mjs     # 백엔드 전수 QA 통합 검증
+│   └── qa_python_verification.py    # Python 워커·DB·전략 유닛 테스트
+├── setup.sh / setup.bat             # [표준 초기 설정] Linux / Windows 원클릭 환경 구축
+├── start_services.sh / .bat         # [표준 서비스 시작] 백엔드(8001) + 프론트엔드(9000) 백그라운드 실행
+├── stop_services.sh / .bat          # [표준 서비스 중지] PID/포트/저장소 경로 기준 안전 종료
+├── run_orchestrator.sh / .bat       # Python 멀티프로세싱 오케스트레이터 실행 (LIVE_EXECUTOR_OWNER 준수)
+├── start_tunnel.sh / stop_tunnel.sh # [외부 접속 터널] Cloudflare HTTPS 보안 주소 발급/종료
+├── Dockerfile / docker-compose.yml  # 멀티스테이지 비루트(non-root) 컨테이너 배포 구성
+├── .env.example                     # 환경 변수 템플릿 (실제 .env는 Git 추적 제외)
+├── LICENSE                          # Apache-2.0 오픈소스 라이선스
+├── package.json                     # 프로젝트 루트 npm 패키지 및 테스트 스크립트 메타데이터
+├── history.md                       # 커밋 1건당 0.0.X 버전 변경 이력 (웹 대시보드 연동)
+├── README.md                        # 프로젝트 종합 안내서 (본 파일)
+├── SETUP_GUIDE.md                   # 다중 PC 및 AI Agent 전용 세팅·검증 가이드
+├── howtorun.md                      # 상세 실행·운영 사용자 가이드
+├── initRule.md                      # 프로젝트 절대 원칙 및 핵심 요구사항 명세
+└── prompt.md                        # 시스템 복원 및 AI Agent 감사 마스터 프롬프트
 ```
 
 ---
@@ -285,12 +339,25 @@ autoCoinTrade/
   "trade_mode": "paper",
   "request_timeout_sec": 5.0,
   "delay_threshold_ms": 800,
-  "gemini_api_key": "GOOGLE_GEMINI_API_KEY"
+  "gemini_api_key": "GOOGLE_GEMINI_API_KEY",
+  "gate_code": "stock",
+  "use_local_ollama_news": true,
+  "ollama_base_url": "http://192.168.0.100:11434",
+  "ollama_news_model": "qwen3-news",
+  "ollama_timeout_ms": 120000,
+  "live_executor_owner": "node",
+  "live_lease_ttl_sec": 30,
+  "live_reentry_cooldown_sec": 900,
+  "live_min_buy_interval_sec": 60,
+  "live_max_buys_per_bot_hour": 3,
+  "live_max_buys_per_bot_day": 12,
+  "live_max_total_buys_day": 30
 }
 ```
 
 - **`trade_mode`**: `"paper"` (가상거래 모의투자 모드) 또는 `"live"` (업비트 실거래 모드)
-- **`gemini_api_key`**: Google AI Studio에서 발급받은 Gemini API 키 (웹 화면에서도 등록/수정 가능)
+- **`live_executor_owner`**: `"node"` (기본값, Node.js 백엔드 단독 실전 주문 권한) — Python 이중 주문 원천 차단
+- **`access_key` / `secret_key` / `gemini_api_key`**: 저장 시 AES-256-GCM 암호화 볼트(`enc:v1:...`, 권한 `0600`)로 자동 보호됩니다.
 
 ---
 
@@ -310,13 +377,13 @@ autoCoinTrade/
 
 ## 🛠️ 기술 스택 (Tech Stack)
 
-- **Frontend**: React 18, Vite 5, CSS3 Custom Properties (Dark Theme), Responsive Mobile Layout
-- **Backend**: Node.js >= 22.5.0 (`node:http`, `node:sqlite` DatabaseSync WAL, `node:crypto`)
-- **Dual Database**: SQLite 3 (WAL 모드) + PostgreSQL 16 (`coin_trader` 양방향 실시간 동기화)
-- **AI Engine**: Google Gemini API (`gemini-3.8-flash`, `gemini-3.1-pro-preview`, `gemini-flash-latest` SSE 스트리밍 & Dual AI 체인)
-- **Exchange API**: Upbit Open API v1.0 (JWT SHA-512 비대칭 서명 인증, Rate Limit 방어)
-- **Network Tunnel**: Cloudflare Quick Tunnel (`cloudflared --no-autoupdate`)
-- **Deployment**: Linux Shell Scripts & Windows Batch / VBScript 무음 백그라운드 자동화
+- **Frontend**: React 18, Vite, CSS3 Custom Properties (Dark Theme), Responsive Mobile Layout, Hardened Static + Proxy Server (`frontend/server.mjs`)
+- **Backend**: Node.js >= 22.5.0 (`node:http`, `node:sqlite` / `better-sqlite3` WAL, `node:crypto` AES-256-GCM Vault, Native WebSocket)
+- **Dual Database**: SQLite 3 (WAL 모드, `busy_timeout=5000`) + PostgreSQL 16 (`coin_trader` 양방향 실시간 동기화)
+- **AI Engine**: 로컬 Ollama (`qwen3-news` 1순위 30분 분석) ➔ Google Gemini API (`gemini-3.8-flash`, `gemini-3.1-pro-preview`, SSE 스트리밍) ➔ BTC 20MA 기계적 안전 Fallback
+- **Exchange & Safety**: Upbit Open API v1.0 (JWT SHA-512, `identifier` 멱등성, WebSocket 멀티플렉서) + **5중 실전 중복 주문 차단 하드 가드레일**
+- **Notifications**: Telegram Bot API · Discord Webhook · WebPush 멀티채널 알림 허브
+- **Deployment & CI**: Linux/Windows 대칭 스크립트(`start_services.*` / `stop_services.*`), `/install` 원클릭 패키지, `Dockerfile` & `docker-compose.yml`, GitHub Actions CI (`.github/workflows/ci.yml`), Cloudflare Tunnel (`start_tunnel.sh`)
 
 ---
 

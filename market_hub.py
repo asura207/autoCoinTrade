@@ -1,8 +1,13 @@
 """
-market_hub.py - Centralized In-Memory Market Data & Rate-Limit Shield for Upbit
-- 실시간 시세(ticker) 및 캔들(OHLCV) 인메모리 캐시 공유
-- 업비트 Open API HTTP 429 (Too Many Requests) 방지를 위한 최소 120ms 딜레이 강제 및 스레드 락 보호
-- 멀티 봇(10개 가상 봇 / 1~3개 실전 봇) 동시 실행 시 중복 API 호출을 방지하고 캐시 우선 반환
+market_hub.py - Python 독립 실행 전용 중앙 시세 캐시 및 Rate-Limit 방어 모듈
+- 적용 대상: Python 멀티프로세싱 오케스트레이터(`main_orchestrator.py`) 및 `bots.py` 단독 실행 시 전용
+- 아키텍처 구분:
+  * 메인 Node.js 백엔드(`backend/node_server.mjs`, `LIVE_EXECUTOR_OWNER=node` 기본)는
+    `backend/common/upbit_ws_hub.mjs` (업비트 공식 WebSocket 실시간 멀티플렉서 + REST 자동 폴백)를 사용합니다.
+  * 본 모듈(`market_hub.py`)은 Node.js WebSocket 허브와 충돌하지 않는 Python 독립 워커 전용 REST 캐시/스레드 락 모듈입니다.
+- 주요 기능:
+  * 실시간 시세(ticker) 및 캔들(OHLCV) 인메모리 TTL 캐시 공유
+  * 업비트 Open API HTTP 429 (Too Many Requests) 방지를 위한 최소 120ms 딜레이 강제 및 스레드 락 보호
 """
 
 import logging

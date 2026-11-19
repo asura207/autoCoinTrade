@@ -1308,7 +1308,7 @@ export default function App() {
   const [gateError, setGateError] = useState("");
 
   // 프로젝트 버전 및 히스토리 모달 상태
-  const [appVersion, setAppVersion] = useState("0.0.29");
+  const [appVersion, setAppVersion] = useState("0.0.31");
   const [historyModalOpen, setHistoryModalOpen] = useState(false);
   const [historyContent, setHistoryContent] = useState("");
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -1642,6 +1642,11 @@ export default function App() {
     type: "info",
   });
   const [zeroBalanceAlerted, setZeroBalanceAlerted] = useState(false);
+
+  // 6-1) 5중 실전 중복 주문 가드레일 상태 & 비상 정지 모달 추적 ref
+  const [guardrailStatus, setGuardrailStatus] = useState(null);
+  const [guardrailResetLoading, setGuardrailResetLoading] = useState(false);
+  const guardrailAlertedAtRef = useRef("");
 
   // 7) AI 실시간 마켓 브리핑 & 듀얼 AI 레짐 게이트웨이 상태
   const [aiBriefing, setAiBriefing] = useState({
@@ -3490,6 +3495,68 @@ export default function App() {
     }
   };
 
+  // 5중 실전 중복 주문 가드레일 상태 반영 및 비상 정지 Modal Popup 표시 (useEffect 상단 선언으로 TDZ 원천 차단)
+  const applyGuardrailPayload = useCallback((payload) => {
+    if (!payload || typeof payload !== "object") return;
+    setGuardrailStatus(payload);
+    if (payload.emergency_halted) {
+      const alertKey = `${payload.emergency_at || "active"}|${payload.emergency_code || ""}`;
+      if (guardrailAlertedAtRef.current !== alertKey) {
+        guardrailAlertedAtRef.current = alertKey;
+        const botSummary =
+          Array.isArray(payload.emergency_bots) && payload.emergency_bots.length > 0
+            ? `\n대상 봇: ${payload.emergency_bots.map((b) => b.bot_id).join(", ")}`
+            : "";
+        showModal(
+          "🚨 실전 주문 가드레일 비상 정지 발동",
+          `${payload.emergency_reason || "이상 연속 매수 시도 또는 미해결 타임아웃 인텐트 누적으로 실전 봇이 자동 정지되었습니다."}${botSummary}\n발동 시각: ${payload.emergency_at || "-"}\n(참고: 10대 가상거래 Arena 경쟁 루프는 영향 없이 정상 가동 중입니다.)`,
+          "danger"
+        );
+      }
+    } else {
+      guardrailAlertedAtRef.current = "";
+    }
+  }, []);
+
+  const fetchGuardrailStatus = useCallback(async () => {
+    try {
+      const resp = await fetch("/api/guardrail/status");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data && data.ok) {
+        applyGuardrailPayload(data);
+      }
+    } catch {}
+  }, [applyGuardrailPayload]);
+
+  const handleResetGuardrailEmergency = useCallback(async () => {
+    setGuardrailResetLoading(true);
+    try {
+      const resp = await fetch("/api/guardrail/reset-emergency", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data?.guardrail) {
+          applyGuardrailPayload(data.guardrail);
+        } else {
+          await fetchGuardrailStatus();
+        }
+        showModal(
+          "가드레일 비상 정지 경고 해제 완료",
+          "비상 정지 알림 플래그가 초기화되었습니다. 원인 점검 후 각 봇의 시작 버튼으로 실전 매매를 재개할 수 있습니다.",
+          "info"
+        );
+      }
+    } catch (err) {
+      console.error("Failed to reset guardrail emergency:", err);
+    } finally {
+      setGuardrailResetLoading(false);
+    }
+  }, [applyGuardrailPayload, fetchGuardrailStatus]);
+
   // 시스템 개요 및 봇 정보 조회
   const fetchOverviewAndBots = async (triggerZeroModalOnTrades = false, targetMode = null) => {
     try {
@@ -3504,6 +3571,9 @@ export default function App() {
       }
       if (data.ollama) {
         setOllamaStatus(data.ollama);
+      }
+      if (data.guardrail) {
+        applyGuardrailPayload(data.guardrail);
       }
       setTotalCapitalInput(
         data.total_capital !== null && data.total_capital !== undefined && data.total_capital !== 0
@@ -3709,6 +3779,9 @@ export default function App() {
       if (data.ollama) {
         setOllamaStatus(data.ollama);
       }
+      if (data.guardrail) {
+        applyGuardrailPayload(data.guardrail);
+      }
     } catch {}
   };
 
@@ -3717,6 +3790,7 @@ export default function App() {
     fetchUpbitStatus();
     fetchUpbitAccount();
     fetchOverviewAndBots(true, "live");
+    fetchGuardrailStatus();
     fetchTrades(selectedBotId, "live");
     fetchStatistics(statsModeTab);
     fetchStatsTrades(1, null, statsModeTab);
@@ -3734,6 +3808,7 @@ export default function App() {
       fetchUpbitStatus();
       fetchUpbitAccount(true);
       refreshBotsStatusOnly("live");
+      fetchGuardrailStatus();
       fetchRotationStatus();
       fetchTrades(selectedBotId, "live");
       fetchTradeMode();
@@ -3741,7 +3816,7 @@ export default function App() {
       fetchNewsAiBriefing(true);
     }, 6000);
     return () => clearInterval(timer);
-  }, [authenticated, selectedBotId, tradeMode.mode, statsModeTab, fetchTradeMode, fetchAlgoLabModels, fetchRotationStatus, fetchEntryCode, fetchOllamaSettings]);
+  }, [authenticated, selectedBotId, tradeMode.mode, statsModeTab, fetchTradeMode, fetchAlgoLabModels, fetchRotationStatus, fetchEntryCode, fetchOllamaSettings, fetchGuardrailStatus]);
 
   // 가상거래 경쟁(Arena) 활성화 시 5초 주기 실시간 리더보드 및 체결 일지 자동 갱신
   useEffect(() => {
@@ -5214,12 +5289,116 @@ export default function App() {
                   >
                     실계좌 연동 · 실전 전용
                   </span>
+                  {guardrailStatus && (
+                    <span
+                      style={{
+                        fontSize: "12px",
+                        padding: "3px 10px",
+                        borderRadius: "12px",
+                        fontWeight: 700,
+                        background: guardrailStatus.emergency_halted
+                          ? "rgba(220, 38, 38, 0.28)"
+                          : (guardrailStatus.counters?.unresolved_timeout_count || 0) > 0 || !guardrailStatus.is_owner_match
+                          ? "rgba(245, 158, 11, 0.22)"
+                          : "rgba(16, 185, 129, 0.18)",
+                        color: guardrailStatus.emergency_halted
+                          ? "#fecaca"
+                          : (guardrailStatus.counters?.unresolved_timeout_count || 0) > 0 || !guardrailStatus.is_owner_match
+                          ? "#fde68a"
+                          : "#6ee7b7",
+                        border: guardrailStatus.emergency_halted
+                          ? "1px solid rgba(239, 68, 68, 0.75)"
+                          : (guardrailStatus.counters?.unresolved_timeout_count || 0) > 0 || !guardrailStatus.is_owner_match
+                          ? "1px solid rgba(245, 158, 11, 0.6)"
+                          : "1px solid rgba(16, 185, 129, 0.45)",
+                      }}
+                      title={`단일 실행 주체: ${String(guardrailStatus.live_executor_owner || "node").toUpperCase()} | 금일 실전 매수: ${guardrailStatus.counters?.today_total_buys || 0}/${guardrailStatus.limits?.max_total_buys_day || 30}회 | 5분 차단: ${guardrailStatus.counters?.recent_blocks_5m || 0}회 | 타임아웃 대기: ${guardrailStatus.counters?.unresolved_timeout_count || 0}건`}
+                    >
+                      {guardrailStatus.emergency_halted
+                        ? "🚨 5중 가드레일 비상 정지 발동"
+                        : (guardrailStatus.counters?.unresolved_timeout_count || 0) > 0
+                        ? `⚠️ 타임아웃 정산 대기 ${guardrailStatus.counters.unresolved_timeout_count}건`
+                        : !guardrailStatus.is_owner_match
+                        ? `⚠️ 실행 주체 불일치 (${String(guardrailStatus.live_executor_owner || "").toUpperCase()})`
+                        : `🛡️ 5중 가드레일 정상 (${String(guardrailStatus.live_executor_owner || "node").toUpperCase()} · 금일 ${guardrailStatus.counters?.today_total_buys || 0}/${guardrailStatus.limits?.max_total_buys_day || 30})`}
+                    </span>
+                  )}
                 </div>
                 <p className="page-desc">
                   설정에서 선택된 1~3개의 실전 담당 봇만 노출되며, 실제 업비트 계좌의 자금과 연동되어 안전하게 매매를 수행합니다.
                 </p>
               </div>
             </div>
+
+            {/* 5중 실전 중복 주문 가드레일 비상 정지 / 타임아웃 경고 배너 */}
+            {guardrailStatus &&
+              (guardrailStatus.emergency_halted ||
+                (guardrailStatus.counters?.unresolved_timeout_count || 0) > 0 ||
+                !guardrailStatus.is_owner_match) && (
+                <div
+                  className="card"
+                  style={{
+                    marginBottom: "16px",
+                    padding: "14px 18px",
+                    background: guardrailStatus.emergency_halted
+                      ? "linear-gradient(135deg, rgba(185, 28, 28, 0.3) 0%, rgba(69, 10, 10, 0.55) 100%)"
+                      : "linear-gradient(135deg, rgba(180, 83, 9, 0.25) 0%, rgba(69, 26, 3, 0.45) 100%)",
+                    borderColor: guardrailStatus.emergency_halted
+                      ? "rgba(248, 113, 113, 0.75)"
+                      : "rgba(251, 191, 36, 0.65)",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                    gap: "12px",
+                  }}
+                >
+                  <div style={{ flex: "1 1 360px" }}>
+                    <div style={{ fontSize: "14.5px", fontWeight: 700, color: guardrailStatus.emergency_halted ? "#fecaca" : "#fde68a" }}>
+                      {guardrailStatus.emergency_halted
+                        ? "🚨 [5중 가드레일 비상 정지] 이상 주문 시도 감지로 실전 봇이 자동 중지되었습니다"
+                        : !guardrailStatus.is_owner_match
+                        ? `⚠️ [실전 실행 주체 불일치] LIVE_EXECUTOR_OWNER=${guardrailStatus.live_executor_owner} (현재 Node 백엔드 주문 차단 중)`
+                        : `⏳ [타임아웃 정산 대기] 업비트 identifier 체결 확인 대기 중인 주문 ${guardrailStatus.counters?.unresolved_timeout_count || 0}건`}
+                    </div>
+                    <div style={{ fontSize: "12.5px", color: "#e2e8f0", marginTop: "4px", lineHeight: 1.5 }}>
+                      {guardrailStatus.emergency_halted
+                        ? `${guardrailStatus.emergency_reason || "가드레일 이상 감지로 실전 매수가 자동 정지되었습니다."} (발동 시각: ${guardrailStatus.emergency_at || "-"})`
+                        : "업비트 거래소 중복 결제 방지를 위해 해당 종목의 추가 매수가 잠금 상태이며, 다음 정산 사이클에서 identifier 조회로 자동 확정됩니다."}
+                    </div>
+                    <div style={{ fontSize: "11.5px", color: "#cbd5e1", marginTop: "4px" }}>
+                      금일 실전 매수: {guardrailStatus.counters?.today_total_buys || 0}/{guardrailStatus.limits?.max_total_buys_day || 30}회 · 최근 5분 차단: {guardrailStatus.counters?.recent_blocks_5m || 0}회 · 미해결 타임아웃: {guardrailStatus.counters?.unresolved_timeout_count || 0}건
+                    </div>
+                  </div>
+                  {guardrailStatus.emergency_halted && (
+                    <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                      <button
+                        type="button"
+                        className="btn btn-outline"
+                        style={{ padding: "7px 12px", fontSize: "12px", borderColor: "#fca5a5", color: "#fecaca" }}
+                        onClick={() =>
+                          showModal(
+                            "🚨 실전 주문 가드레일 비상 정지 상세",
+                            `${guardrailStatus.emergency_reason || "이상 주문 시도 감지로 실전 봇이 자동 정지되었습니다."}\n발동 시각: ${guardrailStatus.emergency_at || "-"}\n정지 대상 봇: ${(guardrailStatus.emergency_bots || []).map((b) => b.bot_id).join(", ") || "실전 봇"}\n미해결 타임아웃: ${guardrailStatus.counters?.unresolved_timeout_count || 0}건 · 최근 5분 차단: ${guardrailStatus.counters?.recent_blocks_5m || 0}회`,
+                            "danger"
+                          )
+                        }
+                      >
+                        📋 상세 알림 보기
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-stop"
+                        style={{ padding: "7px 12px", fontSize: "12px" }}
+                        disabled={guardrailResetLoading}
+                        onClick={handleResetGuardrailEmergency}
+                      >
+                        {guardrailResetLoading ? "해제 중..." : "✅ 비상 정지 경고 해제"}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
 
             {/* 가상거래 / 실거래 모드 상태 안내 카드 */}
             <div

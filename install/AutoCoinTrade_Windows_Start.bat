@@ -76,6 +76,7 @@ if not exist "%APP_DIR%\.env" (
 set "BACKEND_PORT=8001"
 set "FRONTEND_PORT=9000"
 set "FRONTEND_HOST=127.0.0.1"
+set "LIVE_EXECUTOR_OWNER=node"
 set "BACKEND_URL="
 if exist "%APP_DIR%\.env" (
     for /f "usebackq eol=# tokens=1,* delims==" %%A in ("%APP_DIR%\.env") do (
@@ -83,6 +84,7 @@ if exist "%APP_DIR%\.env" (
         if /I "%%~A"=="FRONTEND_PORT" set "FRONTEND_PORT=%%~B"
         if /I "%%~A"=="FRONTEND_HOST" set "FRONTEND_HOST=%%~B"
         if /I "%%~A"=="BACKEND_URL" set "BACKEND_URL=%%~B"
+        if /I "%%~A"=="LIVE_EXECUTOR_OWNER" set "LIVE_EXECUTOR_OWNER=%%~B"
     )
 )
 if "!BACKEND_URL!"=="" set "BACKEND_URL=http://127.0.0.1:!BACKEND_PORT!"

@@ -379,6 +379,8 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
     """
     from init_db import get_db_connection
     from bots import (
+        acquire_live_cycle_mutex,
+        acquire_live_executor_lease,
         can_enter_position,
         evaluate_smart_exit,
         execute_buy_order,
@@ -386,7 +388,10 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
         get_safe_current_price,
         is_backend_running,
         is_dry_run,
+        is_python_live_executor_authorized,
         normalize_bot_id,
+        reconcile_python_unknown_timeout_intents,
+        release_live_cycle_mutex,
         MIN_ORDER_KRW,
     )
     from market_hub import get_cached_ohlcv, get_cached_tickers
@@ -396,11 +401,22 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
     peak_map: Dict[int, float] = {}
 
     while not stop_event.is_set():
+        if not acquire_live_cycle_mutex(bot_id):
+            if stop_event.wait(timeout=2):
+                break
+            continue
         try:
-            if is_backend_running():
+            if is_backend_running() or (not is_dry_run() and not is_python_live_executor_authorized()):
                 if stop_event.wait(timeout=10):
                     break
                 continue
+            if not is_dry_run():
+                lease_ok, _ = acquire_live_executor_lease(db_path=db_path)
+                if not lease_ok:
+                    if stop_event.wait(timeout=10):
+                        break
+                    continue
+                reconcile_python_unknown_timeout_intents(db_path=db_path)
 
             conn = get_db_connection(db_path)
             allow_new_buys = True
@@ -598,6 +614,8 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
 
         except Exception as loop_exc:
             logger.error("[%s] Unexpected error in Jack Kellogg loop: %s", bot_id, loop_exc, exc_info=True)
+        finally:
+            release_live_cycle_mutex(bot_id)
 
         if stop_event.wait(timeout=15):
             break
