@@ -183,16 +183,21 @@ Get-NetTCPConnection -LocalPort 8001,9000 -ErrorAction SilentlyContinue | ForEac
 AI Agent가 서비스 구동 후 정상 여부를 검증할 때 사용하는 엔드포인트 목록입니다:
 
 ```bash
-# 1. 백엔드 상태 및 등록 봇 3개 목록 조회 (HTTP 200)
-curl -s http://localhost:8001/api/bots
+# 1. 백엔드 헬스체크 (인증 불필요, HTTP 200)
+curl -s http://localhost:8001/api/health
 
-# 2. 거래 현황 내역 조회 (HTTP 200)
-curl -s "http://localhost:8001/api/trades?bot_id=bot_volatility"
+# 2. 세션 쿠키 발급 후 10대 봇 목록 조회 (기본 입장 코드: stock)
+curl -s -c /tmp/act_cookie.txt -X POST -H "Content-Type: application/json" \
+  -d '{"code":"stock"}' http://localhost:8001/api/auth/verify
+curl -s -b /tmp/act_cookie.txt http://localhost:8001/api/bots
 
-# 3. AI 시황 브리핑 최근 기록 확인 (HTTP 200)
-curl -s http://localhost:8001/api/ai/briefing
+# 3. 거래 현황 내역 조회 (HTTP 200)
+curl -s -b /tmp/act_cookie.txt "http://localhost:8001/api/trades?bot_id=bot_01"
 
-# 4. 프론트엔드 웹 서버 응답 확인 (HTTP 200)
+# 4. AI 시황 브리핑 최근 기록 확인 (HTTP 200)
+curl -s -b /tmp/act_cookie.txt http://localhost:8001/api/ai/briefing
+
+# 5. 프론트엔드 정적 웹 서버 응답 확인 (HTTP 200)
 curl -s -I http://localhost:9000
 ```
 

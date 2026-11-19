@@ -54,6 +54,8 @@ kill_port() {
         pids=$(fuser "${port}/tcp" 2>/dev/null || true)
     elif command -v lsof >/dev/null 2>&1; then
         pids=$(lsof -t -i ":${port}" 2>/dev/null || true)
+    elif command -v ss >/dev/null 2>&1; then
+        pids=$(ss -ltnp "sport = :${port}" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u || true)
     fi
     for p in $pids; do
         if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
@@ -76,7 +78,9 @@ if command -v pgrep >/dev/null 2>&1; then
             if [ -n "$wp" ] && [ "$wp" != "$$" ] && kill -0 "$wp" 2>/dev/null; then
                 kill -TERM "$wp" >/dev/null 2>&1 || true
                 sleep 0.5
-                kill -9 "$wp" >/dev/null 2>&1 || true
+                if kill -0 "$wp" 2>/dev/null; then
+                    kill -9 "$wp" >/dev/null 2>&1 || true
+                fi
             fi
         done
     done

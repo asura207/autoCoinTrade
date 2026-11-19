@@ -76,7 +76,7 @@ if not exist "%APP_DIR%\.env" (
 set "BACKEND_PORT=8001"
 set "FRONTEND_PORT=9000"
 set "FRONTEND_HOST=127.0.0.1"
-set "BACKEND_URL=http://127.0.0.1:8001"
+set "BACKEND_URL="
 if exist "%APP_DIR%\.env" (
     for /f "usebackq eol=# tokens=1,* delims==" %%A in ("%APP_DIR%\.env") do (
         if /I "%%~A"=="BACKEND_PORT" set "BACKEND_PORT=%%~B"
@@ -85,6 +85,7 @@ if exist "%APP_DIR%\.env" (
         if /I "%%~A"=="BACKEND_URL" set "BACKEND_URL=%%~B"
     )
 )
+if "!BACKEND_URL!"=="" set "BACKEND_URL=http://127.0.0.1:!BACKEND_PORT!"
 
 :: 4. 의존성 패키지 설치 확인
 echo.

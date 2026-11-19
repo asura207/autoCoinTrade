@@ -103,6 +103,10 @@ def compute_vwap(df_15m: pd.DataFrame, current_price: float = 0.0) -> Tuple[floa
         minute=0,
         second=0,
     )
+    idx_tz = getattr(df.index, "tz", None)
+    if idx_tz is not None:
+        kst_tz = datetime.timezone(datetime.timedelta(hours=9))
+        day_start_ts = day_start_ts.tz_localize(kst_tz).tz_convert(idx_tz)
 
     day_mask = df.index >= day_start_ts
     day_vol_sum = vol[day_mask].sum()
@@ -137,11 +141,11 @@ def calculate_kellogg_indicators(
 
     price = current_price if current_price > 0 else float(df_15m["close"].iloc[-1])
 
-    # 1. 3대 기준 가격선 (당일 시가, 전일 종가, 전일 고가, 전일 저가)
-    today_open = price
-    prev_close = price
-    prev_high = price
-    prev_low = price
+    # 1. 3대 기준 가격선 (당일 시가, 전일 종가, 전일 고가, 전일 저가 — 일봉 부재 시 0.0으로 안전 비활성화)
+    today_open = 0.0
+    prev_close = 0.0
+    prev_high = 0.0
+    prev_low = 0.0
 
     if df_day is not None and len(df_day) >= 1:
         today_open = float(df_day["open"].iloc[-1])
@@ -163,12 +167,18 @@ def calculate_kellogg_indicators(
     if not lrc:
         return None
 
-    # 4. 상대 거래량 폭발 배수 (RVOL)
+    # 4. 상대 거래량 폭발 배수 (RVOL — 직전 완성봉 자체 희석 방지 및 0거래량 시 0.0 반환)
     vol_series = df_15m["volume"].astype(float)
-    avg_vol_20 = float(vol_series.iloc[-21:-1].mean()) if len(vol_series) >= 21 else float(vol_series.iloc[:-1].mean())
+    avg_vol_for_cur = float(vol_series.iloc[-21:-1].mean()) if len(vol_series) >= 21 else float(vol_series.iloc[:-1].mean())
+    avg_vol_for_closed = float(vol_series.iloc[-22:-2].mean()) if len(vol_series) >= 22 else (
+        float(vol_series.iloc[:-2].mean()) if len(vol_series) >= 3 else avg_vol_for_cur
+    )
     cur_vol = float(vol_series.iloc[-1])
     closed_vol = float(vol_series.iloc[-2]) if len(vol_series) >= 2 else cur_vol
-    rvol = max(cur_vol, closed_vol) / avg_vol_20 if avg_vol_20 > 0 else 1.0
+    rvol_cur = (cur_vol / avg_vol_for_cur) if (avg_vol_for_cur > 0 and math.isfinite(avg_vol_for_cur)) else 0.0
+    rvol_closed = (closed_vol / avg_vol_for_closed) if (avg_vol_for_closed > 0 and math.isfinite(avg_vol_for_closed)) else 0.0
+    rvol = max(rvol_cur, rvol_closed)
+    avg_vol_20 = avg_vol_for_cur if math.isfinite(avg_vol_for_cur) else 0.0
 
     # 최근 20봉 최고/최저가
     recent_high_20 = float(df_15m["high"].tail(20).max())
@@ -218,7 +228,7 @@ def evaluate_jack_kellogg_strategy(
     params = params or {}
     rvol_breakout_th = float(params.get("rvol_breakout", 1.8 if is_live else 1.4))
     rvol_dip_th = float(params.get("rvol_dip", 1.3))
-    dip_gap_th = float(params.get("vwap_gap", -2.8 if is_live else -2.0))
+    dip_gap_th = -abs(float(params.get("vwap_gap", 2.8 if is_live else 2.0)))
     trailing_pct = float(params.get("trailing_stop_pct", 1.5))
 
     held = open_positions or []
@@ -234,6 +244,13 @@ def evaluate_jack_kellogg_strategy(
 
         is_breakout = any("돌파" in str(p.get("buy_reason", "")) or "Setup A" in str(p.get("buy_reason", "")) for p in held)
         is_dip = any("반등" in str(p.get("buy_reason", "")) or "Setup B" in str(p.get("buy_reason", "")) for p in held)
+        if not is_breakout and not is_dip:
+            inferred_dip = (
+                any(int(p.get("step_level") or 1) >= 2 for p in held)
+                or (k["vwap"] > 0 and avg_buy_price > 0 and ((avg_buy_price - k["vwap"]) / k["vwap"]) * 100.0 <= dip_gap_th)
+            )
+            if inferred_dip:
+                is_dip = True
 
         # (1) 기계적 기준선 손절 (Key Level Hard Stop)
         if is_breakout:
@@ -292,21 +309,22 @@ def evaluate_jack_kellogg_strategy(
         if peak_pnl >= 1.5 and price <= cur_peak * (1.0 - trailing_pct / 100.0):
             return {
                 "signal": "SELL",
-                "reason": f"[트레일링 스탑] 고점 대비 -{trailing_pct}% 반락 익절 (수익률 +{total_pnl_pct:.2f}%)",
+                "reason": f"[트레일링 스탑] 고점 대비 -{trailing_pct}% 반락 익절 (수익률 {total_pnl_pct:+.2f}%)",
             }
 
         # (5) Setup B 2차 분할 매수 (Scaling-In) 평가
         if is_dip and len(held) == 1:
-            first_buy = float(held[0].get("avg_buy_price", price))
-            drop_pct = ((price - first_buy) / first_buy) * 100.0
-            if drop_pct <= -2.5 and (k["prev_low"] <= 0 or price >= k["prev_low"]):
-                return {
-                    "signal": "BUY",
-                    "reason": f"[Setup B 2차 분할 매수] 1차 진입가 대비 {drop_pct:.2f}% 추가 하락 분할 매수 (Scaling-In)",
-                    "setup": "B",
-                    "split_index": 2,
-                    "order_ratio": 0.15,
-                }
+            first_buy = float(held[0].get("avg_buy_price") or 0.0)
+            if first_buy > 0:
+                drop_pct = ((price - first_buy) / first_buy) * 100.0
+                if drop_pct <= -2.5 and (k["prev_low"] <= 0 or price >= k["prev_low"]):
+                    return {
+                        "signal": "BUY",
+                        "reason": f"[Setup B 2차 분할 매수] 1차 진입가 대비 {drop_pct:.2f}% 추가 하락 분할 매수 (Scaling-In)",
+                        "setup": "B",
+                        "split_index": 2,
+                        "order_ratio": 0.15,
+                    }
 
         return {
             "signal": "HOLD",
@@ -368,10 +386,12 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
         get_safe_current_price,
         is_backend_running,
         is_dry_run,
+        normalize_bot_id,
         MIN_ORDER_KRW,
     )
     from market_hub import get_cached_ohlcv, get_cached_tickers
 
+    bot_id = normalize_bot_id(bot_id)
     logger.info("Bot process [%s] (Jack Kellogg Price Action) started.", bot_id)
     peak_map: Dict[int, float] = {}
 
@@ -396,6 +416,7 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
                 )
             bot_acc = conn.execute("SELECT * FROM bot_accounts WHERE bot_id = ?;", (bot_id,)).fetchone()
             available_krw = float(bot_acc["virtual_krw"]) if bot_acc else 0.0
+            allocated_cap = float(bot_acc["allocated_capital"] or 0.0) if bot_acc else 0.0
             open_positions = conn.execute(
                 "SELECT * FROM bot_positions WHERE bot_id = ? AND status = 'OPEN' ORDER BY id ASC;",
                 (bot_id,),
@@ -420,9 +441,23 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
                 if cur_price <= 0:
                     continue
 
+                updated_peaks: List[Tuple[float, int]] = []
                 for p in pos_list:
                     p_id = p["id"]
-                    peak_map[p_id] = max(peak_map.get(p_id, float(p.get("highest_price") or p.get("avg_buy_price") or cur_price)), cur_price)
+                    prev_high = float(p.get("highest_price") or p.get("avg_buy_price") or cur_price)
+                    new_peak = max(peak_map.get(p_id, prev_high), prev_high, cur_price)
+                    peak_map[p_id] = new_peak
+                    p["highest_price"] = new_peak
+                    if new_peak > float(p.get("highest_price_db") or prev_high):
+                        updated_peaks.append((new_peak, p_id))
+                if updated_peaks:
+                    u_conn = get_db_connection(db_path)
+                    try:
+                        for new_peak, p_id in updated_peaks:
+                            u_conn.execute("UPDATE bot_positions SET highest_price = ? WHERE id = ?;", (new_peak, p_id))
+                        u_conn.commit()
+                    finally:
+                        u_conn.close()
 
                 df_15m = get_cached_ohlcv(ticker, interval="minute15", count=100)
                 df_day = get_cached_ohlcv(ticker, interval="day", count=30)
@@ -439,24 +474,24 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
                     (df_15m["high"] - df_15m["close"].shift(1)).abs(),
                     (df_15m["low"] - df_15m["close"].shift(1)).abs()
                 ], axis=1).max(axis=1)
-                atr_val = float(tr.rolling(14).mean().iloc[-1]) if len(tr) >= 14 else 0.0
+                atr_raw = tr.rolling(14).mean().iloc[-1] if len(tr) >= 14 else 0.0
+                atr_val = float(atr_raw) if (not pd.isna(atr_raw) and math.isfinite(float(atr_raw))) else 0.0
 
-                smart_exited_any = False
                 for p in list(pos_list):
                     smart_exit = evaluate_smart_exit(
                         bot_id,
                         p,
                         cur_price,
                         atr=atr_val,
-                        rvol=k.get("rvol", 1.0),
+                        rvol=k.get("rvol", 0.0),
                         is_live=not is_dry_run(),
                     )
                     if smart_exit:
                         logger.info("[%s] Smart Exit on %s: %s", bot_id, ticker, smart_exit["reason"])
-                        execute_sell_order(p["id"], reason=smart_exit["reason"], db_path=db_path)
-                        peak_map.pop(p["id"], None)
-                        pos_list.remove(p)
-                        smart_exited_any = True
+                        sell_res = execute_sell_order(p["id"], reason=smart_exit["reason"], db_path=db_path)
+                        if sell_res:
+                            peak_map.pop(p["id"], None)
+                            pos_list.remove(p)
 
                 if not pos_list:
                     continue
@@ -473,19 +508,32 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
                 if eval_res["signal"] == "SELL":
                     logger.info("[%s] %s SELL triggered: %s", bot_id, ticker, eval_res["reason"])
                     for p in pos_list:
-                        execute_sell_order(p["id"], reason=eval_res["reason"], db_path=db_path)
-                        peak_map.pop(p["id"], None)
+                        sell_res = execute_sell_order(p["id"], reason=eval_res["reason"], db_path=db_path)
+                        if sell_res:
+                            peak_map.pop(p["id"], None)
                     continue
 
                 if allow_new_buys and eval_res["signal"] == "BUY" and eval_res.get("split_index") == 2:
                     # 2차 분할 매수 실행
                     if available_krw >= MIN_ORDER_KRW:
+                        split_ratio = float(eval_res.get("order_ratio", 0.15))
+                        split_budget = min(available_krw, allocated_cap * split_ratio) if allocated_cap > 0 else (available_krw * 0.5)
+                        if split_budget < MIN_ORDER_KRW:
+                            split_budget = min(available_krw, MIN_ORDER_KRW * 1.05)
                         can_enter, invest_krw, reason = can_enter_position(
-                            bot_id, ticker, available_krw * 0.5, db_path=db_path
+                            bot_id, ticker, split_budget, db_path=db_path
                         )
                         if can_enter:
-                            execute_buy_order(bot_id, ticker, invest_krw, step_level=2, db_path=db_path)
-                            available_krw -= invest_krw
+                            buy_res = execute_buy_order(
+                                bot_id,
+                                ticker,
+                                invest_krw,
+                                step_level=2,
+                                db_path=db_path,
+                                buy_reason=eval_res["reason"],
+                            )
+                            if buy_res:
+                                available_krw = max(0.0, available_krw - float(buy_res.get("buy_amount") or invest_krw))
 
             # 2. 신규 진입 종목 스캔 (실전 선택 + 가동 상태일 때만 허용, Graceful Drain 중엔 차단)
             if allow_new_buys:
@@ -529,15 +577,24 @@ def run_bot_jack_kellogg(stop_event, bot_id: str = "bot_10", db_path: Optional[s
 
                     if eval_res["signal"] == "BUY":
                         order_ratio = float(eval_res.get("order_ratio", 0.3))
-                        budget = available_krw * order_ratio
+                        base_cap = allocated_cap if allocated_cap > 0 else available_krw
+                        budget = min(available_krw, base_cap * order_ratio)
                         if budget >= MIN_ORDER_KRW:
                             can_enter, invest_krw, reason = can_enter_position(
                                 bot_id, ticker, budget, db_path=db_path
                             )
                             if can_enter:
                                 logger.info("[%s] BUY entered for %s: %s", bot_id, ticker, eval_res["reason"])
-                                execute_buy_order(bot_id, ticker, invest_krw, step_level=1, db_path=db_path)
-                                available_krw -= invest_krw
+                                buy_res = execute_buy_order(
+                                    bot_id,
+                                    ticker,
+                                    invest_krw,
+                                    step_level=1,
+                                    db_path=db_path,
+                                    buy_reason=eval_res["reason"],
+                                )
+                                if buy_res:
+                                    available_krw = max(0.0, available_krw - float(buy_res.get("buy_amount") or invest_krw))
 
         except Exception as loop_exc:
             logger.error("[%s] Unexpected error in Jack Kellogg loop: %s", bot_id, loop_exc, exc_info=True)

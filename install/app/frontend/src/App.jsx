@@ -198,11 +198,12 @@ function computeAllocationPreview(rawTotalCapital, botsList, ratiosMap) {
 
 function renderColoredProfit(val) {
   const num = Number(val || 0);
-  if (num > 0) {
-    return <span className="pnl-profit">+{Math.floor(num).toLocaleString("ko-KR")}원</span>;
+  const truncated = Math.trunc(Number.isFinite(num) ? num : 0);
+  if (truncated > 0) {
+    return <span className="pnl-profit">+{truncated.toLocaleString("ko-KR")}원</span>;
   }
-  if (num < 0) {
-    return <span className="pnl-loss">{Math.floor(num).toLocaleString("ko-KR")}원</span>;
+  if (truncated < 0) {
+    return <span className="pnl-loss">{truncated.toLocaleString("ko-KR")}원</span>;
   }
   return <span className="pnl-Zero">0원</span>;
 }
@@ -861,7 +862,7 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
                   {formatShortKRW(startBal)}
                 </text>
 
-                {/* 현재/말일 자산 막대 (증가: 에메랄드/그린, 감소: 레드) */}
+                {/* 현재/말일 자산 막대 (한국 금융 표준: 증가 레드 #ef4444, 감소 블루 #3b82f6) */}
                 <rect
                   x={curBarX}
                   y={curBarY}
@@ -875,7 +876,7 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
                   x={curBarX + barWidth / 2}
                   y={curBarY - 8}
                   textAnchor="middle"
-                  fill={isInc ? "#4ade80" : isDec ? "#f87171" : "#e2e8f0"}
+                  fill={isInc ? "#ef4444" : isDec ? "#3b82f6" : "#e2e8f0"}
                   fontSize="10.5"
                   fontWeight="700"
                 >
@@ -890,8 +891,8 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
                     width="88"
                     height="22"
                     rx="11"
-                    fill={isInc ? "rgba(34, 197, 94, 0.22)" : isDec ? "rgba(239, 68, 68, 0.22)" : "rgba(148, 163, 184, 0.2)"}
-                    stroke={isInc ? "#22c55e" : isDec ? "#ef4444" : "#94a3b8"}
+                    fill={isInc ? "rgba(239, 68, 68, 0.22)" : isDec ? "rgba(59, 130, 246, 0.22)" : "rgba(148, 163, 184, 0.2)"}
+                    stroke={isInc ? "#ef4444" : isDec ? "#3b82f6" : "#94a3b8"}
                     strokeWidth="1.2"
                   />
                   <text
@@ -899,7 +900,7 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
                     y="0"
                     textAnchor="middle"
                     dominantBaseline="central"
-                    fill={isInc ? "#4ade80" : isDec ? "#fca5a5" : "#cbd5e1"}
+                    fill={isInc ? "#fca5a5" : isDec ? "#93c5fd" : "#cbd5e1"}
                     fontSize="10"
                     fontWeight="800"
                   >
@@ -938,12 +939,12 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
               <stop offset="100%" stopColor="#334155" />
             </linearGradient>
             <linearGradient id="curBalIncGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#10b981" />
-              <stop offset="100%" stopColor="#047857" />
-            </linearGradient>
-            <linearGradient id="curBalDecGrad" x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor="#ef4444" />
               <stop offset="100%" stopColor="#b91c1c" />
+            </linearGradient>
+            <linearGradient id="curBalDecGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#3b82f6" />
+              <stop offset="100%" stopColor="#1d4ed8" />
             </linearGradient>
             <linearGradient id="curBalFlatGrad" x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor="#94a3b8" />
@@ -974,11 +975,11 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
             <span style={{ color: "#cbd5e1" }}>1일 시점 평가자산</span>
           </span>
           <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-            <span style={{ width: "12px", height: "12px", background: "#10b981", borderRadius: "3px", display: "inline-block" }} />
+            <span style={{ width: "12px", height: "12px", background: "#ef4444", borderRadius: "3px", display: "inline-block" }} />
             <span style={{ color: "#cbd5e1" }}>현재/말일 자산 (자산 증가)</span>
           </span>
           <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-            <span style={{ width: "12px", height: "12px", background: "#ef4444", borderRadius: "3px", display: "inline-block" }} />
+            <span style={{ width: "12px", height: "12px", background: "#3b82f6", borderRadius: "3px", display: "inline-block" }} />
             <span style={{ color: "#cbd5e1" }}>현재/말일 자산 (자산 감소)</span>
           </span>
         </div>
@@ -1047,18 +1048,18 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
                       padding: "8px 10px",
                       textAlign: "right",
                       fontWeight: "700",
-                      color: isInc ? "#4ade80" : isDec ? "#f87171" : "#cbd5e1",
+                      color: isInc ? "#ef4444" : isDec ? "#3b82f6" : "#94a3b8",
                     }}
                   >
                     {isInc ? "+" : ""}
-                    {Math.floor(diff).toLocaleString("ko-KR")}원
+                    {Math.trunc(diff).toLocaleString("ko-KR")}원
                   </td>
                   <td
                     style={{
                       padding: "8px 10px",
                       textAlign: "right",
                       fontWeight: "700",
-                      color: isInc ? "#4ade80" : isDec ? "#f87171" : "#cbd5e1",
+                      color: isInc ? "#ef4444" : isDec ? "#3b82f6" : "#94a3b8",
                     }}
                   >
                     {isInc ? "+" : ""}
@@ -1072,12 +1073,12 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
                         fontSize: "11px",
                         fontWeight: "700",
                         background: isInc
-                          ? "rgba(34, 197, 94, 0.15)"
-                          : isDec
                           ? "rgba(239, 68, 68, 0.15)"
+                          : isDec
+                          ? "rgba(59, 130, 246, 0.15)"
                           : "rgba(148, 163, 184, 0.15)",
-                        color: isInc ? "#4ade80" : isDec ? "#f87171" : "#cbd5e1",
-                        border: `1px solid ${isInc ? "rgba(34, 197, 94, 0.3)" : isDec ? "rgba(239, 68, 68, 0.3)" : "rgba(148, 163, 184, 0.3)"}`,
+                        color: isInc ? "#ef4444" : isDec ? "#3b82f6" : "#94a3b8",
+                        border: `1px solid ${isInc ? "rgba(239, 68, 68, 0.35)" : isDec ? "rgba(59, 130, 246, 0.35)" : "rgba(148, 163, 184, 0.3)"}`,
                       }}
                     >
                       {isInc ? "▲ 금액 증가" : isDec ? "▼ 금액 감소" : "- 보합 유지"}
@@ -1181,9 +1182,17 @@ function MarkdownViewer({ content, isStreaming = false }) {
 }
 
 function getTodayKSTDateString() {
-  const d = new Date();
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Seoul",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date());
+  } catch {
+    const kst = new Date(Date.now() + 9 * 3600 * 1000);
+    return kst.toISOString().slice(0, 10);
+  }
 }
 
 function isDailyGateAuthValid() {
@@ -1276,12 +1285,12 @@ function renderSimpleMarkdown(md) {
       out.push(`<blockquote>${inlineFormat(trimmed.slice(2))}</blockquote>`);
     } else if (trimmed.startsWith("---")) {
       out.push("<hr style='border:none; border-top:1px solid rgba(255,255,255,0.1); margin:16px 0;' />");
+    } else if (/^ {4,}-\s/.test(rawLine)) {
+      out.push(`<div style='padding-left:48px; margin:2px 0; color:#64748b;'>▪ ${inlineFormat(rawLine.replace(/^ {4,}-\s/, ""))}</div>`);
+    } else if (/^ {2,3}-\s/.test(rawLine)) {
+      out.push(`<div style='padding-left:32px; margin:2px 0; color:#94a3b8;'>◦ ${inlineFormat(rawLine.replace(/^ {2,3}-\s/, ""))}</div>`);
     } else if (trimmed.startsWith("- ")) {
       out.push(`<div style='padding-left:16px; margin:3px 0;'>• ${inlineFormat(trimmed.slice(2))}</div>`);
-    } else if (trimmed.startsWith("  - ")) {
-      out.push(`<div style='padding-left:32px; margin:2px 0; color:#94a3b8;'>◦ ${inlineFormat(trimmed.slice(4))}</div>`);
-    } else if (trimmed.startsWith("    - ")) {
-      out.push(`<div style='padding-left:48px; margin:2px 0; color:#64748b;'>▪ ${inlineFormat(trimmed.slice(6))}</div>`);
     } else {
       out.push(`<p style='margin: 4px 0;'>${inlineFormat(trimmed)}</p>`);
     }
@@ -1299,7 +1308,7 @@ export default function App() {
   const [gateError, setGateError] = useState("");
 
   // 프로젝트 버전 및 히스토리 모달 상태
-  const [appVersion, setAppVersion] = useState("0.0.22");
+  const [appVersion, setAppVersion] = useState("0.0.28");
   const [historyModalOpen, setHistoryModalOpen] = useState(false);
   const [historyContent, setHistoryContent] = useState("");
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -1343,10 +1352,8 @@ export default function App() {
       const resp = await fetch(`${API_BASE}/api/setup/status`);
       if (resp.ok) {
         const data = await resp.json();
-        setSetupConfigured(data.is_configured);
-        if (data.is_configured) {
-          setShowSetupWizard(false);
-        }
+        setSetupConfigured(Boolean(data.is_configured));
+        setShowSetupWizard(!data.is_configured);
         if (data.version) {
           setAppVersion(data.version);
         }
@@ -1520,7 +1527,7 @@ export default function App() {
         setInstallState((prev) => ({ ...prev, progress: 100, currentStepIndex: 4 }));
         await new Promise((r) => setTimeout(r, 500));
 
-        const today = new Date().toISOString().slice(0, 10);
+        const today = getTodayKSTDateString();
         sessionStorage.setItem("autoCoinTrade_auth", "true");
         localStorage.setItem("autoCoinTrade_auth", "true");
         sessionStorage.setItem("autoCoinTrade_auth_date", today);
@@ -1737,6 +1744,18 @@ export default function App() {
   const [pushToast, setPushToast] = useState({ show: false, title: "", message: "" });
   const lastBriefingIdRef = useRef(null);
   const lastPushNotifiedTimeRef = useRef(0);
+  const pushToastTimerRef = useRef(null);
+  const newsNoticeTimerRef = useRef(null);
+  const newsFilterRef = useRef({ keyword: "", startDate: "", endDate: "" });
+  const isLiveConfigDirtyRef = useRef(false);
+
+  useEffect(() => {
+    newsFilterRef.current = {
+      keyword: newsKeyword,
+      startDate: newsStartDate,
+      endDate: newsEndDate,
+    };
+  }, [newsKeyword, newsStartDate, newsEndDate]);
 
   // 뉴스 AI 한 글자씩 부드럽게 화면에 타이핑해주는 이펙트
   useEffect(() => {
@@ -1789,7 +1808,7 @@ export default function App() {
     };
   }, [isStreaming]);
 
-  // 컴포넌트 언마운트 시 활성 스트리밍 요청 정리
+  // 컴포넌트 언마운트 시 활성 스트리밍 요청 및 타이머 정리
   useEffect(() => {
     return () => {
       if (activeStreamAbortControllerRef.current) {
@@ -1797,6 +1816,12 @@ export default function App() {
       }
       if (activeNewsStreamAbortControllerRef.current) {
         activeNewsStreamAbortControllerRef.current.abort();
+      }
+      if (pushToastTimerRef.current) {
+        clearTimeout(pushToastTimerRef.current);
+      }
+      if (newsNoticeTimerRef.current) {
+        clearTimeout(newsNoticeTimerRef.current);
       }
     };
   }, []);
@@ -1895,6 +1920,11 @@ export default function App() {
       gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.45);
       osc.connect(gain);
       gain.connect(ctx.destination);
+      osc.onended = () => {
+        try {
+          ctx.close();
+        } catch {}
+      };
       osc.start();
       osc.stop(ctx.currentTime + 0.5);
     } catch (e) {}
@@ -2003,8 +2033,10 @@ export default function App() {
         title,
         message: body,
       });
-      setTimeout(() => {
+      if (pushToastTimerRef.current) clearTimeout(pushToastTimerRef.current);
+      pushToastTimerRef.current = setTimeout(() => {
         setPushToast((prev) => ({ ...prev, show: false }));
+        pushToastTimerRef.current = null;
       }, 5000);
 
       // 3. 브라우저 OS 알림 발송
@@ -2176,6 +2208,9 @@ export default function App() {
   const [selectedLiveBotIds, setSelectedLiveBotIds] = useState(["bot_01", "bot_03", "bot_05"]);
   const [savedLiveBotIds, setSavedLiveBotIds] = useState(["bot_01", "bot_03", "bot_05"]);
   const [isLiveConfigDirty, setIsLiveConfigDirty] = useState(false);
+  useEffect(() => {
+    isLiveConfigDirtyRef.current = isLiveConfigDirty;
+  }, [isLiveConfigDirty]);
   const [liveAllocRatios, setLiveAllocRatios] = useState({ bot_01: 40, bot_03: 40, bot_05: 20 });
   const [savingLiveBots, setSavingLiveBots] = useState(false);
   const [liveBotGroupFilter, setLiveBotGroupFilter] = useState("ALL"); // 'ALL' | 'TREND_SWING' | 'VOLATILITY_BREAKOUT' | 'REVERSAL_GRID'
@@ -2784,15 +2819,20 @@ export default function App() {
       const resp = await fetch(`${API_BASE}/api/ai/weekly-bot-selection/run`, { method: "POST" });
       const data = await resp.json();
       if (resp.ok && data.success) {
-        setWeeklyBotSelection(data);
+        await fetchWeeklyBotSelection();
         await fetchOverviewAndBots(true);
+        const medals = ["🥇", "🥈", "🥉"];
+        const botLines = (Array.isArray(data.selected_bots) ? data.selected_bots : [])
+          .map((b, idx) => {
+            const pct = Number(b?.allocation_ratio || 0) <= 1 ? Number(b?.allocation_ratio || 0) * 100 : Number(b?.allocation_ratio || 0);
+            return `${medals[idx] || "•"} ${idx + 1}위: ${b?.nickname || b?.bot_id || ""} (${pct.toFixed(0)}%)`;
+          })
+          .join("\n");
         showModal(
           "AI 주간 봇 자동 편성 완료",
           `매주 일요일 09:00 기점 최적 봇이 실전 매매 담당으로 자동 세팅되었습니다.\n\n` +
-          `🥇 1위: ${data.selected_bots?.[0]?.nickname || ""} (${(Number(data.selected_bots?.[0]?.allocation_ratio || 0.34) * 100).toFixed(0)}%)\n` +
-          `🥈 2위: ${data.selected_bots?.[1]?.nickname || ""} (${(Number(data.selected_bots?.[1]?.allocation_ratio || 0.33) * 100).toFixed(0)}%)\n` +
-          `🥉 3위: ${data.selected_bots?.[2]?.nickname || ""} (${(Number(data.selected_bots?.[2]?.allocation_ratio || 0.33) * 100).toFixed(0)}%)\n\n` +
-          `전략: ${data.portfolio_strategy || "방어형 포트폴리오"}`,
+            `${botLines || "선출된 봇 정보가 반영되었습니다."}\n\n` +
+            `전략: ${data.portfolio_strategy || "방어형 포트폴리오"}`,
           "success"
         );
       } else {
@@ -2877,72 +2917,82 @@ export default function App() {
       let sseBuffer = "";
       let capturedMeta = null;
 
+      const processAiSseBlock = (block) => {
+        const trimmed = String(block || "").trim();
+        if (!trimmed.startsWith("data:")) return;
+        const jsonStr = trimmed.slice(5).trim();
+        if (!jsonStr) return;
+        try {
+          const data = JSON.parse(jsonStr);
+          if (data.type === "meta") {
+            capturedMeta = data;
+            setStreamingMeta(data);
+            if (data.regime_filter) {
+              setRegimeFilter(data.regime_filter);
+            }
+            if (data.quota) {
+              setGeminiQuota(data.quota);
+              setGeminiQuotaNotice(
+                `금일 자동 분석 예약(${data.quota.auto_reserved_count}건) 제외 남은 무료 API 호출 건수: ${data.quota.remaining_calls}건 (일일 수동 한도 ${data.quota.manual_limit}건 중 ${data.quota.manual_used}건 사용)`
+              );
+            }
+          } else if (data.type === "chunk" && data.text) {
+            typewriterQueueRef.current += data.text;
+          } else if (data.type === "done") {
+            isStreamDoneRef.current = true;
+            isAiBusyRef.current = false;
+            if (data.quota) {
+              setGeminiQuota(data.quota);
+              setGeminiQuotaNotice(
+                `금일 자동 분석 예약(${data.quota.auto_reserved_count}건) 제외 남은 무료 API 호출 건수: ${data.quota.remaining_calls}건 (일일 수동 한도 ${data.quota.manual_limit}건 중 ${data.quota.manual_used}건 사용)`
+              );
+            }
+            const nextRegimeFilter = data.regime_filter || capturedMeta?.regime_filter || null;
+            if (nextRegimeFilter) {
+              setRegimeFilter(nextRegimeFilter);
+            }
+            setAiBriefing((prev) => ({
+              ...prev,
+              last_trigger_type: data.trigger_type || "MANUAL",
+              quota: data.quota || prev.quota,
+              regime_filter: nextRegimeFilter || prev.regime_filter,
+              latest: {
+                id: data.id,
+                provider: data.provider || capturedMeta?.provider || "gemini",
+                model: data.model,
+                btc_price: capturedMeta?.btc_price,
+                btc_daily_20ma: capturedMeta?.btc_daily_20ma,
+                btc_4h_60ma: capturedMeta?.btc_4h_60ma,
+                regime_status: capturedMeta?.regime_status,
+                briefing_text: data.full_text,
+                created_at: data.created_at,
+              },
+            }));
+          } else if (data.type === "error") {
+            setAiError(data.message || "스트리밍 중 오류가 발생했습니다.");
+            isStreamDoneRef.current = true;
+            isAiBusyRef.current = false;
+          }
+        } catch {}
+      };
+
       while (true) {
         const { value, done } = await reader.read();
-        if (done) break;
+        if (done) {
+          sseBuffer += decoder.decode();
+          break;
+        }
 
         sseBuffer += decoder.decode(value, { stream: true });
-        const blocks = sseBuffer.split("\n\n");
+        const blocks = sseBuffer.split(/\r?\n\r?\n/);
         sseBuffer = blocks.pop() || "";
-
         for (const block of blocks) {
-          const trimmed = block.trim();
-          if (trimmed.startsWith("data:")) {
-            const jsonStr = trimmed.slice(5).trim();
-            if (!jsonStr) continue;
-            try {
-              const data = JSON.parse(jsonStr);
-              if (data.type === "meta") {
-                capturedMeta = data;
-                setStreamingMeta(data);
-                if (data.regime_filter) {
-                  setRegimeFilter(data.regime_filter);
-                }
-                if (data.quota) {
-                  setGeminiQuota(data.quota);
-                  setGeminiQuotaNotice(
-                    `금일 자동 분석 예약(${data.quota.auto_reserved_count}건) 제외 남은 무료 API 호출 건수: ${data.quota.remaining_calls}건 (일일 수동 한도 ${data.quota.manual_limit}건 중 ${data.quota.manual_used}건 사용)`
-                  );
-                }
-              } else if (data.type === "chunk" && data.text) {
-                typewriterQueueRef.current += data.text;
-              } else if (data.type === "done") {
-                isStreamDoneRef.current = true;
-                isAiBusyRef.current = false;
-                if (data.quota) {
-                  setGeminiQuota(data.quota);
-                  setGeminiQuotaNotice(
-                    `금일 자동 분석 예약(${data.quota.auto_reserved_count}건) 제외 남은 무료 API 호출 건수: ${data.quota.remaining_calls}건 (일일 수동 한도 ${data.quota.manual_limit}건 중 ${data.quota.manual_used}건 사용)`
-                  );
-                }
-                const nextRegimeFilter = data.regime_filter || capturedMeta?.regime_filter || null;
-                if (nextRegimeFilter) {
-                  setRegimeFilter(nextRegimeFilter);
-                }
-                setAiBriefing((prev) => ({
-                  ...prev,
-                  last_trigger_type: data.trigger_type || "MANUAL",
-                  quota: data.quota || prev.quota,
-                  regime_filter: nextRegimeFilter || prev.regime_filter,
-                  latest: {
-                    id: data.id,
-                    provider: data.provider || capturedMeta?.provider || "gemini",
-                    model: data.model,
-                    btc_price: capturedMeta?.btc_price,
-                    btc_daily_20ma: capturedMeta?.btc_daily_20ma,
-                    btc_4h_60ma: capturedMeta?.btc_4h_60ma,
-                    regime_status: capturedMeta?.regime_status,
-                    briefing_text: data.full_text,
-                    created_at: data.created_at,
-                  },
-                }));
-              } else if (data.type === "error") {
-                setAiError(data.message || "스트리밍 중 오류가 발생했습니다.");
-                isStreamDoneRef.current = true;
-                isAiBusyRef.current = false;
-              }
-            } catch {}
-          }
+          processAiSseBlock(block);
+        }
+      }
+      if (sseBuffer.trim()) {
+        for (const remBlock of sseBuffer.split(/\r?\n\r?\n/)) {
+          processAiSseBlock(remBlock);
         }
       }
 
@@ -3191,18 +3241,22 @@ export default function App() {
       setRatioInputs(newRatios);
       setBotEditForms(newEditForms);
       if (liveIds.length > 0) {
-        setSelectedLiveBotIds(liveIds);
         setSavedLiveBotIds(liveIds);
-        setLiveAllocRatios(liveRats);
-        setIsLiveConfigDirty(false);
+        if (!isLiveConfigDirtyRef.current) {
+          setSelectedLiveBotIds(liveIds);
+          setLiveAllocRatios(liveRats);
+          setIsLiveConfigDirty(false);
+        }
       } else if (botList.length > 0) {
         const fallbackIds = botList.slice(0, 3).map((b) => b.bot_id);
-        setSelectedLiveBotIds(fallbackIds);
         setSavedLiveBotIds(fallbackIds);
-        const fbRats = {};
-        fallbackIds.forEach((id, i) => { fbRats[id] = i === 0 ? 34 : 33; });
-        setLiveAllocRatios(fbRats);
-        setIsLiveConfigDirty(false);
+        if (!isLiveConfigDirtyRef.current) {
+          setSelectedLiveBotIds(fallbackIds);
+          const fbRats = {};
+          fallbackIds.forEach((id, i) => { fbRats[id] = i === 0 ? 34 : 33; });
+          setLiveAllocRatios(fbRats);
+          setIsLiveConfigDirty(false);
+        }
       }
 
       // 요구사항 21: 설정된 잔고가 0 이하로 떨어져 모든 봇이 거래 중지된 경우 거래현황 진입 시 Modal Popup 표시
@@ -3285,8 +3339,10 @@ export default function App() {
     [statsTradeFilterBot, statsModeTab]
   );
 
-  const fetchUpbitAccount = async () => {
-    setUpbitAccount((prev) => ({ ...prev, loading: true }));
+  const fetchUpbitAccount = async (silent = false) => {
+    if (!silent) {
+      setUpbitAccount((prev) => ({ ...prev, loading: true }));
+    }
     try {
       const resp = await fetch(`${API_BASE}/api/upbit/account`);
       if (resp.ok) {
@@ -3369,10 +3425,10 @@ export default function App() {
     if (!authenticated) return;
     fetchUpbitStatus();
     fetchUpbitAccount();
-    fetchOverviewAndBots(true);
-    fetchTrades(selectedBotId);
-    fetchStatistics();
-    fetchStatsTrades(1);
+    fetchOverviewAndBots(true, "live");
+    fetchTrades(selectedBotId, "live");
+    fetchStatistics(statsModeTab);
+    fetchStatsTrades(1, null, statsModeTab);
     fetchAiBriefing();
     fetchNewsAiBriefing();
     fetchWeeklyBotSelection();
@@ -3384,16 +3440,16 @@ export default function App() {
 
     const timer = setInterval(() => {
       fetchUpbitStatus();
-      fetchUpbitAccount();
-      refreshBotsStatusOnly();
+      fetchUpbitAccount(true);
+      refreshBotsStatusOnly("live");
       fetchRotationStatus();
-      fetchTrades(selectedBotId);
+      fetchTrades(selectedBotId, "live");
       fetchTradeMode();
       fetchAiBriefing(true);
       fetchNewsAiBriefing(true);
     }, 6000);
     return () => clearInterval(timer);
-  }, [authenticated, selectedBotId, tradeMode.mode, fetchTradeMode, fetchAlgoLabModels, fetchRotationStatus, fetchEntryCode, fetchOllamaSettings]);
+  }, [authenticated, selectedBotId, tradeMode.mode, statsModeTab, fetchTradeMode, fetchAlgoLabModels, fetchRotationStatus, fetchEntryCode, fetchOllamaSettings]);
 
   // 가상거래 경쟁(Arena) 활성화 시 5초 주기 실시간 리더보드 및 체결 일지 자동 갱신
   useEffect(() => {
@@ -3446,38 +3502,36 @@ export default function App() {
     localStorage.setItem("autoCoinTrade_statsTab", statsPeriodTab);
   }, [statsPeriodTab]);
 
-  // 뉴스 목록 조회 (한 페이지 50건, 날짜/키워드 검색)
-  const fetchNews = useCallback(
-    async (page = 1, options = {}) => {
-      setNewsLoading(true);
-      try {
-        const kw = options.keyword !== undefined ? options.keyword : newsKeyword;
-        const sDate = options.startDate !== undefined ? options.startDate : newsStartDate;
-        const eDate = options.endDate !== undefined ? options.endDate : newsEndDate;
+  // 뉴스 목록 조회 (한 페이지 50건, 날짜/키워드 검색 — 입력 시 불필요한 자동 호출 방지를 위해 ref 참조)
+  const fetchNews = useCallback(async (page = 1, options = {}) => {
+    setNewsLoading(true);
+    try {
+      const latestFilters = newsFilterRef.current || {};
+      const kw = options.keyword !== undefined ? options.keyword : latestFilters.keyword;
+      const sDate = options.startDate !== undefined ? options.startDate : latestFilters.startDate;
+      const eDate = options.endDate !== undefined ? options.endDate : latestFilters.endDate;
 
-        const params = new URLSearchParams();
-        params.append("page", String(page));
-        params.append("limit", "50");
-        if (kw && kw.trim()) params.append("keyword", kw.trim());
-        if (sDate) params.append("start_date", sDate);
-        if (eDate) params.append("end_date", eDate);
+      const params = new URLSearchParams();
+      params.append("page", String(page));
+      params.append("limit", "50");
+      if (kw && kw.trim()) params.append("keyword", kw.trim());
+      if (sDate) params.append("start_date", sDate);
+      if (eDate) params.append("end_date", eDate);
 
-        const resp = await fetch(`${API_BASE}/api/news?${params.toString()}`);
-        if (resp.ok) {
-          const data = await resp.json();
-          setNewsList(data.items || []);
-          setNewsTotal(data.total || 0);
-          setNewsPage(data.page || 1);
-          setNewsTotalPages(data.total_pages || 1);
-        }
-      } catch (err) {
-        console.warn("Failed to fetch news:", err);
-      } finally {
-        setNewsLoading(false);
+      const resp = await fetch(`${API_BASE}/api/news?${params.toString()}`);
+      if (resp.ok) {
+        const data = await resp.json();
+        setNewsList(data.items || []);
+        setNewsTotal(data.total || 0);
+        setNewsPage(data.page || 1);
+        setNewsTotalPages(data.total_pages || 1);
       }
-    },
-    [newsKeyword, newsStartDate, newsEndDate]
-  );
+    } catch (err) {
+      console.warn("Failed to fetch news:", err);
+    } finally {
+      setNewsLoading(false);
+    }
+  }, []);
 
   const triggerNewsAiAnalysis = async () => {
     const canUseLocalOllama = Boolean(ollamaStatus?.enabled && ollamaStatus?.reachable);
@@ -3552,77 +3606,87 @@ export default function App() {
       let sseBuffer = "";
       let capturedNewsMeta = null;
 
+      const processNewsSseBlock = (block) => {
+        const trimmed = String(block || "").trim();
+        if (!trimmed.startsWith("data:")) return;
+        const jsonStr = trimmed.slice(5).trim();
+        if (!jsonStr) return;
+        try {
+          const data = JSON.parse(jsonStr);
+          if (data.type === "meta") {
+            capturedNewsMeta = data;
+            setNewsStreamingMeta(data);
+            if (data.regime_filter) {
+              setRegimeFilter(data.regime_filter);
+            }
+            if (data.quota) {
+              setGeminiQuota(data.quota);
+              setGeminiQuotaNotice(
+                `금일 자동 분석 예약(${data.quota.auto_reserved_count}건) 제외 남은 무료 API 호출 건수: ${data.quota.remaining_calls}건 (일일 수동 한도 ${data.quota.manual_limit}건 중 ${data.quota.manual_used}건 사용)`
+              );
+            }
+          } else if (data.type === "chunk" && data.text) {
+            newsTypewriterQueueRef.current += data.text;
+          } else if (data.type === "done") {
+            isNewsStreamDoneRef.current = true;
+            isNewsAiBusyRef.current = false;
+            if (data.id) {
+              lastBriefingIdRef.current = Number(data.id);
+            }
+            if (data.regime_filter) {
+              setRegimeFilter(data.regime_filter);
+            }
+            // 웹푸시 알림 발송: "ai 분석이 완료되었습니다"
+            showWebPushNotification("AI 뉴스 분석 완료", "ai 분석이 완료되었습니다", {
+              tag: `news-manual-${data.id || Date.now()}`,
+            });
+            if (data.quota) {
+              setGeminiQuota(data.quota);
+              setGeminiQuotaNotice(
+                `금일 자동 분석 예약(${data.quota.auto_reserved_count}건) 제외 남은 무료 API 호출 건수: ${data.quota.remaining_calls}건 (일일 수동 한도 ${data.quota.manual_limit}건 중 ${data.quota.manual_used}건 사용)`
+              );
+            }
+            setNewsAiBriefing((prev) => ({
+              ...prev,
+              last_trigger_type: data.trigger_type || "MANUAL",
+              quota: data.quota || prev.quota,
+              latest: {
+                id: data.id,
+                provider: data.provider || capturedNewsMeta?.provider || "gemini",
+                model: data.model,
+                news_count: data.news_count,
+                bullish_count: data.bullish_count,
+                bearish_count: data.bearish_count,
+                neutral_count: data.neutral_count,
+                briefing_text: data.full_text,
+                created_at: data.created_at,
+              },
+            }));
+          } else if (data.type === "error") {
+            setNewsStreamingText((prev) => prev + `\n\n[오류] ${data.message || "스트리밍 중단"}`);
+            isNewsStreamDoneRef.current = true;
+            isNewsAiBusyRef.current = false;
+          }
+        } catch {}
+      };
+
       while (true) {
         const { value, done } = await reader.read();
-        if (done) break;
+        if (done) {
+          sseBuffer += decoder.decode();
+          break;
+        }
 
         sseBuffer += decoder.decode(value, { stream: true });
-        const blocks = sseBuffer.split("\n\n");
+        const blocks = sseBuffer.split(/\r?\n\r?\n/);
         sseBuffer = blocks.pop() || "";
-
         for (const block of blocks) {
-          const trimmed = block.trim();
-          if (trimmed.startsWith("data:")) {
-            const jsonStr = trimmed.slice(5).trim();
-            if (!jsonStr) continue;
-            try {
-              const data = JSON.parse(jsonStr);
-              if (data.type === "meta") {
-                capturedNewsMeta = data;
-                setNewsStreamingMeta(data);
-                if (data.regime_filter) {
-                  setRegimeFilter(data.regime_filter);
-                }
-                if (data.quota) {
-                  setGeminiQuota(data.quota);
-                  setGeminiQuotaNotice(
-                    `금일 자동 분석 예약(${data.quota.auto_reserved_count}건) 제외 남은 무료 API 호출 건수: ${data.quota.remaining_calls}건 (일일 수동 한도 ${data.quota.manual_limit}건 중 ${data.quota.manual_used}건 사용)`
-                  );
-                }
-              } else if (data.type === "chunk" && data.text) {
-                newsTypewriterQueueRef.current += data.text;
-              } else if (data.type === "done") {
-                isNewsStreamDoneRef.current = true;
-                isNewsAiBusyRef.current = false;
-                if (data.id) {
-                  lastBriefingIdRef.current = Number(data.id);
-                }
-                if (data.regime_filter) {
-                  setRegimeFilter(data.regime_filter);
-                }
-                // 웹푸시 알림 발송: "ai 분석이 완료되었습니다"
-                showWebPushNotification("AI 뉴스 분석 완료", "ai 분석이 완료되었습니다", {
-                  tag: `news-manual-${data.id || Date.now()}`,
-                });
-                if (data.quota) {
-                  setGeminiQuota(data.quota);
-                  setGeminiQuotaNotice(
-                    `금일 자동 분석 예약(${data.quota.auto_reserved_count}건) 제외 남은 무료 API 호출 건수: ${data.quota.remaining_calls}건 (일일 수동 한도 ${data.quota.manual_limit}건 중 ${data.quota.manual_used}건 사용)`
-                  );
-                }
-                setNewsAiBriefing((prev) => ({
-                  ...prev,
-                  last_trigger_type: data.trigger_type || "MANUAL",
-                  quota: data.quota || prev.quota,
-                  latest: {
-                    id: data.id,
-                    provider: data.provider || capturedNewsMeta?.provider || "gemini",
-                    model: data.model,
-                    news_count: data.news_count,
-                    bullish_count: data.bullish_count,
-                    bearish_count: data.bearish_count,
-                    neutral_count: data.neutral_count,
-                    briefing_text: data.full_text,
-                    created_at: data.created_at,
-                  },
-                }));
-              } else if (data.type === "error") {
-                setNewsStreamingText((prev) => prev + `\n\n[오류] ${data.message || "스트리밍 중단"}`);
-                isNewsStreamDoneRef.current = true;
-                isNewsAiBusyRef.current = false;
-              }
-            } catch {}
-          }
+          processNewsSseBlock(block);
+        }
+      }
+      if (sseBuffer.trim()) {
+        for (const remBlock of sseBuffer.split(/\r?\n\r?\n/)) {
+          processNewsSseBlock(remBlock);
         }
       }
       isNewsStreamDoneRef.current = true;
@@ -3685,7 +3749,11 @@ export default function App() {
       setNewsNotice(`뉴스 수집 중 오류: ${err.message}`);
     } finally {
       setNewsRefreshing(false);
-      setTimeout(() => setNewsNotice(""), 6000);
+      if (newsNoticeTimerRef.current) clearTimeout(newsNoticeTimerRef.current);
+      newsNoticeTimerRef.current = setTimeout(() => {
+        setNewsNotice("");
+        newsNoticeTimerRef.current = null;
+      }, 6000);
     }
   };
 
@@ -3704,10 +3772,9 @@ export default function App() {
       fetchAlgoLabTrades(selectedAlgoModelId);
     } else if (targetKey === "stats") {
       fetchStatistics(statsModeTab);
-      fetchStatsTrades(1, statsTradeFilterBot);
+      fetchStatsTrades(1, statsTradeFilterBot, statsModeTab);
     } else if (targetKey === "news") {
-      fetchNews(1);
-      fetchNewsAiBriefing();
+      // activeMenu === "news" useEffect에서 중복 없이 자동 로드
     } else if (targetKey === "settings") {
       fetchOverviewAndBots(false, "live");
       fetchUpbitAccount();
@@ -3928,9 +3995,15 @@ export default function App() {
         return;
       }
       setBotEditForms({});
-      await fetchOverviewAndBots(false);
-      await fetchTrades(selectedBotId);
-      await fetchStatistics();
+      setIsLiveConfigDirty(false);
+      isLiveConfigDirtyRef.current = false;
+      await fetchOverviewAndBots(false, "live");
+      await fetchTrades(selectedBotId, "live");
+      await fetchStatistics(statsModeTab);
+      await fetchAlgoLabModels();
+      await fetchRotationStatus();
+      await fetchEntryCode();
+      await fetchOllamaSettings(true);
       showModal("데이터 복원 완료", data.message, "success");
     } catch (err) {
       showModal("JSON 파일 읽기 오류", `파일 복원 중 오류가 발생했습니다: ${err.message}`, "danger");
@@ -3952,7 +4025,7 @@ export default function App() {
       setEntryCodeMsg({ type: "error", text: "입장 코드는 보안을 위해 최소 4자 이상이어야 합니다." });
       return;
     }
-    if (newEntryCodeConfirm !== "" && trimmed !== newEntryCodeConfirm.trim()) {
+    if (trimmed !== newEntryCodeConfirm.trim()) {
       setEntryCodeMsg({ type: "error", text: "입장 코드 확인 값이 일치하지 않습니다." });
       return;
     }
@@ -3987,10 +4060,12 @@ export default function App() {
     }
   };
 
-  const currentBot = useMemo(
-    () => bots.find((b) => b.bot_id === selectedBotId) || bots[0] || null,
-    [bots, selectedBotId]
-  );
+  const currentBot = useMemo(() => {
+    const matched = bots.find((b) => b.bot_id === selectedBotId);
+    if (matched) return matched;
+    const firstLive = bots.find((b) => Number(b.is_selected_for_live) === 1);
+    return firstLive || bots[0] || null;
+  }, [bots, selectedBotId]);
 
   // ------------------------------------------------------------------
   // 초기 설정 마법사 화면 (Step-by-Step Onboarding Setup Wizard)
@@ -6489,10 +6564,13 @@ export default function App() {
                       onClick={() => handleBotStartStop(currentBot.bot_id, true)}
                       disabled={
                         Boolean(currentBot.is_running) ||
+                        Number(currentBot.is_selected_for_live) !== 1 ||
                         Number(currentBot.allocated_capital || 0) <= 0
                       }
                       title={
-                        Number(currentBot.allocated_capital || 0) <= 0
+                        Number(currentBot.is_selected_for_live) !== 1
+                          ? "실전 담당 해제(Graceful Drain) 상태의 봇은 신규 매수를 시작할 수 없습니다. 보유 포지션만 안전 청산 감시됩니다."
+                          : Number(currentBot.allocated_capital || 0) <= 0
                           ? "할당 원금이 0원이므로 거래를 시작할 수 없습니다. 설정 메뉴에서 자금 분배 비율을 설정해주세요."
                           : ""
                       }
@@ -6823,16 +6901,16 @@ export default function App() {
                   const isInc = diffAmt > 0;
                   const isDec = diffAmt < 0;
                   const statusBg = isInc
-                    ? "rgba(34, 197, 94, 0.12)"
-                    : isDec
                     ? "rgba(239, 68, 68, 0.12)"
+                    : isDec
+                    ? "rgba(59, 130, 246, 0.12)"
                     : "rgba(148, 163, 184, 0.12)";
                   const statusBorder = isInc
-                    ? "rgba(34, 197, 94, 0.4)"
-                    : isDec
                     ? "rgba(239, 68, 68, 0.4)"
+                    : isDec
+                    ? "rgba(59, 130, 246, 0.4)"
                     : "rgba(148, 163, 184, 0.25)";
-                  const statusColor = isInc ? "#4ade80" : isDec ? "#f87171" : "#cbd5e1";
+                  const statusColor = isInc ? "#ef4444" : isDec ? "#3b82f6" : "#94a3b8";
 
                   return (
                     <div
@@ -7250,13 +7328,13 @@ export default function App() {
                                   </div>
                                   <div style={{ fontSize: "11.5px", marginTop: "2px" }}>
                                     <span
-                                      className={
-                                        Number(t.profit_pct) > 0
-                                          ? "pnl-profit"
-                                          : Number(t.profit_pct) < 0
-                                          ? "pnl-loss"
-                                          : "pnl-zero"
-                                      }
+                                        className={
+                                          Number(t.profit_pct) > 0
+                                            ? "pnl-profit"
+                                            : Number(t.profit_pct) < 0
+                                            ? "pnl-loss"
+                                            : "pnl-Zero"
+                                        }
                                       style={{ fontWeight: 600 }}
                                     >
                                       {Number(t.profit_pct) > 0 ? `+${t.profit_pct}` : t.profit_pct}%
@@ -10298,9 +10376,9 @@ export default function App() {
 
                       {(() => {
                         const defaultRatio =
-                          b.bot_id === "bot_volatility"
+                          b.bot_id === "bot_01" || b.bot_id === "bot_volatility"
                             ? 0.3
-                            : b.bot_id === "bot_dual_momentum"
+                            : b.bot_id === "bot_03" || b.bot_id === "bot_dual_momentum"
                             ? 0.35
                             : 0.45;
                         const rawOrderRatio = form.config?.order_ratio;
@@ -10353,7 +10431,7 @@ export default function App() {
                         );
                       })()}
 
-                      {b.bot_id === "bot_volatility" && (
+                      {(b.bot_id === "bot_01" || b.bot_id === "bot_volatility") && (
                         <div className="form-row">
                           <label>변동성 돌파 K 계수 (0.1 ~ 0.9 / 추천: 0.4)</label>
                           <input
@@ -10372,7 +10450,7 @@ export default function App() {
                         </div>
                       )}
 
-                      {b.bot_id === "bot_dual_momentum" && (
+                      {(b.bot_id === "bot_03" || b.bot_id === "bot_dual_momentum") && (
                         <div className="form-row">
                           <label>절대 모멘텀 최소 수익률 기준 (% / 추천: 1.5%)</label>
                           <input
@@ -10391,7 +10469,7 @@ export default function App() {
                         </div>
                       )}
 
-                      {b.bot_id === "bot_bollinger_reversal" && (
+                      {(b.bot_id === "bot_05" || b.bot_id === "bot_bollinger_reversal") && (
                         <div className="form-row">
                           <label>볼린저 밴드 표준편차 배수 (σ / 추천: 2.0)</label>
                           <input
@@ -10516,6 +10594,7 @@ export default function App() {
                       placeholder="한 번 더 입력"
                       value={newEntryCodeConfirm}
                       onChange={(e) => setNewEntryCodeConfirm(e.target.value)}
+                      required
                     />
                   </div>
                 </div>
@@ -10971,8 +11050,10 @@ export default function App() {
               className="modal-title"
               style={{
                 color:
-                  modalInfo.type === "danger"
+                  modalInfo.type === "danger" || modalInfo.type === "error"
                     ? "#f87171"
+                    : modalInfo.type === "warning"
+                    ? "#facc15"
                     : modalInfo.type === "success"
                     ? "#4ade80"
                     : "#a5b4fc",

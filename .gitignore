@@ -48,3 +48,4 @@ install/app/.env
 install/app/config/upbit_config.json
 install/app/data/.session_secret
 .aider*
+.playwright-mcp/

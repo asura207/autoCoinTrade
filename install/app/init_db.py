@@ -119,9 +119,9 @@ _load_env()
 def is_sqlite_mode() -> bool:
     """
     현재 설정이 SQLite 모드인지 확인합니다.
-    - DB_MODE=sqlite
-    - PG_SYNC_ENABLED=false
-    - 또는 미설정 시 기본적으로 SQLite를 우선 지원
+    - DB_MODE=sqlite 또는 PG_SYNC_ENABLED=false -> SQLite
+    - DB_MODE=postgres / postgresql / postgres_hybrid / server -> PostgreSQL
+    - 미설정 시 백엔드(node_server.mjs)와 동일하게 SQLite를 기본값으로 사용
     """
     _load_env()
     mode = os.getenv("DB_MODE", "").strip().lower()
@@ -130,11 +130,6 @@ def is_sqlite_mode() -> bool:
     if mode == "sqlite" or sync_enabled == "false":
         return True
     if mode in ("postgres_hybrid", "postgres", "postgresql", "server"):
-        return False
-
-    # 미설정 상태일 경우 PostgreSQL 연결 정보 유무 확인
-    pg_host = os.getenv("PGHOST") or os.getenv("LOCAL_PG_HOST")
-    if pg_host and HAS_PSYCOPG2:
         return False
     return True
 
@@ -203,37 +198,40 @@ class PgConnectionWrapper:
         if "BEGIN IMMEDIATE" in s.upper():
             return "SELECT 1;"
 
+        had_semicolon = s.endswith(";")
+        s_body = s.rstrip(";").strip()
+
         # AUTOINCREMENT -> BIGSERIAL PRIMARY KEY
-        s = re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", "BIGSERIAL PRIMARY KEY", s, flags=re.I)
+        s_body = re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", "BIGSERIAL PRIMARY KEY", s_body, flags=re.I)
 
         # INSERT OR IGNORE INTO
-        m = re.search(r"INSERT\s+OR\s+IGNORE\s+INTO\s+([a-zA-Z0-9_]+)", s, re.I)
+        m = re.search(r"INSERT\s+OR\s+IGNORE\s+INTO\s+([a-zA-Z0-9_]+)", s_body, re.I)
         if m:
             tbl = m.group(1).lower()
-            s = re.sub(r"INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", s, flags=re.I)
-            if "ON CONFLICT" not in s.upper():
+            s_body = re.sub(r"INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", s_body, flags=re.I)
+            if "ON CONFLICT" not in s_body.upper():
                 if tbl == "market_regime_filter":
-                    s += " ON CONFLICT (id) DO NOTHING"
+                    s_body += " ON CONFLICT (id) DO NOTHING"
                 elif tbl == "auto_rotation_config":
-                    s += " ON CONFLICT (id) DO NOTHING"
+                    s_body += " ON CONFLICT (id) DO NOTHING"
                 elif tbl == "bot_accounts":
-                    s += " ON CONFLICT (bot_id) DO NOTHING"
+                    s_body += " ON CONFLICT (bot_id) DO NOTHING"
                 elif tbl == "bot_positions":
-                    s += " ON CONFLICT (order_uuid) DO NOTHING"
+                    s_body += " ON CONFLICT (order_uuid) DO NOTHING"
                 elif tbl == "system_settings":
-                    s += " ON CONFLICT (key) DO NOTHING"
+                    s_body += " ON CONFLICT (key) DO NOTHING"
                 else:
-                    s += " ON CONFLICT DO NOTHING"
+                    s_body += " ON CONFLICT DO NOTHING"
 
         # INSERT OR REPLACE INTO system_settings
-        if re.search(r"INSERT\s+OR\s+REPLACE\s+INTO\s+system_settings", s, re.I):
-            s = re.sub(r"INSERT\s+OR\s+REPLACE\s+INTO\s+system_settings", "INSERT INTO system_settings", s, flags=re.I)
-            if "ON CONFLICT" not in s.upper():
-                s += " ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at"
+        if re.search(r"INSERT\s+OR\s+REPLACE\s+INTO\s+system_settings", s_body, re.I):
+            s_body = re.sub(r"INSERT\s+OR\s+REPLACE\s+INTO\s+system_settings", "INSERT INTO system_settings", s_body, flags=re.I)
+            if "ON CONFLICT" not in s_body.upper():
+                s_body += " ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at"
 
         # ? -> %s
-        s = s.replace("?", "%s")
-        return s
+        s_body = s_body.replace("?", "%s")
+        return f"{s_body};" if had_semicolon else s_body
 
     def execute(self, sql: str, params: Optional[Any] = None) -> CursorWrapper:
         final_sql = self._convert_sql(sql)
@@ -260,9 +258,12 @@ def get_db_connection(db_path: Optional[str] = None):
     """
     _load_env()
     if is_sqlite_mode():
-        target_path = db_path or os.getenv("DB_PATH") or DEFAULT_SQLITE_PATH
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(target_path, timeout=5.0)
+        raw_path = db_path or os.getenv("AUTOCOIN_DB_PATH") or os.getenv("DB_PATH") or DEFAULT_SQLITE_PATH
+        resolved_path = Path(raw_path)
+        if not resolved_path.is_absolute():
+            resolved_path = (PROJECT_ROOT / resolved_path).resolve()
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(resolved_path), timeout=5.0)
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA busy_timeout = 5000;")
         conn.execute("PRAGMA synchronous = NORMAL;")
@@ -358,7 +359,8 @@ def init_database(db_path: Optional[str] = None) -> None:
                 sell_amount {real_type},
                 sell_fee {real_type},
                 realized_pnl {real_type},
-                pnl_pct {real_type}
+                pnl_pct {real_type},
+                buy_reason TEXT
             );
             """
         )
@@ -374,6 +376,7 @@ def init_database(db_path: Optional[str] = None) -> None:
             ("sell_fee", real_type),
             ("realized_pnl", real_type),
             ("pnl_pct", real_type),
+            ("buy_reason", "TEXT"),
         ]
         if sqlite_mode:
             existing_pos_cols = {
@@ -466,7 +469,7 @@ def init_database(db_path: Optional[str] = None) -> None:
                 nickname TEXT NOT NULL,
                 strategy_type TEXT NOT NULL,
                 strategy_group TEXT DEFAULT 'TREND_SWING',
-                description TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
                 allocation_ratio {real_type} NOT NULL DEFAULT 0,
                 allocated_capital BIGINT NOT NULL DEFAULT 0,
                 virtual_krw BIGINT NOT NULL DEFAULT 0,
@@ -590,10 +593,20 @@ def init_database(db_path: Optional[str] = None) -> None:
                 trade_id BIGINT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'OPEN',
                 created_at TEXT NOT NULL,
-                closed_at TEXT
+                closed_at TEXT,
+                buy_reason TEXT
             );
             """
         )
+        if sqlite_mode:
+            existing_paper_pos_cols = {
+                dict(r)["name"]
+                for r in conn.execute("PRAGMA table_info(paper_bot_positions);").fetchall()
+            }
+            if "buy_reason" not in existing_paper_pos_cols:
+                conn.execute("ALTER TABLE paper_bot_positions ADD COLUMN buy_reason TEXT;")
+        else:
+            conn.execute("ALTER TABLE paper_bot_positions ADD COLUMN IF NOT EXISTS buy_reason TEXT;")
 
         # 8. AI 브리핑 및 뉴스 테이블
         conn.execute(
@@ -625,6 +638,9 @@ def init_database(db_path: Optional[str] = None) -> None:
                 created_at TEXT NOT NULL
             );
             """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_crypto_news_pubdate ON crypto_news (published_at DESC);"
         )
         conn.execute(
             f"""
@@ -718,16 +734,16 @@ def init_database(db_path: Optional[str] = None) -> None:
             """
         )
         conn.execute(
-            """
+            f"""
             CREATE TABLE IF NOT EXISTS monthly_asset_snapshots (
                 year_month TEXT NOT NULL,
                 mode TEXT NOT NULL DEFAULT 'live',
-                month_start_balance REAL NOT NULL,
-                current_balance REAL NOT NULL,
-                krw_balance REAL NOT NULL DEFAULT 0,
-                coin_eval_balance REAL NOT NULL DEFAULT 0,
-                diff_amount REAL NOT NULL DEFAULT 0,
-                diff_rate REAL NOT NULL DEFAULT 0,
+                month_start_balance {real_type} NOT NULL,
+                current_balance {real_type} NOT NULL,
+                krw_balance {real_type} NOT NULL DEFAULT 0,
+                coin_eval_balance {real_type} NOT NULL DEFAULT 0,
+                diff_amount {real_type} NOT NULL DEFAULT 0,
+                diff_rate {real_type} NOT NULL DEFAULT 0,
                 snapshot_date TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (year_month, mode)
@@ -868,14 +884,14 @@ def init_database(db_path: Optional[str] = None) -> None:
         # 11. 10대 알고리즘 봇 기본 계좌 초기화
         initial_bots = [
             ("bot_01", "변동성 돌파봇", 40.0, 1),
-            ("bot_02", "추세 추종봇", 0.0, 0),
+            ("bot_02", "슈퍼트렌드+ATR 추세봇", 0.0, 0),
             ("bot_03", "듀얼 모멘텀봇", 40.0, 1),
-            ("bot_04", "RSI 역추세봇", 0.0, 0),
+            ("bot_04", "볼린저 스퀴즈 돌파봇", 0.0, 0),
             ("bot_05", "볼린저 밴드 반등봇", 20.0, 1),
-            ("bot_06", "MACD 오실레이터봇", 0.0, 0),
-            ("bot_07", "돌파-눌림목 매매봇", 0.0, 0),
-            ("bot_08", "거래량 급증 추종봇", 0.0, 0),
-            ("bot_09", "단기 스캘핑봇", 0.0, 0),
+            ("bot_06", "다단계 분할 그리드봇", 0.0, 0),
+            ("bot_07", "MACD+RSI 추세봇", 0.0, 0),
+            ("bot_08", "정배열 20일선 눌림목봇", 0.0, 0),
+            ("bot_09", "거래량 폭발 스캘퍼봇", 0.0, 0),
             ("bot_10", "잭 켈로그 프라이스액션", 0.0, 0),
         ]
         for b_id, b_name, b_ratio, b_live in initial_bots:

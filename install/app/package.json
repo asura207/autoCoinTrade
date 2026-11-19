@@ -1,7 +1,7 @@
 {
   "name": "auto-coin-trade",
-  "version": "0.0.27",
-  "description": "Upbit Open API & Google Gemini AI(Flash/Pro) 기반 10대 알고리즘 상시 가상 경쟁(Arena) 및 선택형(1~3개) 동적 실전 코인 자동매매 웹 플랫폼 (Windows/Linux 원클릭 설치 지원)",
+  "version": "0.0.28",
+  "description": "Upbit Open API & Dual AI(Ollama qwen3-news / Google Gemini Flash·Pro) 기반 10대 알고리즘 상시 가상 경쟁(Arena) 및 선택형(1~3개) 동적 실전 코인 자동매매 웹 플랫폼 (Windows/Linux 원클릭 설치 지원)",
   "keywords": [
     "upbit",
     "crypto-trading-bot",
@@ -16,11 +16,13 @@
   ],
   "license": "Apache-2.0",
   "scripts": {
-    "test": "node tests/verify_rotation_drain_edge_cases.mjs && node tests/verify_all_bots_and_execution.mjs && node tests/verify_log_rotation.mjs && node tests/verify_ollama_integration.mjs",
+    "test": "node tests/verify_rotation_drain_edge_cases.mjs && node tests/verify_all_bots_and_execution.mjs && node tests/verify_log_rotation.mjs && node tests/verify_ollama_integration.mjs && node tests/qa_full_verification.mjs",
     "test:rotation": "node tests/verify_rotation_drain_edge_cases.mjs",
     "test:bots": "node tests/verify_all_bots_and_execution.mjs",
     "test:logs": "node tests/verify_log_rotation.mjs",
-    "test:ollama": "node tests/verify_ollama_integration.mjs"
+    "test:ollama": "node tests/verify_ollama_integration.mjs",
+    "test:qa": "node tests/qa_full_verification.mjs",
+    "test:py": "python3 tests/qa_python_verification.py"
   },
   "repository": {
     "type": "git",

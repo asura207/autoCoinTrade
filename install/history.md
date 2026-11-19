@@ -10,7 +10,8 @@
 
 | 버전 (Version) | 릴리즈 일시 | 커밋 해시 | 주요 수정 내용 요약 |
 | :--- | :--- | :--- | :--- |
-| **v0.0.27** | 2026-11-18 | - | 로컬 Ollama(`qwen3-news`) 인텔 맥북 CPU 추론 안정화 및 30분 분석 모델 UI 표기 고도화: 타임아웃 기본 `120,000ms`(최대 `180,000ms`) 상향·뉴스 6건(제목 90자) 프롬프트 경량화·코인 전용 `system` 프롬프트 오버라이드(`~41.5초` 응답), `market_regime_filter`·`system_settings`에 실제 실행된 `flash_provider`/`flash_model` 추적 저장 및 대시보드(실제거래 현황·듀얼 AI 매트릭스·뉴스 AI 헤더/본문) 실행 모델명 실시간 표기 |
+| **v0.0.28** | 2026-11-19 | - | 전수 QA 체크리스트(`docs/QA_CHECKLIST.md`) 및 자동화 검증 스위트(`tests/qa_full_verification.mjs`, `tests/qa_python_verification.py`) 구축 및 발견된 치명·주요 결함 전면 수정: 실전 매도 원장 정합성(활성 봇 원금 이중 가산·`accounts` 오류 시 포지션 유실·타 봇 코인 침범·더스트 정화 무한 루프·`<1원` 소수점 코인 단가 0원화·SQLite 중첩 트랜잭션 충돌), 다단계 분할봇(`bot_06`/`bot_10`) 9초 무한 회전, 듀얼 AI Ollama 단독 `BLOCK` 영구 잠금(Sticky Latch) 및 BTC 장애 Fail-Safe, Python `Decimal ROUND_DOWN`·`drain_handoff_logs` NameError·`highest_price` 미커밋·KST Time-Stop 왜곡, 프론트엔드 초기 마법사 자동 표시·KST 인증 만료·주간 편성 카드 갱신·한국식 손익 색상(빨강/파랑)·설정 파라미터 ID 정규화 일괄 해결 |
+| **v0.0.27** | 2026-11-18 | `d2f60e1` | 로컬 Ollama(`qwen3-news`) 인텔 맥북 CPU 추론 안정화 및 30분 분석 모델 UI 표기 고도화: 타임아웃 기본 `120,000ms`(최대 `180,000ms`) 상향·뉴스 6건(제목 90자) 프롬프트 경량화·코인 전용 `system` 프롬프트 오버라이드(`~41.5초` 응답), `market_regime_filter`·`system_settings`에 실제 실행된 `flash_provider`/`flash_model` 추적 저장 및 대시보드(실제거래 현황·듀얼 AI 매트릭스·뉴스 AI 헤더/본문) 실행 모델명 실시간 표기 |
 | **v0.0.26** | 2026-11-17 | `887c868` | 30분 단기 뉴스·시황 분석기(`FLASH_30M`) 맥북 프로 로컬 Ollama(`qwen3-news`) 1순위 연동 및 3중 무중단 Fallback(로컬 Ollama → Gemini Flash 지수 백오프 → 직전 캐시/BTC 20MA·4h 60MA 기계적 안전 모드) 구축, 백엔드·Python 워커(`think: false`, `format: json`, `25,000ms` 타임아웃)·PostgreSQL(`pg_sync.mjs`) AI 브리핑 동기화·설정 UI/SSE 스트리밍(`18ms` 타이프라이터)·통합 검증 스위트(`tests/verify_ollama_integration.mjs`) 추가 |
 | **v0.0.25** | 2026-11-15 | - | 프로덕션 정적 서버(`frontend/server.mjs`) 전환·Vite `8.3.8` 업그레이드, 백엔드 `HttpOnly` 서명 쿠키 기반 전역 `/api/*` 인증 게이트(`"stock"`/`"ㄴ새차"` 백도어·평문 코드 노출·무차별 대입·전역 CORS `*` 제거), `scripts/setup_wireguard.sh` VPN+방화벽 설정 추가, Arena 상단 버튼 단일 행(`nowrap`) 툴바 배치 |
 | **v0.0.24** | 2026-11-14 | `1a6e38e` | 주간 TOP 1 로테이션 & Graceful Drain 자금 이관 7대 엣지 케이스 검증 및 결함 수정: Zero-Sum(`1원` 자투리 #1 봇 귀속) 불변식·`order_uuid` 독립 청산·AI `BLOCK`/잔고부족 시 매도 감시 유지·`drain_handoff_logs` 감사 원장·동시성 뮤텍스/신규 DB 마이그레이션 버그 수정 및 7대 시나리오 자동 검증 통과 |
@@ -41,6 +42,22 @@
 ---
 
 ## 📝 상세 버전별 변경 내역 (Detailed Changelog)
+
+### [v0.0.28] - 2026-11-19
+#### 전수 QA 명세서·자동화 검증 스위트 추가 및 6대 영역 결함 전면 수정 (Surgical Fix)
+- **매매 엔진 · 원장 격리 · 주문 정밀도 (`backend/node_server.mjs`, `backend/common/algo_lab_service.mjs`, `bots.py`, `agentBot/bot_10_jack_kellogg.py`)**:
+  - `settleLiveSellOrderInDb` 활성 봇 매도 시 `allocated_capital` 원금 이중 가산 버그 수정 및 `withDbWriteLock` 전역 직렬화로 SQLite 중첩 트랜잭션(`BEGIN IMMEDIATE`) 충돌 완전 차단.
+  - `executeBotSellOrder`의 `/v1/accounts` 통신 실패 시 DB 포지션 강제 종료 방지, `maxAvailableForThisBot <= 0` 시 타 봇 코인 오매도 차단, 15분 더스트 정화(Buy-to-Cleanse) 쿨다운 및 체결 대기/포지션 갱신 추가, 업비트 API `AbortSignal.timeout(8000)` 및 실체결 매도 단가 정산 적용.
+  - `floorTo8DecimalsStr` 문자열 기반 소수점 8자리 내림 정밀도 개선 및 `normalizeExecPrice` 도입으로 `< 1 KRW` 소수점 코인(`KRW-SHIB` 등) `avg_buy_price = 0` 버그 해결.
+  - `runPaperBot` 다단계 분할 포지션(`bot_06`/`bot_10`)의 그룹 `peak` 공유로 인한 9초 무한 재진입·손절 루프 해소(포지션별 독립 `perPosPeak` + `soldMarketsThisCycle` 가드), `bot_01` 20일 이평선 추세 필터 복구, `bot_10` DB 설정 파라미터 연동 및 Setup B `ATR_HARD_STOP` 예외 처리.
+  - `runLiveTradingBotsCycle`에 `isLiveMode()` 가드 및 모든 OPEN/Draining 포지션 마켓 합집합 스캔 추가.
+  - Python `bots.py`에 `Decimal(ROUND_DOWN)` 8자리 내림·고정소수점 문자열 직렬화, KST 기준 Time-Stop 통일, `drain_handoff_logs`의 `pos_dict` `NameError` 수정, 활성 봇 0대 시 Zero-Sum 자금 보전, `highest_price` DB `commit()` 및 `trades` 원장 동기화, `bot_08` 매핑(`run_bot_bb`) 교정 적용.
+- **듀얼 AI 게이트웨이 & DB · 통계 정합성 (`backend/node_server.mjs`, `llm_filter_worker.py`, `init_db.py`, `backend/common/pg_sync.mjs`, `backend/common/sqlite_db.mjs`)**:
+  - Ollama 단독 운용 시 미실행 반대 슬롯이 직전 `BLOCK`/`HALT_NEW_BUYS`를 복사해 영구 잠금(Sticky Latch)되는 결함 수정, BTC 시세 수신 불가 시 Fail-Safe(`SIDEWAYS / 0.5x`) 강제, Python `risk_alert: "false"` 문자열 오판(`_parse_bool_flag`) 및 90분 캐시 만료·HTTP 401/403 즉시 중단 적용.
+  - `init_db.py`의 `PgConnectionWrapper` trailing `;` 제거 후 `ON CONFLICT` 부착, 기본 SQLite 모드 통일, `AUTOCOIN_DB_PATH` 지원 및 `buy_reason` 컬럼/`pg_sync.mjs` 스키마·멀티 스테이트먼트 분리 동기화.
+  - `/api/statistics` ISO 주차 계산(W53+ 오류 제거), 누적 수익 단조 합산, 기간별 코인 랭킹 필터링, `/api/auth/verify` 기본 코드(`stock`) 한정 `ㄴ새차` 변환 및 `gate_code` 동기화, `/api/settings/import-json` 민감 키 보존 및 트랜잭션 원자화.
+- **프론트엔드 UI/UX · 스크립트 · QA 문서화 (`frontend/src/App.jsx`, `frontend/src/styles.css`, `docs/QA_CHECKLIST.md`, `tests/qa_full_verification.mjs`, `tests/qa_python_verification.py`)**:
+  - 신규 미설정 환경 초기 설정 마법사 자동 오픈, KST `Intl.DateTimeFormat` 통일, 주간 편성 실행 후 카드 정상 재조회, SSE CRLF/EOF 버퍼 플러시, 뉴스 필터 입력 시 과호출 제거, 월별 자산 차트 한국식 색상(증가 `#ef4444` / 감소 `#3b82f6`) 통일, 설정 화면 `bot_01`/`bot_03`/`bot_05` 전략 파라미터 복구, `.btn-secondary`/`.spinner` CSS 및 `/install` 패키지 동기화.
 
 ### [v0.0.27] - 2026-11-18
 #### 로컬 Ollama(`qwen3-news`) CPU 추론 타임아웃·프롬프트 경량화 및 30분 분석 모델 표기 개선

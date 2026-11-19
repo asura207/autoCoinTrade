@@ -6,7 +6,7 @@ if not exist "..\logs" mkdir "..\logs"
 set "FRONTEND_PORT=9000"
 set "FRONTEND_HOST=127.0.0.1"
 set "BACKEND_PORT=8001"
-set "BACKEND_URL=http://127.0.0.1:8001"
+set "BACKEND_URL="
 if exist "..\.env" (
     for /f "usebackq eol=# tokens=1,* delims==" %%A in ("..\.env") do (
         if /I "%%~A"=="FRONTEND_PORT" set "FRONTEND_PORT=%%~B"
@@ -15,6 +15,7 @@ if exist "..\.env" (
         if /I "%%~A"=="BACKEND_URL" set "BACKEND_URL=%%~B"
     )
 )
+if "%BACKEND_URL%"=="" set "BACKEND_URL=http://127.0.0.1:%BACKEND_PORT%"
 
 set "NODE_EXE="
 where node >nul 2>&1

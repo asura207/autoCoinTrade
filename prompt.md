@@ -14,7 +14,7 @@
   - 10대 알고리즘 아레나(10-Bot Arena) 24시간 실시간 모의투자 시뮬레이션 엔진
   - **매주 일요일 오전 09:00:00 KST 기점** LLM 주간 봇 최적 편성 스케줄러 (1분 주기 감시)
   - Web Push (VAPID 기반) 실시간 브라우저 체결 및 브리핑 푸시 알림
-- **Frontend Runtime**: React 18+, Vite 5 (Port `9000`)
+- **Frontend Runtime**: React 18+, Vite 8 빌드 및 프로덕션 정적 서버(`frontend/server.mjs`, Port `9000`)
   - 프리미엄 다크 테마 UI (Pretendard 폰트 기반, `#0b0f19` 배경, 2:8 화면 분할 및 모바일 반응형 1열 전환)
   - 상대 경로(`API_BASE = ""`) 및 Vite 프록시(`vite.config.js`)를 통한 로컬, 사내 LAN, 외부 도메인 무설정 동시 지원
   - 뉴스 50건 페이징 및 행 높이 48px 고정 1줄 말줄임 뷰
@@ -38,14 +38,14 @@
 ```text
 autoCoinTrade/
 ├── backend/
-│   ├── node_server.mjs          # [메인 백엔드] Node.js 22 SQLite + Upbit API + Gemini AI + REST API + SSE + 일요일 09:00 스케줄러
-│   ├── main.py                  # (선택) FastAPI 백엔드
+│   ├── node_server.mjs          # [메인 백엔드] Node.js 22 SQLite + Upbit API + Dual AI(Ollama/Gemini) + REST API + SSE + 주간 로테이션
 │   └── common/
 │       ├── algo_lab_service.mjs # 10대 알고리즘 아레나(10-Bot Arena) 시뮬레이션, 지표 계산, 랭킹 및 봇 시드 엔진
+│       ├── log_rotator.mjs      # KST 일일 로그 로테이션 및 7일 보존 정책 유틸리티
 │       ├── news_service.mjs     # 구글 뉴스 & 토큰포스트 RSS 파싱, 30분 주기 감성 분석, 태그 추출
-│       ├── pg_sync.mjs          # PostgreSQL 16 실시간 11개 테이블 데이터 동기화 매니저
-│       ├── database.py          # Python DB 어댑터
-│       └── upbit_client.py      # Python 업비트 연동 클라이언트
+│       ├── pg_db.mjs            # PostgreSQL 비동기 풀 및 SQL 변환 어댑터
+│       ├── pg_sync.mjs          # PostgreSQL 16 실시간 테이블 데이터 동기화 매니저
+│       └── sqlite_db.mjs        # Node.js 내장 node:sqlite WAL 연결 관리 및 경로 해석
 ├── config/
 │   ├── upbit_config.json        # 업비트 및 Gemini API 키 설정 파일 (Git 추적 제외)
 │   └── upbit_config.example.json# 설정 파일 템플릿

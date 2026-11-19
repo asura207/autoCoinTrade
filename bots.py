@@ -9,6 +9,7 @@ bots.py - 3개 트레이딩 봇 매매 전략 및 공통 리스크 게이트웨�
 """
 
 import datetime
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 import json
 import logging
 import math
@@ -39,31 +40,62 @@ logger = logging.getLogger("bots")
 UPBIT_FEE_RATE = 0.0005  # 업비트 원화 마켓 수수료 0.05%
 MIN_ORDER_KRW = 5000.0   # 업비트 최소 주문 금액 5,000원
 SAFE_MIN_ORDER_KRW = 6500.0  # -20% 손절 시에도 5,200원 유지 (업비트 5,000원 최소 매도 제한 데드락 방지)
+KST_TZ = datetime.timezone(datetime.timedelta(hours=9))
+
+
+def _now_kst_str() -> str:
+    return datetime.datetime.now(KST_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _to_decimal_volume_8(vol: Any) -> Decimal:
+    """Decimal 기반 소수점 8자리 내림(ROUND_DOWN) 수량을 반환합니다."""
+    try:
+        if vol is None:
+            return Decimal("0")
+        raw = str(vol).strip()
+        if not raw:
+            return Decimal("0")
+        d = Decimal(raw)
+        if not d.is_finite() or d <= 0:
+            return Decimal("0")
+        return d.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal("0")
 
 
 def round_down_volume_8(vol: Any) -> float:
-    """업비트 주문 수량을 소수점 8자리 내림(ROUND_DOWN) 처리합니다."""
-    try:
-        v = float(vol)
-        if v <= 0 or math.isnan(v) or math.isinf(v):
-            return 0.0
-        return math.floor(v * 100_000_000) / 100_000_000
-    except Exception:
-        return 0.0
+    """업비트 주문 수량을 Decimal 기반 소수점 8자리 내림(ROUND_DOWN) 처리합니다."""
+    d = _to_decimal_volume_8(vol)
+    return float(d) if d > 0 else 0.0
+
+
+def format_volume_8(vol: Any) -> str:
+    """지수 표기법(5e-05 등) 없이 고정 소수점 8자리 문자열로 직렬화합니다."""
+    d = _to_decimal_volume_8(vol)
+    if d <= 0:
+        return "0"
+    return f"{d:.8f}"
 
 
 def is_backend_running(port: Optional[int] = None) -> bool:
     """
-    Node.js 백엔드(BACKEND_PORT, 기본 8001)가 기동 중인지 검사합니다.
+    Node.js 백엔드(BACKEND_PORT/PORT, 기본 8001)가 기동 중인지 검사합니다.
     백엔드가 자체적으로 실전/가상 매매 루프를 실행 중인 경우,
     Python 봇 프로세스가 동일한 주문을 중복 실행(Double Execution)하지 않도록 방어합니다.
     """
     import socket
-    target_port = int(port or os.getenv("BACKEND_PORT", "8001"))
+    raw_port = str(port if port is not None else (os.getenv("BACKEND_PORT") or os.getenv("PORT") or "8001")).strip()
+    try:
+        target_port = int(raw_port) if raw_port else 8001
+    except ValueError:
+        target_port = 8001
+    target_host = (os.getenv("BACKEND_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+    if target_host in ("0.0.0.0", "::"):
+        target_host = "127.0.0.1"
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(0.25)
-            if s.connect_ex(("127.0.0.1", target_port)) == 0:
+            if s.connect_ex((target_host, target_port)) == 0:
                 return True
     except Exception:
         pass
@@ -72,8 +104,11 @@ def is_backend_running(port: Optional[int] = None) -> bool:
         if os.path.isfile(pid_path):
             with open(pid_path, "r", encoding="utf-8") as f:
                 pid = int(f.read().strip())
-            os.kill(pid, 0)
-            return True
+            try:
+                os.kill(pid, 0)
+                return True
+            except PermissionError:
+                return True
     except Exception:
         pass
     return False
@@ -181,51 +216,63 @@ def evaluate_smart_exit(
     if peak_pnl_pct >= 1.2 and pnl_pct <= 0.25:
         return {
             "signal": "SELL",
-            "reason": f"BREAKEVEN_STOP: Peak +{peak_pnl_pct:.2f}% dropped to +{pnl_pct:.2f}%",
+            "reason": f"BREAKEVEN_STOP: Peak +{peak_pnl_pct:.2f}% dropped to {pnl_pct:+.2f}%",
         }
 
-    # 2. 시간 제한 청산 (Time-Stop)
+    # 2. 시간 제한 청산 (Time-Stop, KST 기준 통일 — UTC 호스트 +9시간 왜곡 방지)
     time_stop_bots = {"bot_01", "bot_04", "bot_05", "bot_09", "bot_10"}
     if norm_id in time_stop_bots:
         created_str = open_pos.get("created_at") or open_pos.get("opened_at")
         if created_str:
             try:
-                dt_str = str(created_str).replace("T", " ").split(".")[0]
-                entry_dt = datetime.datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
-                elapsed_hours = (datetime.datetime.now() - entry_dt).total_seconds() / 3600.0
+                raw_ts = str(created_str).strip()
+                if raw_ts.endswith("Z"):
+                    entry_dt = datetime.datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).astimezone(KST_TZ)
+                elif "+" in raw_ts[10:] or "-" in raw_ts[10:]:
+                    entry_dt = datetime.datetime.fromisoformat(raw_ts).astimezone(KST_TZ)
+                else:
+                    dt_str = raw_ts.replace("T", " ").split(".")[0]
+                    entry_dt = datetime.datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST_TZ)
+                elapsed_hours = (datetime.datetime.now(KST_TZ) - entry_dt).total_seconds() / 3600.0
                 max_hours = 6.0 if is_live else 2.0
 
                 in_box = (-0.6 <= pnl_pct <= 0.8)
                 if elapsed_hours >= max_hours and in_box and rvol < 1.0:
                     return {
                         "signal": "SELL",
-                        "reason": f"TIME_STOP: {elapsed_hours:.1f}h elapsed (box {pnl_pct:.2f}%, RVOL {rvol:.1f}x)",
+                        "reason": f"TIME_STOP: {elapsed_hours:.1f}h elapsed (box {pnl_pct:+.2f}%, RVOL {rvol:.1f}x)",
                     }
             except Exception:
                 pass
 
-    # 3. ATR 기반 동적 트레일링 스탑
-    if atr > 0:
-        hard_stop_price = avg_buy - (2.2 * atr)
-        if current_price <= hard_stop_price:
-            return {
-                "signal": "SELL",
-                "reason": f"ATR_HARD_STOP: -2.2xATR ({hard_stop_price:,.0f} KRW) hit (PnL {pnl_pct:.2f}%)",
-            }
-
-        if highest_price > avg_buy:
-            trailing_stop_price = highest_price - (1.8 * atr)
-            if current_price <= trailing_stop_price:
+    # 3. ATR 기반 동적 트레일링 스탑 (다단계 분할 그리드 bot_06 및 bot_10 Setup B 반등 물타기는 ATR 하드 손절 예외)
+    buy_reason = str(open_pos.get("buy_reason") or "")
+    is_grid_or_dip_scale = (
+        norm_id == "bot_06"
+        or (norm_id == "bot_10" and ("반등" in buy_reason or "Setup B" in buy_reason or "SETUP_B" in buy_reason))
+    )
+    if atr > 0 and math.isfinite(atr):
+        if not is_grid_or_dip_scale:
+            hard_stop_price = avg_buy - (2.2 * atr)
+            if current_price <= hard_stop_price:
                 return {
                     "signal": "SELL",
-                    "reason": f"ATR_TRAILING_STOP: -1.8xATR from peak ({trailing_stop_price:,.0f} KRW) hit (PnL {pnl_pct:.2f}%)",
+                    "reason": f"ATR_HARD_STOP: -2.2xATR ({hard_stop_price:,.0f} KRW) hit (PnL {pnl_pct:+.2f}%)",
                 }
-    else:
+
+        if peak_pnl_pct >= 1.0:
+            trailing_stop_price = highest_price - (1.8 * atr)
+            if trailing_stop_price > avg_buy and current_price <= trailing_stop_price:
+                return {
+                    "signal": "SELL",
+                    "reason": f"ATR_TRAILING_STOP: -1.8xATR from peak ({trailing_stop_price:,.0f} KRW) hit (PnL {pnl_pct:+.2f}%)",
+                }
+    elif not is_grid_or_dip_scale:
         fixed_stop = -abs(float(stop_loss_pct or 2.5))
         if pnl_pct <= fixed_stop:
             return {
                 "signal": "SELL",
-                "reason": f"FIXED_STOP_LOSS: PnL {pnl_pct:.2f}% <= {fixed_stop:.2f}%",
+                "reason": f"FIXED_STOP_LOSS: PnL {pnl_pct:+.2f}% <= {fixed_stop:.2f}%",
             }
 
     return None
@@ -341,13 +388,23 @@ def can_enter_position(
     try:
         # 0-1. 실전 일일 서킷 브레이커 (Daily Circuit Breaker): 당일 실현 손실이 배정원금의 -4.0% 이하 시 신규 매수 차단
         if not is_paper and not is_dry_run():
-            today_start = datetime.datetime.now().strftime("%Y-%m-%d 00:00:00")
+            today_start = datetime.datetime.now(KST_TZ).strftime("%Y-%m-%d 00:00:00")
             loss_row = conn.execute(
-                "SELECT COALESCE(SUM(profit_krw), 0) AS daily_profit FROM trades WHERE (bot_id = ? OR bot_id = ?) AND status = 'COMPLETED' AND sell_date >= ?;",
+                "SELECT COUNT(*) AS cnt, COALESCE(SUM(profit_krw), 0) AS daily_profit FROM trades WHERE (bot_id = ? OR bot_id = ?) AND status IN ('CLOSED', 'COMPLETED') AND sell_date >= ?;",
                 (bot_id, norm_id, today_start),
             ).fetchone()
+            trades_cnt = int(loss_row["cnt"]) if loss_row else 0
             daily_profit = float(loss_row["daily_profit"]) if loss_row else 0.0
+            if trades_cnt == 0:
+                pos_loss_row = conn.execute(
+                    "SELECT COALESCE(SUM(realized_pnl), 0) AS daily_profit FROM bot_positions WHERE (bot_id = ? OR bot_id = ?) AND status = 'CLOSED' AND closed_at >= ?;",
+                    (bot_id, norm_id, today_start),
+                ).fetchone()
+                if pos_loss_row:
+                    daily_profit = float(pos_loss_row["daily_profit"] or 0.0)
             bot_row = conn.execute("SELECT allocated_capital FROM bots WHERE bot_id = ?;", (norm_id,)).fetchone()
+            if bot_row is None:
+                bot_row = conn.execute("SELECT allocated_capital FROM bot_accounts WHERE bot_id = ?;", (norm_id,)).fetchone()
             allocated_cap = float(bot_row["allocated_capital"]) if bot_row else 0.0
             loss_limit = -math.floor(allocated_cap * 0.04) if allocated_cap > 0 else -40000.0
             if allocated_cap > 0 and daily_profit <= loss_limit:
@@ -372,8 +429,19 @@ def can_enter_position(
                             0.0,
                             f"Live Gateway Blocked: {norm_id} is inactive or in Graceful Drain (existing positions still monitored)",
                         )
-            except Exception:
-                pass
+                else:
+                    acc_live_row = conn.execute(
+                        "SELECT is_selected_for_live FROM bot_accounts WHERE bot_id = ?;",
+                        (norm_id,),
+                    ).fetchone()
+                    if acc_live_row is not None and int(dict(acc_live_row).get("is_selected_for_live") or 0) != 1:
+                        return (
+                            False,
+                            0.0,
+                            f"Live Gateway Blocked: {norm_id} is in Graceful Drain (bot_accounts)",
+                        )
+            except Exception as gw_exc:
+                logger.warning("[%s] Live selection gateway check failed: %s", norm_id, gw_exc)
 
         # 1. LLM 필터 테이블 조회
         raw_filter_row = conn.execute("SELECT * FROM market_regime_filter WHERE id = 1;").fetchone()
@@ -557,134 +625,187 @@ def execute_buy_order(
     invest_krw: float,
     step_level: int = 1,
     db_path: Optional[str] = None,
+    buy_reason: str = "",
 ) -> Optional[Dict[str, Any]]:
     """
-    매수 주문 실행 및 SQLite 가상 원장(bot_positions, bot_accounts) 원자적 업데이트:
+    매수 주문 실행 및 SQLite 가상 원장(bot_positions, trades, bot_accounts, bots) 원자적 업데이트:
     - DRY_RUN 모드: 실시간 시세 기준 가상 주문 생성
     - LIVE 모드: 최유리 지정가 주문 우선(미체결 폴링 취소) 후 필요 시 시장가 폴백
-    - bot_accounts의 virtual_krw 차감 및 bot_positions 행 추가
+    - bot_accounts/bots의 virtual_krw 차감 및 bot_positions + trades 행 추가
     """
-    conn = get_db_connection(db_path)
-    dry = is_dry_run()
-    upbit = get_upbit_client()
-
     norm_bot_id = normalize_bot_id(bot_id)
 
     # Node.js 백엔드가 매매를 관장 중인 경우 Python 중복 주문 차단 (실전/DRY_RUN 공통)
     if is_backend_running():
         logger.info("[%s] Node.js backend is active. Deferring buy order to backend.", norm_bot_id)
-        conn.close()
         return None
 
-    current_price = get_safe_current_price(ticker)
-    if current_price <= 0:
-        logger.error("[%s] Cannot execute buy: Invalid price for %s", norm_bot_id, ticker)
-        conn.close()
-        return None
-
-    invest_krw = float(math.floor(float(invest_krw)))
-    buy_fee = invest_krw * UPBIT_FEE_RATE
-    net_invest = invest_krw - buy_fee
-    volume = round_down_volume_8(net_invest / current_price)
-    if volume <= 0:
-        logger.error("[%s] Cannot execute buy: Computed volume <= 0 for %s", norm_bot_id, ticker)
-        conn.close()
-        return None
-    order_uuid = f"sim-buy-{uuid.uuid4().hex[:12]}"
-    executed_price = current_price
-
-    if not dry and upbit:
-        # 1. 슬리피지 방어를 위한 최유리 지정가 주문 우선 시도 (35초 폴링)
-        limit_res = execute_limit_order_with_polling(upbit, "bid", ticker, current_price, volume, timeout_sec=35)
-        if limit_res:
-            order_uuid = limit_res["uuid"]
-            executed_price = limit_res["executed_price"]
-            volume = round_down_volume_8(limit_res["executed_volume"])
-            buy_fee = limit_res["paid_fee"]
-            invest_krw = math.floor(volume * executed_price + buy_fee)
-        else:
-            # 2. 지정가 미체결/실패 시 안전 시장가 매수 폴백
-            logger.info("[%s] Limit buy not filled; falling back to market buy for %s", norm_bot_id, ticker)
-            res = retry_with_backoff(upbit.buy_market_order, ticker, invest_krw)
-            if not res or "uuid" not in res:
-                logger.error("[%s] Live market buy order failed for %s", norm_bot_id, ticker)
-                conn.close()
-                return None
-            order_uuid = res["uuid"]
-            time.sleep(0.5)
-            order_detail = retry_with_backoff(upbit.get_order, order_uuid)
-            if order_detail:
-                executed_price = float(order_detail.get("price", current_price))
-                volume = round_down_volume_8(order_detail.get("executed_volume", volume))
-                buy_fee = float(order_detail.get("paid_fee", buy_fee))
-                trades = order_detail.get("trades", [])
-                total_funds = sum(float(t.get("funds", 0.0)) for t in trades)
-                if total_funds > 0 and volume > 0:
-                    executed_price = total_funds / volume
-                    invest_krw = math.floor(total_funds + buy_fee)
-
+    conn = get_db_connection(db_path)
     try:
-        conn.execute("BEGIN IMMEDIATE;")
+        dry = is_dry_run()
+        upbit = get_upbit_client()
 
-        # bot_positions 테이블에 신규 포지션 기록 (market + ticker 동기화)
-        conn.execute(
-            """
-            INSERT INTO bot_positions (
-                bot_id, market, ticker, order_uuid, volume, avg_buy_price,
-                buy_amount, buy_fee, highest_price, step_level, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', CURRENT_TIMESTAMP);
-            """,
-            (
-                norm_bot_id,
-                ticker,
-                ticker,
-                order_uuid,
-                volume,
-                executed_price,
-                invest_krw,
-                buy_fee,
-                executed_price,
-                step_level,
-            ),
-        )
+        current_price = get_safe_current_price(ticker)
+        if current_price <= 0:
+            logger.error("[%s] Cannot execute buy: Invalid price for %s", norm_bot_id, ticker)
+            return None
 
-        # bot_accounts 및 bots의 virtual_krw 동시 차감
-        conn.execute(
-            """
-            UPDATE bot_accounts
-            SET virtual_krw = MAX(0.0, virtual_krw - ?),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE bot_id = ?;
-            """,
-            (invest_krw, norm_bot_id),
-        )
-        conn.execute(
-            """
-            UPDATE bots
-            SET virtual_krw = MAX(0, virtual_krw - ?),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE bot_id = ?;
-            """,
-            (math.floor(invest_krw), norm_bot_id),
-        )
+        invest_krw = float(math.floor(float(invest_krw)))
+        if not math.isfinite(invest_krw) or invest_krw < MIN_ORDER_KRW:
+            logger.error("[%s] Cannot execute buy: Invalid invest_krw=%s for %s", norm_bot_id, invest_krw, ticker)
+            return None
+        buy_fee = invest_krw * UPBIT_FEE_RATE
+        # 지정가 주문 시 can_enter_position에서 이미 수수료 버퍼를 적용했으므로 이중 차감하지 않고, DRY_RUN/시장가는 원금 내 수수료 반영
+        limit_volume = round_down_volume_8(invest_krw / current_price)
+        volume = round_down_volume_8((invest_krw - buy_fee) / current_price)
+        if volume <= 0 or limit_volume <= 0:
+            logger.error("[%s] Cannot execute buy: Computed volume <= 0 for %s", norm_bot_id, ticker)
+            return None
+        order_uuid = f"sim-buy-{uuid.uuid4().hex[:12]}"
+        executed_price = current_price
 
-        conn.execute("COMMIT;")
-        logger.info(
-            f"[{norm_bot_id}] BUY Executed ({'DRY_RUN' if dry else 'LIVE'}): {ticker} | "
-            f"Amount={invest_krw:,.0f}원 | Price={executed_price:,.0f}원 | Vol={volume:.8f} | UUID={order_uuid}"
-        )
-        return {
-            "bot_id": norm_bot_id,
-            "ticker": ticker,
-            "order_uuid": order_uuid,
-            "volume": volume,
-            "avg_buy_price": executed_price,
-            "buy_amount": invest_krw,
-        }
-    except Exception as exc:
-        conn.execute("ROLLBACK;")
-        logger.error("[%s] Buy transaction failed in SQLite: %s", bot_id, exc)
-        return None
+        if not dry and upbit:
+            # 1. 슬리피지 방어를 위한 최유리 지정가 주문 우선 시도 (35초 폴링)
+            limit_res = execute_limit_order_with_polling(upbit, "bid", ticker, current_price, limit_volume, timeout_sec=35)
+            if limit_res:
+                order_uuid = limit_res["uuid"]
+                executed_price = float(limit_res.get("executed_price") or current_price)
+                filled_vol = round_down_volume_8(limit_res.get("executed_volume") or 0)
+                if filled_vol > 0:
+                    volume = filled_vol
+                buy_fee = float(limit_res.get("paid_fee") or (volume * executed_price * UPBIT_FEE_RATE))
+                invest_krw = float(math.floor(volume * executed_price + buy_fee))
+            else:
+                # 2. 지정가 미체결/실패 시 안전 시장가 매수 폴백
+                logger.info("[%s] Limit buy not filled; falling back to market buy for %s", norm_bot_id, ticker)
+                res = retry_with_backoff(upbit.buy_market_order, ticker, invest_krw)
+                if not res or "uuid" not in res:
+                    logger.error("[%s] Live market buy order failed for %s", norm_bot_id, ticker)
+                    return None
+                order_uuid = res["uuid"]
+                order_detail = None
+                for _attempt in range(3):
+                    time.sleep(0.5)
+                    order_detail = retry_with_backoff(upbit.get_order, order_uuid)
+                    if order_detail and str(order_detail.get("state") or "") in ("done", "cancel"):
+                        break
+                if order_detail:
+                    exec_vol = round_down_volume_8(order_detail.get("executed_volume") or 0)
+                    if exec_vol > 0:
+                        volume = exec_vol
+                    raw_fee = order_detail.get("paid_fee")
+                    if raw_fee is not None and str(raw_fee) != "":
+                        buy_fee = float(raw_fee)
+                    trades = order_detail.get("trades") or []
+                    total_funds = sum(float(t.get("funds") or 0.0) for t in trades if isinstance(t, dict))
+                    if total_funds > 0 and volume > 0:
+                        executed_price = total_funds / volume
+                        invest_krw = float(math.floor(total_funds + buy_fee))
+                    else:
+                        raw_price = order_detail.get("price")
+                        if raw_price is not None and str(raw_price) != "" and float(raw_price) > 0:
+                            # Upbit market-buy 'price' field is total KRW order amount, not unit price
+                            if volume > 0 and abs(float(raw_price) - invest_krw) < max(1000.0, invest_krw * 0.2):
+                                executed_price = float(raw_price) / volume
+                            else:
+                                executed_price = current_price
+
+        now_kst = _now_kst_str()
+        vol_str = format_volume_8(volume)
+        safe_reason = str(buy_reason or f"PYTHON_STEP_{step_level}")[:240]
+
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+
+            # trades 원장 동기 기록 (Daily Circuit Breaker / 통계 정합성)
+            trade_id = 0
+            try:
+                t_cur = conn.execute(
+                    """
+                    INSERT INTO trades (
+                        bot_id, market, buy_order_uuid, buy_price, buy_volume, buy_amount, buy_date, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'HOLDING');
+                    """,
+                    (
+                        norm_bot_id,
+                        ticker,
+                        order_uuid,
+                        executed_price,
+                        vol_str,
+                        math.floor(invest_krw),
+                        now_kst,
+                    ),
+                )
+                trade_id = int(getattr(t_cur.cur, "lastrowid", 0) or 0)
+            except Exception as tr_exc:
+                logger.debug("[%s] Optional trades insert skipped: %s", norm_bot_id, tr_exc)
+
+            # bot_positions 테이블에 신규 포지션 기록 (market + ticker + buy_reason + KST created_at)
+            conn.execute(
+                """
+                INSERT INTO bot_positions (
+                    bot_id, market, ticker, order_uuid, volume, avg_buy_price,
+                    buy_amount, buy_fee, trade_id, highest_price, step_level, status, created_at, buy_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?);
+                """,
+                (
+                    norm_bot_id,
+                    ticker,
+                    ticker,
+                    order_uuid,
+                    vol_str,
+                    executed_price,
+                    math.floor(invest_krw),
+                    buy_fee,
+                    trade_id,
+                    executed_price,
+                    step_level,
+                    now_kst,
+                    safe_reason,
+                ),
+            )
+
+            # bot_accounts 및 bots의 virtual_krw 동시 차감
+            conn.execute(
+                """
+                UPDATE bot_accounts
+                SET virtual_krw = MAX(0.0, virtual_krw - ?),
+                    updated_at = ?
+                WHERE bot_id = ?;
+                """,
+                (invest_krw, now_kst, norm_bot_id),
+            )
+            conn.execute(
+                """
+                UPDATE bots
+                SET virtual_krw = MAX(0, virtual_krw - ?),
+                    updated_at = ?
+                WHERE bot_id = ?;
+                """,
+                (math.floor(invest_krw), now_kst, norm_bot_id),
+            )
+
+            conn.commit()
+            logger.info(
+                f"[{norm_bot_id}] BUY Executed ({'DRY_RUN' if dry else 'LIVE'}): {ticker} | "
+                f"Amount={invest_krw:,.0f}원 | Price={executed_price:,.0f}원 | Vol={vol_str} | UUID={order_uuid}"
+            )
+            return {
+                "bot_id": norm_bot_id,
+                "ticker": ticker,
+                "order_uuid": order_uuid,
+                "trade_id": trade_id,
+                "volume": volume,
+                "avg_buy_price": executed_price,
+                "buy_amount": invest_krw,
+            }
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.error("[%s] Buy transaction failed in SQLite: %s", bot_id, exc)
+            return None
     finally:
         conn.close()
 
@@ -698,306 +819,411 @@ def execute_sell_order(
     개별 포지션 분할 매도 실행:
     - 절대 get_balance() 전체 잔고를 매도하지 않음!
     - bot_positions 테이블에 기록된 해당 position_id의 volume 수량만 지정하여 매도
-    - 매도 후 status='CLOSED', realized_pnl 갱신 및 bot_accounts의 virtual_krw 복원
+    - 매도 후 status='CLOSED', realized_pnl 갱신 및 bot_accounts/bots의 virtual_krw 복원 (Graceful Drain Zero-Sum 보장)
     """
-    conn = get_db_connection(db_path)
-    dry = is_dry_run()
-    upbit = get_upbit_client()
-
-    pos = conn.execute("SELECT * FROM bot_positions WHERE id = ? AND status = 'OPEN';", (position_id,)).fetchone()
-    if not pos:
-        logger.warning("Position id=%d is not in OPEN status.", position_id)
-        conn.close()
-        return None
-    pos = dict(pos)
-
-    bot_id = pos["bot_id"]
-    norm_bot_id = normalize_bot_id(bot_id)
-    ticker = pos.get("ticker") or pos.get("market") or ""
-    volume = round_down_volume_8(pos["volume"])
-    if volume <= 0:
-        logger.error("[%s] Cannot sell position %d: invalid volume=%s", bot_id, position_id, pos.get("volume"))
-        conn.close()
-        return None
-    buy_amount = float(pos["buy_amount"])
-    avg_buy_price = float(pos["avg_buy_price"])
-
     # Node.js 백엔드가 매매를 관장 중인 경우 Python 중복 주문 차단 (실전/DRY_RUN 공통)
     if is_backend_running():
-        logger.info("[%s] Node.js backend is active. Deferring sell order to backend.", norm_bot_id)
-        conn.close()
+        logger.info("[pos=%d] Node.js backend is active. Deferring sell order to backend.", position_id)
         return None
 
-    current_price = get_safe_current_price(ticker)
-    if current_price <= 0:
-        logger.error("[%s] Cannot sell position %d: Invalid price for %s", bot_id, position_id, ticker)
-        conn.close()
-        return None
-
-    gross_amount = volume * current_price
-    sell_fee = gross_amount * UPBIT_FEE_RATE
-    net_sell_amount = gross_amount - sell_fee
-    realized_pnl = net_sell_amount - buy_amount
-    pnl_pct = (realized_pnl / buy_amount) * 100.0 if buy_amount > 0 else 0.0
-    sell_order_uuid = f"sim-sell-{uuid.uuid4().hex[:12]}"
-    executed_sell_price = current_price
-
-    if not dry and upbit:
-        # 엄격하게 본인 bot_positions에 기록된 volume 수량만 지정하여 최유리 지정가 매도 우선 시도
-        limit_res = execute_limit_order_with_polling(upbit, "ask", ticker, current_price, volume, timeout_sec=35)
-        if limit_res:
-            sell_order_uuid = limit_res["uuid"]
-            executed_sell_price = limit_res["executed_price"]
-            volume = round_down_volume_8(limit_res["executed_volume"])
-            sell_fee = limit_res["paid_fee"]
-            gross_amount = volume * executed_sell_price
-            net_sell_amount = gross_amount - sell_fee
-            realized_pnl = net_sell_amount - buy_amount
-            pnl_pct = (realized_pnl / buy_amount) * 100.0 if buy_amount > 0 else 0.0
-        else:
-            logger.info("[%s] Limit sell not filled; falling back to market sell for pos %d (%s, vol=%.8f)", bot_id, position_id, ticker, volume)
-            res = retry_with_backoff(upbit.sell_market_order, ticker, volume)
-            if not res or "uuid" not in res:
-                logger.error("[%s] Live market sell failed for pos %d (%s, vol=%.8f)", bot_id, position_id, ticker, volume)
-                conn.close()
-                return None
-            sell_order_uuid = res["uuid"]
-            time.sleep(0.5)
-            order_detail = retry_with_backoff(upbit.get_order, sell_order_uuid)
-            if order_detail:
-                executed_sell_price = float(order_detail.get("price", current_price))
-                volume = round_down_volume_8(order_detail.get("executed_volume", volume))
-                sell_fee = float(order_detail.get("paid_fee", sell_fee))
-                trades = order_detail.get("trades", [])
-                total_funds = sum(float(t.get("funds", 0.0)) for t in trades)
-                if total_funds > 0 and volume > 0:
-                    executed_sell_price = total_funds / volume
-                    gross_amount = total_funds
-                else:
-                    gross_amount = volume * executed_sell_price
-                net_sell_amount = gross_amount - sell_fee
-                realized_pnl = net_sell_amount - buy_amount
-                pnl_pct = (realized_pnl / buy_amount) * 100.0 if buy_amount > 0 else 0.0
-
+    conn = get_db_connection(db_path)
     try:
-        conn.execute("BEGIN IMMEDIATE;")
+        dry = is_dry_run()
+        upbit = get_upbit_client()
 
-        # 1. bot_positions 상태 업데이트 (CLOSED)
-        conn.execute(
-            """
-            UPDATE bot_positions
-            SET status = 'CLOSED',
-                sell_order_uuid = ?,
-                sell_price = ?,
-                sell_amount = ?,
-                sell_fee = ?,
-                realized_pnl = ?,
-                pnl_pct = ?,
-                closed_at = CURRENT_TIMESTAMP
-            WHERE id = ?;
-            """,
-            (
-                sell_order_uuid,
-                executed_sell_price,
-                net_sell_amount,
-                sell_fee,
-                realized_pnl,
-                pnl_pct,
+        pos_row = conn.execute("SELECT * FROM bot_positions WHERE id = ? AND status = 'OPEN';", (position_id,)).fetchone()
+        if not pos_row:
+            logger.warning("Position id=%d is not in OPEN status.", position_id)
+            return None
+        pos = dict(pos_row)
+
+        bot_id = pos["bot_id"]
+        norm_bot_id = normalize_bot_id(bot_id)
+        ticker = pos.get("ticker") or pos.get("market") or ""
+        original_volume = round_down_volume_8(pos["volume"])
+        if original_volume <= 0:
+            logger.error("[%s] Cannot sell position %d: invalid volume=%s", bot_id, position_id, pos.get("volume"))
+            return None
+        volume = original_volume
+        buy_amount = float(pos["buy_amount"] or 0.0)
+        avg_buy_price = float(pos["avg_buy_price"] or 0.0)
+
+        current_price = get_safe_current_price(ticker)
+        if current_price <= 0:
+            logger.error("[%s] Cannot sell position %d: Invalid price for %s", bot_id, position_id, ticker)
+            return None
+
+        if not dry and upbit and (volume * current_price) < MIN_ORDER_KRW:
+            logger.warning(
+                "[%s] Skip live sell for pos %d (%s): notional %.0f KRW < min %.0f KRW",
+                norm_bot_id,
                 position_id,
-            ),
-        )
+                ticker,
+                volume * current_price,
+                MIN_ORDER_KRW,
+            )
+            return None
 
-        # 2. 실전 선택 여부 확인 (Graceful Drain 탈락 봇 청산 시 회수 원화 활성 봇 자동 귀속)
-        bot_live_row = conn.execute(
-            "SELECT is_selected_for_live FROM bots WHERE bot_id = ?;",
-            (norm_bot_id,),
-        ).fetchone()
-        if bot_live_row is None:
+        gross_amount = volume * current_price
+        sell_fee = gross_amount * UPBIT_FEE_RATE
+        net_sell_amount = gross_amount - sell_fee
+        realized_pnl = net_sell_amount - buy_amount
+        pnl_pct = (realized_pnl / buy_amount) * 100.0 if buy_amount > 0 else 0.0
+        sell_order_uuid = f"sim-sell-{uuid.uuid4().hex[:12]}"
+        executed_sell_price = current_price
+        is_partial_fill = False
+        remaining_vol = 0.0
+
+        if not dry and upbit:
+            # 엄격하게 본인 bot_positions에 기록된 volume 수량만 지정하여 최유리 지정가 매도 우선 시도
+            limit_res = execute_limit_order_with_polling(upbit, "ask", ticker, current_price, volume, timeout_sec=35)
+            if limit_res:
+                sell_order_uuid = limit_res["uuid"]
+                executed_sell_price = float(limit_res.get("executed_price") or current_price)
+                filled_vol = round_down_volume_8(limit_res.get("executed_volume") or 0)
+                if filled_vol > 0:
+                    volume = filled_vol
+                sell_fee = float(limit_res.get("paid_fee") or (volume * executed_sell_price * UPBIT_FEE_RATE))
+                gross_amount = volume * executed_sell_price
+                net_sell_amount = gross_amount - sell_fee
+                # 부분 체결 시 잔여 물량이 최소 주문 금액 이상이면 포지션을 고아 코인으로 버리지 않고 부분 차감
+                rem_candidate = round_down_volume_8(original_volume - volume)
+                if rem_candidate > 0 and (rem_candidate * executed_sell_price) >= MIN_ORDER_KRW:
+                    is_partial_fill = True
+                    remaining_vol = rem_candidate
+                    filled_ratio = min(1.0, max(0.0, volume / original_volume)) if original_volume > 0 else 1.0
+                    sold_cost = buy_amount * filled_ratio
+                    realized_pnl = net_sell_amount - sold_cost
+                    pnl_pct = (realized_pnl / sold_cost) * 100.0 if sold_cost > 0 else 0.0
+                else:
+                    realized_pnl = net_sell_amount - buy_amount
+                    pnl_pct = (realized_pnl / buy_amount) * 100.0 if buy_amount > 0 else 0.0
+            else:
+                logger.info("[%s] Limit sell not filled; falling back to market sell for pos %d (%s, vol=%.8f)", bot_id, position_id, ticker, volume)
+                res = retry_with_backoff(upbit.sell_market_order, ticker, volume)
+                if not res or "uuid" not in res:
+                    logger.error("[%s] Live market sell failed for pos %d (%s, vol=%.8f)", bot_id, position_id, ticker, volume)
+                    return None
+                sell_order_uuid = res["uuid"]
+                order_detail = None
+                for _attempt in range(3):
+                    time.sleep(0.5)
+                    order_detail = retry_with_backoff(upbit.get_order, sell_order_uuid)
+                    if order_detail and str(order_detail.get("state") or "") in ("done", "cancel"):
+                        break
+                if order_detail:
+                    exec_vol = round_down_volume_8(order_detail.get("executed_volume") or 0)
+                    if exec_vol > 0:
+                        volume = exec_vol
+                    raw_fee = order_detail.get("paid_fee")
+                    if raw_fee is not None and str(raw_fee) != "":
+                        sell_fee = float(raw_fee)
+                    trades = order_detail.get("trades") or []
+                    total_funds = sum(float(t.get("funds") or 0.0) for t in trades if isinstance(t, dict))
+                    if total_funds > 0 and volume > 0:
+                        executed_sell_price = total_funds / volume
+                        gross_amount = total_funds
+                    else:
+                        # 시장가 매도 주문 응답의 price 필드는 None일 수 있으므로 절대 직접 float(None) 금지
+                        raw_price = order_detail.get("price")
+                        executed_sell_price = float(raw_price) if (raw_price is not None and str(raw_price) != "" and float(raw_price) > 0) else current_price
+                        gross_amount = volume * executed_sell_price
+                    net_sell_amount = gross_amount - sell_fee
+                    realized_pnl = net_sell_amount - buy_amount
+                    pnl_pct = (realized_pnl / buy_amount) * 100.0 if buy_amount > 0 else 0.0
+
+        now_kst = _now_kst_str()
+        safe_net_sell = float(net_sell_amount) if math.isfinite(net_sell_amount) else 0.0
+        safe_realized_pnl = float(realized_pnl) if math.isfinite(realized_pnl) else 0.0
+        safe_pnl_pct = float(pnl_pct) if math.isfinite(pnl_pct) else 0.0
+
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+
+            if is_partial_fill and remaining_vol > 0:
+                rem_ratio = remaining_vol / original_volume if original_volume > 0 else 0.0
+                rem_buy_amount = max(0, math.floor(buy_amount * rem_ratio))
+                upd = conn.execute(
+                    """
+                    UPDATE bot_positions
+                    SET volume = ?,
+                        buy_amount = ?,
+                        sell_order_uuid = ?
+                    WHERE id = ? AND status = 'OPEN';
+                    """,
+                    (format_volume_8(remaining_vol), rem_buy_amount, sell_order_uuid, position_id),
+                )
+                if upd.rowcount == 0:
+                    conn.rollback()
+                    logger.warning("[%s] Position %d already modified/closed concurrently.", norm_bot_id, position_id)
+                    return None
+            else:
+                # 1. bot_positions 상태 업데이트 (CLOSED, 원자적 OPEN 가드)
+                upd = conn.execute(
+                    """
+                    UPDATE bot_positions
+                    SET status = 'CLOSED',
+                        sell_order_uuid = ?,
+                        sell_price = ?,
+                        sell_amount = ?,
+                        sell_fee = ?,
+                        realized_pnl = ?,
+                        pnl_pct = ?,
+                        closed_at = ?
+                    WHERE id = ? AND status = 'OPEN';
+                    """,
+                    (
+                        sell_order_uuid,
+                        executed_sell_price,
+                        safe_net_sell,
+                        sell_fee,
+                        safe_realized_pnl,
+                        safe_pnl_pct,
+                        now_kst,
+                        position_id,
+                    ),
+                )
+                if upd.rowcount == 0:
+                    conn.rollback()
+                    logger.warning("[%s] Position %d already closed concurrently; skipping duplicate settlement.", norm_bot_id, position_id)
+                    return None
+
+                trade_id_val = int(pos.get("trade_id") or 0)
+                if trade_id_val > 0:
+                    try:
+                        conn.execute(
+                            """
+                            UPDATE trades
+                            SET sell_order_uuid = ?,
+                                sell_date = ?,
+                                sell_price = ?,
+                                sell_volume = ?,
+                                sell_amount = ?,
+                                profit_krw = ?,
+                                profit_pct = ?,
+                                status = 'COMPLETED'
+                            WHERE id = ? AND status = 'HOLDING';
+                            """,
+                            (
+                                sell_order_uuid,
+                                now_kst,
+                                executed_sell_price,
+                                format_volume_8(volume),
+                                math.floor(safe_net_sell),
+                                math.floor(safe_realized_pnl),
+                                round(safe_pnl_pct, 2),
+                                trade_id_val,
+                            ),
+                        )
+                    except Exception as tr_upd_exc:
+                        logger.debug("[%s] Optional trades update skipped: %s", norm_bot_id, tr_upd_exc)
+
+            # 2. 실전 선택 여부 확인 (Graceful Drain 탈락 봇 청산 시 회수 원화 활성 봇 자동 귀속)
             bot_live_row = conn.execute(
-                "SELECT is_selected_for_live FROM bot_accounts WHERE bot_id = ?;",
+                "SELECT is_selected_for_live FROM bots WHERE bot_id = ?;",
                 (norm_bot_id,),
             ).fetchone()
-        is_selected_live = int(dict(bot_live_row).get("is_selected_for_live") or 0) == 1 if bot_live_row is not None else True
+            if bot_live_row is None:
+                bot_live_row = conn.execute(
+                    "SELECT is_selected_for_live FROM bot_accounts WHERE bot_id = ?;",
+                    (norm_bot_id,),
+                ).fetchone()
+            is_selected_live = int(dict(bot_live_row).get("is_selected_for_live") or 0) == 1 if bot_live_row is not None else True
 
-        if not is_selected_live:
-            # 탈락(Draining) 봇: 실현 손익 누적만 기록하고, 회수 원화(+미사용 잔고)는 현재 활성 실전 봇들의 allocation_ratio 비율대로 안전 이관
-            prev_cash_row = conn.execute(
-                "SELECT COALESCE(virtual_krw, 0) AS vkrw FROM bot_accounts WHERE bot_id = ?;",
-                (norm_bot_id,),
-            ).fetchone()
-            prev_cash = max(0, math.floor(float(dict(prev_cash_row).get("vkrw") or 0))) if prev_cash_row else 0
-            remaining_open_row = conn.execute(
-                "SELECT COUNT(*) AS open_cnt, COALESCE(SUM(buy_amount), 0) AS open_used FROM bot_positions WHERE (bot_id = ? OR bot_id = ?) AND status = 'OPEN';",
-                (bot_id, norm_bot_id),
-            ).fetchone()
-            rem_dict = dict(remaining_open_row) if remaining_open_row else {}
-            remaining_open_cnt = int(rem_dict.get("open_cnt") or 0)
-            remaining_open_used = max(0, math.floor(float(rem_dict.get("open_used") or 0)))
+            if not is_selected_live:
+                # 탈락(Draining) 봇: 실현 손익 누적만 기록하고, 회수 원화(+미사용 잔고)는 현재 활성 실전 봇들의 allocation_ratio 비율대로 안전 이관
+                prev_cash_row = conn.execute(
+                    "SELECT COALESCE(virtual_krw, 0) AS vkrw FROM bot_accounts WHERE bot_id = ?;",
+                    (norm_bot_id,),
+                ).fetchone()
+                prev_cash = max(0, math.floor(float(dict(prev_cash_row).get("vkrw") or 0))) if prev_cash_row else 0
+                remaining_open_row = conn.execute(
+                    "SELECT COUNT(*) AS open_cnt, COALESCE(SUM(buy_amount), 0) AS open_used FROM bot_positions WHERE (bot_id = ? OR bot_id = ?) AND status = 'OPEN';",
+                    (bot_id, norm_bot_id),
+                ).fetchone()
+                rem_dict = dict(remaining_open_row) if remaining_open_row else {}
+                remaining_open_cnt = int(rem_dict.get("open_cnt") or 0)
+                remaining_open_used = max(0, math.floor(float(rem_dict.get("open_used") or 0)))
 
-            safe_proceeds = max(0, math.floor(net_sell_amount)) if math.isfinite(net_sell_amount) else 0
-            floored_proceeds = safe_proceeds + prev_cash
+                safe_proceeds = max(0, math.floor(safe_net_sell))
+                floored_proceeds = safe_proceeds + prev_cash
 
-            conn.execute(
-                """
-                UPDATE bot_accounts
-                SET virtual_krw = 0,
-                    allocated_capital = ?,
-                    is_selected_for_live = 0,
-                    total_realized_pnl = total_realized_pnl + ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE bot_id = ?;
-                """,
-                (remaining_open_used, realized_pnl, norm_bot_id),
-            )
-            conn.execute(
-                """
-                UPDATE bots
-                SET virtual_krw = 0,
-                    allocated_capital = ?,
-                    is_selected_for_live = 0,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE bot_id = ?;
-                """,
-                (remaining_open_used, norm_bot_id),
-            )
-
-            active_rows = conn.execute(
-                """
-                SELECT bot_id, COALESCE(allocation_ratio, 0) AS allocation_ratio
-                FROM bots
-                WHERE is_selected_for_live = 1
-                ORDER BY allocation_ratio DESC, bot_id ASC;
-                """
-            ).fetchall()
-            if not active_rows:
                 active_rows = conn.execute(
                     """
                     SELECT bot_id, COALESCE(allocation_ratio, 0) AS allocation_ratio
-                    FROM bot_accounts
+                    FROM bots
                     WHERE is_selected_for_live = 1
                     ORDER BY allocation_ratio DESC, bot_id ASC;
                     """
                 ).fetchall()
+                if not active_rows:
+                    active_rows = conn.execute(
+                        """
+                        SELECT bot_id, COALESCE(allocation_ratio, 0) AS allocation_ratio
+                        FROM bot_accounts
+                        WHERE is_selected_for_live = 1
+                        ORDER BY allocation_ratio DESC, bot_id ASC;
+                        """
+                    ).fetchall()
 
-            active_list = [dict(r) for r in active_rows if r["bot_id"] != norm_bot_id]
-            ratio_sum = sum(
-                max(0.0, float(r.get("allocation_ratio") or 0.0))
-                for r in active_list
-                if math.isfinite(float(r.get("allocation_ratio") or 0.0))
-            )
-            transfer_logs = []
-            alloc_summary = []
-            if active_list and floored_proceeds > 0:
-                base_shares = []
-                for active_bot in active_list:
-                    raw_ratio = float(active_bot.get("allocation_ratio") or 0.0)
-                    ratio_val = max(0.0, raw_ratio) if math.isfinite(raw_ratio) else 0.0
-                    if ratio_sum > 0:
-                        share = max(0, math.floor(floored_proceeds * (ratio_val / ratio_sum)))
-                    else:
-                        share = max(0, math.floor(floored_proceeds / len(active_list)))
-                    base_shares.append(share)
-                # Math.floor 나머지 자투리 원화(1~2원)는 1위 활성 봇(idx == 0)에 합산하여 Zero-Sum 보장
-                remainder = floored_proceeds - sum(base_shares)
-                if remainder > 0 and base_shares:
-                    base_shares[0] += remainder
+                active_list = [dict(r) for r in active_rows if r["bot_id"] != norm_bot_id]
+                # 활성 봇이 0대인 예외 상황에서는 원화를 증발(0원화)시키지 않고 탈락 봇 계좌에 안전 보전(Zero-Sum)
+                retained_cash = floored_proceeds if not active_list else 0
+                retained_alloc = remaining_open_used + retained_cash
 
-                for active_bot, share in zip(active_list, base_shares):
-                    if share > 0:
-                        target_id = active_bot["bot_id"]
-                        conn.execute(
-                            """
-                            UPDATE bot_accounts
-                            SET virtual_krw = virtual_krw + ?,
-                                allocated_capital = allocated_capital + ?,
-                                updated_at = CURRENT_TIMESTAMP
-                            WHERE bot_id = ?;
-                            """,
-                            (share, share, target_id),
-                        )
-                        conn.execute(
-                            """
-                            UPDATE bots
-                            SET virtual_krw = virtual_krw + ?,
-                                allocated_capital = allocated_capital + ?,
-                                updated_at = CURRENT_TIMESTAMP
-                            WHERE bot_id = ?;
-                            """,
-                            (share, share, target_id),
-                        )
-                        transfer_logs.append(f"{target_id}+{share:,}원")
-                        alloc_summary.append({"bot_id": target_id, "amount_krw": share})
-
-            try:
-                import json as _json
                 conn.execute(
                     """
-                    INSERT INTO drain_handoff_logs (
-                        from_bot_id, market, position_id, trade_id, reason,
-                        sell_amount, sell_fee, net_proceeds_krw, realized_pnl_krw,
-                        allocations_json, remaining_positions_count, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
+                    UPDATE bot_accounts
+                    SET virtual_krw = ?,
+                        allocated_capital = ?,
+                        is_selected_for_live = 0,
+                        total_realized_pnl = total_realized_pnl + ?,
+                        updated_at = ?
+                    WHERE bot_id = ?;
                     """,
-                    (
-                        norm_bot_id,
-                        ticker,
-                        position_id,
-                        int(pos_dict.get("trade_id") or 0),
-                        reason,
-                        float(net_sell_amount + sell_fee),
-                        float(sell_fee),
-                        float(floored_proceeds),
-                        float(realized_pnl),
-                        _json.dumps(alloc_summary, ensure_ascii=False),
-                        remaining_open_cnt,
-                    ),
+                    (retained_cash, retained_alloc, safe_realized_pnl, now_kst, norm_bot_id),
                 )
+                conn.execute(
+                    """
+                    UPDATE bots
+                    SET virtual_krw = ?,
+                        allocated_capital = ?,
+                        is_selected_for_live = 0,
+                        updated_at = ?
+                    WHERE bot_id = ?;
+                    """,
+                    (retained_cash, retained_alloc, now_kst, norm_bot_id),
+                )
+
+                ratio_sum = sum(
+                    max(0.0, float(r.get("allocation_ratio") or 0.0))
+                    for r in active_list
+                    if math.isfinite(float(r.get("allocation_ratio") or 0.0))
+                )
+                transfer_logs = []
+                alloc_summary = []
+                if active_list and floored_proceeds > 0:
+                    base_shares = []
+                    for active_bot in active_list:
+                        raw_ratio = float(active_bot.get("allocation_ratio") or 0.0)
+                        ratio_val = max(0.0, raw_ratio) if math.isfinite(raw_ratio) else 0.0
+                        if ratio_sum > 0:
+                            share = max(0, math.floor(floored_proceeds * (ratio_val / ratio_sum)))
+                        else:
+                            share = max(0, math.floor(floored_proceeds / len(active_list)))
+                        base_shares.append(share)
+                    # Math.floor 나머지 자투리 원화(1~2원)는 1위 활성 봇(idx == 0)에 합산하여 Zero-Sum 보장
+                    remainder = floored_proceeds - sum(base_shares)
+                    if remainder > 0 and base_shares:
+                        base_shares[0] += remainder
+
+                    for active_bot, share in zip(active_list, base_shares):
+                        if share > 0:
+                            target_id = active_bot["bot_id"]
+                            conn.execute(
+                                """
+                                UPDATE bot_accounts
+                                SET virtual_krw = virtual_krw + ?,
+                                    allocated_capital = allocated_capital + ?,
+                                    updated_at = ?
+                                WHERE bot_id = ?;
+                                """,
+                                (share, share, now_kst, target_id),
+                            )
+                            conn.execute(
+                                """
+                                UPDATE bots
+                                SET virtual_krw = virtual_krw + ?,
+                                    allocated_capital = allocated_capital + ?,
+                                    updated_at = ?
+                                WHERE bot_id = ?;
+                                """,
+                                (share, share, now_kst, target_id),
+                            )
+                            transfer_logs.append(f"{target_id}+{share:,}원")
+                            alloc_summary.append({"bot_id": target_id, "amount_krw": share})
+
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO drain_handoff_logs (
+                            from_bot_id, market, position_id, trade_id, reason,
+                            sell_amount, sell_fee, net_proceeds_krw, realized_pnl_krw,
+                            allocations_json, remaining_positions_count, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        """,
+                        (
+                            norm_bot_id,
+                            ticker,
+                            position_id,
+                            int(pos.get("trade_id") or 0),
+                            reason,
+                            float(safe_net_sell + sell_fee),
+                            float(sell_fee),
+                            float(floored_proceeds),
+                            float(safe_realized_pnl),
+                            json.dumps(alloc_summary, ensure_ascii=False),
+                            remaining_open_cnt,
+                            now_kst,
+                        ),
+                    )
+                except Exception as log_exc:
+                    logger.warning("[%s] Failed to insert drain_handoff_logs: %s", norm_bot_id, log_exc)
+
+                logger.info(
+                    f"[{norm_bot_id}] [Graceful Drain 정산 이관] 탈락 봇 {ticker} 매도 정산금 {floored_proceeds:,}원 "
+                    f"(실현손익 {safe_realized_pnl:+,.0f}원, 잔여포지션 {remaining_open_cnt}건) 회수 -> 활성 실전 봇 충전: "
+                    f"{', '.join(transfer_logs) if transfer_logs else '이관 대상 없음(자체 보전)'}"
+                )
+            else:
+                # 일반 활성 봇: bot_accounts & bots 가상 원화 복원 및 실현 손익 누적
+                floored_proceeds = max(0, math.floor(safe_net_sell))
+                remaining_open_row = conn.execute(
+                    "SELECT COALESCE(SUM(buy_amount), 0) AS open_used FROM bot_positions WHERE (bot_id = ? OR bot_id = ?) AND status = 'OPEN';",
+                    (bot_id, norm_bot_id),
+                ).fetchone()
+                remaining_open_used = max(0, math.floor(float(dict(remaining_open_row).get("open_used") or 0))) if remaining_open_row else 0
+                conn.execute(
+                    """
+                    UPDATE bot_accounts
+                    SET virtual_krw = virtual_krw + ?,
+                        allocated_capital = virtual_krw + ? + ?,
+                        total_realized_pnl = total_realized_pnl + ?,
+                        updated_at = ?
+                    WHERE bot_id = ?;
+                    """,
+                    (floored_proceeds, floored_proceeds, remaining_open_used, safe_realized_pnl, now_kst, norm_bot_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE bots
+                    SET virtual_krw = virtual_krw + ?,
+                        allocated_capital = virtual_krw + ? + ?,
+                        updated_at = ?
+                    WHERE bot_id = ?;
+                    """,
+                    (floored_proceeds, floored_proceeds, remaining_open_used, now_kst, norm_bot_id),
+                )
+
+            conn.commit()
+            logger.info(
+                f"[{norm_bot_id}] SELL Executed ({'DRY_RUN' if dry else 'LIVE'}, {reason}): {ticker} | "
+                f"SellPrice={executed_sell_price:,.0f}원 | PnL={safe_realized_pnl:,.0f}원 ({safe_pnl_pct:+.2f}%) | UUID={sell_order_uuid}"
+            )
+            return {
+                "position_id": position_id,
+                "realized_pnl": safe_realized_pnl,
+                "pnl_pct": safe_pnl_pct,
+                "net_sell_amount": safe_net_sell,
+                "partial": is_partial_fill,
+            }
+        except Exception as exc:
+            try:
+                conn.rollback()
             except Exception:
                 pass
-
-            logger.info(
-                f"[{norm_bot_id}] [Graceful Drain 정산 이관] 탈락 봇 {ticker} 매도 정산금 {floored_proceeds:,}원 "
-                f"(실현손익 {realized_pnl:+,.0f}원, 잔여포지션 {remaining_open_cnt}건) 회수 -> 활성 실전 봇 충전: "
-                f"{', '.join(transfer_logs) if transfer_logs else '이관 대상 없음'}"
-            )
-        else:
-            # 일반 활성 봇: bot_accounts & bots 가상 원화 복원 및 실현 손익 누적
-            floored_proceeds = math.floor(net_sell_amount)
-            conn.execute(
-                """
-                UPDATE bot_accounts
-                SET virtual_krw = virtual_krw + ?,
-                    total_realized_pnl = total_realized_pnl + ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE bot_id = ?;
-                """,
-                (floored_proceeds, realized_pnl, norm_bot_id),
-            )
-            conn.execute(
-                """
-                UPDATE bots
-                SET virtual_krw = virtual_krw + ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE bot_id = ?;
-                """,
-                (floored_proceeds, norm_bot_id),
-            )
-
-        conn.execute("COMMIT;")
-        logger.info(
-            f"[{norm_bot_id}] SELL Executed ({'DRY_RUN' if dry else 'LIVE'}, {reason}): {ticker} | "
-            f"SellPrice={executed_sell_price:,.0f}원 | PnL={realized_pnl:,.0f}원 ({pnl_pct:.2f}%) | UUID={sell_order_uuid}"
-        )
-        return {
-            "position_id": position_id,
-            "realized_pnl": realized_pnl,
-            "pnl_pct": pnl_pct,
-            "net_sell_amount": net_sell_amount,
-        }
-    except Exception as exc:
-        conn.execute("ROLLBACK;")
-        logger.error("[%s] Sell transaction failed in SQLite: %s", bot_id, exc)
-        return None
+            logger.error("[%s] Sell transaction failed in SQLite: %s", bot_id, exc)
+            return None
     finally:
         conn.close()
 
@@ -1072,11 +1298,12 @@ def run_bot_vb(stop_event, bot_id: str = "bot_01", db_path: Optional[str] = None
 
             bot_acc = conn.execute("SELECT * FROM bot_accounts WHERE bot_id = ?;", (norm_id,)).fetchone()
             available_krw = float(bot_acc["virtual_krw"]) if bot_acc else 0.0
-            has_open_rows = conn.execute(
-                "SELECT COUNT(*) as cnt FROM bot_positions WHERE (bot_id = ? OR bot_id = ?) AND status = 'OPEN';",
+            open_pos_markets_rows = conn.execute(
+                "SELECT DISTINCT COALESCE(NULLIF(ticker, ''), market) AS m FROM bot_positions WHERE (bot_id = ? OR bot_id = ?) AND status = 'OPEN';",
                 (bot_id, norm_id),
-            ).fetchone()
-            has_open_pos = int(dict(has_open_rows).get("cnt", 0)) > 0 if has_open_rows else False
+            ).fetchall()
+            open_pos_markets = [str(dict(r).get("m") or "") for r in open_pos_markets_rows if str(dict(r).get("m") or "")]
+            has_open_pos = len(open_pos_markets) > 0
             conn.close()
 
             if not allow_new_buys and not has_open_pos:
@@ -1084,7 +1311,8 @@ def run_bot_vb(stop_event, bot_id: str = "bot_01", db_path: Optional[str] = None
                     break
                 continue
 
-            for ticker in target_tickers:
+            loop_tickers = list(dict.fromkeys(target_tickers + open_pos_markets))
+            for ticker in loop_tickers:
                 if stop_event.is_set():
                     break
 
@@ -1113,20 +1341,23 @@ def run_bot_vb(stop_event, bot_id: str = "bot_01", db_path: Optional[str] = None
 
                 # 2. 보유 중 포지션 관리: ATR 트레일링 스탑 및 3단계 스마트 청산
                 if open_pos:
-                    pos_id = open_pos["id"]
-                    highest_price = max(float(open_pos["highest_price"] or 0.0), current_price)
+                    open_pos_dict = dict(open_pos)
+                    pos_id = open_pos_dict["id"]
+                    highest_price = max(float(open_pos_dict.get("highest_price") or 0.0), current_price)
 
-                    # 최고가 갱신
-                    if highest_price > float(open_pos["highest_price"] or 0.0):
+                    # 최고가 갱신 (commit 필수 + 인메모리 동기화)
+                    if highest_price > float(open_pos_dict.get("highest_price") or 0.0):
                         conn = get_db_connection(db_path)
                         conn.execute("UPDATE bot_positions SET highest_price = ? WHERE id = ?;", (highest_price, pos_id))
+                        conn.commit()
                         conn.close()
+                        open_pos_dict["highest_price"] = highest_price
 
                     # 스마트 청산(본절 스탑, 시간 제한 청산, 동적 ATR 트레일링 스탑)
                     rvol_val = curr_vol / vol_ma20 if vol_ma20 > 0 else 1.0
                     smart_exit = evaluate_smart_exit(
                         norm_id,
-                        dict(open_pos),
+                        open_pos_dict,
                         current_price,
                         atr=atr_val,
                         rvol=rvol_val,
@@ -1179,8 +1410,9 @@ def run_bot_vb(stop_event, bot_id: str = "bot_01", db_path: Optional[str] = None
                             bot_id, ticker, available_krw, db_path=db_path
                         )
                         if can_enter:
-                            execute_buy_order(bot_id, ticker, invest_krw, step_level=1, db_path=db_path)
-                            available_krw -= invest_krw
+                            buy_res = execute_buy_order(bot_id, ticker, invest_krw, step_level=1, db_path=db_path, buy_reason="VB_BREAKOUT")
+                            if buy_res:
+                                available_krw = max(0.0, available_krw - float(buy_res.get("buy_amount") or invest_krw))
                         else:
                             logger.info("[%s] Entry blocked by gateway for %s: %s", bot_id, ticker, reason)
 
@@ -1254,7 +1486,9 @@ def run_bot_momentum(stop_event, bot_id: str = "bot_03", db_path: Optional[str] 
                     if highest_price > float(pos_dict.get("highest_price") or 0.0):
                         conn = get_db_connection(db_path)
                         conn.execute("UPDATE bot_positions SET highest_price = ? WHERE id = ?;", (highest_price, pos_id))
+                        conn.commit()
                         conn.close()
+                        pos_dict["highest_price"] = highest_price
 
                     tr = pd.concat([
                         df["high"] - df["low"],
@@ -1349,9 +1583,10 @@ def run_bot_momentum(stop_event, bot_id: str = "bot_03", db_path: Optional[str] 
                         bot_id, candidate, slot_budget, db_path=db_path
                     )
                     if can_enter:
-                        execute_buy_order(bot_id, candidate, invest_krw, step_level=1, db_path=db_path)
-                        available_krw -= invest_krw
-                        remaining_slots -= 1
+                        buy_res = execute_buy_order(bot_id, candidate, invest_krw, step_level=1, db_path=db_path, buy_reason="BB_SQUEEZE_BREAKOUT")
+                        if buy_res:
+                            available_krw = max(0.0, available_krw - float(buy_res.get("buy_amount") or invest_krw))
+                            remaining_slots -= 1
                     else:
                         logger.info("[%s] Entry blocked by gateway for %s: %s", bot_id, candidate, reason)
 
@@ -1427,7 +1662,9 @@ def run_bot_bb(stop_event, bot_id: str = "bot_05", db_path: Optional[str] = None
                 if highest_price > float(pos_dict.get("highest_price") or 0.0):
                     conn = get_db_connection(db_path)
                     conn.execute("UPDATE bot_positions SET highest_price = ? WHERE id = ?;", (highest_price, pos_id))
+                    conn.commit()
                     conn.close()
+                    pos_dict["highest_price"] = highest_price
 
                 df = get_cached_ohlcv(ticker, interval="minute30", count=25)
                 atr_val = 0.0
@@ -1535,8 +1772,9 @@ def run_bot_bb(stop_event, bot_id: str = "bot_05", db_path: Optional[str] = None
                                 bot_id, ticker, first_entry_budget, db_path=db_path
                             )
                             if can_enter:
-                                execute_buy_order(bot_id, ticker, invest_krw, step_level=1, db_path=db_path)
-                                available_krw -= invest_krw
+                                buy_res = execute_buy_order(bot_id, ticker, invest_krw, step_level=1, db_path=db_path, buy_reason="BB_DCA_STEP_1")
+                                if buy_res:
+                                    available_krw = max(0.0, available_krw - float(buy_res.get("buy_amount") or invest_krw))
 
                     # Case B: 추가 분할 매수 (-3% 추가 하락 시 2차 진입, -6% 추가 하락 시 3차 진입)
                     elif len(ticker_positions) > 0 and available_krw >= MIN_ORDER_KRW:
@@ -1550,8 +1788,9 @@ def run_bot_bb(stop_event, bot_id: str = "bot_05", db_path: Optional[str] = None
                                 bot_id, ticker, available_krw * 0.50, db_path=db_path
                             )
                             if can_enter:
-                                execute_buy_order(bot_id, ticker, invest_krw, step_level=2, db_path=db_path)
-                                available_krw -= invest_krw
+                                buy_res = execute_buy_order(bot_id, ticker, invest_krw, step_level=2, db_path=db_path, buy_reason="BB_DCA_STEP_2")
+                                if buy_res:
+                                    available_krw = max(0.0, available_krw - float(buy_res.get("buy_amount") or invest_krw))
 
                         elif max_step == 2 and drop_ratio <= -0.06:
                             logger.info("[%s] DCA Step 3 triggered on %s: Drop=%.2f%%", bot_id, ticker, drop_ratio * 100.0)
@@ -1559,8 +1798,9 @@ def run_bot_bb(stop_event, bot_id: str = "bot_05", db_path: Optional[str] = None
                                 bot_id, ticker, available_krw, db_path=db_path
                             )
                             if can_enter:
-                                execute_buy_order(bot_id, ticker, invest_krw, step_level=3, db_path=db_path)
-                                available_krw -= invest_krw
+                                buy_res = execute_buy_order(bot_id, ticker, invest_krw, step_level=3, db_path=db_path, buy_reason="BB_DCA_STEP_3")
+                                if buy_res:
+                                    available_krw = max(0.0, available_krw - float(buy_res.get("buy_amount") or invest_krw))
 
         except Exception as loop_exc:
             logger.error("[%s] Unexpected error in loop: %s", bot_id, loop_exc, exc_info=True)
@@ -1593,7 +1833,7 @@ BOT_RUNNERS: Dict[str, Any] = {
     "bot_05": run_bot_bb,
     "bot_06": run_bot_bb,
     "bot_07": run_bot_momentum,
-    "bot_08": run_bot_vb,
+    "bot_08": run_bot_bb,
     "bot_09": run_bot_momentum,
     "bot_10": run_bot_jack_kellogg,
     # 하위 호환 별칭

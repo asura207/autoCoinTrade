@@ -45,8 +45,15 @@ export function translateSqlite(sql) {
   return s;
 }
 
+function resolveDefaultDbPath() {
+  const custom = process.env.AUTOCOIN_DB_PATH || process.env.DB_PATH;
+  if (!custom || !String(custom).trim()) return DB_PATH;
+  const trimmed = String(custom).trim();
+  return path.isAbsolute(trimmed) ? trimmed : path.resolve(ROOT_DIR, trimmed);
+}
+
 export class SqliteDatabase {
-  constructor(dbFilePath = process.env.AUTOCOIN_DB_PATH || DB_PATH) {
+  constructor(dbFilePath = resolveDefaultDbPath()) {
     this.dbPath = dbFilePath;
     this.rawDb = null;
     this.engine = null; // 'better-sqlite3' | 'node:sqlite'
@@ -205,7 +212,7 @@ export class SqliteDatabase {
 // 싱글톤 인스턴스 (lazy initialized; AUTOCOIN_DB_PATH 변경 시 자동 재바인딩)
 let _sqliteInstance = null;
 export function getSqliteDb() {
-  const desiredPath = process.env.AUTOCOIN_DB_PATH || DB_PATH;
+  const desiredPath = resolveDefaultDbPath();
   if (!_sqliteInstance || _sqliteInstance.dbPath !== desiredPath) {
     if (_sqliteInstance) {
       try {

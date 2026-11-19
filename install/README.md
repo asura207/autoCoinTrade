@@ -150,7 +150,7 @@
   - 통합 백엔드 API: `http://localhost:8001` (백엔드 자체에서도 웹 화면 접근 지원)
 - **외부 스마트폰/원격 PC 접속 안내**:
   - 동일 공유기(와이파이) 내 스마트폰: 본인 PC의 사설 IP(예: `http://192.168.0.15:9000`)로 접속 가능.
-  - 외부 인터넷 접속: 공유기 설정에서 9000번 포트를 포트포워딩하거나, 프로젝트 내 포함된 Cloudflare SSH 터널링(`scripts/start_tunnel.sh`)을 활용하세요.
+  - 외부 인터넷 접속: 공유기 설정에서 9000번 포트를 포트포워딩하거나, 프로젝트 루트에 포함된 Cloudflare 터널링(`./start_tunnel.sh`) 또는 WireGuard VPN(`scripts/setup_wireguard.sh`)을 활용하세요.
 
 ---
 

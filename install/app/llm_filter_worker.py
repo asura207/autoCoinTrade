@@ -12,6 +12,7 @@ llm_filter_worker.py - Dual AI Engine (30m Gemini Flash & 1h Gemini Pro) Market 
 
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -343,7 +344,7 @@ def _fetch_btc_4h_60ma() -> Dict[str, Any]:
     except Exception as exc:
         logger.debug("REST BTC 4h ohlcv fetch failed: %s", exc)
 
-    return {"ma60_4h": 0.0, "disparity_4h_pct": 0.0, "is_above_ma60_4h": True}
+    return {"ma60_4h": 0.0, "disparity_4h_pct": 0.0, "is_above_ma60_4h": False}
 
 
 def _fetch_btc_1h_change_pct() -> float:
@@ -378,10 +379,10 @@ def fetch_btc_technical_summary() -> Dict[str, Any]:
         if df is not None and len(df) >= 20:
             current_price = float(df["close"].iloc[-1])
             prev_close = float(df["close"].iloc[-2])
-            change_rate_24h = ((current_price - prev_close) / prev_close) * 100.0
+            change_rate_24h = ((current_price - prev_close) / prev_close) * 100.0 if prev_close > 0 else 0.0
             ma20 = float(df["close"].rolling(20).mean().iloc[-1])
-            disparity_pct = ((current_price - ma20) / ma20) * 100.0
-            is_above_ma20 = current_price >= ma20
+            disparity_pct = ((current_price - ma20) / ma20) * 100.0 if ma20 > 0 else 0.0
+            is_above_ma20 = current_price >= ma20 if ma20 > 0 else False
             return {
                 "current_price": current_price,
                 "change_rate_24h": round(change_rate_24h, 2),
@@ -407,16 +408,16 @@ def fetch_btc_technical_summary() -> Dict[str, Any]:
             if len(closes) >= 20:
                 current_price = float(closes[-1])
                 prev_close = float(closes[-2])
-                change_rate_24h = ((current_price - prev_close) / prev_close) * 100.0
+                change_rate_24h = ((current_price - prev_close) / prev_close) * 100.0 if prev_close > 0 else 0.0
                 ma20 = sum(closes[-20:]) / 20.0
-                disparity_pct = ((current_price - ma20) / ma20) * 100.0
+                disparity_pct = ((current_price - ma20) / ma20) * 100.0 if ma20 > 0 else 0.0
                 return {
                     "current_price": current_price,
                     "change_rate_24h": round(change_rate_24h, 2),
                     "change_rate_1h": change_rate_1h,
                     "ma20": round(ma20, 1),
                     "disparity_pct": round(disparity_pct, 2),
-                    "is_above_ma20": current_price >= ma20,
+                    "is_above_ma20": (current_price >= ma20) if ma20 > 0 else False,
                     **ma4h,
                 }
     except Exception as exc:
@@ -428,7 +429,7 @@ def fetch_btc_technical_summary() -> Dict[str, Any]:
         "change_rate_1h": change_rate_1h,
         "ma20": 0.0,
         "disparity_pct": 0.0,
-        "is_above_ma20": True,
+        "is_above_ma20": False,
         **ma4h,
     }
 
@@ -723,8 +724,28 @@ def make_fallback_regime(btc_summary: Dict[str, Any], label: str = "Fallback") -
     - BTC가 일봉 20MA 및 4시간 60MA 상단: 10대 봇 전체 ALLOW, position_size_multiplier = 1.0 (정상 운용)
     - BTC가 일봉 20MA 또는 4시간 60MA 하단: 추세/돌파 봇(bot_01,02,03,04,07,09) BLOCK, 역추세/그리드(bot_05,06,08,10) ALLOW, 비중 0.5
     """
-    is_above_ma20 = bool(btc_summary.get("is_above_ma20", True))
-    is_above_ma60_4h = bool(btc_summary.get("is_above_ma60_4h", True))
+    current_price = float(btc_summary.get("current_price") or 0.0)
+    ma20_val = float(btc_summary.get("ma20") or 0.0)
+    if current_price <= 0 or ma20_val <= 0:
+        bot_overrides = {
+            bot_id: ("BLOCK" if bot_id in TREND_BREAKOUT_BOT_IDS else "ALLOW")
+            for bot_id in ALL_BOT_IDS
+        }
+        return {
+            "provider": "fallback",
+            "model": "mechanical-btc-20ma",
+            "sentiment_score": -0.2,
+            "market_regime": "SIDEWAYS",
+            "risk_alert": False,
+            "recommended_action": "REDUCE_SIZE",
+            "position_size_multiplier": 0.5,
+            "bot_overrides": bot_overrides,
+            "blacklist_tickers": [],
+            "reason": f"{label}: BTC 시세/이평선 수신 불가 -> Fail-Safe 보수적 방어(추세·돌파 봇 차단, 역추세 0.5x)",
+        }
+
+    is_above_ma20 = bool(btc_summary.get("is_above_ma20", False))
+    is_above_ma60_4h = bool(btc_summary.get("is_above_ma60_4h", False))
     is_above = is_above_ma20 and is_above_ma60_4h
     regime = "BULL" if is_above else ("BEAR" if not is_above_ma20 else "SIDEWAYS")
     multiplier = 1.0 if is_above else 0.5
@@ -804,6 +825,9 @@ def _call_gemini_api_with_model(
                             if raw_text:
                                 logger.info("Gemini API call succeeded with model: %s", model)
                                 return raw_text, model
+                elif resp.status_code in (401, 403):
+                    logger.error("Gemini API authentication/permission denied (%s). Stopping retries.", resp.status_code)
+                    return None, model
                 elif resp.status_code in (400, 404):
                     unavailable_404.add(model)
                     logger.warning("Gemini model %s unavailable (%s): %s", model, resp.status_code, resp.text[:120])
@@ -926,20 +950,32 @@ def parse_and_validate_llm_json(raw_text: Optional[str], default_reason: str = "
             logger.error("LLM JSON missing required decision keys: %s", (raw_text or "")[:200])
             return None
 
-        sentiment_score = float(parsed.get("sentiment_score", 0.0))
+        try:
+            raw_sent = parsed.get("sentiment_score", 0.0)
+            sentiment_score = float(0.0 if raw_sent is None else raw_sent)
+            if not math.isfinite(sentiment_score):
+                sentiment_score = 0.0
+        except (TypeError, ValueError):
+            sentiment_score = 0.0
         sentiment_score = max(-1.0, min(1.0, sentiment_score))
 
-        regime = str(parsed.get("market_regime", "SIDEWAYS")).upper()
+        regime = str(parsed.get("market_regime", "SIDEWAYS") or "SIDEWAYS").upper()
         if regime not in ("BULL", "BEAR", "SIDEWAYS", "HIGH_VOLATILITY_SHOCK"):
             regime = "SIDEWAYS"
 
-        risk_alert = bool(parsed.get("risk_alert", False))
+        risk_alert = _parse_bool_flag(parsed.get("risk_alert"), False)
 
-        action = str(parsed.get("recommended_action", "NORMAL")).upper()
+        action = str(parsed.get("recommended_action", "NORMAL") or "NORMAL").upper()
         if action not in ("NORMAL", "REDUCE_SIZE", "HALT_NEW_BUYS", "EMERGENCY_CLOSE_ALL"):
             action = "NORMAL"
 
-        multiplier = float(parsed.get("position_size_multiplier", 1.0))
+        try:
+            raw_mult = parsed.get("position_size_multiplier", 1.0)
+            multiplier = float(1.0 if raw_mult is None else raw_mult)
+            if not math.isfinite(multiplier):
+                multiplier = 1.0
+        except (TypeError, ValueError):
+            multiplier = 1.0
         if risk_alert or action in ("HALT_NEW_BUYS", "EMERGENCY_CLOSE_ALL"):
             multiplier = 0.0
         elif multiplier <= 0.0:
@@ -1102,6 +1138,8 @@ def call_flash_fast_analysis(
                 db_path=db_path,
             )
             if ollama_res:
+                ollama_res["_cached_at"] = time.time()
+                ollama_res["is_cached_fallback"] = False
                 logger.info(
                     "Local Ollama (%s) 30m analysis succeeded in %dms.",
                     ollama_res.get("model"),
@@ -1117,9 +1155,12 @@ def call_flash_fast_analysis(
 
     if not gemini_key and not openai_key:
         logger.info("No LLM API keys for Flash fallback. Applying mechanical/cache fallback.")
-        if previous_state:
-            previous_state["bot_overrides"] = normalize_bot_overrides(previous_state.get("bot_overrides"))
-            return previous_state
+        cache_ts = float(previous_state.get("_cached_at") or 0.0) if isinstance(previous_state, dict) else 0.0
+        if previous_state and cache_ts > 0 and (time.time() - cache_ts) <= 5400:
+            cached = dict(previous_state)
+            cached["bot_overrides"] = normalize_bot_overrides(cached.get("bot_overrides"))
+            cached["is_cached_fallback"] = True
+            return cached
         return make_fallback_regime(btc_summary, "Flash Fallback")
 
     headline_strings = [
@@ -1163,13 +1204,18 @@ def call_flash_fast_analysis(
     if parsed:
         parsed["provider"] = chosen_provider
         parsed["model"] = chosen_model
+        parsed["_cached_at"] = time.time()
+        parsed["is_cached_fallback"] = False
         return parsed
 
-    # 3순위: 직전 유효 캐시 유지 또는 BTC 일봉 20MA / 4시간봉 60MA 기계적 안전 모드
-    if previous_state:
-        logger.warning("Flash API call failed; keeping previous Flash state.")
-        previous_state["bot_overrides"] = normalize_bot_overrides(previous_state.get("bot_overrides"))
-        return previous_state
+    # 3순위: 90분 이내 직전 유효 캐시 유지, 만료 시 BTC 일봉 20MA / 4시간봉 60MA 기계적 안전 모드
+    cache_ts = float(previous_state.get("_cached_at") or 0.0) if isinstance(previous_state, dict) else 0.0
+    if previous_state and cache_ts > 0 and (time.time() - cache_ts) <= 5400:
+        logger.warning("Flash API call failed; keeping recent cached Flash state (<90m).")
+        cached = dict(previous_state)
+        cached["bot_overrides"] = normalize_bot_overrides(cached.get("bot_overrides"))
+        cached["is_cached_fallback"] = True
+        return cached
 
     return make_fallback_regime(btc_summary, "Flash Fallback Rule")
 
@@ -1230,12 +1276,17 @@ def call_pro_indepth_analysis(
     if parsed:
         parsed["provider"] = chosen_provider
         parsed["model"] = chosen_model
+        parsed["_cached_at"] = time.time()
+        parsed["is_cached_fallback"] = False
         return parsed
 
-    if previous_state:
-        logger.warning("Pro API call failed; keeping previous Pro state.")
-        previous_state["bot_overrides"] = normalize_bot_overrides(previous_state.get("bot_overrides"))
-        return previous_state
+    cache_ts = float(previous_state.get("_cached_at") or 0.0) if isinstance(previous_state, dict) else 0.0
+    if previous_state and cache_ts > 0 and (time.time() - cache_ts) <= 5400:
+        logger.warning("Pro API call failed; keeping recent cached Pro state (<90m).")
+        cached = dict(previous_state)
+        cached["bot_overrides"] = normalize_bot_overrides(cached.get("bot_overrides"))
+        cached["is_cached_fallback"] = True
+        return cached
 
     return make_fallback_regime(btc_summary, "Pro Fallback Rule")
 
@@ -1463,7 +1514,7 @@ def update_market_regime_filter_table(
                 json.dumps(synthesized["final_bot_overrides"], ensure_ascii=False),
             ),
         )
-        conn.execute("COMMIT;")
+        conn.commit()
         logger.info(
             "[Dual AI] market_regime_filter updated: Mode=%s, Action=%s, Mult=%.1f, Alert=%s, Reason=%s",
             synthesized.get("synthesis_mode", "N/A"),
@@ -1473,7 +1524,10 @@ def update_market_regime_filter_table(
             synthesized["reason"][:120],
         )
     except Exception as exc:
-        conn.execute("ROLLBACK;")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         logger.error("Failed to update market_regime_filter table: %s", exc)
         raise
     finally:
@@ -1489,6 +1543,8 @@ def save_ai_briefings_to_db(
     db_path: Optional[str] = None,
     save_market: bool = True,
     save_news: bool = True,
+    flash_ran: bool = True,
+    pro_ran: bool = True,
 ) -> None:
     """
     ai_market_briefings 및 ai_news_briefings 테이블에 분석 내역을 기록합니다.
@@ -1503,6 +1559,8 @@ def save_ai_briefings_to_db(
         flash_model = str(active_flash.get("model") or "mechanical-btc-20ma")
         pro_provider = str(active_pro.get("provider") or "fallback")
         pro_model = str(active_pro.get("model") or "mechanical-btc-20ma")
+        flash_is_fresh = flash_ran and not bool(active_flash.get("is_cached_fallback")) and flash_provider in ("ollama", "gemini", "openai")
+        pro_is_fresh = pro_ran and not bool(active_pro.get("is_cached_fallback")) and pro_provider in ("ollama", "gemini", "openai")
 
         btc_price = float(btc_summary.get("current_price") or 0.0)
         btc_ma20 = float(btc_summary.get("ma20") or 0.0)
@@ -1513,9 +1571,11 @@ def save_ai_briefings_to_db(
             else str(synthesized.get("market_regime") or "SIDEWAYS")
         )
 
-        if save_market and (flash_provider in ("ollama", "gemini", "openai") or pro_provider in ("ollama", "gemini", "openai")):
-            primary_provider = flash_provider if flash_provider in ("ollama", "gemini", "openai") else pro_provider
-            primary_model = flash_model if flash_provider in ("ollama", "gemini", "openai") else pro_model
+        if save_market and (flash_is_fresh or pro_is_fresh):
+            if pro_is_fresh and not flash_is_fresh:
+                primary_provider, primary_model = pro_provider, pro_model
+            else:
+                primary_provider, primary_model = flash_provider, flash_model
             overrides = synthesized.get("final_bot_overrides") or {}
             allow_bots = [bid for bid in ALL_BOT_IDS if overrides.get(bid) == "ALLOW"]
             block_bots = [bid for bid in ALL_BOT_IDS if overrides.get(bid) == "BLOCK"]
@@ -1540,7 +1600,7 @@ def save_ai_briefings_to_db(
                 (primary_provider, primary_model, btc_price, btc_ma20, btc_4h60, regime_status, market_md, now_kst),
             )
 
-        if save_news and flash_provider in ("ollama", "gemini", "openai"):
+        if save_news and flash_is_fresh:
             stats_row = conn.execute(
                 """
                 SELECT
@@ -1573,7 +1633,7 @@ def save_ai_briefings_to_db(
                 (flash_provider, flash_model, total_news, bull_cnt, bear_cnt, neut_cnt, news_md, now_kst),
             )
 
-        if flash_res:
+        if flash_ran and flash_res and not bool(active_flash.get("is_cached_fallback")):
             conn.execute(
                 "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES (?, ?, ?);",
                 ("dual_ai_flash_provider", flash_provider, now_kst),
@@ -1582,7 +1642,7 @@ def save_ai_briefings_to_db(
                 "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES (?, ?, ?);",
                 ("dual_ai_flash_model", flash_model, now_kst),
             )
-        if pro_res:
+        if pro_ran and pro_res and not bool(active_pro.get("is_cached_fallback")):
             conn.execute(
                 "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES (?, ?, ?);",
                 ("dual_ai_pro_provider", pro_provider, now_kst),
@@ -1637,24 +1697,34 @@ def run_llm_sentiment_worker(stop_event, bot_id: str = "bot_llm_filter", db_path
                 if row.get("final_position_multiplier") is not None
                 else 1.0
             )
+            flash_act = str(row.get("flash_recommended_action") or "NORMAL").upper()
+            pro_act = str(row.get("pro_recommended_action") or "NORMAL").upper()
+            saved_f_prov = _get_system_setting("dual_ai_flash_provider", "", db_path=db_path)
+            saved_f_mod = _get_system_setting("dual_ai_flash_model", "", db_path=db_path)
+            saved_p_prov = _get_system_setting("dual_ai_pro_provider", "", db_path=db_path)
+            saved_p_mod = _get_system_setting("dual_ai_pro_model", "", db_path=db_path)
             current_flash_result = {
                 "sentiment_score": float(row.get("flash_sentiment_score") or 0.0),
                 "market_regime": row.get("market_regime") or "SIDEWAYS",
-                "risk_alert": bool(row.get("final_risk_alert", 0)),
-                "recommended_action": row.get("flash_recommended_action") or "NORMAL",
-                "position_size_multiplier": restored_mult,
+                "risk_alert": flash_act in ("HALT_NEW_BUYS", "EMERGENCY_CLOSE_ALL"),
+                "recommended_action": flash_act,
+                "position_size_multiplier": 0.0 if flash_act in ("HALT_NEW_BUYS", "EMERGENCY_CLOSE_ALL") else restored_mult,
                 "bot_overrides": restored_overrides,
                 "blacklist_tickers": restored_blacklist,
+                "provider": saved_f_prov,
+                "model": saved_f_mod,
                 "reason": row.get("reason") or "Restored Flash baseline from DB",
             }
             current_pro_result = {
                 "sentiment_score": float(row.get("pro_sentiment_score") or 0.0),
                 "market_regime": row.get("market_regime") or "SIDEWAYS",
-                "risk_alert": bool(row.get("final_risk_alert", 0)),
-                "recommended_action": row.get("pro_recommended_action") or "NORMAL",
-                "position_size_multiplier": restored_mult,
+                "risk_alert": pro_act in ("HALT_NEW_BUYS", "EMERGENCY_CLOSE_ALL"),
+                "recommended_action": pro_act,
+                "position_size_multiplier": 0.0 if pro_act in ("HALT_NEW_BUYS", "EMERGENCY_CLOSE_ALL") else restored_mult,
                 "bot_overrides": restored_overrides,
                 "blacklist_tickers": restored_blacklist,
+                "provider": saved_p_prov,
+                "model": saved_p_mod,
                 "reason": row.get("reason") or "Restored Pro baseline from DB",
             }
             logger.info("[%s] Successfully loaded previous Dual AI baseline from DB.", bot_id)
@@ -1668,7 +1738,11 @@ def run_llm_sentiment_worker(stop_event, bot_id: str = "bot_llm_filter", db_path
         # Node.js 백엔드 기동 중일 때 듀얼 AI 스케줄러 중복 호출 방지 (백엔드 장애 시 자동 폴백)
         if os.getenv("PYTHON_LLM_COEXIST", "false").strip().lower() != "true":
             import socket
-            backend_port = int(os.getenv("BACKEND_PORT", "8001"))
+            raw_bport = (os.getenv("BACKEND_PORT") or os.getenv("PORT") or "8001").strip()
+            try:
+                backend_port = int(raw_bport) if raw_bport else 8001
+            except ValueError:
+                backend_port = 8001
             backend_up = False
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -1768,6 +1842,8 @@ def run_llm_sentiment_worker(stop_event, bot_id: str = "bot_llm_filter", db_path
                     db_path=db_path,
                     save_market=should_run_flash or should_run_pro,
                     save_news=should_run_flash,
+                    flash_ran=should_run_flash,
+                    pro_ran=should_run_pro,
                 )
 
             except Exception as loop_exc:

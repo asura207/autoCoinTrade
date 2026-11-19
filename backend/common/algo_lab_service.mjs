@@ -67,7 +67,7 @@ export function computeRsiSeries(closes, period = 14) {
   }
   let avgGain = gains / period;
   let avgLoss = losses / period;
-  const calc = () => (avgLoss === 0 ? 100.0 : 100.0 - 100.0 / (1.0 + avgGain / avgLoss));
+  const calc = () => (avgGain === 0 && avgLoss === 0 ? 50.0 : avgLoss === 0 ? 100.0 : 100.0 - 100.0 / (1.0 + avgGain / avgLoss));
   out[period] = calc();
   for (let i = period + 1; i < closes.length; i++) {
     const diff = closes[i] - closes[i - 1];
@@ -329,16 +329,18 @@ export function calculateKelloggIndicators(m15Candles, dayCandles, currentPrice)
   const closes = m15Candles.map((c) => Number(c.trade_price));
   const lrc = computeLinearRegressionChannel(closes, 20);
 
-  // 4. 상대 거래량 (RVOL)
+  // 4. 상대 거래량 (RVOL) — 직전 완료 캔들 기준과 진행 중 캔들 기준 분모 분리 (자기희석 및 0거래량 Time-Stop 차단 방지)
   const n = m15Candles.length;
   const cur = m15Candles[n - 1];
   const closed = m15Candles[n - 2] || cur;
-  const avg20 = avgVolume(m15Candles, 1, 20); // 직전 20개 완료 캔들 평균 거래량
+  const avg20ForCur = avgVolume(m15Candles, 1, 20);
+  const avg20ForClosed = avgVolume(m15Candles, 2, 20) || avg20ForCur;
   const curVol = Number(cur.candle_acc_trade_volume || 0);
   const closedVol = Number(closed.candle_acc_trade_volume || 0);
-  const rvol = avg20 > 0 ? Math.max(curVol, closedVol) / avg20 : 1.0;
-  const curRvol = avg20 > 0 ? curVol / avg20 : 1.0;
-  const closedRvol = avg20 > 0 ? closedVol / avg20 : 1.0;
+  const curRvol = avg20ForCur > 0 ? curVol / avg20ForCur : 0.0;
+  const closedRvol = avg20ForClosed > 0 ? closedVol / avg20ForClosed : 0.0;
+  const rvol = Math.max(curRvol, closedRvol);
+  const avg20 = avg20ForCur;
 
   // 최근 20봉 최고가/최저가
   const win20 = m15Candles.slice(-20);
@@ -591,7 +593,7 @@ export function evaluateSmartExit({
     return {
       signal: "SELL",
       exitType: "BREAKEVEN_STOP",
-      reason: `본절 스탑(Breakeven-Exit): 최고 +${fmt(peakPnlPct)}% 도달 후 +${fmt(pnlPct)}% 하락 반납 방지 청산`,
+      reason: `본절 스탑(Breakeven-Exit): 최고 +${fmt(peakPnlPct)}% 도달 후 ${pnlPct >= 0 ? "+" : ""}${fmt(pnlPct)}% 하락 반납 방지 청산`,
     };
   }
 
@@ -627,8 +629,11 @@ export function evaluateSmartExit({
   // 3. ATR 기반 동적 트레일링 스탑 (Dynamic ATR Trailing Stop)
   const atr = Number(indicators?.m15?.atr14 || indicators?.m60?.atr14 || indicators?.atr || 0);
   if (atr > 0) {
-    // 3-1. 진입가 대비 2.2 * ATR 하락 시 손절 (다단계 분할 그리드 bot_06 은 -2.5%/-5.0% 물타기를 허용하고 고정 -9% 손절 사용)
-    if (normId !== "bot_06") {
+    // 3-1. 진입가 대비 2.2 * ATR 하락 시 손절
+    // (분할 그리드 bot_06 및 Jack Kellogg Setup B 2분할 반등 포지션은 자체 분할/기준선 손절을 사용하므로 15m ATR 선손절 제외)
+    const buyReasonStr = String(position?.buy_reason || "");
+    const isBot10SetupB = normId === "bot_10" && (buyReasonStr.includes("반등") || buyReasonStr.includes("Setup B"));
+    if (normId !== "bot_06" && !isBot10SetupB) {
       const hardStopPrice = avgBuy - 2.2 * atr;
       if (curPrice <= hardStopPrice) {
         return {
@@ -867,11 +872,11 @@ export const ARENA_BOT_DEFS = [
     stop_loss_pct: 2.5,
     take_profit_pct: 5.0,
     config: {
-      rvol_breakout_arena: 1.5,
-      rvol_breakout_live: 2.0,
+      rvol_breakout_arena: 1.4,
+      rvol_breakout_live: 1.8,
       rvol_dip: 1.3,
-      vwap_gap_arena: 2.2,
-      vwap_gap_live: 3.0,
+      vwap_gap_arena: 2.0,
+      vwap_gap_live: 2.8,
       order_ratio: 0.3,
       max_positions: 3,
     },
@@ -935,11 +940,12 @@ const STRATEGIES = {
     const target = d.todayOpen + (d.prevHigh - d.prevLow) * k;
     const volMult = Number(params.volume_multiplier ?? (isLive ? 1.5 : 1.2));
     const volOk = ind.m15 ? ind.m15.volSurge5 >= volMult : true;
-    if (price >= target && price > d.todayOpen && volOk) {
+    const trendOk = d.ma20 !== null && d.ma20 !== undefined ? price >= d.ma20 : true;
+    if (price >= target && price > d.todayOpen && trendOk && volOk) {
       // 윗꼬리 및 이격도 과열 필터 검사
       const filter = checkUpperWickAndOverextension(ind.m15?.cur || ind.m15?.closed, price, ind.m15?.ema20 || d.ma20, ind.m15?.vwap);
       if (!filter.ok) return hold(filter.reason);
-      return buy(`변동성 돌파(K=${k}) 목표가 ${ko(target)} 돌파 · 거래량 증가`);
+      return buy(`변동성 돌파(K=${k}) 목표가 ${ko(target)} 돌파 · 20MA 상회 · 거래량 증가`);
     }
     return hold(`돌파목표 ${ko(target)} 대기 (현재 ${ko(price)})`);
   },
@@ -1156,11 +1162,21 @@ const STRATEGIES = {
     if (!k || !k.lrc || !k.vwap) return hold("잭 켈로그 4대 지표(VWAP/LRC) 데이터 산출 대기");
 
     const isLive = Boolean(options.isLive);
-    const rvolBreakoutTh = Number(params.rvol_breakout ?? (isLive ? 1.8 : 1.4));
-    const rvolDipTh = Number(params.rvol_dip ?? 1.3);
-    const dipGapTh = Number(params.vwap_gap ?? (isLive ? -2.8 : -2.0));
-    const trailingPct = Number(params.trailing_stop_pct ?? 1.5);
-    const minLrcTpPct = Number(params.min_lrc_tp_pct ?? 0.6);
+    const rawRvolBreakout = (isLive ? params.rvol_breakout_live : params.rvol_breakout_arena) ?? params.rvol_breakout;
+    const rvolBreakoutTh = Number.isFinite(Number(rawRvolBreakout))
+      ? Number(rawRvolBreakout)
+      : isLive
+      ? 1.8
+      : 1.4;
+    const rvolDipTh = Number.isFinite(Number(params.rvol_dip)) ? Number(params.rvol_dip) : 1.3;
+    const rawDipGap = (isLive ? params.vwap_gap_live : params.vwap_gap_arena) ?? params.vwap_gap;
+    const dipGapTh = Number.isFinite(Number(rawDipGap))
+      ? -Math.abs(Number(rawDipGap))
+      : isLive
+      ? -2.8
+      : -2.0;
+    const trailingPct = Number.isFinite(Number(params.trailing_stop_pct)) ? Number(params.trailing_stop_pct) : 1.5;
+    const minLrcTpPct = Number.isFinite(Number(params.min_lrc_tp_pct)) ? Number(params.min_lrc_tp_pct) : 0.6;
 
     // ==========================================
     // 1. 보유 포지션 매도 / 익절 / 손절 평가
@@ -1231,7 +1247,7 @@ const STRATEGIES = {
       const peak = Math.max(Number(options.peakPrice || 0), price);
       const peakPnl = pctChange(peak, avgBuyPrice);
       if (peakPnl >= 1.5 && price <= peak * (1 - trailingPct / 100)) {
-        return sell(`[트레일링 스탑] 고점 대비 -${trailingPct}% 반락 익절 (수익률 +${fmt(totalPnlPct)}%)`);
+        return sell(`[트레일링 스탑] 고점 대비 -${trailingPct}% 반락 익절 (수익률 ${totalPnlPct >= 0 ? "+" : ""}${fmt(totalPnlPct)}%)`);
       }
 
       // (5) Setup B 2차 분할 매수 (Scaling-In): -2.5% 손절 이전(-1.5%~-2.4%) 전일 저가 지지 반등 시 추가 분할 매수
@@ -1609,13 +1625,19 @@ async function paperSell(db, bot, positions, price, reason) {
     const profit = net - buyAmt - buyFee;
     const rawPct = buyAmt > 0 ? (profit / buyAmt) * 100 : 0;
     const profitPct = Number.isFinite(rawPct) ? Number(rawPct.toFixed(2)) : 0;
+    const posRes = await db
+      .prepare("UPDATE paper_bot_positions SET status = 'CLOSED', closed_at = ? WHERE id = ? AND status = 'OPEN'")
+      .run(now, p.id);
+    if (!posRes?.changes) {
+      peakMap.delete(`paper-${p.id}`);
+      continue;
+    }
     if (Number.isFinite(profit)) totalProfit += profit;
-    await db.prepare("UPDATE paper_bot_positions SET status = 'CLOSED', closed_at = ? WHERE id = ? AND status = 'OPEN'").run(now, p.id);
     await db.prepare(`
       UPDATE paper_trades
       SET sell_order_uuid = ?, sell_price = ?, sell_volume = ?, sell_amount = ?, sell_date = ?,
           profit_krw = ?, profit_pct = ?, status = 'COMPLETED', sell_reason = ?
-      WHERE id = ?
+      WHERE id = ? AND status = 'HOLDING'
     `).run(sellUuid, safePrice, String(p.volume), gross, now, profit, profitPct, reason, p.trade_id);
     peakMap.delete(`paper-${p.id}`);
   }
@@ -1665,28 +1687,33 @@ export async function runPaperBot(db, bot, ctx) {
     byMarket.get(p.market).push(p);
   }
 
+  const soldMarketsThisCycle = new Set();
   for (const [market, group] of byMarket) {
     const md = mdMap.get(market);
     const price = Number(md?.price || tickerMap.get(market)?.trade_price || 0);
     if (!(price > 0)) continue;
-    let peak = 0;
+    let groupPeak = 0;
+    const perPosPeak = new Map();
     for (const p of group) {
-      peak = Math.max(peak, updatePeakPrice(`paper-${p.id}`, price, Number(p.avg_buy_price)));
+      const pPeak = updatePeakPrice(`paper-${p.id}`, price, Number(p.avg_buy_price));
+      perPosPeak.set(p.id, pPeak);
+      groupPeak = Math.max(groupPeak, pPeak);
     }
     const remaining = [];
     for (const p of group) {
-      // 3단계 스마트 청산 유틸리티 (본절 스탑, 시간 제한 청산, 동적 ATR 트레일링 스탑)
+      // 3단계 스마트 청산 유틸리티 — 반드시 개별 포지션 고유 고점(posPeak)을 전달하여 다중 분할(bot_06/bot_10) 즉시 본절 청산 루프 방지
       const smartExit = evaluateSmartExit({
         botId: bot.bot_id,
         position: p,
         currentPrice: price,
         indicators: md?.indicators,
-        peakPrice: peak,
+        peakPrice: perPosPeak.get(p.id) || Number(p.avg_buy_price),
         isLive: false,
         stopLossPct: stopLoss,
       });
       if (smartExit && smartExit.signal === "SELL") {
         const profit = await paperSell(db, bot, [p], price, smartExit.reason);
+        soldMarketsThisCycle.add(market);
         lastAction = `[가상매도] ${market} ${smartExit.reason} (${profit >= 0 ? "+" : ""}${ko(profit)}원)`;
         continue;
       }
@@ -1694,9 +1721,11 @@ export async function runPaperBot(db, bot, ctx) {
       const pnl = pctChange(price, Number(p.avg_buy_price));
       if (pnl <= stopLoss) {
         const profit = await paperSell(db, bot, [p], price, `손절(${fmt(pnl)}%)`);
+        soldMarketsThisCycle.add(market);
         lastAction = `[가상매도] ${market} 손절 (${profit >= 0 ? "+" : ""}${ko(profit)}원)`;
       } else if (pnl >= takeProfit) {
         const profit = await paperSell(db, bot, [p], price, `익절(+${fmt(pnl)}%)`);
+        soldMarketsThisCycle.add(market);
         lastAction = `[가상매도] ${market} 익절 (+${ko(profit)}원)`;
       } else {
         remaining.push(p);
@@ -1705,7 +1734,7 @@ export async function runPaperBot(db, bot, ctx) {
     if (remaining.length > 0 && md) {
       const sig = evaluateStrategy(bot.bot_id, md, md.indicators, remaining, {
         params,
-        peakPrice: peak,
+        peakPrice: groupPeak,
         momentumRank: rankMap,
         market,
       });
@@ -1713,6 +1742,7 @@ export async function runPaperBot(db, bot, ctx) {
         const targets = sig.sellPositionIds ? remaining.filter((p) => sig.sellPositionIds.includes(p.id)) : remaining;
         if (targets.length > 0) {
           const profit = await paperSell(db, bot, targets, price, sig.reason);
+          soldMarketsThisCycle.add(market);
           lastAction = `[가상매도] ${market} ${sig.reason} (${profit >= 0 ? "+" : ""}${ko(profit)}원)`;
         }
       }
@@ -1740,6 +1770,7 @@ export async function runPaperBot(db, bot, ctx) {
 
   const canScaleIn = bot.bot_id === "bot_06" || bot.bot_id === "bot_10";
   for (const market of candidates) {
+    if (soldMarketsThisCycle.has(market)) continue;
     const held = heldByMarket.get(market) || [];
     if (held.length > 0 && !canScaleIn) continue;
     if (bot.bot_id === "bot_10" && held.length >= 2) continue;
@@ -1763,8 +1794,9 @@ export async function runPaperBot(db, bot, ctx) {
     } else if (bot.bot_id === "bot_06") {
       ratio = ratio / Math.max(1, Number(cfg.max_splits || 3));
     }
-    const budget = Math.min(Math.floor(initial * ratio), Math.floor(cash / (1 + PAPER_FEE_RATE)));
-    if (budget < PAPER_MIN_ORDER_KRW) break;
+    // paperBuy 내부에서 (1 + PAPER_FEE_RATE) 수수료 완충 나눗셈을 1회만 수행하므로 여기서는 원금 상한만 전달
+    const budget = Math.min(Math.floor(initial * ratio), Math.floor(cash));
+    if (Math.floor(budget / (1 + PAPER_FEE_RATE)) < PAPER_MIN_ORDER_KRW) break;
     const filled = await paperBuy(db, bot, market, md.price, budget, sig.reason);
     if (filled) {
       lastAction = `[가상매수] ${market} ${sig.reason} (${ko(filled.buyAmount)}원)`;
@@ -1900,9 +1932,11 @@ export async function readMarketRegimeContext(db, explicitRegime = null) {
   const multiplier = Number(src.final_position_multiplier ?? src.position_size_multiplier ?? 1.0);
   const isBearOrDefensive =
     marketRegime === "BEAR" ||
+    marketRegime === "CRASH" ||
     marketRegime === "HIGH_VOLATILITY_SHOCK" ||
     recommendedAction === "REDUCE_SIZE" ||
     recommendedAction === "HOLD_ALL" ||
+    recommendedAction === "HOLD_CASH" ||
     recommendedAction === "HALT_NEW_BUYS" ||
     recommendedAction === "EMERGENCY_CLOSE_ALL";
   const regimeBucket = isBearOrDefensive ? "BEAR" : marketRegime === "BULL" ? "BULL" : "SIDEWAYS";
@@ -1995,7 +2029,8 @@ export function selectSingleMarketFitChampion(enrichedBots = [], { regimeContext
  *   해당 전략군 주간 거래가 0건인 초기 DB 환경에서는 누적 Arena 성적(ARENA_CUMULATIVE_FALLBACK)으로 자동 폴백
  */
 export async function evaluateWeeklyStrategyChampions(db, options = {}) {
-  const minWeeklyTrades = Math.max(0, Number(options.minWeeklyTrades ?? 2));
+  const rawMinTrades = Number(options.minWeeklyTrades ?? 2);
+  const minWeeklyTrades = Number.isFinite(rawMinTrades) ? Math.max(0, Math.floor(rawMinTrades)) : 2;
   const allocationMode = ALLOCATION_MODE_WEIGHTS[options.allocationMode]
     ? options.allocationMode
     : "RANK_WEIGHTED_40_35_25";
@@ -2040,7 +2075,8 @@ export async function evaluateWeeklyStrategyChampions(db, options = {}) {
         weeklyTradeCount++;
       }
       if (isCompleted) {
-        const pnl = Number(tr.profit_krw || 0);
+        const rawPnl = Number(tr.profit_krw);
+        const pnl = Number.isFinite(rawPnl) ? rawPnl : 0;
         if (closeTs && closeTs >= cutoff7d) {
           weeklyRealized += pnl;
           if (pnl > 0) weeklyWins++;
@@ -2051,9 +2087,12 @@ export async function evaluateWeeklyStrategyChampions(db, options = {}) {
       }
     }
 
-    const baselineEquity = Math.max(1, Number(s.initial_capital || DEFAULT_PAPER_CAPITAL) + realizedBefore7d);
-    const weeklyTotalPnl = weeklyRealized + Number(s.unrealized_profit_krw || 0);
-    const weeklyReturnPct = Number(((weeklyTotalPnl / baselineEquity) * 100).toFixed(2));
+    const safeInitialCap = Math.max(1, Number(s.initial_capital || DEFAULT_PAPER_CAPITAL));
+    // 과거 누적 손실로 자본이 0 이하로 내려가도 분모가 1원으로 폭축해 수익률이 +100,000% 폭발하는 이상치 방어
+    const baselineEquity = Math.max(Math.floor(safeInitialCap * 0.1), safeInitialCap + realizedBefore7d);
+    const weeklyTotalPnl = weeklyRealized + (Number.isFinite(Number(s.unrealized_profit_krw)) ? Number(s.unrealized_profit_krw) : 0);
+    const rawWeeklyRet = baselineEquity > 0 ? (weeklyTotalPnl / baselineEquity) * 100 : 0;
+    const weeklyReturnPct = Number.isFinite(rawWeeklyRet) ? Number(rawWeeklyRet.toFixed(2)) : 0.0;
     const weeklyDecided = weeklyWins + weeklyLosses;
     const weeklyWinRate = weeklyDecided > 0 ? Number(((weeklyWins / weeklyDecided) * 100).toFixed(1)) : 0.0;
 
@@ -2097,10 +2136,10 @@ export async function evaluateWeeklyStrategyChampions(db, options = {}) {
       const minTradeMet = !useFallback && b.weekly_trade_count >= minWeeklyTrades;
       const tradeBonus = minTradeMet ? 1.0 : 0.0;
       const rawScore = evalReturnPct - Math.abs(b.mdd_pct) * 0.5 + evalWinRatePct * 0.05 + tradeBonus;
-      b.eval_return_pct = evalReturnPct;
-      b.eval_win_rate_pct = evalWinRatePct;
+      b.eval_return_pct = Number.isFinite(evalReturnPct) ? evalReturnPct : 0;
+      b.eval_win_rate_pct = Number.isFinite(evalWinRatePct) ? evalWinRatePct : 0;
       b.min_trade_bonus = tradeBonus;
-      b.rotation_score = Number(rawScore.toFixed(3));
+      b.rotation_score = Number.isFinite(rawScore) ? Number(rawScore.toFixed(3)) : 0;
       b.evaluation_basis = basis;
     }
 
@@ -2280,7 +2319,7 @@ export async function runArenaCycle(db, deps) {
     if (!tk) continue;
     mdMap.set(m, await buildMarketData(m, tk, deps.fetchCandles));
   }
-  const rankMap = computeMomentumRanking(mdMap, universe);
+  const rankMap = computeMomentumRanking(mdMap, markets);
 
   const bots = await db.prepare("SELECT * FROM bots WHERE paper_is_running = 1 ORDER BY bot_id ASC").all();
   const statusMap = {};

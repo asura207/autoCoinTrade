@@ -7,7 +7,7 @@ const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT_DIR = path.resolve(__dirname, "../..");
-const ENV_PATH = path.join(ROOT_DIR, ".env");
+const ENV_PATH = process.env.AUTOCOIN_ENV_PATH ? path.resolve(process.env.AUTOCOIN_ENV_PATH) : path.join(ROOT_DIR, ".env");
 
 const ALL_BOT_IDS = Array.from({ length: 10 }, (_, idx) => `bot_${String(idx + 1).padStart(2, "0")}`);
 const LEGACY_BOT_OVERRIDE_ALIAS = {
@@ -224,7 +224,7 @@ export class PgSyncManager {
         console.warn(`[PgSync] market_regime_filter sync skip: ${rErr.message}`);
       }
 
-      // 2. bots
+      // 2. bots (paper_trades ALTER와 분리해 신규 PG에서 테이블 미생성으로 인한 전체 트랜잭션 롤백 방지)
       try {
         await this.pool.query(`
           ALTER TABLE bots ADD COLUMN IF NOT EXISTS strategy_group VARCHAR(32) NOT NULL DEFAULT 'TREND_SWING';
@@ -235,8 +235,6 @@ export class PgSyncManager {
           ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_peak_equity BIGINT NOT NULL DEFAULT 1000000;
           ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_mdd_pct NUMERIC(8,2) NOT NULL DEFAULT 0.0;
           ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_status_msg TEXT NOT NULL DEFAULT '시그널 대기 중';
-          ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS buy_reason TEXT;
-          ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS sell_reason TEXT;
         `);
       } catch {}
 
@@ -284,7 +282,7 @@ export class PgSyncManager {
             Number(b.is_selected_for_live || 0),
             Math.floor(Number(b.paper_initial_capital || 1000000)),
             Math.floor(Number(b.paper_virtual_krw || 1000000)),
-            Number(b.paper_is_running || 1),
+            Number(b.paper_is_running ?? 1),
             Math.floor(Number(b.paper_peak_equity || 1000000)),
             Number(b.paper_mdd_pct || 0),
             b.paper_status_msg || "시그널 대기 중"
@@ -325,7 +323,7 @@ export class PgSyncManager {
         );
       }
 
-      // 4. bot_positions (스키마 마이그레이션 + sell/메타 컬럼 포함 UPSERT)
+      // 4. bot_positions (스키마 마이그레이션 + sell/메타/buy_reason 컬럼 포함 UPSERT)
       try {
         await this.pool.query(`
           ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS ticker TEXT;
@@ -337,6 +335,7 @@ export class PgSyncManager {
           ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS sell_fee NUMERIC(20,4);
           ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS realized_pnl NUMERIC(20,2);
           ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS pnl_pct NUMERIC(8,2);
+          ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS buy_reason TEXT;
         `);
       } catch {}
 
@@ -348,8 +347,8 @@ export class PgSyncManager {
              id, bot_id, market, ticker, order_uuid, volume,
              avg_buy_price, buy_amount, buy_fee, trade_id,
              highest_price, step_level, status, created_at, closed_at,
-             sell_order_uuid, sell_price, sell_amount, sell_fee, realized_pnl, pnl_pct
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+             sell_order_uuid, sell_price, sell_amount, sell_fee, realized_pnl, pnl_pct, buy_reason
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
            ON CONFLICT (order_uuid) DO UPDATE SET
              bot_id = EXCLUDED.bot_id,
              market = EXCLUDED.market,
@@ -367,7 +366,8 @@ export class PgSyncManager {
              sell_amount = EXCLUDED.sell_amount,
              sell_fee = EXCLUDED.sell_fee,
              realized_pnl = EXCLUDED.realized_pnl,
-             pnl_pct = EXCLUDED.pnl_pct`,
+             pnl_pct = EXCLUDED.pnl_pct,
+             buy_reason = COALESCE(EXCLUDED.buy_reason, bot_positions.buy_reason)`,
           [
             p.id, p.bot_id, mkt, p.ticker || mkt, p.order_uuid, String(p.volume),
             Number(p.avg_buy_price || 0), Math.floor(Number(p.buy_amount || 0)),
@@ -379,7 +379,8 @@ export class PgSyncManager {
             p.sell_amount !== null && p.sell_amount !== undefined ? Number(p.sell_amount) : null,
             p.sell_fee !== null && p.sell_fee !== undefined ? Number(p.sell_fee) : null,
             p.realized_pnl !== null && p.realized_pnl !== undefined ? Number(p.realized_pnl) : null,
-            p.pnl_pct !== null && p.pnl_pct !== undefined ? Number(p.pnl_pct) : null
+            p.pnl_pct !== null && p.pnl_pct !== undefined ? Number(p.pnl_pct) : null,
+            p.buy_reason ?? null
           ]
         );
       }
@@ -552,11 +553,13 @@ export class PgSyncManager {
             [
               t.id, t.model_id, t.market, Number(t.buy_price || 0),
               String(t.buy_volume || "0"), Math.floor(Number(t.buy_amount || 0)),
-              t.buy_date, t.sell_price ? Number(t.sell_price) : null,
-              t.sell_volume ? String(t.sell_volume) : null,
-              t.sell_amount ? Math.floor(Number(t.sell_amount)) : null,
-              t.sell_date, t.profit_krw ? Math.floor(Number(t.profit_krw)) : null,
-              t.profit_pct ? Number(t.profit_pct) : null,
+              t.buy_date,
+              t.sell_price !== null && t.sell_price !== undefined ? Number(t.sell_price) : null,
+              t.sell_volume !== null && t.sell_volume !== undefined ? String(t.sell_volume) : null,
+              t.sell_amount !== null && t.sell_amount !== undefined ? Math.floor(Number(t.sell_amount)) : null,
+              t.sell_date,
+              t.profit_krw !== null && t.profit_krw !== undefined ? Math.floor(Number(t.profit_krw)) : null,
+              t.profit_pct !== null && t.profit_pct !== undefined ? Number(t.profit_pct) : null,
               t.reason || "", t.status || "HOLDING"
             ]
           );
@@ -599,8 +602,12 @@ export class PgSyncManager {
             trade_id BIGINT NOT NULL,
             status VARCHAR(16) NOT NULL DEFAULT 'OPEN',
             created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-            closed_at TIMESTAMP
+            closed_at TIMESTAMP,
+            buy_reason TEXT
           );
+          ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS buy_reason TEXT;
+          ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS sell_reason TEXT;
+          ALTER TABLE paper_bot_positions ADD COLUMN IF NOT EXISTS buy_reason TEXT;
         `);
 
         const pTrades = sqliteDb.prepare("SELECT * FROM paper_trades").all();
@@ -645,20 +652,21 @@ export class PgSyncManager {
             `INSERT INTO paper_bot_positions (
                id, bot_id, market, order_uuid, volume,
                avg_buy_price, buy_amount, buy_fee, trade_id,
-               status, created_at, closed_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+               status, created_at, closed_at, buy_reason
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
              ON CONFLICT (order_uuid) DO UPDATE SET
                volume = EXCLUDED.volume,
                avg_buy_price = EXCLUDED.avg_buy_price,
                buy_amount = EXCLUDED.buy_amount,
                buy_fee = EXCLUDED.buy_fee,
                status = EXCLUDED.status,
-               closed_at = EXCLUDED.closed_at`,
+               closed_at = EXCLUDED.closed_at,
+               buy_reason = COALESCE(EXCLUDED.buy_reason, paper_bot_positions.buy_reason)`,
             [
               p.id, p.bot_id, p.market, p.order_uuid, String(p.volume),
               Number(p.avg_buy_price), Math.floor(Number(p.buy_amount)),
               Number(p.buy_fee || 0), Number(p.trade_id),
-              p.status || "OPEN", p.created_at, p.closed_at ?? null
+              p.status || "OPEN", p.created_at, p.closed_at ?? null, p.buy_reason ?? null
             ]
           );
         }
