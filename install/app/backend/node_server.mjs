@@ -37,6 +37,38 @@ import {
   getArenaStatus,
   resetArena,
 } from "./common/algo_lab_service.mjs";
+import {
+  isEncryptedVaultValue,
+  encryptSecret,
+  decryptSecret,
+  safeDecryptSecret,
+  migrateConfigSecrets,
+  VAULT_SECRET_FIELDS,
+} from "./common/crypto_vault.mjs";
+import {
+  UpbitWsHub,
+  upbitWsHub,
+} from "./common/upbit_ws_hub.mjs";
+import {
+  analyzeOrderbookQuality,
+  computeAtrVolatilityMultiplier,
+  computeSlippageBps,
+} from "./common/execution_quality_service.mjs";
+import {
+  loadNotificationSettings,
+  saveNotificationSettings,
+  maskSecretValue,
+  formatNotificationMessage,
+  dispatchMultiChannelNotification,
+} from "./common/notification_hub.mjs";
+import {
+  ensureBacktestTables,
+  fetchAndCacheHistoricalCandles,
+  simulateBarByBarBacktest,
+  runHistoricalBacktest,
+  getBacktestHistory,
+  buildChartTradeMarkers,
+} from "./common/backtest_service.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -64,7 +96,7 @@ if (fs.existsSync(ENV_PATH)) {
 const HOST = process.env.BACKEND_HOST || "127.0.0.1";
 const PORT = Number(process.env.BACKEND_PORT || process.env.PORT || 8001);
 
-let APP_VERSION = "0.0.22";
+let APP_VERSION = "0.0.29";
 try {
   const pkgJsonPath = path.join(BASE_DIR, "package.json");
   if (fs.existsSync(pkgJsonPath)) {
@@ -878,6 +910,12 @@ export async function initializeDatabase() {
     ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS realized_pnl DOUBLE PRECISION;
     ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS pnl_pct DOUBLE PRECISION;
     ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS buy_reason TEXT;
+    ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS expected_price DOUBLE PRECISION;
+    ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS slippage_bps DOUBLE PRECISION;
+    ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS atr_sizing_mult DOUBLE PRECISION DEFAULT 1.0;
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS expected_price DOUBLE PRECISION;
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS slippage_bps DOUBLE PRECISION;
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS atr_sizing_mult DOUBLE PRECISION DEFAULT 1.0;
     ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS buy_reason TEXT;
     ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS sell_reason TEXT;
     ALTER TABLE paper_bot_positions ADD COLUMN IF NOT EXISTS buy_reason TEXT;
@@ -893,6 +931,8 @@ export async function initializeDatabase() {
     ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS final_position_multiplier DOUBLE PRECISION DEFAULT 1.0;
     ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS final_bot_overrides_json TEXT DEFAULT '${DEFAULT_BOT_OVERRIDES_JSON}';
   `);
+
+  await ensureBacktestTables(db);
 
   // market_regime_filter id=1 행 보장 및 레거시 3봇 키(bot_vb 등) -> 표준 10대 봇(bot_01~bot_10) 안전 마이그레이션
   try {
@@ -1117,11 +1157,7 @@ function isLiveMode() {
   if (process.env.AUTOCOIN_FORCE_LIVE_MODE === "1" && process.env.AUTOCOIN_LIBRARY_MODE === "1") {
     return true;
   }
-  const cfgPath = fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : EXAMPLE_CONFIG_PATH;
-  let cfg = {};
-  try {
-    cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
-  } catch {}
+  const cfg = getRuntimeConfig();
   return (
     String(cfg.trade_mode || "").toLowerCase() === "live" &&
     cfg.access_key &&
@@ -1397,6 +1433,7 @@ async function checkAndHaltIfZeroBalance(mode = null) {
   }
 
   if (shouldHalt) {
+    const prevHalted = (await getSetting("zero_balance_halted", "0")) === "1";
     const now = nowKSTString();
     await db.prepare("UPDATE bots SET is_running = 0, last_status_msg = ?, updated_at = ?").run(
       "잔고 0 이하 도달로 긴급 자동 중지됨",
@@ -1404,6 +1441,16 @@ async function checkAndHaltIfZeroBalance(mode = null) {
     );
     await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('zero_balance_halted', '1', ?)").run(now);
     await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('zero_balance_reason', ?, ?)").run(reason, now);
+    if (!prevHalted) {
+      dispatchMultiChannelNotification(
+        db,
+        {
+          eventType: "ZERO_BALANCE_HALT",
+          reason,
+        },
+        { webPushBroadcastFn: broadcastWebPushNotification }
+      ).catch(() => {});
+    }
     return { halted: true, reason };
   }
   return {
@@ -1458,11 +1505,7 @@ async function getValidKrwMarkets(timeoutMs = 5000) {
 }
 
 async function fetchUpbitAccountBalance() {
-  const cfgPath = fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : EXAMPLE_CONFIG_PATH;
-  let cfg = {};
-  try {
-    cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
-  } catch {}
+  const cfg = getRuntimeConfig();
 
   const accessKey = String(cfg.access_key || "").trim();
   const secretKey = String(cfg.secret_key || "").trim();
@@ -1838,11 +1881,7 @@ async function syncMonthlyAssetSnapshot(targetMode = "live", forcedAccountInfo =
 }
 
 async function fetchUpbitRecentOrders(limit = 20) {
-  const cfgPath = fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : EXAMPLE_CONFIG_PATH;
-  let cfg = {};
-  try {
-    cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
-  } catch {}
+  const cfg = getRuntimeConfig();
 
   const accessKey = String(cfg.access_key || "").trim();
   const secretKey = String(cfg.secret_key || "").trim();
@@ -1908,15 +1947,12 @@ async function fetchUpbitRecentOrders(limit = 20) {
 }
 
 async function checkUpbitStatus() {
-  const cfgPath = fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : EXAMPLE_CONFIG_PATH;
-  let cfg = {};
-  try {
-    cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
-  } catch {}
+  const cfg = getRuntimeConfig();
   const delayThreshold = Number(cfg.delay_threshold_ms || 800);
   const timeoutMs = Number(cfg.request_timeout_sec || 5) * 1000;
   const start = Date.now();
   const checkedAt = nowKSTString();
+  const wsStatus = upbitWsHub.getWsHealth();
 
   try {
     await new Promise((r) => setTimeout(r, 120)); // Rate limit 0.12s
@@ -1937,6 +1973,9 @@ async function checkUpbitStatus() {
           latency_ms: elapsed,
           reason: `업비트 API 응답 지연 감지 (${elapsed}ms / 기준 ${delayThreshold}ms 초과)`,
           checked_at: checkedAt,
+          ws_status: wsStatus,
+          ws_connected: wsStatus.connected,
+          transport_mode: wsStatus.transport_mode,
         };
       }
       return {
@@ -1946,6 +1985,9 @@ async function checkUpbitStatus() {
         latency_ms: elapsed,
         reason: `업비트 Open API 서버 정상 응답 (${elapsed}ms)`,
         checked_at: checkedAt,
+        ws_status: wsStatus,
+        ws_connected: wsStatus.connected,
+        transport_mode: wsStatus.transport_mode,
       };
     }
     return {
@@ -1955,6 +1997,9 @@ async function checkUpbitStatus() {
       latency_ms: elapsed,
       reason: `업비트 Open API 서버 오류 응답 (HTTP ${resp.status})`,
       checked_at: checkedAt,
+      ws_status: wsStatus,
+      ws_connected: wsStatus.connected,
+      transport_mode: wsStatus.transport_mode,
     };
   } catch (err) {
     return {
@@ -1964,6 +2009,9 @@ async function checkUpbitStatus() {
       latency_ms: Date.now() - start,
       reason: `업비트 Open API 서버 연결 실패: ${err.message}`,
       checked_at: checkedAt,
+      ws_status: wsStatus,
+      ws_connected: wsStatus.connected,
+      transport_mode: wsStatus.transport_mode,
     };
   }
 }
@@ -2210,10 +2258,20 @@ function parseBooleanFlag(val, defaultVal = true) {
   return defaultVal;
 }
 
-function getRuntimeConfig() {
+function getRuntimeConfig(options = {}) {
   const cfgPath = fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : EXAMPLE_CONFIG_PATH;
   try {
-    return JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
+    if (cfgPath === CONFIG_PATH && fs.existsSync(CONFIG_PATH) && options?.autoMigrate !== false) {
+      migrateConfigSecrets(CONFIG_PATH);
+    }
+    const rawCfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
+    const out = { ...rawCfg };
+    for (const field of VAULT_SECRET_FIELDS) {
+      if (typeof out[field] === "string" && out[field].trim()) {
+        out[field] = safeDecryptSecret(out[field].trim());
+      }
+    }
+    return out;
   } catch {
     return {};
   }
@@ -2228,10 +2286,23 @@ function saveRuntimeConfig(partial = {}) {
       cfg = JSON.parse(fs.readFileSync(EXAMPLE_CONFIG_PATH, "utf-8"));
     }
     const merged = { ...cfg, ...partial };
+    const toStore = { ...merged };
+    for (const field of VAULT_SECRET_FIELDS) {
+      const val = String(toStore[field] || "").trim();
+      if (
+        val &&
+        val !== "YOUR_UPBIT_ACCESS_KEY" &&
+        val !== "YOUR_UPBIT_SECRET_KEY" &&
+        val !== "YOUR_GEMINI_API_KEY_HERE" &&
+        !isEncryptedVaultValue(val)
+      ) {
+        toStore[field] = encryptSecret(val);
+      }
+    }
     fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(merged, null, 2), { encoding: "utf-8", mode: 0o600 });
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(toStore, null, 2), { encoding: "utf-8", mode: 0o600 });
     fs.chmodSync(CONFIG_PATH, 0o600);
-    return merged;
+    return getRuntimeConfig({ autoMigrate: false });
   } catch (err) {
     console.error("Failed to write to config/upbit_config.json:", err.message);
     return null;
@@ -2433,13 +2504,13 @@ async function checkOllamaStatus(options = {}) {
 async function getGeminiApiKey() {
   const cfg = getRuntimeConfig();
   if (cfg.gemini_api_key && cfg.gemini_api_key !== "YOUR_GEMINI_API_KEY_HERE" && cfg.gemini_api_key.trim().length > 0) {
-    return cfg.gemini_api_key.trim();
+    return safeDecryptSecret(cfg.gemini_api_key.trim());
   }
   const dbKey = await getSetting("gemini_api_key", "");
   if (dbKey && dbKey.trim().length > 0) {
-    return dbKey.trim();
+    return safeDecryptSecret(dbKey.trim());
   }
-  return (process.env.GEMINI_API_KEY || "").trim();
+  return safeDecryptSecret((process.env.GEMINI_API_KEY || "").trim());
 }
 
 async function saveGeminiApiKey(key) {
@@ -2447,7 +2518,8 @@ async function saveGeminiApiKey(key) {
   saveRuntimeConfig({ gemini_api_key: cleanKey });
   const now = nowKSTString();
   const db = getDb();
-  await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('gemini_api_key', ?, ?)").run(cleanKey, now);
+  const storedKey = cleanKey ? encryptSecret(cleanKey) : "";
+  await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('gemini_api_key', ?, ?)").run(storedKey, now);
   return cleanKey;
 }
 
@@ -5744,6 +5816,14 @@ export async function executeWeeklyBotRotation({ triggerType = "MANUAL_IMMEDIATE
       .run(nowStr, nextRotStr, nowStr);
 
     console.log(`[Auto-Rotation] ${summaryText}`);
+    dispatchMultiChannelNotification(
+      db,
+      {
+        eventType: "WEEKLY_ROTATION",
+        reason: summaryText,
+      },
+      { webPushBroadcastFn: broadcastWebPushNotification }
+    ).catch(() => {});
     const status = await getRotationStatusPayload({ skipMarketFetch: skipLiveAccountSync });
     return {
       success: true,
@@ -6179,12 +6259,12 @@ const server = http.createServer(async (req, res) => {
       const geminiKey = String(body.gemini_api_key || "").trim();
       const skipUpbit = !!body.skip_upbit;
 
-      // 1. config/upbit_config.json 저장
+      // 1. config/upbit_config.json 저장 (AES-256-GCM 암호화 볼트 적용)
       let existingConfig = {};
       if (fs.existsSync(CONFIG_PATH)) {
         try { existingConfig = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch {}
       }
-      const newConfig = {
+      saveRuntimeConfig({
         ...existingConfig,
         access_key: skipUpbit ? "" : upbitAccess,
         secret_key: skipUpbit ? "" : upbitSecret,
@@ -6197,10 +6277,7 @@ const server = http.createServer(async (req, res) => {
         ollama_news_model: existingConfig.ollama_news_model || process.env.OLLAMA_NEWS_MODEL || DEFAULT_OLLAMA_NEWS_MODEL,
         ollama_timeout_ms: Number(existingConfig.ollama_timeout_ms || process.env.OLLAMA_TIMEOUT_MS || DEFAULT_OLLAMA_TIMEOUT_MS),
         setup_completed: true,
-      };
-      fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
-      fs.writeFileSync(CONFIG_PATH, JSON.stringify(newConfig, null, 2), { encoding: "utf-8", mode: 0o600 });
-      fs.chmodSync(CONFIG_PATH, 0o600);
+      });
 
       // 2. .env 파일 생성/갱신
       let envLines = [];
@@ -6279,7 +6356,7 @@ const server = http.createServer(async (req, res) => {
       await targetDb.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('total_capital', ?, ?)").run(String(initialCapital), now);
       await targetDb.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('capital_configured', '1', ?)").run(now);
       if (geminiKey) {
-        await targetDb.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('gemini_api_key', ?, ?)").run(geminiKey, now);
+        await targetDb.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('gemini_api_key', ?, ?)").run(encryptSecret(geminiKey), now);
       }
       if (initialCapital > 0) {
         try {
@@ -6358,6 +6435,7 @@ const server = http.createServer(async (req, res) => {
         regimeFilterRow = enrichRegimeFilterRow(rawRegime, await loadDualAiModelMeta(db));
       } catch {}
       const ollama = await checkOllamaStatus();
+      const wsStatus = upbitWsHub.getWsHealth();
       return sendJson(res, 200, {
         mode,
         total_capital: Math.floor(Number(await getSetting("total_capital", "0"))),
@@ -6367,6 +6445,7 @@ const server = http.createServer(async (req, res) => {
         bots: await getBots(mode),
         regime_filter: regimeFilterRow,
         ollama,
+        ws_status: wsStatus,
       });
     }
 
@@ -6723,7 +6802,10 @@ const server = http.createServer(async (req, res) => {
               profit_pct, 
               status, 
               NULL AS buy_reason, 
-              NULL AS sell_reason 
+              NULL AS sell_reason,
+              expected_price,
+              slippage_bps,
+              atr_sizing_mult
             FROM trades
           `;
         } else if (mode === "paper") {
@@ -6747,7 +6829,10 @@ const server = http.createServer(async (req, res) => {
               profit_pct, 
               status, 
               buy_reason, 
-              sell_reason 
+              sell_reason,
+              NULL AS expected_price,
+              NULL AS slippage_bps,
+              NULL AS atr_sizing_mult
             FROM paper_trades
           `;
         } else {
@@ -6772,7 +6857,10 @@ const server = http.createServer(async (req, res) => {
               profit_pct, 
               status, 
               NULL AS buy_reason, 
-              NULL AS sell_reason 
+              NULL AS sell_reason,
+              expected_price,
+              slippage_bps,
+              atr_sizing_mult
             FROM trades
             UNION ALL
             SELECT 
@@ -6794,7 +6882,10 @@ const server = http.createServer(async (req, res) => {
               profit_pct, 
               status, 
               buy_reason, 
-              sell_reason 
+              sell_reason,
+              NULL AS expected_price,
+              NULL AS slippage_bps,
+              NULL AS atr_sizing_mult
             FROM paper_trades
           `;
         }
@@ -6820,7 +6911,10 @@ const server = http.createServer(async (req, res) => {
               profit_pct::numeric AS profit_pct, 
               status, 
               NULL::text AS buy_reason, 
-              NULL::text AS sell_reason 
+              NULL::text AS sell_reason,
+              expected_price::numeric AS expected_price,
+              slippage_bps::numeric AS slippage_bps,
+              atr_sizing_mult::numeric AS atr_sizing_mult
             FROM trades
           `;
         } else if (mode === "paper") {
@@ -6844,7 +6938,10 @@ const server = http.createServer(async (req, res) => {
               profit_pct::numeric AS profit_pct, 
               status, 
               buy_reason, 
-              sell_reason 
+              sell_reason,
+              NULL::numeric AS expected_price,
+              NULL::numeric AS slippage_bps,
+              NULL::numeric AS atr_sizing_mult
             FROM paper_trades
           `;
         } else {
@@ -6869,7 +6966,10 @@ const server = http.createServer(async (req, res) => {
               profit_pct::numeric AS profit_pct, 
               status, 
               NULL::text AS buy_reason, 
-              NULL::text AS sell_reason 
+              NULL::text AS sell_reason,
+              expected_price::numeric AS expected_price,
+              slippage_bps::numeric AS slippage_bps,
+              atr_sizing_mult::numeric AS atr_sizing_mult
             FROM trades
             UNION ALL
             SELECT 
@@ -6891,7 +6991,10 @@ const server = http.createServer(async (req, res) => {
               profit_pct::numeric AS profit_pct, 
               status, 
               buy_reason, 
-              sell_reason 
+              sell_reason,
+              NULL::numeric AS expected_price,
+              NULL::numeric AS slippage_bps,
+              NULL::numeric AS atr_sizing_mult
             FROM paper_trades
           `;
         }
@@ -7112,10 +7215,29 @@ const server = http.createServer(async (req, res) => {
 
       const monthlyAssets = await syncMonthlyAssetSnapshot(mode);
 
+      const slippageTrades = trades.filter(
+        (t) => t.slippage_bps !== null && t.slippage_bps !== undefined && Number.isFinite(Number(t.slippage_bps))
+      );
+      const avgSlippageBps =
+        slippageTrades.length > 0
+          ? Number(
+              (
+                slippageTrades.reduce((acc, t) => acc + Number(t.slippage_bps || 0), 0) / slippageTrades.length
+              ).toFixed(2)
+            )
+          : 0;
+      const executionQualitySummary = {
+        avg_slippage_bps: avgSlippageBps,
+        measured_trades_count: slippageTrades.length,
+        favorable_or_zero_count: slippageTrades.filter((t) => Number(t.slippage_bps || 0) <= 0).length,
+      };
+
       return sendJson(res, 200, {
         mode,
         start_date: "2026.10.01",
         monthly_assets: monthlyAssets,
+        avg_slippage_bps: avgSlippageBps,
+        execution_quality_summary: executionQualitySummary,
         daily: buildSeries(dailyMap, dailyTradedSet),
         weekly: buildSeries(weeklyMap, weeklyTradedSet),
         monthly: buildSeries(monthlyMap, monthlyTradedSet),
@@ -7375,7 +7497,16 @@ const server = http.createServer(async (req, res) => {
         marketRegimeFilter = await db.prepare("SELECT * FROM market_regime_filter").all();
       } catch {}
       const rawSettings = await db.prepare("SELECT * FROM system_settings").all();
-      const excludedExportKeys = new Set(["auth_session_secret", "entry_code", "gate_code", "gemini_api_key", "vapid_private_key"]);
+      const excludedExportKeys = new Set([
+        "auth_session_secret",
+        "entry_code",
+        "gate_code",
+        "gemini_api_key",
+        "vapid_private_key",
+        "telegram_bot_token",
+        "telegram_chat_id",
+        "discord_webhook_url",
+      ]);
       const safeSystemSettings = rawSettings.filter((s) => !excludedExportKeys.has(s.key));
       const payload = {
         schema_version: "1.2",
@@ -7406,6 +7537,9 @@ const server = http.createServer(async (req, res) => {
         "gemini_api_key",
         "vapid_private_key",
         "vapid_public_key",
+        "telegram_bot_token",
+        "telegram_chat_id",
+        "discord_webhook_url",
       ]);
       await withDbWriteLock(async () => {
         const existingSecretRows = [];
@@ -7723,11 +7857,7 @@ const server = http.createServer(async (req, res) => {
     // [가상거래 모드 (Paper Trading) API]
     // ============================================================
     if (pathname === "/api/trade-mode" && req.method === "GET") {
-      const cfgPath = fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : EXAMPLE_CONFIG_PATH;
-      let cfg = {};
-      try {
-        cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
-      } catch {}
+      const cfg = getRuntimeConfig();
       const mode = String(cfg.trade_mode || "paper").toLowerCase();
       const hasKeys = !!(
         cfg.access_key &&
@@ -7746,17 +7876,9 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/trade-mode" && req.method === "POST") {
       const body = await readJsonBody(req);
       const targetMode = String(body.mode || "").toLowerCase() === "live" ? "live" : "paper";
-      const cfgPath = fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : EXAMPLE_CONFIG_PATH;
-      let cfg = {};
-      try {
-        cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
-      } catch {}
-      cfg.trade_mode = targetMode;
-      try {
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), { encoding: "utf-8", mode: 0o600 });
-        fs.chmodSync(CONFIG_PATH, 0o600);
-      } catch (err) {
-        return sendJson(res, 500, { success: false, message: `설정 파일 저장 실패: ${err.message}` });
+      const savedCfg = saveRuntimeConfig({ trade_mode: targetMode });
+      if (!savedCfg) {
+        return sendJson(res, 500, { success: false, message: "설정 파일 저장 실패" });
       }
       await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('trade_mode', ?, ?)").run(
         targetMode,
@@ -7770,6 +7892,142 @@ const server = http.createServer(async (req, res) => {
             ? "실거래(Live) 모드로 전환되었습니다. 실제 업비트 주문이 전송됩니다."
             : "가상거래(Paper) 모드로 전환되었습니다. 실제 코인 시세를 기반으로 모의 체결됩니다.",
       });
+    }
+
+    // ============================================================
+    // [히스토리컬 캔들 백테스팅 & Walk-Forward 검증소 API]
+    // ============================================================
+    if (pathname === "/api/backtest/run" && req.method === "POST") {
+      try {
+        const body = await readJsonBody(req);
+        const result = await runHistoricalBacktest(db, {
+          botId: body.bot_id || "bot_10",
+          market: body.market || "KRW-BTC",
+          timeframe: body.timeframe || "15m",
+          days: Number(body.days || 30),
+          initialCapital: Number(body.initial_capital || 1000000),
+          slippageBps: Number(body.slippage_bps ?? 5),
+          feeRate: Number(body.fee_rate ?? 0.0005),
+          walkForward: Boolean(body.walk_forward),
+          customParams: body.custom_params || null,
+          candlesOverride: Array.isArray(body.candles_override) ? body.candles_override : null,
+        });
+        return sendJson(res, 200, result);
+      } catch (err) {
+        return sendJson(res, 400, { success: false, message: err.message });
+      }
+    }
+
+    if (pathname === "/api/backtest/history" && req.method === "GET") {
+      const limit = Math.min(100, Math.max(1, Number(parsedUrl.searchParams.get("limit") || 20)));
+      const history = await getBacktestHistory(db, limit);
+      return sendJson(res, 200, { success: true, history });
+    }
+
+    if (pathname === "/api/backtest/apply-params" && req.method === "POST") {
+      try {
+        const body = await readJsonBody(req);
+        const botId = normalizeBotId(String(body.bot_id || ""));
+        const targetBot = (await getBots()).find((b) => b.bot_id === botId);
+        if (!targetBot) {
+          return sendJson(res, 404, { success: false, message: `존재하지 않는 봇입니다: ${botId}` });
+        }
+        const params = body.params || {};
+        const nextStopLoss =
+          params.stop_loss_pct !== undefined
+            ? Math.abs(Number(params.stop_loss_pct))
+            : Number(targetBot.stop_loss_pct || 2.5);
+        const nextTakeProfit =
+          params.take_profit_pct !== undefined
+            ? Math.abs(Number(params.take_profit_pct))
+            : Number(targetBot.take_profit_pct || 4.5);
+        const mergedCfg = { ...(targetBot.config || {}) };
+        for (const [k, v] of Object.entries(params)) {
+          if (k !== "stop_loss_pct" && k !== "take_profit_pct") {
+            mergedCfg[k] = v;
+          }
+        }
+        const now = nowKSTString();
+        await db
+          .prepare(
+            "UPDATE bots SET stop_loss_pct = ?, take_profit_pct = ?, config_json = ?, updated_at = ? WHERE bot_id = ?"
+          )
+          .run(nextStopLoss, nextTakeProfit, JSON.stringify(mergedCfg), now, botId);
+        const updated = (await getBots()).find((b) => b.bot_id === botId);
+        return sendJson(res, 200, {
+          success: true,
+          message: `[${updated?.nickname || botId}] 백테스트 검증 파라미터(손절 -${nextStopLoss}%, 익절 +${nextTakeProfit}%)가 봇 설정에 반영되었습니다.`,
+          bot: updated,
+        });
+      } catch (err) {
+        return sendJson(res, 400, { success: false, message: err.message });
+      }
+    }
+
+    // ============================================================
+    // [캔들스틱 매수/매도 타점 마커 & 지표 오버레이 차트 API]
+    // ============================================================
+    if (pathname === "/api/chart/trade-markers" && req.method === "GET") {
+      try {
+        const market = parsedUrl.searchParams.get("market") || "KRW-BTC";
+        const botId = parsedUrl.searchParams.get("bot_id") || "all";
+        const mode = parsedUrl.searchParams.get("mode") || (isLiveMode() ? "live" : "paper");
+        const unit = Number(parsedUrl.searchParams.get("unit") || 15);
+        const count = Number(parsedUrl.searchParams.get("count") || 96);
+        const payload = await buildChartTradeMarkers(db, { market, botId, mode, unit, count });
+        return sendJson(res, 200, payload);
+      } catch (err) {
+        return sendJson(res, 400, { success: false, message: err.message });
+      }
+    }
+
+    // ============================================================
+    // [멀티채널 실시간 알림 허브 (Telegram · Discord · WebPush) API]
+    // ============================================================
+    if (pathname === "/api/settings/notifications" && req.method === "GET") {
+      const settings = await loadNotificationSettings(db, { maskSecrets: true });
+      return sendJson(res, 200, { success: true, settings });
+    }
+
+    if (pathname === "/api/settings/notifications" && (req.method === "PUT" || req.method === "POST")) {
+      try {
+        const body = await readJsonBody(req);
+        const settings = await saveNotificationSettings(db, body || {});
+        return sendJson(res, 200, {
+          success: true,
+          message: "멀티채널 실시간 알림 설정(Telegram · Discord · WebPush)이 암호화 저장되었습니다.",
+          settings,
+        });
+      } catch (err) {
+        return sendJson(res, 400, { success: false, message: err.message });
+      }
+    }
+
+    if (pathname === "/api/settings/notifications/test" && req.method === "POST") {
+      try {
+        const body = await readJsonBody(req);
+        const result = await dispatchMultiChannelNotification(
+          db,
+          {
+            eventType: "TEST",
+            botId: body?.bot_id || "bot_10",
+            botName: body?.bot_name || "잭 켈로그 올라운더봇",
+            market: body?.market || "KRW-BTC",
+            reason: body?.message || "멀티채널 실시간 알림(Telegram · Discord · WebPush) 연동 테스트입니다.",
+          },
+          {
+            forceSend: true,
+            webPushBroadcastFn: broadcastWebPushNotification,
+          }
+        );
+        return sendJson(res, 200, {
+          success: true,
+          message: "멀티채널 테스트 알림 발송 요청이 처리되었습니다.",
+          result,
+        });
+      } catch (err) {
+        return sendJson(res, 400, { success: false, message: err.message });
+      }
     }
 
     // ============================================================
@@ -7862,8 +8120,17 @@ async function fetchUpbitTickersMap(markets) {
   const map = new Map();
   if (!markets || markets.length === 0) return map;
   const now = Date.now();
+  const wsFresh = !upbitWsHub.isStale();
   const missing = [];
   for (const m of markets) {
+    if (wsFresh) {
+      const wsTk = upbitWsHub.getLatestTicker(m);
+      if (wsTk && Number(wsTk.trade_price) > 0) {
+        upbitTickersCache.set(m, { ts: now, data: wsTk });
+        map.set(m, wsTk);
+        continue;
+      }
+    }
     const cached = upbitTickersCache.get(m);
     if (cached && now - cached.ts < 3000) {
       map.set(m, cached.data);
@@ -7928,7 +8195,7 @@ function computeRsi(closes, period = 7) {
   return 100.0 - 100.0 / (1.0 + rs);
 }
 
-function getSafeOrderKrw(bot, ratio = null, aiMultiplier = 1.0) {
+function getSafeOrderKrw(bot, ratio = null, aiMultiplier = 1.0, options = {}) {
   const rawVirtual = Number(bot.virtual_krw || 0);
   const virtualKrw = Number.isFinite(rawVirtual) ? Math.floor(rawVirtual) : 0;
   const rawMult = Number(aiMultiplier ?? 1.0);
@@ -7948,8 +8215,18 @@ function getSafeOrderKrw(bot, ratio = null, aiMultiplier = 1.0) {
   const baseCapital = Math.max(virtualKrw, Number.isFinite(rawAlloc) ? Math.floor(rawAlloc) : 0);
   const slotBudgetKrw = cfgOrderKrw >= MIN_UPBIT_ORDER_KRW ? Math.min(cfgOrderKrw, virtualKrw) : Math.min(virtualKrw, Math.floor(baseCapital * normRatio));
 
+  const atrInfo =
+    options && Number(options.atr14) > 0 && Number(options.currentPrice) > 0
+      ? computeAtrVolatilityMultiplier({
+          atr14: options.atr14,
+          currentPrice: options.currentPrice,
+          targetAtrPct: options.targetAtrPct || 1.5,
+        })
+      : { atr_sizing_mult: 1.0, atr_pct: 0 };
+  const atrMult = Number(atrInfo.atr_sizing_mult || 1.0);
+
   const maxAffordable = Math.floor(virtualKrw / 1.0005);
-  let orderKrw = Math.floor((slotBudgetKrw * mult) / 1.0005);
+  let orderKrw = Math.floor((slotBudgetKrw * mult * atrMult) / 1.0005);
 
   if (!Number.isFinite(orderKrw) || orderKrw < MIN_UPBIT_ORDER_KRW) {
     orderKrw = maxAffordable >= SAFE_ADJUSTED_MIN_KRW ? SAFE_ADJUSTED_MIN_KRW : 0;
@@ -8084,6 +8361,13 @@ function normalizeUpbitKrwTick(price) {
 }
 
 async function fetchUpbitBestBidPrice(market, fallbackPrice = 0) {
+  if (!upbitWsHub.isStale()) {
+    const wsOb = upbitWsHub.getLatestOrderbook(market);
+    const wsBid = Number(wsOb?.orderbook_units?.[0]?.bid_price || 0);
+    if (wsBid > 0) {
+      return wsBid;
+    }
+  }
   try {
     await new Promise((r) => setTimeout(r, 120));
     const resp = await fetch(`https://api.upbit.com/v1/orderbook?markets=${encodeURIComponent(market)}`, {
@@ -8178,11 +8462,26 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, bu
     return false;
   }
 
-  const cfgPath = fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : EXAMPLE_CONFIG_PATH;
-  let cfg = {};
-  try {
-    cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
-  } catch {}
+  const cfg = getRuntimeConfig();
+
+  // 호가 불균형(OBI) 및 Bid-Ask 스프레드 과열 체결 품질 가드
+  const candidateOrderbook =
+    options?.orderbook || (!options?.skipUpbitApi && !upbitWsHub.isStale() ? upbitWsHub.getLatestOrderbook(market) : null);
+  if (candidateOrderbook) {
+    const obQuality = analyzeOrderbookQuality(candidateOrderbook, orderKrw, {
+      botId: bot.bot_id,
+      maxSpreadPct: options?.maxSpreadPct,
+      minObi: options?.minObi,
+    });
+    if (obQuality.blocked) {
+      await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
+        `[호가 품질 가드] ${market} 진입 보류: ${obQuality.reason}`,
+        nowKSTString(),
+        bot.bot_id
+      );
+      return false;
+    }
+  }
 
   if (!isLive) {
     // [가상거래 모드 (Paper Trading)]
@@ -8437,12 +8736,18 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, bu
   }
 
   const now = nowKSTString();
+  const expectedPrice = Number(currentPrice || execPrice);
+  const slippageBps = computeSlippageBps(expectedPrice, execPrice);
+  const atrSizingMult = Number.isFinite(Number(options?.atrSizingMult))
+    ? Number(Number(options.atrSizingMult).toFixed(4))
+    : 1.0;
+
   const newVirtual = Math.max(0, Math.floor(Number(latestBot.virtual_krw) - actualBuyAmount - fee));
   const newAllocated = newVirtual + Math.floor(currentInvested + Number(actualBuyAmount || 0));
   await db.prepare("UPDATE bots SET allocated_capital = ?, virtual_krw = ?, last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
     newAllocated,
     newVirtual,
-    `${market} 최유리 지정가(1호가 ${execPrice.toLocaleString("ko-KR")}원) 매수 체결 (${actualBuyAmount.toLocaleString("ko-KR")}원)`,
+    `${market} 최유리 지정가(1호가 ${execPrice.toLocaleString("ko-KR")}원) 매수 체결 (${actualBuyAmount.toLocaleString("ko-KR")}원 · 슬리피지 ${slippageBps >= 0 ? "+" : ""}${slippageBps}bps)`,
     now,
     bot.bot_id
   );
@@ -8452,16 +8757,60 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, bu
         bot_id, market, buy_order_uuid, sell_order_uuid,
         buy_price, buy_volume, buy_amount, buy_date,
         sell_price, sell_volume, sell_amount, sell_date,
-        profit_krw, profit_pct, status
-      ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, 'HOLDING')
+        profit_krw, profit_pct, status,
+        expected_price, slippage_bps, atr_sizing_mult
+      ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, 'HOLDING', ?, ?, ?)
     `)
-    .run(bot.bot_id, market, orderUuid, execPrice, execVolume, actualBuyAmount, now);
+    .run(
+      bot.bot_id,
+      market,
+      orderUuid,
+      execPrice,
+      execVolume,
+      actualBuyAmount,
+      now,
+      expectedPrice,
+      slippageBps,
+      atrSizingMult
+    );
 
   await db.prepare(`
     INSERT INTO bot_positions (
-      bot_id, market, ticker, order_uuid, volume, avg_buy_price, buy_amount, buy_fee, trade_id, status, created_at, buy_reason
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
-  `).run(bot.bot_id, market, market, orderUuid, execVolume, execPrice, actualBuyAmount, fee, trRes.lastInsertRowid, now, buyReason || null);
+      bot_id, market, ticker, order_uuid, volume, avg_buy_price, buy_amount, buy_fee, trade_id, status, created_at, buy_reason,
+      expected_price, slippage_bps, atr_sizing_mult
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?)
+  `).run(
+    bot.bot_id,
+    market,
+    market,
+    orderUuid,
+    execVolume,
+    execPrice,
+    actualBuyAmount,
+    fee,
+    trRes.lastInsertRowid,
+    now,
+    buyReason || null,
+    expectedPrice,
+    slippageBps,
+    atrSizingMult
+  );
+
+  dispatchMultiChannelNotification(
+    db,
+    {
+      eventType: "LIVE_BUY",
+      botId: bot.bot_id,
+      botName: latestBot.nickname || latestBot.name || bot.bot_id,
+      market,
+      price: execPrice,
+      volume: execVolume,
+      amountKrw: actualBuyAmount,
+      reason: buyReason || "전략 매수 체결",
+    },
+    { webPushBroadcastFn: broadcastWebPushNotification }
+  ).catch(() => {});
+
   return true;
 }
 
@@ -8657,6 +9006,29 @@ export async function settleLiveSellOrderInDb({
     }
   });
 
+  const totalProfitPct =
+    totalBuyAmount > 0 ? Number(((totalProfitKrw / totalBuyAmount) * 100).toFixed(2)) : 0;
+  dispatchMultiChannelNotification(
+    db,
+    {
+      eventType: isDrainingBot ? "DRAIN_HANDOFF" : "LIVE_SELL",
+      botId: bot.bot_id,
+      botName: bot.nickname || bot.name || bot.bot_id,
+      market: primaryPos?.market,
+      price: sellPrice,
+      volume: primaryPos?.volume,
+      amountKrw: safeFunds,
+      profitKrw: totalProfitKrw,
+      profitPct: totalProfitPct,
+      reason: reasonLabel || "전략 청산",
+      extra: {
+        netProceedsKrw: netProceeds,
+        remainingPositionsCount: remainingOpenCnt,
+      },
+    },
+    { webPushBroadcastFn: broadcastWebPushNotification }
+  ).catch(() => {});
+
   return {
     isDrainingBot,
     netProceeds,
@@ -8784,11 +9156,7 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
     return true;
   }
 
-  const cfgPath = fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : EXAMPLE_CONFIG_PATH;
-  let cfg = {};
-  try {
-    cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
-  } catch {}
+  const cfg = getRuntimeConfig();
 
   // 업비트 실계좌 보유 수량 조회 — 절대 계좌 전량을 매도하지 않고 본인 봇/order_uuid 기록 volume(소수점 8자리 내림 ROUND_DOWN)만 사용
   const currency = String(currentPos.market || "").split("-")[1] || "";
@@ -9125,7 +9493,130 @@ let isLiveCycleRunning = false;
 const liveBotPeakMap = new Map();
 const liveBotCooldownMap = new Map();
 const cleanseAttemptMap = new Map();
+const lastTickExitCheckMap = new Map();
+const inFlightTickExitSet = new Set();
+const circuitBreakerNotifiedDateMap = new Map();
 const LIVE_REENTRY_COOLDOWN_MS = 15 * 60 * 1000;
+const TICK_EXIT_DEBOUNCE_MS = 1500;
+
+export async function triggerTickReactiveSmartExit(tickEvent = {}) {
+  const market = String(tickEvent?.market || "").trim().toUpperCase();
+  const price = Number(tickEvent?.price || 0);
+  if (!market || !Number.isFinite(price) || price <= 0) {
+    return { triggered: false, reason: "INVALID_TICK" };
+  }
+
+  if (tickEvent?.ticker) {
+    upbitTickersCache.set(market, { ts: Date.now(), data: tickEvent.ticker });
+  }
+
+  if (!isLiveMode() && !tickEvent?.allowPaperMode) {
+    return { triggered: false, reason: "NOT_LIVE_MODE" };
+  }
+
+  if (inFlightTickExitSet.has(market)) {
+    return { triggered: false, reason: "IN_FLIGHT" };
+  }
+
+  const nowMs = Date.now();
+  const lastCheckMs = lastTickExitCheckMap.get(market) || 0;
+  if (!tickEvent?.bypassDebounce && nowMs - lastCheckMs < TICK_EXIT_DEBOUNCE_MS) {
+    return { triggered: false, reason: "DEBOUNCED" };
+  }
+
+  const db = getDb();
+  if (!db) return { triggered: false, reason: "NO_DB" };
+
+  let openRows = [];
+  try {
+    openRows = await db
+      .prepare(
+        `SELECT p.*, b.stop_loss_pct, b.take_profit_pct, b.nickname, b.name, b.is_selected_for_live
+         FROM bot_positions p
+         JOIN bots b ON p.bot_id = b.bot_id
+         WHERE p.market = ? AND p.status = 'OPEN'
+         ORDER BY p.id ASC`
+      )
+      .all(market);
+  } catch {
+    return { triggered: false, reason: "DB_QUERY_ERROR" };
+  }
+
+  if (!Array.isArray(openRows) || openRows.length === 0) {
+    return { triggered: false, reason: "NO_OPEN_POSITION" };
+  }
+
+  lastTickExitCheckMap.set(market, nowMs);
+  inFlightTickExitSet.add(market);
+  const soldPositions = [];
+
+  try {
+    for (const pos of openRows) {
+      const avgBuy = Number(pos.avg_buy_price || 0);
+      if (avgBuy <= 0) continue;
+
+      const peakKey = `live-${pos.id}`;
+      const prevPeak = Number(liveBotPeakMap.get(peakKey) || pos.highest_price || avgBuy);
+      const curPeak = Math.max(prevPeak, price);
+      liveBotPeakMap.set(peakKey, curPeak);
+
+      const pnlPct = ((price - avgBuy) / avgBuy) * 100.0;
+      const stopLossPct = -Math.abs(Number(pos.stop_loss_pct || 2.5));
+      const takeProfitPct = Math.abs(Number(pos.take_profit_pct || 4.5));
+
+      let exitReason = "";
+      const smartExit = evaluateSmartExit({
+        botId: pos.bot_id,
+        position: pos,
+        currentPrice: price,
+        indicators: tickEvent?.indicators || null,
+        peakPrice: curPeak,
+        isLive: true,
+        stopLossPct,
+      });
+
+      if (smartExit && smartExit.signal === "SELL") {
+        exitReason = smartExit.reason;
+      } else if (pnlPct <= stopLossPct) {
+        exitReason = `틱즉시손절(${pnlPct.toFixed(2)}%)`;
+      } else if (pnlPct >= takeProfitPct) {
+        exitReason = `틱즉시익절(+${pnlPct.toFixed(2)}%)`;
+      }
+
+      if (exitReason) {
+        const botRef = {
+          bot_id: pos.bot_id,
+          nickname: pos.nickname || pos.name || pos.bot_id,
+          name: pos.name || pos.bot_id,
+        };
+        const sold = await executeBotSellOrder(botRef, pos, price, exitReason, {
+          skipUpbitApi: Boolean(tickEvent?.skipUpbitApi),
+        });
+        if (sold) {
+          liveBotPeakMap.delete(peakKey);
+          soldPositions.push({
+            position_id: pos.id,
+            bot_id: pos.bot_id,
+            market,
+            sell_price: price,
+            reason: exitReason,
+          });
+        }
+      }
+    }
+    return {
+      triggered: soldPositions.length > 0,
+      sold_count: soldPositions.length,
+      sold_positions: soldPositions,
+    };
+  } finally {
+    inFlightTickExitSet.delete(market);
+  }
+}
+
+upbitWsHub.onTickerTick((tickEvent) => {
+  triggerTickReactiveSmartExit(tickEvent).catch(() => {});
+});
 
 export async function runLiveTradingBotsCycle(options = {}) {
   // 가상거래 모드에서는 Always-On Arena(runAlwaysOnPaperArenaCycle)가 10대 봇을 독립 운용하므로 실전 루프의 paper_* 교차 오염을 원천 차단
@@ -9161,6 +9652,9 @@ export async function runLiveTradingBotsCycle(options = {}) {
       .flatMap((b) => (b.open_positions || []).map((p) => p.market || p.ticker))
       .filter(Boolean);
     const allMarkets = [...new Set([...baseMarkets, ...openPosMarkets])];
+    if (upbitWsHub.isConnected()) {
+      upbitWsHub.updateSubscriptions(allMarkets);
+    }
     const tickerMap = options?.tickerMapOverride || (await fetchUpbitTickersMap(allMarkets));
     if (!tickerMap || tickerMap.size === 0) return;
 
@@ -9342,6 +9836,21 @@ export async function runLiveTradingBotsCycle(options = {}) {
           now,
           bot.bot_id
         );
+        const todayKey = `${bot.bot_id}|${todayDateString()}`;
+        if (!circuitBreakerNotifiedDateMap.has(todayKey)) {
+          circuitBreakerNotifiedDateMap.set(todayKey, true);
+          dispatchMultiChannelNotification(
+            db,
+            {
+              eventType: "CIRCUIT_BREAKER",
+              botId: bot.bot_id,
+              botName: refreshedBot.nickname || refreshedBot.name || bot.bot_id,
+              profitKrw: dailyProfit,
+              reason: cbMsg,
+            },
+            { webPushBroadcastFn: broadcastWebPushNotification }
+          ).catch(() => {});
+        }
         continue;
       }
 
@@ -9424,9 +9933,20 @@ export async function runLiveTradingBotsCycle(options = {}) {
 
         if (sig.signal === "BUY") {
           const baseRatio = Number(sig.order_ratio || cfg.order_ratio || 0.35);
-          const orderKrw = getSafeOrderKrw(refreshedBot, baseRatio, regimeInfo.multiplier ?? 1.0);
+          const atr14Val = Number(md?.indicators?.m15?.atr14 || 0);
+          const atrInfo = computeAtrVolatilityMultiplier({
+            atr14: atr14Val,
+            currentPrice: md.price,
+          });
+          const orderKrw = getSafeOrderKrw(refreshedBot, baseRatio, regimeInfo.multiplier ?? 1.0, {
+            atr14: atr14Val,
+            currentPrice: md.price,
+          });
           if (orderKrw >= 5000) {
-            const ok = await executeBotBuyOrder(refreshedBot, mkt, orderKrw, md.price, sig.reason, sellOpts);
+            const ok = await executeBotBuyOrder(refreshedBot, mkt, orderKrw, md.price, sig.reason, {
+              ...sellOpts,
+              atrSizingMult: atrInfo.atr_sizing_mult,
+            });
             if (ok) {
               actionMsg = `${mkt} ${sig.reason} 매수 체결 (${orderKrw.toLocaleString("ko-KR")}원)`;
               break;
@@ -9490,11 +10010,7 @@ async function reconcileOpenPositionsWithUpbit() {
   if (!isLiveMode()) {
     return;
   }
-  const cfgPath = fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : EXAMPLE_CONFIG_PATH;
-  let cfg = {};
-  try {
-    cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
-  } catch {}
+  const cfg = getRuntimeConfig();
   if (!cfg.access_key || !cfg.secret_key || cfg.access_key === "YOUR_UPBIT_ACCESS_KEY") {
     return;
   }
@@ -9668,6 +10184,16 @@ startBackgroundWorkers = async function() {
   if (workersStarted) return;
   workersStarted = true;
 
+  // 업비트 공식 WebSocket 실시간 시세/호가/체결 허브 시작
+  try {
+    upbitWsHub.start([
+      "KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-DOGE",
+      "KRW-SUI", "KRW-AVAX", "KRW-SHIB", "KRW-ADA", "KRW-NEAR",
+    ]);
+  } catch (wsErr) {
+    console.warn("[UpbitWsHub] Start warning:", wsErr.message);
+  }
+
   setTimeout(async () => {
     try {
       if (process.env.PG_SYNC_ENABLED !== "false" && process.env.DB_MODE !== "sqlite") {
@@ -9725,6 +10251,9 @@ export {
   updateAutoRotationConfig,
   runLlmWeeklyBotSelection,
   getRuntimeConfig,
+  saveRuntimeConfig,
+  getGeminiApiKey,
+  saveGeminiApiKey,
   getOllamaRuntimeConfig,
   saveOllamaSettings,
   checkOllamaStatus,
@@ -9740,6 +10269,29 @@ export {
   withDbWriteLock,
   getEffectiveEntryCode,
   runAlwaysOnPaperArenaCycle,
+  fetchUpbitTickersMap,
+  fetchUpbitBestBidPrice,
+  UpbitWsHub,
+  upbitWsHub,
+  analyzeOrderbookQuality,
+  computeAtrVolatilityMultiplier,
+  computeSlippageBps,
+  ensureBacktestTables,
+  fetchAndCacheHistoricalCandles,
+  simulateBarByBarBacktest,
+  runHistoricalBacktest,
+  getBacktestHistory,
+  buildChartTradeMarkers,
+  loadNotificationSettings,
+  saveNotificationSettings,
+  maskSecretValue,
+  formatNotificationMessage,
+  dispatchMultiChannelNotification,
+  isEncryptedVaultValue,
+  encryptSecret,
+  decryptSecret,
+  safeDecryptSecret,
+  migrateConfigSecrets,
 };
 
 

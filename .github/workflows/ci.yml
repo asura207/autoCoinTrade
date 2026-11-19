@@ -1,0 +1,75 @@
+name: AutoCoinTrade CI/CD Pipeline
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify-and-build:
+    name: Syntax, Unit/Integration QA, Secret Guard & Frontend Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend & frontend dependencies
+        run: |
+          npm ci --no-audit --no-fund
+          cd frontend && npm ci --no-audit --no-fund
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check JavaScript & Python syntax
+        run: |
+          node --check backend/node_server.mjs
+          for f in backend/common/*.mjs; do node --check "$f"; done
+          python3 -m py_compile *.py agentBot/*.py
+
+      - name: Secret leak guard (tracked repository files)
+        run: |
+          if git ls-files | grep -E '(^\.env$|^config/upbit_config\.json$|data/.*\.db$|data/\.session_secret$|data/\.vault_master_key$)'; then
+            echo "ERROR: Sensitive runtime file is tracked in git!"
+            exit 1
+          fi
+          if git grep -nE 'AIzaSy[0-9A-Za-z_-]{33}' -- ':!tests/*'; then
+            echo "ERROR: Potential hardcoded Google API key found!"
+            exit 1
+          fi
+          echo "Secret leak guard passed."
+
+      - name: Build frontend (Vite production bundle)
+        run: |
+          cd frontend && npm run build
+
+      - name: Run Node.js core & enhancement test suites
+        run: |
+          npm test
+          node tests/verify_upbit_ws_hub.mjs
+          node tests/verify_backtest_engine.mjs
+          node tests/verify_execution_quality_and_sizing.mjs
+          node tests/verify_notification_hub_and_journal.mjs
+          node tests/verify_crypto_vault.mjs
+
+      - name: Run Python QA verification suite
+        run: |
+          python3 tests/qa_python_verification.py

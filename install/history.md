@@ -10,7 +10,8 @@
 
 | 버전 (Version) | 릴리즈 일시 | 커밋 해시 | 주요 수정 내용 요약 |
 | :--- | :--- | :--- | :--- |
-| **v0.0.28** | 2026-11-19 | - | 전수 QA 체크리스트(`docs/QA_CHECKLIST.md`) 및 자동화 검증 스위트(`tests/qa_full_verification.mjs`, `tests/qa_python_verification.py`) 구축 및 발견된 치명·주요 결함 전면 수정: 실전 매도 원장 정합성(활성 봇 원금 이중 가산·`accounts` 오류 시 포지션 유실·타 봇 코인 침범·더스트 정화 무한 루프·`<1원` 소수점 코인 단가 0원화·SQLite 중첩 트랜잭션 충돌), 다단계 분할봇(`bot_06`/`bot_10`) 9초 무한 회전, 듀얼 AI Ollama 단독 `BLOCK` 영구 잠금(Sticky Latch) 및 BTC 장애 Fail-Safe, Python `Decimal ROUND_DOWN`·`drain_handoff_logs` NameError·`highest_price` 미커밋·KST Time-Stop 왜곡, 프론트엔드 초기 마법사 자동 표시·KST 인증 만료·주간 편성 카드 갱신·한국식 손익 색상(빨강/파랑)·설정 파라미터 ID 정규화 일괄 해결 |
+| **v0.0.29** | 2026-11-19 | - | 5대 기관급 퀀트 아키텍처 고도화 일괄 구현 및 자동화 검증 스위트 5종 추가: ① 업비트 WebSocket(`wss://api.upbit.com/websocket/v1`) 실시간 스트림 허브·REST 자동 폴백·틱 반응형 즉시 스마트 청산(`1,500ms` 디바운스) 및 사이드바 `WS 실시간`/`REST 폴백` 배지, ② Zero Look-Ahead Bias 과거 캔들 백테스팅·Walk-Forward(70/30) 검증 엔진(`historical_candles`, `backtest_runs`)·SVG 자산 곡선 및 원클릭 파라미터 반영 모달, ③ 호가창 불균형(OBI)·스프레드 가드·MTF(60m/240m) 역추세 차단·ATR 변동성 역가중 포지션 사이징(`5,250원` 하한 보장)·슬리피지(`slippage_bps`) 원장·통계 UI, ④ Telegram/Discord/WebPush 멀티채널 알림 허브(AES-256-GCM 암호화 저장·이벤트 토글) 및 인터랙티브 캔들스틱+VWAP/LRC/20MA+BUY/SELL 타점 마커 차트 모달, ⑤ Node.js↔Python 호환 AES-256-GCM API 키 암호화 볼트(`crypto_vault.mjs`)·멀티스테이지 `Dockerfile`·`docker-compose.yml`·GitHub Actions CI(`.github/workflows/ci.yml`) |
+| **v0.0.28** | 2026-11-19 | `a134f92` | 전수 QA 체크리스트(`docs/QA_CHECKLIST.md`) 및 자동화 검증 스위트(`tests/qa_full_verification.mjs`, `tests/qa_python_verification.py`) 구축 및 발견된 치명·주요 결함 전면 수정: 실전 매도 원장 정합성(활성 봇 원금 이중 가산·`accounts` 오류 시 포지션 유실·타 봇 코인 침범·더스트 정화 무한 루프·`<1원` 소수점 코인 단가 0원화·SQLite 중첩 트랜잭션 충돌), 다단계 분할봇(`bot_06`/`bot_10`) 9초 무한 회전, 듀얼 AI Ollama 단독 `BLOCK` 영구 잠금(Sticky Latch) 및 BTC 장애 Fail-Safe, Python `Decimal ROUND_DOWN`·`drain_handoff_logs` NameError·`highest_price` 미커밋·KST Time-Stop 왜곡, 프론트엔드 초기 마법사 자동 표시·KST 인증 만료·주간 편성 카드 갱신·한국식 손익 색상(빨강/파랑)·설정 파라미터 ID 정규화 일괄 해결 |
 | **v0.0.27** | 2026-11-18 | `d2f60e1` | 로컬 Ollama(`qwen3-news`) 인텔 맥북 CPU 추론 안정화 및 30분 분석 모델 UI 표기 고도화: 타임아웃 기본 `120,000ms`(최대 `180,000ms`) 상향·뉴스 6건(제목 90자) 프롬프트 경량화·코인 전용 `system` 프롬프트 오버라이드(`~41.5초` 응답), `market_regime_filter`·`system_settings`에 실제 실행된 `flash_provider`/`flash_model` 추적 저장 및 대시보드(실제거래 현황·듀얼 AI 매트릭스·뉴스 AI 헤더/본문) 실행 모델명 실시간 표기 |
 | **v0.0.26** | 2026-11-17 | `887c868` | 30분 단기 뉴스·시황 분석기(`FLASH_30M`) 맥북 프로 로컬 Ollama(`qwen3-news`) 1순위 연동 및 3중 무중단 Fallback(로컬 Ollama → Gemini Flash 지수 백오프 → 직전 캐시/BTC 20MA·4h 60MA 기계적 안전 모드) 구축, 백엔드·Python 워커(`think: false`, `format: json`, `25,000ms` 타임아웃)·PostgreSQL(`pg_sync.mjs`) AI 브리핑 동기화·설정 UI/SSE 스트리밍(`18ms` 타이프라이터)·통합 검증 스위트(`tests/verify_ollama_integration.mjs`) 추가 |
 | **v0.0.25** | 2026-11-15 | - | 프로덕션 정적 서버(`frontend/server.mjs`) 전환·Vite `8.3.8` 업그레이드, 백엔드 `HttpOnly` 서명 쿠키 기반 전역 `/api/*` 인증 게이트(`"stock"`/`"ㄴ새차"` 백도어·평문 코드 노출·무차별 대입·전역 CORS `*` 제거), `scripts/setup_wireguard.sh` VPN+방화벽 설정 추가, Arena 상단 버튼 단일 행(`nowrap`) 툴바 배치 |
@@ -42,6 +43,25 @@
 ---
 
 ## 📝 상세 버전별 변경 내역 (Detailed Changelog)
+
+### [v0.0.29] - 2026-11-19
+#### 5대 기관급 퀀트 고도화 과제(P0/P1) 일괄 구현 및 검증 스위트 5종 완비
+- **[과제 1 · P0] 업비트 WebSocket 실시간 스트림 허브 & 틱 반응형 스마트 청산 (`backend/common/upbit_ws_hub.mjs`, `backend/node_server.mjs`, `frontend/src/App.jsx`, `tests/verify_upbit_ws_hub.mjs`)**:
+  - `wss://api.upbit.com/websocket/v1` 실시간 `ticker`·`orderbook`·`trade` 멀티플렉서 허브 구축(지수 백오프 재연결, 60초 PING 하트비트, `>5,000ms` 지연 시 자동 REST 폴백).
+  - `fetchUpbitTickersMap` / `fetchUpbitBestBidPrice` WebSocket 캐시 우선 조회 연동 및 오픈 포지션 보유 종목 급변 시 10초 폴링 대기 없이 즉시 청산(`triggerTickReactiveSmartExit`, 종목별 `1,500ms` 디바운스 락·`inFlightTickExitSet`) 구현.
+  - `/api/upbit/status`, `/api/system/overview`, `/api/health`에 `ws_status` 추가 및 좌측 사이드바 `WS 실시간` / `REST 폴백` 상태 배지 UI 반영.
+- **[과제 2 · P0] 과거 캔들 정량 백테스팅 & Walk-Forward(70%/30%) 검증기 (`backend/common/backtest_service.mjs`, `backend/node_server.mjs`, `frontend/src/App.jsx`, `tests/verify_backtest_engine.mjs`)**:
+  - `historical_candles` 및 `backtest_runs` 테이블 추가(SQLite · PostgreSQL 양방향 동기화), Look-Ahead Bias 완전 차단 봉 단위 시뮬레이션(업비트 수수료 0.05% + 슬리피지 bps 반영).
+  - 10대 봇 전체 시뮬레이션, 70% In-Sample 최적화 ➔ 30% Out-of-Sample 검증, Sharpe/Sortino/CAGR/MDD/WinRate/Profit Factor/평균 보유시간 산출, `/api/backtest/run|history|apply-params` API 및 `[📊 백테스트 검증]` 모달(SVG Equity Curve · 원클릭 봇 파라미터 반영) 추가.
+- **[과제 3 · P1] OBI · 스프레드 가드 · MTF 역추세 필터 · ATR 변동성 역가중 사이징 & 슬리피지 원장 (`backend/common/execution_quality_service.mjs`, `backend/common/algo_lab_service.mjs`, `backend/node_server.mjs`, `tests/verify_execution_quality_and_sizing.mjs`)**:
+  - 상위 5호가 기반 스프레드(`>0.35%`) 및 상단 매도벽 불균형(`OBI < -0.45`) 돌파형 봇 매수 진입 보류, 60m+240m 상위 타임프레임 동반 하락장 역추세 진입 차단.
+  - 14봉 ATR% 기반 변동성 역가중 포지션 사이징(`0.5x ~ 1.0x`, 소액 계좌 `5,250원` 하한 보존) 및 `trades`/`bot_positions` 테이블 `expected_price`·`slippage_bps`·`atr_sizing_mult` 컬럼·`/api/statistics` 평균 슬리피지 집계·UI 배지 표출.
+- **[과제 4 · P1] 멀티채널 알림 허브 & 인터랙티브 캔들스틱 타점 마커 차트 (`backend/common/notification_hub.mjs`, `backend/node_server.mjs`, `frontend/src/App.jsx`, `tests/verify_notification_hub_and_journal.mjs`)**:
+  - Telegram Bot API · Discord Webhook · WebPush 통합 알림 디스패처 구현(`LIVE_BUY`, `LIVE_SELL`, `DRAIN_HANDOFF`, `CIRCUIT_BREAKER`, `ZERO_BALANCE_HALT`, `WEEKLY_ROTATION` 이벤트 지원, 설정 UI 5-1 카드·마스킹·테스트 발송 API).
+  - `/api/chart/trade-markers` API 및 체결 내역/통계 테이블 `[📈 타점]` 인터랙티브 SVG 캔들스틱 + VWAP/LRC/20MA + BUY(▲)/SELL(▼) 타점 마커 차트 모달 구축.
+- **[과제 5 · P1] AES-256-GCM 암호화 볼트 & Docker / GitHub Actions CI (`backend/common/crypto_vault.mjs`, `llm_filter_worker.py`, `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `.github/workflows/ci.yml`, `tests/verify_crypto_vault.mjs`)**:
+  - Node.js ↔ Python 상호 복호화 호환 AES-256-GCM(`enc:v1:...`) 암호화 볼트, 평문 설정 자동 암호화 마이그레이션(`0600` 권한) 및 내보내기/불러오기 시 민감 키 보호.
+  - 비루트(non-root) 멀티스테이지 `Dockerfile` + `HEALTHCHECK`, `docker-compose.yml`, `.dockerignore`, GitHub Actions CI(문법 검사·시크릿 유출 차단·프론트엔드 빌드·Node 10종 + Python QA 자동 검증) 추가.
 
 ### [v0.0.28] - 2026-11-19
 #### 전수 QA 명세서·자동화 검증 스위트 추가 및 6대 영역 결함 전면 수정 (Surgical Fix)

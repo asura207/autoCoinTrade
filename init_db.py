@@ -360,7 +360,10 @@ def init_database(db_path: Optional[str] = None) -> None:
                 sell_fee {real_type},
                 realized_pnl {real_type},
                 pnl_pct {real_type},
-                buy_reason TEXT
+                buy_reason TEXT,
+                expected_price {real_type},
+                slippage_bps {real_type},
+                atr_sizing_mult {real_type}
             );
             """
         )
@@ -377,6 +380,9 @@ def init_database(db_path: Optional[str] = None) -> None:
             ("realized_pnl", real_type),
             ("pnl_pct", real_type),
             ("buy_reason", "TEXT"),
+            ("expected_price", real_type),
+            ("slippage_bps", real_type),
+            ("atr_sizing_mult", real_type),
         ]
         if sqlite_mode:
             existing_pos_cols = {
@@ -534,10 +540,33 @@ def init_database(db_path: Optional[str] = None) -> None:
                 sell_date TEXT,
                 profit_krw BIGINT,
                 profit_pct {real_type},
-                status TEXT NOT NULL DEFAULT 'HOLDING'
+                status TEXT NOT NULL DEFAULT 'HOLDING',
+                buy_reason TEXT,
+                sell_reason TEXT,
+                expected_price {real_type},
+                slippage_bps {real_type},
+                atr_sizing_mult {real_type}
             );
             """
         )
+        trade_alter_cols = [
+            ("buy_reason", "TEXT"),
+            ("sell_reason", "TEXT"),
+            ("expected_price", real_type),
+            ("slippage_bps", real_type),
+            ("atr_sizing_mult", real_type),
+        ]
+        if sqlite_mode:
+            tr_cols = {
+                dict(r)["name"]
+                for r in conn.execute("PRAGMA table_info(trades);").fetchall()
+            }
+            for col_name, col_def in trade_alter_cols:
+                if col_name not in tr_cols:
+                    conn.execute(f"ALTER TABLE trades ADD COLUMN {col_name} {col_def};")
+        else:
+            for col_name, col_def in trade_alter_cols:
+                conn.execute(f"ALTER TABLE trades ADD COLUMN IF NOT EXISTS {col_name} {col_def};")
 
         # 7. 가상 체결 원장 테이블 (paper_trades, paper_bot_positions)
         conn.execute(
@@ -747,6 +776,51 @@ def init_database(db_path: Optional[str] = None) -> None:
                 snapshot_date TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (year_month, mode)
+            );
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS historical_candles (
+                market TEXT NOT NULL,
+                unit TEXT NOT NULL,
+                candle_time_kst TEXT NOT NULL,
+                open {real_type} NOT NULL,
+                high {real_type} NOT NULL,
+                low {real_type} NOT NULL,
+                close {real_type} NOT NULL,
+                volume {real_type} NOT NULL,
+                PRIMARY KEY (market, unit, candle_time_kst)
+            );
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS backtest_runs (
+                id {id_primary_key},
+                bot_id TEXT NOT NULL,
+                markets_json TEXT NOT NULL,
+                unit TEXT NOT NULL DEFAULT '15',
+                start_date TEXT,
+                end_date TEXT,
+                initial_capital BIGINT NOT NULL DEFAULT 1000000,
+                final_equity BIGINT NOT NULL DEFAULT 1000000,
+                total_return_pct {real_type} NOT NULL DEFAULT 0,
+                cagr_pct {real_type} DEFAULT 0,
+                mdd_pct {real_type} NOT NULL DEFAULT 0,
+                win_rate_pct {real_type} NOT NULL DEFAULT 0,
+                profit_factor {real_type} NOT NULL DEFAULT 0,
+                sharpe_ratio {real_type} NOT NULL DEFAULT 0,
+                sortino_ratio {real_type} DEFAULT 0,
+                avg_holding_hours {real_type} DEFAULT 0,
+                slippage_bps {real_type} DEFAULT 5,
+                trade_count INTEGER NOT NULL DEFAULT 0,
+                params_json TEXT,
+                walk_forward_json TEXT,
+                equity_curve_json TEXT,
+                trades_json TEXT,
+                created_at TEXT NOT NULL
             );
             """
         )

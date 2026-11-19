@@ -92,15 +92,62 @@ def _get_system_setting(key: str, default: str = "", db_path: Optional[str] = No
     return default
 
 
+def _decrypt_vault_secret(raw_val: Any) -> str:
+    """
+    AES-256-GCM 암호화 볼트 문자열(enc:v1:<iv>:<tag>:<cipher>)을 복호화합니다.
+    평문(enc:v1: 미포함)인 경우 하위 호환성을 위해 그대로 반환합니다.
+    """
+    s = str(raw_val or "").strip()
+    if not s or not s.startswith("enc:v1:"):
+        return s
+    try:
+        import hashlib
+        parts = s[len("enc:v1:") :].split(":")
+        if len(parts) != 3:
+            return ""
+        iv = bytes.fromhex(parts[0])
+        tag = bytes.fromhex(parts[1])
+        ciphertext = bytes.fromhex(parts[2]) if parts[2] else b""
+
+        master_key = (os.getenv("AUTOCOIN_MASTER_KEY") or "").strip()
+        if not master_key:
+            key_file = Path(os.getenv("AUTOCOIN_VAULT_KEY_PATH") or str(BASE_DIR / "data" / ".vault_master_key"))
+            if not key_file.is_absolute():
+                key_file = (BASE_DIR / key_file).resolve()
+            if key_file.exists():
+                master_key = key_file.read_text(encoding="utf-8").strip()
+        if not master_key:
+            return ""
+
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            derived_key = hashlib.pbkdf2_hmac("sha256", master_key.encode("utf-8"), b"autocoin-vault-salt-v1", 100000, dklen=32)
+            aesgcm = AESGCM(derived_key)
+            plain_bytes = aesgcm.decrypt(iv, ciphertext + tag, None)
+            return plain_bytes.decode("utf-8")
+        except ImportError:
+            import subprocess
+            node_script = (
+                "import('./backend/common/crypto_vault.mjs').then(m => "
+                "process.stdout.write(m.safeDecryptSecret(process.env._ACT_ENC_VAL || '')))"
+            )
+            env_copy = dict(os.environ)
+            env_copy["_ACT_ENC_VAL"] = s
+            out = subprocess.check_output(["node", "-e", node_script], cwd=str(BASE_DIR), env=env_copy, timeout=3.0)
+            return out.decode("utf-8").strip()
+    except Exception:
+        return ""
+
+
 def get_gemini_api_key(db_path: Optional[str] = None) -> str:
     cfg = _load_runtime_config()
-    cfg_key = str(cfg.get("gemini_api_key") or "").strip()
+    cfg_key = _decrypt_vault_secret(cfg.get("gemini_api_key"))
     if cfg_key and cfg_key != "YOUR_GEMINI_API_KEY_HERE":
         return cfg_key
-    db_key = _get_system_setting("gemini_api_key", "", db_path=db_path).strip()
+    db_key = _decrypt_vault_secret(_get_system_setting("gemini_api_key", "", db_path=db_path))
     if db_key:
         return db_key
-    return os.getenv("GEMINI_API_KEY", "").strip()
+    return _decrypt_vault_secret(os.getenv("GEMINI_API_KEY", ""))
 
 
 def get_ollama_runtime_config(db_path: Optional[str] = None) -> Dict[str, Any]:

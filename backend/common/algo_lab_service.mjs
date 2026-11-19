@@ -481,6 +481,21 @@ export function buildIndicators(marketData) {
     ind.m15.kellogg = kellogg;
   }
   ind.atr = ind.m15?.atr14 || ind.m60?.atr14 || null;
+  const m60Bullish = ind.m60 ? Boolean(ind.m60.ema20 >= ind.m60.ema60 || ind.m60.supertrend?.isUp) : null;
+  const m240Bullish = ind.m240 ? Boolean((ind.m240.ma20 && price >= ind.m240.ma20) || ind.m240.supertrend?.isUp) : null;
+  const dayBullish = ind.day?.ma20 ? price >= ind.day.ma20 : null;
+  const htfChecks = [m60Bullish, m240Bullish, dayBullish].filter((v) => v !== null);
+  const htfAlignedUp = htfChecks.length === 0 ? true : htfChecks.some(Boolean);
+  const htfStronglyBearish =
+    (m60Bullish === false && m240Bullish === false) ||
+    (m60Bullish === false && dayBullish === false && ind.m60?.supertrend?.isUp === false);
+  ind.mtf = {
+    m60Bullish,
+    m240Bullish,
+    dayBullish,
+    htfAlignedUp,
+    htfStronglyBearish,
+  };
   return ind;
 }
 
@@ -1326,20 +1341,33 @@ const STRATEGIES = {
  * @returns {{signal: "BUY"|"SELL"|"HOLD", reason: string, splitIndex?: number, sellPositionIds?: number[]}}
  */
 export function evaluateStrategy(botId, marketData, indicators, position, options = {}) {
-  const fn = STRATEGIES[normalizeBotId(botId)];
+  const normId = normalizeBotId(botId);
+  const fn = STRATEGIES[normId];
   if (!fn) return hold("알 수 없는 봇");
   const price = Number(marketData?.price || 0);
   if (!(price > 0)) return hold("현재가 없음");
   const heldList = Array.isArray(position) ? position : position ? [position] : [];
   try {
-    return fn({
+    const resolvedInd = indicators || buildIndicators(marketData);
+    const res = fn({
       price,
       marketData,
-      ind: indicators || buildIndicators(marketData),
+      ind: resolvedInd,
       held: heldList,
       params: options.params || {},
       options: { ...options, market: options.market || marketData?.market },
     });
+    const mtfTrendBots = new Set(["bot_01", "bot_02", "bot_03", "bot_04", "bot_07", "bot_09"]);
+    if (
+      res?.signal === "BUY" &&
+      heldList.length === 0 &&
+      mtfTrendBots.has(normId) &&
+      options?.enforceMtf !== false &&
+      resolvedInd?.mtf?.htfStronglyBearish
+    ) {
+      return hold("MTF 상위 타임프레임(1시간/4시간) 하락 추세 역행 진입 차단");
+    }
+    return res;
   } catch (err) {
     return hold(`지표 계산 오류: ${err.message}`);
   }

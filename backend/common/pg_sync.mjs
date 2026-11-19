@@ -291,6 +291,15 @@ export class PgSyncManager {
       }
 
       // 3. trades
+      try {
+        await this.pool.query(`
+          ALTER TABLE trades ADD COLUMN IF NOT EXISTS buy_reason TEXT;
+          ALTER TABLE trades ADD COLUMN IF NOT EXISTS sell_reason TEXT;
+          ALTER TABLE trades ADD COLUMN IF NOT EXISTS expected_price NUMERIC(20,8);
+          ALTER TABLE trades ADD COLUMN IF NOT EXISTS slippage_bps NUMERIC(12,4);
+          ALTER TABLE trades ADD COLUMN IF NOT EXISTS atr_sizing_mult NUMERIC(10,4);
+        `);
+      } catch {}
       const trades = sqliteDb.prepare("SELECT * FROM trades").all();
       for (const t of trades) {
         await this.pool.query(
@@ -336,6 +345,9 @@ export class PgSyncManager {
           ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS realized_pnl NUMERIC(20,2);
           ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS pnl_pct NUMERIC(8,2);
           ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS buy_reason TEXT;
+          ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS expected_price NUMERIC(20,8);
+          ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS slippage_bps NUMERIC(12,4);
+          ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS atr_sizing_mult NUMERIC(10,4);
         `);
       } catch {}
 

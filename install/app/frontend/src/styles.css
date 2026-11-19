@@ -1899,3 +1899,144 @@ body {
   font-size: 13px;
 }
 
+/* ============================================================
+   WebSocket 실시간 배지 / 체결 슬리피지 배지 / 백테스트 & 타점 차트 모달
+   ============================================================ */
+.ws-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.ws-mode-badge.ws-live {
+  background: rgba(16, 185, 129, 0.18);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.45);
+}
+
+.ws-mode-badge.ws-rest {
+  background: rgba(245, 158, 11, 0.18);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.45);
+}
+
+.slippage-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 6px;
+  font-size: 10.5px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.slippage-pill.slip-good {
+  background: rgba(16, 185, 129, 0.16);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.35);
+}
+
+.slippage-pill.slip-neutral {
+  background: rgba(148, 163, 184, 0.16);
+  color: #cbd5e1;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+}
+
+.slippage-pill.slip-warn {
+  background: rgba(245, 158, 11, 0.18);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.4);
+}
+
+.quant-modal-box {
+  width: 96%;
+  max-width: 980px;
+  max-height: 90vh;
+  background: #0f172a;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  border-radius: 16px;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 25px 60px -10px rgba(0, 0, 0, 0.85), 0 0 24px rgba(56, 189, 248, 0.18);
+  overflow: hidden;
+}
+
+.quant-modal-header {
+  padding: 16px 22px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  background: rgba(15, 23, 42, 0.96);
+}
+
+.quant-modal-body {
+  padding: 18px 22px 24px 22px;
+  overflow-y: auto;
+}
+
+.quant-field-label {
+  display: block;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: #94a3b8;
+  margin-bottom: 5px;
+}
+
+.backtest-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+  padding: 14px;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.72);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.backtest-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  gap: 10px;
+}
+
+.bt-metric-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: rgba(30, 41, 59, 0.65);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.bt-metric-label {
+  font-size: 11px;
+  color: #94a3b8;
+  font-weight: 600;
+}
+
+.bt-metric-val {
+  font-size: 18px;
+  font-weight: 800;
+  color: #f8fafc;
+}
+
+.bt-metric-sub {
+  font-size: 11px;
+  color: #64748b;
+}
+
+.quant-chart-shell {
+  padding: 14px;
+  border-radius: 12px;
+  background: rgba(2, 6, 23, 0.75);
+  border: 1px solid rgba(56, 189, 248, 0.22);
+}
+
+

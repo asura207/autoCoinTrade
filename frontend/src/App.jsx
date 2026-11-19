@@ -1308,7 +1308,7 @@ export default function App() {
   const [gateError, setGateError] = useState("");
 
   // 프로젝트 버전 및 히스토리 모달 상태
-  const [appVersion, setAppVersion] = useState("0.0.28");
+  const [appVersion, setAppVersion] = useState("0.0.29");
   const [historyModalOpen, setHistoryModalOpen] = useState(false);
   const [historyContent, setHistoryContent] = useState("");
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -2748,6 +2748,297 @@ export default function App() {
     }
   };
 
+  // ------------------------------------------------------------------
+  // [고도화 2] 히스토리컬 캔들 백테스팅 & Walk-Forward 검증 모달 상태 및 핸들러
+  // ------------------------------------------------------------------
+  const [backtestModalOpen, setBacktestModalOpen] = useState(false);
+  const [backtestForm, setBacktestForm] = useState({
+    bot_id: "bot_10",
+    market: "KRW-BTC",
+    timeframe: "15m",
+    days: 30,
+    initial_capital: 1000000,
+    slippage_bps: 5,
+    walk_forward: true,
+  });
+  const [backtestLoading, setBacktestLoading] = useState(false);
+  const [backtestResult, setBacktestResult] = useState(null);
+  const [backtestHistory, setBacktestHistory] = useState([]);
+  const [backtestApplying, setBacktestApplying] = useState(false);
+
+  const fetchBacktestHistory = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/backtest/history?limit=15`);
+      if (resp.ok) {
+        const data = await resp.json();
+        if (Array.isArray(data.history)) {
+          setBacktestHistory(data.history);
+        }
+      }
+    } catch {}
+  }, []);
+
+  const handleOpenBacktestModal = useCallback(
+    (defaultBotId = null) => {
+      if (defaultBotId && defaultBotId !== "all") {
+        setBacktestForm((prev) => ({ ...prev, bot_id: defaultBotId }));
+      }
+      setBacktestModalOpen(true);
+      fetchBacktestHistory();
+    },
+    [fetchBacktestHistory]
+  );
+
+  const handleRunBacktest = async (e) => {
+    if (e) e.preventDefault();
+    setBacktestLoading(true);
+    try {
+      const resp = await fetch(`${API_BASE}/api/backtest/run`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(backtestForm),
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        setBacktestResult(data);
+        fetchBacktestHistory();
+      } else {
+        showModal("백테스트 실행 실패", data.message || "백테스트 중 오류가 발생했습니다.", "danger");
+      }
+    } catch (err) {
+      showModal("백테스트 통신 오류", err.message, "danger");
+    } finally {
+      setBacktestLoading(false);
+    }
+  };
+
+  const handleApplyBacktestParams = async (targetBotId, paramsToApply) => {
+    if (!targetBotId || !paramsToApply) return;
+    setBacktestApplying(true);
+    try {
+      const resp = await fetch(`${API_BASE}/api/backtest/apply-params`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bot_id: targetBotId,
+          params: paramsToApply,
+        }),
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        await fetchOverviewAndBots(false);
+        await fetchAlgoLabModels();
+        showModal("백테스트 파라미터 적용 완료", data.message, "success");
+      } else {
+        showModal("파라미터 적용 실패", data.message || "적용 중 오류가 발생했습니다.", "danger");
+      }
+    } catch (err) {
+      showModal("통신 오류", err.message, "danger");
+    } finally {
+      setBacktestApplying(false);
+    }
+  };
+
+  // ------------------------------------------------------------------
+  // [고도화 4-A] 인터랙티브 캔들스틱 + VWAP/LRC/20MA + BUY/SELL 타점 차트 모달 상태 및 핸들러
+  // ------------------------------------------------------------------
+  const [chartModalOpen, setChartModalOpen] = useState(false);
+  const [chartQuery, setChartQuery] = useState({
+    market: "KRW-BTC",
+    bot_id: "all",
+    mode: "live",
+    unit: 15,
+    count: 72,
+  });
+  const [chartData, setChartData] = useState({
+    candles: [],
+    markers: [],
+    loading: false,
+  });
+  const [hoveredCandleIdx, setHoveredCandleIdx] = useState(null);
+
+  const fetchTradeMarkerChart = useCallback(async (override = {}) => {
+    setChartData((prev) => ({ ...prev, loading: true }));
+    try {
+      const mkt = override.market || chartQuery.market || "KRW-BTC";
+      const bId = override.bot_id || chartQuery.bot_id || "all";
+      const md = override.mode || chartQuery.mode || "live";
+      const un = Number(override.unit || chartQuery.unit || 15);
+      const cnt = Number(override.count || chartQuery.count || 72);
+      const qs = new URLSearchParams({
+        market: mkt,
+        bot_id: bId,
+        mode: md,
+        unit: String(un),
+        count: String(cnt),
+      });
+      const resp = await fetch(`${API_BASE}/api/chart/trade-markers?${qs.toString()}`);
+      if (resp.ok) {
+        const data = await resp.json();
+        setChartData({
+          candles: Array.isArray(data.candles) ? data.candles : [],
+          markers: Array.isArray(data.markers) ? data.markers : [],
+          loading: false,
+        });
+      } else {
+        setChartData((prev) => ({ ...prev, loading: false }));
+      }
+    } catch {
+      setChartData((prev) => ({ ...prev, loading: false }));
+    }
+  }, [chartQuery.market, chartQuery.bot_id, chartQuery.mode, chartQuery.unit, chartQuery.count]);
+
+  const openTradeMarkerChart = useCallback(
+    ({ market = "KRW-BTC", bot_id = "all", mode = "live", unit = 15 } = {}) => {
+      const next = {
+        market: market || "KRW-BTC",
+        bot_id: bot_id || "all",
+        mode: mode || "live",
+        unit: Number(unit || 15),
+        count: 72,
+      };
+      setChartQuery(next);
+      setHoveredCandleIdx(null);
+      setChartModalOpen(true);
+      fetchTradeMarkerChart(next);
+    },
+    [fetchTradeMarkerChart]
+  );
+
+  // ------------------------------------------------------------------
+  // [고도화 4-B] 멀티채널 실시간 알림 허브 (Telegram · Discord · WebPush) 설정 상태 및 핸들러
+  // ------------------------------------------------------------------
+  const [notifForm, setNotifForm] = useState({
+    telegram_enabled: false,
+    telegram_bot_token: "",
+    telegram_bot_token_masked: "",
+    telegram_chat_id: "",
+    discord_enabled: false,
+    discord_webhook_url: "",
+    discord_webhook_url_masked: "",
+    webpush_enabled: true,
+    notify_on_trade: true,
+    notify_on_risk: true,
+    notify_on_daily_report: true,
+  });
+  const [notifSaving, setNotifSaving] = useState(false);
+  const [notifTesting, setNotifTesting] = useState(false);
+  const [notifMsg, setNotifMsg] = useState(null);
+
+  const fetchNotificationSettings = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/settings/notifications`);
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.settings) {
+          setNotifForm((prev) => ({
+            ...prev,
+            ...data.settings,
+            telegram_bot_token: "",
+            discord_webhook_url: "",
+          }));
+        }
+      }
+    } catch {}
+  }, []);
+
+  const handleSaveNotificationSettings = async (e) => {
+    if (e) e.preventDefault();
+    setNotifSaving(true);
+    setNotifMsg(null);
+    try {
+      const payload = {
+        telegram_enabled: Boolean(notifForm.telegram_enabled),
+        telegram_chat_id: String(notifForm.telegram_chat_id || "").trim(),
+        discord_enabled: Boolean(notifForm.discord_enabled),
+        webpush_enabled: Boolean(notifForm.webpush_enabled),
+        notify_on_trade: Boolean(notifForm.notify_on_trade),
+        notify_on_risk: Boolean(notifForm.notify_on_risk),
+        notify_on_daily_report: Boolean(notifForm.notify_on_daily_report),
+      };
+      if (String(notifForm.telegram_bot_token || "").trim()) {
+        payload.telegram_bot_token = String(notifForm.telegram_bot_token).trim();
+      }
+      if (String(notifForm.discord_webhook_url || "").trim()) {
+        payload.discord_webhook_url = String(notifForm.discord_webhook_url).trim();
+      }
+      const resp = await fetch(`${API_BASE}/api/settings/notifications`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        if (data.settings) {
+          setNotifForm((prev) => ({
+            ...prev,
+            ...data.settings,
+            telegram_bot_token: "",
+            discord_webhook_url: "",
+          }));
+        }
+        setNotifMsg({
+          type: "success",
+          text: data.message || "멀티채널 알림 설정이 AES-256-GCM 암호화 저장되었습니다.",
+        });
+      } else {
+        setNotifMsg({
+          type: "danger",
+          text: data.message || "알림 설정 저장에 실패했습니다.",
+        });
+      }
+    } catch (err) {
+      setNotifMsg({
+        type: "danger",
+        text: `알림 설정 저장 오류: ${err.message}`,
+      });
+    } finally {
+      setNotifSaving(false);
+    }
+  };
+
+  const handleTestMultiChannelNotification = async () => {
+    setNotifTesting(true);
+    setNotifMsg(null);
+    try {
+      const resp = await fetch(`${API_BASE}/api/settings/notifications/test`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bot_id: selectedBotId || "bot_10",
+          market: "KRW-BTC",
+          message: "autoCoinTrade 멀티채널 실시간 알림(Telegram · Discord · WebPush) 연동 테스트 발송입니다.",
+        }),
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        showWebPushNotification("🔔 멀티채널 알림 테스트", "Telegram · Discord · WebPush 테스트 알림이 발송되었습니다.", {
+          tag: `multi-channel-test-${Date.now()}`,
+        });
+        const ch = data.result?.channels || {};
+        const tgStatus = ch.telegram?.sent ? "Telegram 성공" : `Telegram(${ch.telegram?.reason || "미전송"})`;
+        const dcStatus = ch.discord?.sent ? "Discord 성공" : `Discord(${ch.discord?.reason || "미전송"})`;
+        const wpStatus = ch.webpush?.sent ? `WebPush(${ch.webpush?.count ?? 0}명)` : "WebPush(인앱 표시)";
+        setNotifMsg({
+          type: "success",
+          text: `${data.message} [${tgStatus} · ${dcStatus} · ${wpStatus}]`,
+        });
+      } else {
+        setNotifMsg({
+          type: "danger",
+          text: data.message || "테스트 알림 발송에 실패했습니다.",
+        });
+      }
+    } catch (err) {
+      setNotifMsg({
+        type: "danger",
+        text: `테스트 발송 오류: ${err.message}`,
+      });
+    } finally {
+      setNotifTesting(false);
+    }
+  };
+
   const fetchAiBriefing = async (silent = false) => {
     if (silent && isAiBusyRef.current) return;
     try {
@@ -3437,6 +3728,7 @@ export default function App() {
     fetchRotationStatus();
     fetchEntryCode();
     fetchOllamaSettings();
+    fetchNotificationSettings();
 
     const timer = setInterval(() => {
       fetchUpbitStatus();
@@ -3489,8 +3781,9 @@ export default function App() {
       fetchEntryCode();
       fetchRotationStatus();
       fetchOllamaSettings(true);
+      fetchNotificationSettings();
     }
-  }, [activeMenu, fetchEntryCode, fetchRotationStatus, fetchOllamaSettings]);
+  }, [activeMenu, fetchEntryCode, fetchRotationStatus, fetchOllamaSettings, fetchNotificationSettings]);
 
   useEffect(() => {
     sessionStorage.setItem("autoCoinTrade_bot", selectedBotId);
@@ -4730,19 +5023,26 @@ export default function App() {
             </button>
           </div>
 
-          {/* 요구사항 19: 메뉴 상단 업비트 통신 상태 식별 영역 (초록/노랑/빨강 + 마우스 오버 사유 표기) */}
+          {/* 요구사항 19: 메뉴 상단 업비트 통신 상태 식별 영역 (초록/노랑/빨강 + WebSocket 실시간 배지 + 마우스 오버 사유 표기) */}
           <div className="upbit-status-box">
             <div className="status-header-row">
               <span className="status-title">업비트 Open API 통신 상태</span>
-              <div className="status-indicator-wrap">
+              <div className="status-indicator-wrap" style={{ display: "flex", alignItems: "center", gap: "6px" }}>
                 <span className={`status-dot ${upbitStatus.status || "green"}`} />
                 <span className={`status-label-text ${upbitStatus.status || "green"}`}>
                   {upbitStatus.label || "정상통신"}
                 </span>
+                <span
+                  className={`ws-mode-badge ${
+                    upbitStatus.transport_mode === "WS" || upbitStatus.ws_connected ? "ws-live" : "ws-rest"
+                  }`}
+                >
+                  {upbitStatus.transport_mode === "WS" || upbitStatus.ws_connected ? "WS 실시간" : "REST 폴백"}
+                </span>
               </div>
             </div>
             <div className="status-help-hint" style={{ fontSize: "11.5px", color: "#94a3b8" }}>
-              마우스를 올리면 상세 통신 사유를 확인합니다.
+              마우스를 올리면 상세 통신 사유 및 WebSocket 스트림 상태를 확인합니다.
             </div>
 
             {/* 마우스 오버 시 나타나는 상세 이유 툴팁 */}
@@ -4753,6 +5053,12 @@ export default function App() {
               <div>• 상태: {upbitStatus.label}</div>
               <div>• 사유: {upbitStatus.reason}</div>
               <div>• 응답속도: {upbitStatus.latency_ms ?? 0} ms</div>
+              <div>
+                • 시세 스트림:{" "}
+                {upbitStatus.transport_mode === "WS" || upbitStatus.ws_connected
+                  ? `WebSocket 실시간 (구독 ${upbitStatus.ws_status?.subscribed_count ?? 0}종목 · 틱 반응형 청산 활성)`
+                  : "REST API 자동 폴백 동작 중"}
+              </div>
               <div>• 최근확인: {upbitStatus.checked_at || "-"}</div>
             </div>
           </div>
@@ -6609,11 +6915,28 @@ export default function App() {
                   gap: "8px",
                 }}
               >
-                <h3 style={{ fontSize: "16px", fontWeight: 700 }}>
-                  거래 내역 게시판 ({currentBot?.nickname})
-                </h3>
+                <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+                  <h3 style={{ fontSize: "16px", fontWeight: 700, margin: 0 }}>
+                    거래 내역 게시판 ({currentBot?.nickname})
+                  </h3>
+                  <button
+                    type="button"
+                    className="btn btn-outline"
+                    style={{ padding: "4px 10px", fontSize: "11.5px" }}
+                    onClick={() =>
+                      openTradeMarkerChart({
+                        market: trades[0]?.market || "KRW-BTC",
+                        bot_id: currentBot?.bot_id || selectedBotId || "all",
+                        mode: "live",
+                        unit: 15,
+                      })
+                    }
+                  >
+                    📈 캔들 타점 차트 열기
+                  </button>
+                </div>
                 <span style={{ fontSize: "12px", color: "#94a3b8" }}>
-                  * 매도를 하지 않은 포지션은 매도/매도일/차익 칸이 빈칸으로 유지되며, 매도 완료 시 해당 줄(Row)이 자동 업데이트됩니다.
+                  * 매도를 하지 않은 포지션은 매도/매도일/차익 칸이 빈칸으로 유지되며, 행의 [📈 타점] 버튼으로 매수/매도 체결 캔들 차트를 확인할 수 있습니다.
                 </span>
               </div>
 
@@ -6623,23 +6946,29 @@ export default function App() {
                     <tr>
                       <th>번호</th>
                       <th>코인(마켓)</th>
-                      <th>매수 (금액 / 단가 / 수량)</th>
+                      <th>매수 (금액 / 단가 / 수량 / 체결품질)</th>
                       <th>매도 (금액 / 단가 / 수량)</th>
                       <th>매수일</th>
                       <th>매도일</th>
                       <th>차익</th>
+                      <th style={{ textAlign: "center" }}>타점 차트</th>
                     </tr>
                   </thead>
                   <tbody>
                     {trades.length === 0 ? (
                       <tr>
-                        <td colSpan={7} style={{ textAlign: "center", padding: "32px", color: "#94a3b8" }}>
+                        <td colSpan={8} style={{ textAlign: "center", padding: "32px", color: "#94a3b8" }}>
                           해당 봇의 거래 내역이 없습니다.
                         </td>
                       </tr>
                     ) : (
                       trades.map((t, index) => {
                         const isSold = t.status === "COMPLETED" && t.sell_amount !== null;
+                        const hasSlip =
+                          t.slippage_bps !== null &&
+                          t.slippage_bps !== undefined &&
+                          Number.isFinite(Number(t.slippage_bps));
+                        const slipVal = hasSlip ? Number(t.slippage_bps) : 0;
                         return (
                           <tr key={t.id}>
                             <td>{trades.length - index}</td>
@@ -6649,6 +6978,22 @@ export default function App() {
                               <div style={{ fontSize: "12px", color: "#94a3b8" }}>
                                 단가 {Number(t.buy_price).toLocaleString()}원 | 수량 {t.buy_volume}
                               </div>
+                              {hasSlip && (
+                                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "3px" }}>
+                                  <span
+                                    className={`slippage-pill ${
+                                      slipVal <= 0 ? "slip-good" : slipVal <= 15 ? "slip-neutral" : "slip-warn"
+                                    }`}
+                                  >
+                                    슬리피지 {slipVal >= 0 ? `+${slipVal}` : slipVal} bps
+                                  </span>
+                                  {t.atr_sizing_mult && Number(t.atr_sizing_mult) !== 1 && (
+                                    <span className="slippage-pill slip-neutral">
+                                      ATR사이징 {Math.round(Number(t.atr_sizing_mult) * 100)}%
+                                    </span>
+                                  )}
+                                </div>
+                              )}
                             </td>
                             {/* 매도하지 않았다면 빈칸(""), 매도했다면 업데이트된 값 표시 */}
                             <td>
@@ -6676,6 +7021,23 @@ export default function App() {
                               ) : (
                                 ""
                               )}
+                            </td>
+                            <td style={{ textAlign: "center" }}>
+                              <button
+                                type="button"
+                                className="btn btn-outline"
+                                style={{ padding: "4px 8px", fontSize: "11px" }}
+                                onClick={() =>
+                                  openTradeMarkerChart({
+                                    market: t.market || "KRW-BTC",
+                                    bot_id: t.bot_id || currentBot?.bot_id || "all",
+                                    mode: "live",
+                                    unit: 15,
+                                  })
+                                }
+                              >
+                                📈 타점
+                              </button>
                             </td>
                           </tr>
                         );
@@ -6760,6 +7122,40 @@ export default function App() {
                       : "가상거래 전용 원장(paper_trades)에 기록된 10대 알고리즘 모의 체결 통계입니다."}
                   </div>
                 </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                <span
+                  className={`slippage-pill ${
+                    Number(stats.avg_slippage_bps || 0) <= 0
+                      ? "slip-good"
+                      : Number(stats.avg_slippage_bps || 0) <= 15
+                      ? "slip-neutral"
+                      : "slip-warn"
+                  }`}
+                  style={{ fontSize: "12px", padding: "5px 10px" }}
+                  title="체결 품질(Execution Quality): 신호 기대가 대비 실제 체결가 슬리피지 평균 (1 bps = 0.01%)"
+                >
+                  🎯 평균 체결 슬리피지:{" "}
+                  {Number(stats.avg_slippage_bps || 0) >= 0
+                    ? `+${Number(stats.avg_slippage_bps || 0).toFixed(2)}`
+                    : Number(stats.avg_slippage_bps || 0).toFixed(2)}{" "}
+                  bps (측정 {stats.execution_quality_summary?.measured_trades_count ?? 0}건)
+                </span>
+                <button
+                  type="button"
+                  className="btn btn-outline"
+                  style={{ padding: "5px 12px", fontSize: "12px" }}
+                  onClick={() =>
+                    openTradeMarkerChart({
+                      market: statsTrades[0]?.market || "KRW-BTC",
+                      bot_id: statsTradeFilterBot || "all",
+                      mode: statsModeTab,
+                      unit: 15,
+                    })
+                  }
+                >
+                  📈 캔들 타점 차트 보기
+                </button>
               </div>
             </div>
 
@@ -7260,18 +7656,19 @@ export default function App() {
                       <th>매도 정보 (금액 / 단가 / 수량 / 일시)</th>
                       <th>실현손익</th>
                       <th style={{ width: "80px", textAlign: "center" }}>상태</th>
+                      <th style={{ width: "85px", textAlign: "center" }}>타점</th>
                     </tr>
                   </thead>
                   <tbody>
                     {statsTradeLoading && statsTrades.length === 0 ? (
                       <tr>
-                        <td colSpan={7} style={{ textAlign: "center", padding: "36px", color: "#94a3b8" }}>
+                        <td colSpan={8} style={{ textAlign: "center", padding: "36px", color: "#94a3b8" }}>
                           거래 내역을 불러오는 중입니다...
                         </td>
                       </tr>
                     ) : statsTrades.length === 0 ? (
                       <tr>
-                        <td colSpan={7} style={{ textAlign: "center", padding: "36px", color: "#94a3b8" }}>
+                        <td colSpan={8} style={{ textAlign: "center", padding: "36px", color: "#94a3b8" }}>
                           {statsModeTab === "live" ? "체결된 실제 거래 내역이 없습니다." : "체결된 가상 거래 내역이 없습니다."}
                         </td>
                       </tr>
@@ -7279,6 +7676,11 @@ export default function App() {
                       statsTrades.map((t, idx) => {
                         const rowNum = (statsTradePage - 1) * statsTradeLimit + idx + 1;
                         const isSold = t.status === "COMPLETED" && t.sell_amount !== null;
+                        const hasSlip =
+                          t.slippage_bps !== null &&
+                          t.slippage_bps !== undefined &&
+                          Number.isFinite(Number(t.slippage_bps));
+                        const slipVal = hasSlip ? Number(t.slippage_bps) : 0;
 
                         return (
                           <tr key={`live-trade-${t.id}-${idx}`}>
@@ -7302,6 +7704,17 @@ export default function App() {
                               <div style={{ fontSize: "11px", color: "#64748b", marginTop: "2px" }}>
                                 {String(t.buy_date || "").slice(0, 19).replace("T", " ")}
                               </div>
+                              {hasSlip && (
+                                <div style={{ marginTop: "3px" }}>
+                                  <span
+                                    className={`slippage-pill ${
+                                      slipVal <= 0 ? "slip-good" : slipVal <= 15 ? "slip-neutral" : "slip-warn"
+                                    }`}
+                                  >
+                                    슬리피지 {slipVal >= 0 ? `+${slipVal}` : slipVal} bps
+                                  </span>
+                                </div>
+                              )}
                             </td>
                             <td>
                               {isSold ? (
@@ -7362,6 +7775,23 @@ export default function App() {
                               >
                                 {t.status === "COMPLETED" ? "완료" : "보유중"}
                               </span>
+                            </td>
+                            <td style={{ textAlign: "center" }}>
+                              <button
+                                type="button"
+                                className="btn btn-outline"
+                                style={{ padding: "3px 8px", fontSize: "11px" }}
+                                onClick={() =>
+                                  openTradeMarkerChart({
+                                    market: t.market || "KRW-BTC",
+                                    bot_id: t.bot_id || "all",
+                                    mode: statsModeTab,
+                                    unit: 15,
+                                  })
+                                }
+                              >
+                                📈 차트
+                              </button>
                             </td>
                           </tr>
                         );
@@ -7522,6 +7952,28 @@ export default function App() {
                     flexShrink: 0,
                   }}
                 >
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={() => handleOpenBacktestModal(selectedAlgoModelId)}
+                    style={{
+                      padding: "8px 14px",
+                      fontSize: "12.5px",
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      background: "linear-gradient(135deg, #0ea5e9, #4f46e5)",
+                      borderColor: "#38bdf8",
+                      color: "#f8fafc",
+                      fontWeight: 800,
+                      whiteSpace: "nowrap",
+                      flexShrink: 0,
+                    }}
+                    title="과거 캔들 기반 정량 백테스팅 및 In-Sample(70%)/Out-of-Sample(30%) 워크포워드 검증을 실행합니다."
+                  >
+                    <span>📊</span>
+                    <span>백테스트 검증</span>
+                  </button>
                   <button
                     type="button"
                     className="btn btn-primary"
@@ -9035,6 +9487,28 @@ export default function App() {
                     }}
                   >
                     {Number(rotationConfigDraft.is_enabled) === 1 ? "🟢 주간 자동 로테이션 ON" : "⚪ 주간 자동 로테이션 OFF"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={() => handleOpenBacktestModal(selectedAlgoModelId)}
+                    style={{
+                      padding: "8px 14px",
+                      fontSize: "12.5px",
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      background: "linear-gradient(135deg, #0ea5e9, #4f46e5)",
+                      borderColor: "#38bdf8",
+                      color: "#f8fafc",
+                      fontWeight: 800,
+                      whiteSpace: "nowrap",
+                      flexShrink: 0,
+                    }}
+                    title="과거 캔들 기반 정량 백테스팅 및 In-Sample(70%)/Out-of-Sample(30%) 워크포워드 검증을 실행합니다."
+                  >
+                    <span>📊</span>
+                    <span>백테스트 검증</span>
                   </button>
                   <button
                     type="button"
@@ -10924,6 +11398,277 @@ export default function App() {
               </div>
             </div>
 
+            {/* 5-1. 실시간 멀티채널 알림 허브 설정 (Telegram · Discord · WebPush · AES-256-GCM 암호화 저장) */}
+            <div className="card" style={{ marginTop: "20px" }}>
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  marginBottom: "14px",
+                  flexWrap: "wrap",
+                  gap: "10px",
+                }}
+              >
+                <div>
+                  <h3 style={{ fontSize: "16px", fontWeight: 700, margin: 0, color: "#f8fafc" }}>
+                    5-1. 실시간 멀티채널 알림 허브 (Telegram · Discord · WebPush)
+                  </h3>
+                  <p style={{ margin: "4px 0 0 0", fontSize: "12.5px", color: "#94a3b8" }}>
+                    실전 매수·매도 체결, Graceful Drain 이관, 일일 -4.0% 서킷브레이커, 잔고 0 긴급 중지, 주간 로테이션 이벤트를 모바일로 즉시 수신합니다. (토큰/Webhook은 AES-256-GCM 암호화 보관)
+                  </p>
+                </div>
+                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                  <span
+                    className={`slippage-pill ${notifForm.telegram_enabled ? "slip-good" : "slip-neutral"}`}
+                    style={{ fontSize: "11.5px", padding: "3px 9px" }}
+                  >
+                    ✈️ Telegram {notifForm.telegram_enabled ? "ON" : "OFF"}
+                  </span>
+                  <span
+                    className={`slippage-pill ${notifForm.discord_enabled ? "slip-good" : "slip-neutral"}`}
+                    style={{ fontSize: "11.5px", padding: "3px 9px" }}
+                  >
+                    💬 Discord {notifForm.discord_enabled ? "ON" : "OFF"}
+                  </span>
+                </div>
+              </div>
+
+              <form onSubmit={handleSaveNotificationSettings} style={{ maxWidth: "820px" }}>
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
+                    gap: "14px",
+                    marginBottom: "14px",
+                  }}
+                >
+                  <div
+                    style={{
+                      padding: "14px",
+                      borderRadius: "10px",
+                      background: "rgba(15, 23, 42, 0.55)",
+                      border: "1px solid rgba(56, 189, 248, 0.22)",
+                    }}
+                  >
+                    <label
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "8px",
+                        fontSize: "13.5px",
+                        fontWeight: 700,
+                        color: "#38bdf8",
+                        marginBottom: "10px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={Boolean(notifForm.telegram_enabled)}
+                        onChange={(e) =>
+                          setNotifForm((prev) => ({ ...prev, telegram_enabled: e.target.checked }))
+                        }
+                        style={{ width: "16px", height: "16px", accentColor: "#38bdf8" }}
+                      />
+                      <span>✈️ Telegram Bot 알림 사용</span>
+                    </label>
+                    <div className="form-row" style={{ marginBottom: "10px" }}>
+                      <label>
+                        Bot Token{" "}
+                        {notifForm.telegram_bot_token_masked && (
+                          <span style={{ color: "#34d399", fontSize: "11px" }}>
+                            (저장됨: {notifForm.telegram_bot_token_masked})
+                          </span>
+                        )}
+                      </label>
+                      <input
+                        type="password"
+                        className="form-input"
+                        placeholder={
+                          notifForm.telegram_bot_token_masked
+                            ? "변경 시에만 새 Bot Token 입력"
+                            : "123456789:ABCdefGHIjklMNO..."
+                        }
+                        value={notifForm.telegram_bot_token}
+                        onChange={(e) =>
+                          setNotifForm((prev) => ({ ...prev, telegram_bot_token: e.target.value }))
+                        }
+                      />
+                    </div>
+                    <div className="form-row" style={{ margin: 0 }}>
+                      <label>Chat ID</label>
+                      <input
+                        type="text"
+                        className="form-input"
+                        placeholder="예: 123456789 또는 -100..."
+                        value={notifForm.telegram_chat_id}
+                        onChange={(e) =>
+                          setNotifForm((prev) => ({ ...prev, telegram_chat_id: e.target.value }))
+                        }
+                      />
+                    </div>
+                  </div>
+
+                  <div
+                    style={{
+                      padding: "14px",
+                      borderRadius: "10px",
+                      background: "rgba(15, 23, 42, 0.55)",
+                      border: "1px solid rgba(129, 140, 248, 0.25)",
+                    }}
+                  >
+                    <label
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "8px",
+                        fontSize: "13.5px",
+                        fontWeight: 700,
+                        color: "#a5b4fc",
+                        marginBottom: "10px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={Boolean(notifForm.discord_enabled)}
+                        onChange={(e) =>
+                          setNotifForm((prev) => ({ ...prev, discord_enabled: e.target.checked }))
+                        }
+                        style={{ width: "16px", height: "16px", accentColor: "#818cf8" }}
+                      />
+                      <span>💬 Discord Webhook 알림 사용</span>
+                    </label>
+                    <div className="form-row" style={{ marginBottom: "10px" }}>
+                      <label>
+                        Webhook URL{" "}
+                        {notifForm.discord_webhook_url_masked && (
+                          <span style={{ color: "#34d399", fontSize: "11px" }}>
+                            (저장됨: {notifForm.discord_webhook_url_masked})
+                          </span>
+                        )}
+                      </label>
+                      <input
+                        type="password"
+                        className="form-input"
+                        placeholder={
+                          notifForm.discord_webhook_url_masked
+                            ? "변경 시에만 새 Discord Webhook URL 입력"
+                            : "https://discord.com/api/webhooks/..."
+                        }
+                        value={notifForm.discord_webhook_url}
+                        onChange={(e) =>
+                          setNotifForm((prev) => ({ ...prev, discord_webhook_url: e.target.value }))
+                        }
+                      />
+                    </div>
+                    <label
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "8px",
+                        fontSize: "12.5px",
+                        color: "#cbd5e1",
+                        marginTop: "12px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={Boolean(notifForm.webpush_enabled)}
+                        onChange={(e) =>
+                          setNotifForm((prev) => ({ ...prev, webpush_enabled: e.target.checked }))
+                        }
+                        style={{ width: "15px", height: "15px", accentColor: "#10b981" }}
+                      />
+                      <span>🔔 브라우저 WebPush 동시 브로드캐스트</span>
+                    </label>
+                  </div>
+                </div>
+
+                {/* 이벤트 유형 필터 토글 */}
+                <div
+                  style={{
+                    display: "flex",
+                    gap: "16px",
+                    flexWrap: "wrap",
+                    padding: "10px 14px",
+                    borderRadius: "8px",
+                    background: "rgba(15, 23, 42, 0.6)",
+                    border: "1px solid rgba(148, 163, 184, 0.18)",
+                    marginBottom: "14px",
+                    fontSize: "12.5px",
+                    color: "#e2e8f0",
+                  }}
+                >
+                  <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(notifForm.notify_on_trade)}
+                      onChange={(e) =>
+                        setNotifForm((prev) => ({ ...prev, notify_on_trade: e.target.checked }))
+                      }
+                    />
+                    <span>🟢 실전 매수/매도 & Drain 이관</span>
+                  </label>
+                  <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(notifForm.notify_on_risk)}
+                      onChange={(e) =>
+                        setNotifForm((prev) => ({ ...prev, notify_on_risk: e.target.checked }))
+                      }
+                    />
+                    <span>🚨 서킷브레이커(-4%) & 잔고0 긴급중지</span>
+                  </label>
+                  <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(notifForm.notify_on_daily_report)}
+                      onChange={(e) =>
+                        setNotifForm((prev) => ({ ...prev, notify_on_daily_report: e.target.checked }))
+                      }
+                    />
+                    <span>🏆 주간 로테이션 & 일일 요약</span>
+                  </label>
+                </div>
+
+                {notifMsg && (
+                  <div
+                    style={{
+                      padding: "8px 12px",
+                      borderRadius: "6px",
+                      fontSize: "12.5px",
+                      marginBottom: "12px",
+                      background:
+                        notifMsg.type === "success"
+                          ? "rgba(34, 197, 94, 0.15)"
+                          : "rgba(239, 68, 68, 0.15)",
+                      color: notifMsg.type === "success" ? "#4ade80" : "#fca5a5",
+                      border: `1px solid ${notifMsg.type === "success" ? "#22c55e" : "#ef4444"}`,
+                    }}
+                  >
+                    {notifMsg.text}
+                  </div>
+                )}
+
+                <div className="btn-group">
+                  <button type="submit" className="btn btn-primary" disabled={notifSaving}>
+                    {notifSaving ? "암호화 저장 중..." : "💾 멀티채널 알림 설정 암호화 저장"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-outline"
+                    disabled={notifTesting}
+                    onClick={handleTestMultiChannelNotification}
+                  >
+                    {notifTesting ? "⏳ 테스트 발송 중..." : "🔔 테스트 알림 발송"}
+                  </button>
+                </div>
+              </form>
+            </div>
+
             {/* 요구사항: 프로젝트 버전 및 변경 이력 (History) 정보 카드 */}
             <div className="card" style={{ marginTop: "20px" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px", flexWrap: "wrap", gap: "10px" }}>
@@ -11068,6 +11813,621 @@ export default function App() {
               <button className="btn btn-primary" onClick={closeModal}>
                 확인
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* [고도화 2] 히스토리컬 캔들 백테스팅 & Walk-Forward 검증 모달 */}
+      {backtestModalOpen && (
+        <div className="modal-backdrop" onClick={() => setBacktestModalOpen(false)}>
+          <div className="quant-modal-box" onClick={(e) => e.stopPropagation()}>
+            <div className="quant-modal-header">
+              <div>
+                <h3 style={{ margin: 0, fontSize: "17px", fontWeight: 800, color: "#f8fafc" }}>
+                  📊 정량 백테스팅 & Walk-Forward 검증소
+                </h3>
+                <div style={{ fontSize: "12px", color: "#94a3b8", marginTop: "3px" }}>
+                  Look-Ahead Bias 0% 봉별 순차 시뮬레이션 · 수수료 0.05% + 가변 슬리피지 반영 · In-Sample(70%) / Out-of-Sample(30%)
+                </div>
+              </div>
+              <button
+                type="button"
+                className="btn btn-outline"
+                style={{ padding: "4px 10px", fontSize: "12px" }}
+                onClick={() => setBacktestModalOpen(false)}
+              >
+                닫기 ✕
+              </button>
+            </div>
+
+            <div className="quant-modal-body">
+              <form onSubmit={handleRunBacktest} className="backtest-form-grid">
+                <div>
+                  <label className="quant-field-label">대상 알고리즘 봇</label>
+                  <select
+                    className="form-input"
+                    value={backtestForm.bot_id}
+                    onChange={(e) => setBacktestForm((p) => ({ ...p, bot_id: e.target.value }))}
+                  >
+                    {ALL_BOT_IDS_UI.map((id) => (
+                      <option key={id} value={id}>
+                        {id} · {BOT_SHORT_LABELS_UI[id]}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="quant-field-label">대상 마켓</label>
+                  <select
+                    className="form-input"
+                    value={backtestForm.market}
+                    onChange={(e) => setBacktestForm((p) => ({ ...p, market: e.target.value }))}
+                  >
+                    {["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-DOGE", "KRW-SUI", "KRW-AVAX", "KRW-SHIB"].map(
+                      (m) => (
+                        <option key={m} value={m}>
+                          {m}
+                        </option>
+                      )
+                    )}
+                  </select>
+                </div>
+                <div>
+                  <label className="quant-field-label">검증 기간</label>
+                  <select
+                    className="form-input"
+                    value={backtestForm.days}
+                    onChange={(e) => setBacktestForm((p) => ({ ...p, days: Number(e.target.value) }))}
+                  >
+                    <option value={7}>최근 7일</option>
+                    <option value={14}>최근 14일</option>
+                    <option value={30}>최근 30일</option>
+                    <option value={90}>최근 90일</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="quant-field-label">타임프레임</label>
+                  <select
+                    className="form-input"
+                    value={backtestForm.timeframe}
+                    onChange={(e) => setBacktestForm((p) => ({ ...p, timeframe: e.target.value }))}
+                  >
+                    <option value="15m">15분봉</option>
+                    <option value="60m">60분봉</option>
+                    <option value="240m">4시간봉</option>
+                    <option value="days">일봉</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="quant-field-label">슬리피지 (bps · 5=0.05%)</label>
+                  <input
+                    type="number"
+                    min="0"
+                    max="100"
+                    className="form-input"
+                    value={backtestForm.slippage_bps}
+                    onChange={(e) => setBacktestForm((p) => ({ ...p, slippage_bps: Number(e.target.value || 0) }))}
+                  />
+                </div>
+                <div style={{ display: "flex", alignItems: "flex-end", gap: "8px" }}>
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      fontSize: "12px",
+                      color: "#cbd5e1",
+                      cursor: "pointer",
+                      paddingBottom: "8px",
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={Boolean(backtestForm.walk_forward)}
+                      onChange={(e) => setBacktestForm((p) => ({ ...p, walk_forward: e.target.checked }))}
+                    />
+                    <span>Walk-Forward(70/30)</span>
+                  </label>
+                  <button
+                    type="submit"
+                    className="btn btn-primary"
+                    disabled={backtestLoading}
+                    style={{ width: "100%", padding: "9px 14px", fontSize: "12.5px", fontWeight: 700 }}
+                  >
+                    {backtestLoading ? "⏳ 시뮬레이션 실행 중..." : "🚀 백테스트 실행"}
+                  </button>
+                </div>
+              </form>
+
+              {backtestResult && (
+                <div style={{ marginTop: "18px" }}>
+                  <div className="backtest-metrics-grid">
+                    <div className="bt-metric-card">
+                      <span className="bt-metric-label">총 수익률 / 최종 자산</span>
+                      <span
+                        className="bt-metric-val"
+                        style={{
+                          color:
+                            Number(backtestResult.total_return_pct) > 0
+                              ? "#ef4444"
+                              : Number(backtestResult.total_return_pct) < 0
+                              ? "#3b82f6"
+                              : "#f8fafc",
+                        }}
+                      >
+                        {Number(backtestResult.total_return_pct) >= 0
+                          ? `+${backtestResult.total_return_pct}%`
+                          : `${backtestResult.total_return_pct}%`}
+                      </span>
+                      <span className="bt-metric-sub">{formatKRW(backtestResult.final_equity)}</span>
+                    </div>
+                    <div className="bt-metric-card">
+                      <span className="bt-metric-label">CAGR (연환산)</span>
+                      <span className="bt-metric-val">{backtestResult.cagr_pct}%</span>
+                      <span className="bt-metric-sub">슬리피지 {backtestResult.slippage_bps}bps</span>
+                    </div>
+                    <div className="bt-metric-card">
+                      <span className="bt-metric-label">최대 낙폭 (MDD)</span>
+                      <span className="bt-metric-val" style={{ color: "#f87171" }}>
+                        -{backtestResult.mdd_pct}%
+                      </span>
+                      <span className="bt-metric-sub">리스크 방어 지표</span>
+                    </div>
+                    <div className="bt-metric-card">
+                      <span className="bt-metric-label">승률 / 전적</span>
+                      <span className="bt-metric-val">{backtestResult.win_rate_pct}%</span>
+                      <span className="bt-metric-sub">
+                        총 {backtestResult.total_trades}건 ({backtestResult.win_trades}승 {backtestResult.lose_trades}패)
+                      </span>
+                    </div>
+                    <div className="bt-metric-card">
+                      <span className="bt-metric-label">손익비 (Profit Factor)</span>
+                      <span className="bt-metric-val">{backtestResult.profit_factor}</span>
+                      <span className="bt-metric-sub">평균 보유 {backtestResult.avg_holding_hours}h</span>
+                    </div>
+                    <div className="bt-metric-card">
+                      <span className="bt-metric-label">Sharpe / Sortino</span>
+                      <span className="bt-metric-val">
+                        {backtestResult.sharpe_ratio} / {backtestResult.sortino_ratio}
+                      </span>
+                      <span className="bt-metric-sub">위험조정 수익성</span>
+                    </div>
+                  </div>
+
+                  {/* SVG 자산 곡선(Equity Curve) */}
+                  {Array.isArray(backtestResult.equity_curve) && backtestResult.equity_curve.length > 1 && (() => {
+                    const pts = backtestResult.equity_curve;
+                    const W = 820;
+                    const H = 200;
+                    const padL = 62;
+                    const padR = 16;
+                    const padT = 18;
+                    const padB = 26;
+                    const eqVals = pts.map((p) => Number(p.equity || 0));
+                    const minEq = Math.min(...eqVals) * 0.995;
+                    const maxEq = Math.max(...eqVals) * 1.005;
+                    const spanEq = Math.max(1, maxEq - minEq);
+                    const toX = (i) => padL + (i / Math.max(1, pts.length - 1)) * (W - padL - padR);
+                    const toY = (v) => padT + (1 - (v - minEq) / spanEq) * (H - padT - padB);
+                    const polyPoints = pts.map((p, i) => `${toX(i).toFixed(1)},${toY(Number(p.equity)).toFixed(1)}`).join(" ");
+                    const baseY = toY(Number(backtestResult.initial_capital || 1000000));
+                    const isPositive = Number(backtestResult.total_return_pct) >= 0;
+
+                    return (
+                      <div className="quant-chart-shell" style={{ marginTop: "14px" }}>
+                        <div style={{ fontSize: "12.5px", fontWeight: 700, color: "#cbd5e1", marginBottom: "6px" }}>
+                          📈 백테스트 자산 곡선 (Equity Curve · {backtestResult.market} · {backtestResult.bot_id})
+                        </div>
+                        <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "200px", display: "block" }}>
+                          <line
+                            x1={padL}
+                            y1={baseY}
+                            x2={W - padR}
+                            y2={baseY}
+                            stroke="rgba(148,163,184,0.35)"
+                            strokeDasharray="4,4"
+                          />
+                          <polyline
+                            fill="none"
+                            stroke={isPositive ? "#ef4444" : "#3b82f6"}
+                            strokeWidth="2.2"
+                            points={polyPoints}
+                          />
+                          <text x={padL - 8} y={padT + 8} textAnchor="end" fill="#94a3b8" fontSize="10">
+                            {formatKRW(Math.floor(maxEq))}
+                          </text>
+                          <text x={padL - 8} y={H - padB} textAnchor="end" fill="#94a3b8" fontSize="10">
+                            {formatKRW(Math.floor(minEq))}
+                          </text>
+                          <text x={padL} y={H - 6} textAnchor="start" fill="#64748b" fontSize="10">
+                            {String(pts[0]?.time || "").slice(0, 16)}
+                          </text>
+                          <text x={W - padR} y={H - 6} textAnchor="end" fill="#64748b" fontSize="10">
+                            {String(pts[pts.length - 1]?.time || "").slice(0, 16)}
+                          </text>
+                        </svg>
+                      </div>
+                    );
+                  })()}
+
+                  {/* Walk-Forward 70% In-Sample -> 30% Out-of-Sample 결과 및 원클릭 적용 */}
+                  {backtestResult.walk_forward && (
+                    <div
+                      style={{
+                        marginTop: "14px",
+                        padding: "14px",
+                        borderRadius: "10px",
+                        background: "rgba(30, 41, 59, 0.72)",
+                        border: "1px solid rgba(56, 189, 248, 0.35)",
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        flexWrap: "wrap",
+                        gap: "12px",
+                      }}
+                    >
+                      <div style={{ fontSize: "12.5px", color: "#e2e8f0", lineHeight: "1.6" }}>
+                        <div style={{ fontWeight: 800, color: "#38bdf8", marginBottom: "4px" }}>
+                          🧪 Walk-Forward 전진 검증 결과 (In-Sample 70% 최적화 ➔ Out-of-Sample 30% 실전 검증)
+                        </div>
+                        <div>
+                          • 최적 탐색 파라미터: 손절{" "}
+                          <strong>-{backtestResult.walk_forward.best_params?.stop_loss_pct}%</strong> / 익절{" "}
+                          <strong>+{backtestResult.walk_forward.best_params?.take_profit_pct}%</strong>
+                        </div>
+                        <div>
+                          • In-Sample(70%): 수익률{" "}
+                          <strong>{backtestResult.walk_forward.in_sample?.total_return_pct}%</strong> / MDD -
+                          {backtestResult.walk_forward.in_sample?.mdd_pct}% | Out-of-Sample(30%): 수익률{" "}
+                          <strong style={{ color: "#34d399" }}>
+                            {backtestResult.walk_forward.out_of_sample?.total_return_pct}%
+                          </strong>{" "}
+                          / MDD -{backtestResult.walk_forward.out_of_sample?.mdd_pct}%
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        disabled={backtestApplying}
+                        onClick={() =>
+                          handleApplyBacktestParams(
+                            backtestResult.bot_id,
+                            backtestResult.walk_forward.best_params
+                          )
+                        }
+                        style={{ padding: "8px 14px", fontSize: "12.5px", fontWeight: 700 }}
+                      >
+                        {backtestApplying ? "⏳ 적용 중..." : "✨ 이 파라미터를 봇 설정에 적용"}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* 최근 백테스트 실행 이력 */}
+              {backtestHistory.length > 0 && (
+                <div style={{ marginTop: "18px" }}>
+                  <div style={{ fontSize: "13px", fontWeight: 700, color: "#cbd5e1", marginBottom: "8px" }}>
+                    🕘 최근 백테스트 실행 이력
+                  </div>
+                  <div className="table-container" style={{ maxHeight: "180px", overflowY: "auto" }}>
+                    <table className="board-table">
+                      <thead>
+                        <tr>
+                          <th>실행시각</th>
+                          <th>봇</th>
+                          <th>마켓</th>
+                          <th>수익률</th>
+                          <th>MDD</th>
+                          <th>승률</th>
+                          <th>Sharpe</th>
+                          <th>거래수</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {backtestHistory.map((h) => (
+                          <tr key={h.id}>
+                            <td style={{ fontSize: "11.5px", color: "#94a3b8" }}>{h.created_at}</td>
+                            <td style={{ fontWeight: 700 }}>{h.bot_id}</td>
+                            <td>{h.market}</td>
+                            <td style={{ fontWeight: 700, color: Number(h.total_return_pct) >= 0 ? "#ef4444" : "#3b82f6" }}>
+                              {Number(h.total_return_pct) >= 0 ? `+${h.total_return_pct}%` : `${h.total_return_pct}%`}
+                            </td>
+                            <td style={{ color: "#f87171" }}>-{h.mdd_pct}%</td>
+                            <td>{h.win_rate_pct}%</td>
+                            <td>{h.sharpe_ratio}</td>
+                            <td>{h.total_trades}건</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* [고도화 4-A] 캔들스틱 + VWAP/LRC/20MA + BUY/SELL 타점 마커 차트 모달 */}
+      {chartModalOpen && (
+        <div className="modal-backdrop" onClick={() => setChartModalOpen(false)}>
+          <div className="quant-modal-box" onClick={(e) => e.stopPropagation()}>
+            <div className="quant-modal-header">
+              <div>
+                <h3 style={{ margin: 0, fontSize: "17px", fontWeight: 800, color: "#f8fafc" }}>
+                  📈 인터랙티브 매매 타점 차트 ({chartQuery.market})
+                </h3>
+                <div style={{ fontSize: "12px", color: "#94a3b8", marginTop: "3px" }}>
+                  캔들스틱 + VWAP(황색) · 20봉 선형회귀채널 LRC(하늘색) · 20MA(보라색) + 매수(▲ 빨강)/매도(▼ 파랑) 체결 마커
+                </div>
+              </div>
+              <button
+                type="button"
+                className="btn btn-outline"
+                style={{ padding: "4px 10px", fontSize: "12px" }}
+                onClick={() => setChartModalOpen(false)}
+              >
+                닫기 ✕
+              </button>
+            </div>
+
+            <div className="quant-modal-body">
+              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "14px", alignItems: "center" }}>
+                <select
+                  className="form-input"
+                  style={{ width: "auto", minWidth: "125px" }}
+                  value={chartQuery.market}
+                  onChange={(e) => {
+                    const next = { ...chartQuery, market: e.target.value };
+                    setChartQuery(next);
+                    fetchTradeMarkerChart(next);
+                  }}
+                >
+                  {["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-DOGE", "KRW-SUI", "KRW-AVAX", "KRW-SHIB"].map(
+                    (m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    )
+                  )}
+                </select>
+                <select
+                  className="form-input"
+                  style={{ width: "auto", minWidth: "130px" }}
+                  value={chartQuery.bot_id}
+                  onChange={(e) => {
+                    const next = { ...chartQuery, bot_id: e.target.value };
+                    setChartQuery(next);
+                    fetchTradeMarkerChart(next);
+                  }}
+                >
+                  <option value="all">전체 봇 마커</option>
+                  {ALL_BOT_IDS_UI.map((id) => (
+                    <option key={id} value={id}>
+                      {id} · {BOT_SHORT_LABELS_UI[id]}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  className="form-input"
+                  style={{ width: "auto", minWidth: "105px" }}
+                  value={chartQuery.mode}
+                  onChange={(e) => {
+                    const next = { ...chartQuery, mode: e.target.value };
+                    setChartQuery(next);
+                    fetchTradeMarkerChart(next);
+                  }}
+                >
+                  <option value="live">실거래 원장</option>
+                  <option value="paper">가상거래 원장</option>
+                </select>
+                <select
+                  className="form-input"
+                  style={{ width: "auto", minWidth: "95px" }}
+                  value={chartQuery.unit}
+                  onChange={(e) => {
+                    const next = { ...chartQuery, unit: Number(e.target.value) };
+                    setChartQuery(next);
+                    fetchTradeMarkerChart(next);
+                  }}
+                >
+                  <option value={15}>15분봉</option>
+                  <option value={60}>60분봉</option>
+                  <option value={240}>4시간봉</option>
+                </select>
+                <button
+                  type="button"
+                  className="btn btn-outline"
+                  style={{ padding: "7px 12px", fontSize: "12px" }}
+                  onClick={() => fetchTradeMarkerChart(chartQuery)}
+                >
+                  🔄 새로고침
+                </button>
+              </div>
+
+              {chartData.loading ? (
+                <div style={{ padding: "60px", textAlign: "center", color: "#94a3b8" }}>
+                  ⏳ 캔들 데이터와 체결 타점을 불러오는 중입니다...
+                </div>
+              ) : chartData.candles.length === 0 ? (
+                <div style={{ padding: "60px", textAlign: "center", color: "#94a3b8" }}>
+                  표시할 캔들 데이터가 없습니다.
+                </div>
+              ) : (() => {
+                const candles = chartData.candles;
+                const markers = chartData.markers || [];
+                const W = 860;
+                const H = 330;
+                const padL = 70;
+                const padR = 20;
+                const padT = 22;
+                const padB = 30;
+                const allPrices = [];
+                candles.forEach((c) => {
+                  allPrices.push(c.high, c.low);
+                  if (c.vwap) allPrices.push(c.vwap);
+                  if (c.lrc_upper) allPrices.push(c.lrc_upper);
+                  if (c.lrc_lower) allPrices.push(c.lrc_lower);
+                });
+                const minP = Math.min(...allPrices) * 0.997;
+                const maxP = Math.max(...allPrices) * 1.003;
+                const spanP = Math.max(1e-8, maxP - minP);
+                const plotW = W - padL - padR;
+                const plotH = H - padT - padB;
+                const stepX = plotW / Math.max(1, candles.length);
+                const candleW = Math.max(2, Math.min(9, stepX * 0.62));
+                const getX = (i) => padL + i * stepX + stepX / 2;
+                const getY = (p) => padT + (1 - (p - minP) / spanP) * plotH;
+
+                const makeLine = (field) =>
+                  candles
+                    .map((c, i) => (c[field] ? `${getX(i).toFixed(1)},${getY(c[field]).toFixed(1)}` : null))
+                    .filter(Boolean)
+                    .join(" ");
+
+                const activeC =
+                  hoveredCandleIdx !== null && candles[hoveredCandleIdx]
+                    ? candles[hoveredCandleIdx]
+                    : candles[candles.length - 1];
+
+                return (
+                  <div className="quant-chart-shell">
+                    {activeC && (
+                      <div
+                        style={{
+                          display: "flex",
+                          gap: "12px",
+                          flexWrap: "wrap",
+                          fontSize: "12px",
+                          color: "#cbd5e1",
+                          marginBottom: "8px",
+                          padding: "6px 10px",
+                          background: "rgba(15, 23, 42, 0.7)",
+                          borderRadius: "8px",
+                        }}
+                      >
+                        <strong style={{ color: "#38bdf8" }}>{String(activeC.time || "").slice(0, 16)}</strong>
+                        <span>시 {Number(activeC.open).toLocaleString()}</span>
+                        <span style={{ color: "#f87171" }}>고 {Number(activeC.high).toLocaleString()}</span>
+                        <span style={{ color: "#60a5fa" }}>저 {Number(activeC.low).toLocaleString()}</span>
+                        <span style={{ fontWeight: 700, color: "#f8fafc" }}>종 {Number(activeC.close).toLocaleString()}</span>
+                        {activeC.vwap && <span style={{ color: "#f59e0b" }}>VWAP {Math.floor(activeC.vwap).toLocaleString()}</span>}
+                        {activeC.ma20 && <span style={{ color: "#c084fc" }}>20MA {Math.floor(activeC.ma20).toLocaleString()}</span>}
+                        <span style={{ marginLeft: "auto", color: "#94a3b8" }}>체결 마커 {markers.length}건</span>
+                      </div>
+                    )}
+                    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "330px", display: "block" }}>
+                      {[0, 0.25, 0.5, 0.75, 1].map((r, idx) => {
+                        const y = padT + r * plotH;
+                        const pVal = maxP - r * spanP;
+                        return (
+                          <g key={idx}>
+                            <line x1={padL} y1={y} x2={W - padR} y2={y} stroke="rgba(148,163,184,0.12)" strokeDasharray="3,3" />
+                            <text x={padL - 8} y={y + 4} textAnchor="end" fill="#94a3b8" fontSize="10">
+                              {pVal >= 1000 ? Math.floor(pVal).toLocaleString() : pVal.toFixed(2)}
+                            </text>
+                          </g>
+                        );
+                      })}
+
+                      {/* LRC 채널 상/하단 */}
+                      <polyline fill="none" stroke="rgba(56, 189, 248, 0.45)" strokeWidth="1.2" strokeDasharray="4,3" points={makeLine("lrc_upper")} />
+                      <polyline fill="none" stroke="rgba(56, 189, 248, 0.45)" strokeWidth="1.2" strokeDasharray="4,3" points={makeLine("lrc_lower")} />
+                      {/* 20MA */}
+                      <polyline fill="none" stroke="#c084fc" strokeWidth="1.3" points={makeLine("ma20")} />
+                      {/* VWAP */}
+                      <polyline fill="none" stroke="#f59e0b" strokeWidth="1.8" points={makeLine("vwap")} />
+
+                      {/* 캔들스틱 */}
+                      {candles.map((c, idx) => {
+                        const x = getX(idx);
+                        const yHigh = getY(c.high);
+                        const yLow = getY(c.low);
+                        const yOpen = getY(c.open);
+                        const yClose = getY(c.close);
+                        const isUp = c.close >= c.open;
+                        const col = isUp ? "#ef4444" : "#3b82f6";
+                        const bodyTop = Math.min(yOpen, yClose);
+                        const bodyH = Math.max(1.5, Math.abs(yClose - yOpen));
+                        return (
+                          <g key={idx} onMouseEnter={() => setHoveredCandleIdx(idx)} style={{ cursor: "crosshair" }}>
+                            <line x1={x} y1={yHigh} x2={x} y2={yLow} stroke={col} strokeWidth="1.2" />
+                            <rect x={x - candleW / 2} y={bodyTop} width={candleW} height={bodyH} fill={col} rx="1" />
+                          </g>
+                        );
+                      })}
+
+                      {/* BUY(▲ 빨강) / SELL(▼ 파랑) 체결 타점 마커 */}
+                      {markers.map((m, idx) => {
+                        const cIdx = Math.max(0, Math.min(candles.length - 1, Number(m.candle_index ?? candles.length - 1)));
+                        const x = getX(cIdx);
+                        const y = getY(Number(m.price || candles[cIdx]?.close || 0));
+                        const isBuy = m.type === "BUY";
+                        return (
+                          <g key={`mk-${idx}`}>
+                            <text
+                              x={x}
+                              y={isBuy ? y + 14 : y - 6}
+                              textAnchor="middle"
+                              fill={isBuy ? "#ef4444" : "#3b82f6"}
+                              fontSize="13"
+                              fontWeight="900"
+                            >
+                              {isBuy ? "▲" : "▼"}
+                              <title>
+                                {`${m.type} | ${m.bot_id} | ${m.time} | ${Number(m.price).toLocaleString()}원 | ${m.reason || ""}`}
+                              </title>
+                            </text>
+                          </g>
+                        );
+                      })}
+                    </svg>
+
+                    {markers.length > 0 && (
+                      <div style={{ marginTop: "10px", maxHeight: "140px", overflowY: "auto" }}>
+                        <table className="board-table">
+                          <thead>
+                            <tr>
+                              <th>구분</th>
+                              <th>봇</th>
+                              <th>시각</th>
+                              <th>체결가</th>
+                              <th>사유 / 손익</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {markers.slice(0, 20).map((m, i) => (
+                              <tr key={i}>
+                                <td>
+                                  <span
+                                    style={{
+                                      fontWeight: 800,
+                                      color: m.type === "BUY" ? "#ef4444" : "#3b82f6",
+                                    }}
+                                  >
+                                    {m.type === "BUY" ? "▲ BUY" : "▼ SELL"}
+                                  </span>
+                                </td>
+                                <td>{m.bot_id}</td>
+                                <td style={{ fontSize: "11.5px", color: "#94a3b8" }}>{m.time}</td>
+                                <td style={{ fontWeight: 700 }}>{Number(m.price || 0).toLocaleString()}원</td>
+                                <td style={{ fontSize: "12px", color: "#cbd5e1" }}>
+                                  {m.reason || "-"}
+                                  {m.type === "SELL" && m.profit_krw !== undefined && (
+                                    <span style={{ marginLeft: "6px" }}>{renderColoredProfit(m.profit_krw)}</span>
+                                  )}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
           </div>
         </div>

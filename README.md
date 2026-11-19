@@ -1,6 +1,6 @@
 # Upbit AutoCoinTrade (업비트 다중 전략 자동매매 & 실시간 AI 퀀트 시스템)
 
-[![Version](https://img.shields.io/badge/version-v0.0.28-green.svg)](history.md)
+[![Version](https://img.shields.io/badge/version-v0.0.29-green.svg)](history.md)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 > 업비트(Upbit) Open API를 기반으로 선택형(1~3개) 퀀트 실전 봇을 동시에 운용하고, 10대 알고리즘 상시 가상 경쟁(Always-On Arena)과 실시간 뉴스 인텔리전스, 그리고 듀얼 AI 스트리밍 시황 분석(30분 로컬 Ollama `qwen3-news` 1순위 ➔ Gemini Flash 백업 ➔ BTC 20MA 기계적 안전 모드 / 1시간 Gemini Pro 심층 교차 검증)을 결합한 통합 가상자산 퀀트 트레이딩 플랫폼입니다.
@@ -166,8 +166,28 @@
   - 기본 입장 코드: **`stock`** (한글 자판 오타 `ㄴ새차` 자동 변환 지원)
   - 설정 화면에서 현재 적용된 코드를 확인(보기/숨기기)하고, 원하는 새 코드로 언제든 변경 저장 가능 (`.env`의 `GATE_CODE`와도 연동).
   - 변경 시 로컬 SQLite 및 원격 PostgreSQL에 실시간 양방향 동기화.
-- **API 키 관리**: 업비트 Open API 키 및 Google Gemini API 키 웹 UI 등록 및 마스킹 저장.
+- **API 키 관리 & AES-256-GCM 보안 볼트(Vault)**: 업비트 Open API 키, Google Gemini 키, 텔레그램·디스코드 알림 자격증명을 AES-256-GCM(`enc:v1:...`)으로 암호화 저장하고 자동 마이그레이션(권한 `0600`) 및 마스킹 표시 지원.
+- **🔔 멀티채널 실시간 알림 허브 (Telegram · Discord · WebPush)**: 실전 매수·매도 체결, 서킷 브레이커, 잔고 0원 중지, 주간 TOP 1 로테이션 및 Graceful Drain 자금 이관 이벤트를 실시간 발송하며 채널별/이벤트별 On·Off 토글과 테스트 발송 지원.
 - **데이터 마이그레이션 (JSON)**: SQLite 전체 DB 백업 내보내기(Export) 및 무결성 복원(Import).
+
+---
+
+## ⚡ v0.0.29 기관급 퀀트 고도화 아키텍처 (5대 핵심 확장)
+
+1. **업비트 WebSocket 실시간 스트림 허브 & 틱 반응형 스마트 청산 (`backend/common/upbit_ws_hub.mjs`)**:
+   - `wss://api.upbit.com/websocket/v1` 실시간 `ticker`·`orderbook`·`trade` 스트림 구독, 지수 백오프 재연결 및 60초 하트비트, `> 5,000ms` 지연 시 REST 자동 폴백 전환 (`WS 실시간` / `REST 폴백` 배지 표기).
+   - 실전 오픈 포지션 보유 종목 급변 시 10초 폴링을 기다리지 않고 즉시 손절·본절·ATR 트레일링 청산(`triggerTickReactiveSmartExit`, 종목별 `1,500ms` 디바운스 락) 수행.
+2. **히스토리컬 캔들 정량 백테스팅 & Walk-Forward 검증소 (`backend/common/backtest_service.mjs`)**:
+   - `historical_candles` / `backtest_runs` DB 캐시 기반 Zero Look-Ahead Bias 봉 단위 시뮬레이션(수수료 0.05% + 슬리피지 bps 반영).
+   - 70% In-Sample 최적화 ➔ 30% Out-of-Sample 검증, Sharpe/Sortino/CAGR/MDD/Profit Factor 산출, SVG 자산 곡선 및 원클릭 파라미터 반영(`[📊 백테스트 검증]` 모달).
+3. **체결 품질(OBI · 스프레드 가드) · MTF 역추세 필터 · ATR 변동성 역가중 사이징 & 슬리피지 원장 (`backend/common/execution_quality_service.mjs`)**:
+   - 호가 스프레드(`> 0.35%`) 또는 상단 매도벽 불균형(`OBI < -0.45`) 시 돌파형 봇 진입 보류, 60m+240m 상위 타임프레임 동반 하락장 역추세 돌파 차단.
+   - 14봉 ATR% 역가중 포지션 사이징(최소 안전 주문 `5,250원` 보장) 및 체결별 `expected_price`, `slippage_bps`, `atr_sizing_mult` 원장·통계 집계.
+4. **멀티채널 알림 허브 & 인터랙티브 캔들스틱 타점 차트 (`backend/common/notification_hub.mjs`)**:
+   - Telegram Bot API · Discord Webhook · WebPush 통합 브로드캐스트.
+   - 체결 일지 및 통계 테이블 `[📈 타점]` 버튼으로 캔들스틱 + VWAP · 20봉 선형회귀채널(LRC) · 20MA + 매수(▲)/매도(▼) 체결 마커 차트 모달 열람.
+5. **AES-256-GCM 암호화 볼트 & Docker Compose / GitHub Actions CI (`backend/common/crypto_vault.mjs`, `Dockerfile`, `docker-compose.yml`, `.github/workflows/ci.yml`)**:
+   - Node.js ↔ Python(`llm_filter_worker.py`) 상호 복호화 호환 AES-256-GCM 볼트, 비루트(non-root) 멀티스테이지 컨테이너 빌드 + 헬스체크, GitHub Actions CI 자동 검증 파이프라인.
 
 ---
 
