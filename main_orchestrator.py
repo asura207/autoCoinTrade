@@ -19,8 +19,13 @@ from dotenv import load_dotenv
 
 from bots import (
     BOT_RUNNERS,
+    acquire_live_executor_lease,
+    get_live_executor_owner,
     is_backend_running,
+    is_dry_run,
+    is_python_live_executor_authorized,
     normalize_bot_id,
+    release_live_executor_lease,
     run_bot_bb,
     run_bot_jack_kellogg,
     run_bot_momentum,
@@ -244,7 +249,20 @@ def main():
     except Exception as hub_err:
         logger.warning("Market Data Hub initial ticker fetch error: %s", hub_err)
 
-    # Node.js 백엔드 구동 감지 및 조율 모드 확인
+    # Node.js 백엔드 구동 감지 및 단일 실전 실행 주체(LIVE_EXECUTOR_OWNER) 검증
+    live_owner = get_live_executor_owner()
+    logger.info("[Guardrail] LIVE_EXECUTOR_OWNER=%s (DRY_RUN=%s)", live_owner, is_dry_run())
+    if not is_dry_run() and not is_python_live_executor_authorized():
+        logger.warning(
+            "[Guardrail][Single Live Executor] LIVE_EXECUTOR_OWNER='%s' != 'python'. "
+            "Python trading workers are HARD-BLOCKED from calling Upbit POST /v1/orders; only non-order workers remain active.",
+            live_owner,
+        )
+    elif not is_dry_run():
+        lease_ok, lease_msg = acquire_live_executor_lease()
+        if not lease_ok:
+            logger.warning("[Guardrail][LeaseLock] Could not acquire Python live lease: %s", lease_msg)
+
     backend_port = int(os.getenv("BACKEND_PORT", "8001"))
     if is_backend_running(backend_port):
         logger.info(
@@ -344,6 +362,11 @@ def main():
                     logger.warning("Worker [%s] (PID %d) did not terminate in time. Forcing termination...", bot_id, proc.pid)
                     proc.terminate()
                     proc.join(timeout=1.0)
+
+        try:
+            release_live_executor_lease()
+        except Exception:
+            pass
 
         try:
             if os.path.isfile(pid_file_path):

@@ -69,6 +69,27 @@ import {
   getBacktestHistory,
   buildChartTradeMarkers,
 } from "./common/backtest_service.mjs";
+import {
+  LIVE_CYCLE_STALE_WARN_MS,
+  getLiveExecutorOwner,
+  getGuardrailConfig,
+  ensureLiveGuardrailTables,
+  acquireOrRenewLiveExecutorLease,
+  releaseLiveExecutorLease,
+  claimLiveBuyIntentAtomic,
+  markLiveIntentSubmitted,
+  markLiveIntentUnknownTimeout,
+  refundFailedOrCanceledBuyIntentAtomic,
+  confirmBuyIntentAndRecordPositionAtomic,
+  claimLiveSellIntentAtomic,
+  releaseFailedSellIntentAtomic,
+  confirmSellIntentAtomic,
+  reconcileUnknownTimeoutIntents,
+  resetGuardrailEmergencyState,
+  getGuardrailStatus,
+  buildBuyIntentBucket,
+  buildSellIntentBucket,
+} from "./common/live_order_guardrail.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -933,6 +954,7 @@ export async function initializeDatabase() {
   `);
 
   await ensureBacktestTables(db);
+  await ensureLiveGuardrailTables(db);
 
   // market_regime_filter id=1 행 보장 및 레거시 3봇 키(bot_vb 등) -> 표준 10대 봇(bot_01~bot_10) 안전 마이그레이션
   try {
@@ -1274,7 +1296,21 @@ export async function recalculateAndApplyBotAllocations(flooredTotal, ratiosMap 
   const rankPriorityMap = options?.rankPriorityMap || {};
   const items = [];
   for (const b of bots) {
-    const used = Math.floor(Number(b.used_capital || 0));
+    let pendingReserved = 0;
+    if ((mode || (isLiveMode() ? "live" : "paper")) === "live") {
+      try {
+        const pr = await db
+          .prepare(
+            `SELECT COALESCE(SUM(requested_krw), 0) AS pending_krw
+             FROM live_order_intents
+             WHERE bot_id = ? AND side = 'BUY' AND refunded = 0
+               AND status IN ('PENDING', 'SUBMITTED', 'UNKNOWN_TIMEOUT')`
+          )
+          .get(b.bot_id);
+        pendingReserved = Math.max(0, Math.floor(Number(pr?.pending_krw || 0)));
+      } catch {}
+    }
+    const used = Math.floor(Number(b.used_capital || 0)) + pendingReserved;
     const isSelected = Number(b.is_selected_for_live || 0) === 1;
     const ratio = !isSelected
       ? 0
@@ -6436,6 +6472,7 @@ const server = http.createServer(async (req, res) => {
       } catch {}
       const ollama = await checkOllamaStatus();
       const wsStatus = upbitWsHub.getWsHealth();
+      const guardrail = await getLiveGuardrailStatusPayload();
       return sendJson(res, 200, {
         mode,
         total_capital: Math.floor(Number(await getSetting("total_capital", "0"))),
@@ -6446,7 +6483,24 @@ const server = http.createServer(async (req, res) => {
         regime_filter: regimeFilterRow,
         ollama,
         ws_status: wsStatus,
+        guardrail,
       });
+    }
+
+    if (pathname === "/api/guardrail/status" && req.method === "GET") {
+      const status = await getLiveGuardrailStatusPayload();
+      return sendJson(res, 200, status);
+    }
+
+    if (pathname === "/api/guardrail/reset-emergency" && req.method === "POST") {
+      const result = await resetGuardrailEmergencyState(db, {
+        withDbWriteLock,
+        beginWriteTx,
+        commitWriteTx,
+        rollbackWriteTx,
+      });
+      const status = await getLiveGuardrailStatusPayload();
+      return sendJson(res, 200, { ...result, guardrail: status });
     }
 
     if (pathname === "/api/bots" && req.method === "GET") {
@@ -6463,6 +6517,7 @@ const server = http.createServer(async (req, res) => {
         zero_balance_halted: haltInfo.halted,
         zero_balance_reason: haltInfo.reason,
         regime_filter: regimeFilterRow,
+        guardrail: await getLiveGuardrailStatusPayload(),
       });
     }
 
@@ -8083,6 +8138,23 @@ if (process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
   server.listen(PORT, HOST, () => {
     console.log(`AutoCoinTrade Backend listening on http://${HOST}:${PORT}`);
   });
+
+  const handleGracefulBackendShutdown = async (sig) => {
+    console.log(`[Backend] Received ${sig}, releasing live executor lease & shutting down...`);
+    try {
+      await releaseLiveExecutorLeaseNow();
+    } catch {}
+    try {
+      server.close();
+    } catch {}
+    setTimeout(() => process.exit(0), 1500).unref();
+  };
+  process.on("SIGINT", () => {
+    handleGracefulBackendShutdown("SIGINT").catch(() => process.exit(0));
+  });
+  process.on("SIGTERM", () => {
+    handleGracefulBackendShutdown("SIGTERM").catch(() => process.exit(0));
+  });
 }
 
 // ============================================================================
@@ -8408,13 +8480,20 @@ async function cancelUpbitOrder(orderUuid, cfg) {
 
 export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, buyReason = null, options = {}) {
   const db = getDb();
+  const isLive = isLiveMode();
 
-  const latestBot = (await getBots()).find((b) => b.bot_id === bot.bot_id);
+  const latestBot = (await getBots(isLive ? "live" : "paper")).find((b) => b.bot_id === bot.bot_id);
+  if (!latestBot) {
+    return false;
+  }
+
+  // 실전 모드에서 virtual_krw < 0 이상치는 아래 5중 가드레일(claimLiveBuyIntentAtomic)이 즉시 비상 정지(Auto Kill-Switch)를 발동하도록 통과
+  const hasNegativeLiveBalance = isLive && Number(latestBot.virtual_krw || 0) < 0;
   if (
-    !latestBot ||
-    Number(latestBot.is_selected_for_live) !== 1 ||
-    Number(latestBot.is_running) !== 1 ||
-    Number(latestBot.virtual_krw || 0) < orderKrw
+    !hasNegativeLiveBalance &&
+    (Number(latestBot.is_selected_for_live) !== 1 ||
+      Number(latestBot.is_running) !== 1 ||
+      (!isLive && Number(latestBot.virtual_krw || 0) < orderKrw))
   ) {
     return false;
   }
@@ -8425,7 +8504,7 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, bu
   const isBotBlocked = regimeInfo.botOverrides?.[bot.bot_id] === "BLOCK";
   const isBlacklisted = (regimeInfo.blacklistTickers || []).includes(normMkt);
 
-  if (regimeInfo.finalRiskAlert || !regimeInfo.allowBuy) {
+  if (!hasNegativeLiveBalance && (regimeInfo.finalRiskAlert || !regimeInfo.allowBuy)) {
     await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
       regimeInfo.reason,
       nowKSTString(),
@@ -8433,7 +8512,7 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, bu
     );
     return false;
   }
-  if (isBotBlocked) {
+  if (!hasNegativeLiveBalance && isBotBlocked) {
     await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
       "AI 장세 필터에 의해 신규 진입 보류(보유 포지션은 정상 감시)",
       nowKSTString(),
@@ -8441,7 +8520,7 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, bu
     );
     return false;
   }
-  if (isBlacklisted) {
+  if (!hasNegativeLiveBalance && isBlacklisted) {
     await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
       `[블랙리스트 종목 차단] ${normMkt} 신규 진입 보류(보유 포지션은 정상 감시)`,
       nowKSTString(),
@@ -8450,16 +8529,17 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, bu
     return false;
   }
 
-  const isLive = isLiveMode();
   const posTable = isLive ? "bot_positions" : "paper_bot_positions";
 
-  // 현재 OPEN 포지션 투자 합계가 할당 원금(allocated_capital)을 초과하지 않도록 엄격 검증
-  const invRow = await db
-    .prepare(`SELECT COALESCE(SUM(buy_amount), 0) AS invested FROM ${posTable} WHERE bot_id = ? AND status = 'OPEN'`)
-    .get(bot.bot_id);
-  const currentInvested = Number(invRow?.invested || 0);
-  if (currentInvested + orderKrw > Number(latestBot.allocated_capital || 0)) {
-    return false;
+  // 가상거래 모드 원금 한도 검증 (실거래 모드는 claimLiveBuyIntentAtomic BEGIN IMMEDIATE 내부에서 원자적 검증)
+  if (!isLive) {
+    const invRow = await db
+      .prepare(`SELECT COALESCE(SUM(buy_amount), 0) AS invested FROM ${posTable} WHERE bot_id = ? AND status = 'OPEN'`)
+      .get(bot.bot_id);
+    const currentInvested = Number(invRow?.invested || 0);
+    if (currentInvested + orderKrw > Number(latestBot.allocated_capital || 0)) {
+      return false;
+    }
   }
 
   const cfg = getRuntimeConfig();
@@ -8467,7 +8547,7 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, bu
   // 호가 불균형(OBI) 및 Bid-Ask 스프레드 과열 체결 품질 가드
   const candidateOrderbook =
     options?.orderbook || (!options?.skipUpbitApi && !upbitWsHub.isStale() ? upbitWsHub.getLatestOrderbook(market) : null);
-  if (candidateOrderbook) {
+  if (!hasNegativeLiveBalance && candidateOrderbook) {
     const obQuality = analyzeOrderbookQuality(candidateOrderbook, orderKrw, {
       botId: bot.bot_id,
       maxSpreadPct: options?.maxSpreadPct,
@@ -8558,7 +8638,8 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, bu
     return true;
   }
 
-  // 매수 1호가(Best Bid) 조회 후 최유리 지정가 주문(ord_type: 'limit') 생성
+  // [실거래 모드 (Live Trading)] — 5중 하드 가드레일(Hard Guardrail) + 2단계 커밋(2PC)
+  // 매수 1호가(Best Bid) 조회 후 Step A(원자적 PENDING 선점 + 선차감) -> Step B(identifier 주문 전송) -> Step C(확정/환불/타임아웃 잠금)
   const bestBidPrice = options?.skipUpbitApi
     ? normalizeUpbitKrwTick(currentPrice)
     : await fetchUpbitBestBidPrice(market, currentPrice);
@@ -8566,17 +8647,48 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, bu
     return false;
   }
 
-  const rawVol = Math.floor(orderKrw) / bestBidPrice;
-  let limitVolNum = Number(floorTo8DecimalsStr(rawVol));
-  if (limitVolNum * bestBidPrice < 5000) {
-    const stepped = Number(floorTo8DecimalsStr(limitVolNum + 0.00000001));
-    if (Math.ceil(stepped * bestBidPrice * 1.0005) <= Math.floor(Number(latestBot.virtual_krw || orderKrw))) {
-      limitVolNum = stepped;
-    } else {
-      return false;
-    }
+  const guardrailTxDeps = {
+    runtimeConfig: cfg,
+    withDbWriteLock,
+    beginWriteTx,
+    commitWriteTx,
+    rollbackWriteTx,
+    syncBotAccountsFromBots,
+    onKillSwitch: (ks) => {
+      dispatchMultiChannelNotification(
+        db,
+        {
+          eventType: "CIRCUIT_BREAKER",
+          botId: (ks?.halted_bots || [bot.bot_id])[0] || bot.bot_id,
+          botName: latestBot.nickname || latestBot.name || bot.bot_id,
+          market,
+          reason: ks?.reason || "가드레일 비상 정지 발동",
+        },
+        { webPushBroadcastFn: broadcastWebPushNotification }
+      ).catch(() => {});
+    },
+  };
+
+  // [Step A] 단일 BEGIN IMMEDIATE 트랜잭션으로 5중 가드레일 검증 + live_order_intents(PENDING) 선점 + virtual_krw 선차감
+  const claim = await claimLiveBuyIntentAtomic(
+    db,
+    {
+      botId: bot.bot_id,
+      market,
+      orderKrw,
+      bestBidPrice,
+      floorTo8DecimalsStr,
+      options,
+      inMemoryCooldownMap: liveBotCooldownMap,
+    },
+    guardrailTxDeps
+  );
+
+  if (!claim || !claim.ok) {
+    return false;
   }
-  const limitVolumeStr = floorTo8DecimalsStr(limitVolNum);
+
+  const { intentId, limitVolumeStr, limitVolNum, reservedKrw, stepLevel } = claim;
   const limitPriceStr = String(bestBidPrice);
 
   let orderUuid = "";
@@ -8588,213 +8700,266 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, bu
   if (options?.skipUpbitApi) {
     orderUuid = `sim-bid-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
   } else {
-  try {
-    await new Promise((r) => setTimeout(r, 120));
-    const params = {
-      market,
-      side: "bid",
-      volume: limitVolumeStr,
-      price: limitPriceStr,
-      ord_type: "limit",
-    };
-    const token = createUpbitJwt(String(cfg.access_key).trim(), String(cfg.secret_key).trim(), params);
-    const resp = await fetch("https://api.upbit.com/v1/orders", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify(params),
-      signal: AbortSignal.timeout(8000),
-    });
-    if (resp.status !== 200 && resp.status !== 201) {
-      const errData = await resp.json().catch(() => ({}));
-      const errMsg = errData?.error?.message || `HTTP ${resp.status}`;
+    const rateDelayMs = options?.skipDelay ? 0 : 120;
+    const pollAttempts = Math.max(1, Number(options?.pollAttempts ?? 10));
+    const pollIntervalMs = Number.isFinite(Number(options?.pollIntervalMs)) ? Math.max(0, Number(options.pollIntervalMs)) : 4000;
+    const postCancelDelayMs = options?.skipDelay ? 0 : 500;
+
+    try {
+      if (rateDelayMs > 0) await new Promise((r) => setTimeout(r, rateDelayMs));
+      // [Step B] 업비트 POST /v1/orders 에 반드시 identifier: intentId 포함 (절대 맹목 재시도 금지)
+      const params = {
+        market,
+        side: "bid",
+        volume: limitVolumeStr,
+        price: limitPriceStr,
+        ord_type: "limit",
+        identifier: intentId,
+      };
+      const token = createUpbitJwt(String(cfg.access_key).trim(), String(cfg.secret_key).trim(), params);
+      const resp = await fetch("https://api.upbit.com/v1/orders", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(params),
+        signal: AbortSignal.timeout(8000),
+      });
+
+      if (resp.status >= 400 && resp.status < 500) {
+        // 명확한 4xx 거절: 업비트에 주문 미생성 확정 -> FAILED_NOT_CREATED 및 선차감 원화 정확히 1회 환불
+        const errData = await resp.json().catch(() => ({}));
+        const errMsg = errData?.error?.message || `HTTP ${resp.status}`;
+        await refundFailedOrCanceledBuyIntentAtomic(
+          db,
+          {
+            intentId,
+            botId: bot.bot_id,
+            nextStatus: "FAILED_NOT_CREATED",
+            errorMessage: `Upbit 4xx(${resp.status}): ${errMsg}`,
+            statusMsg: `${market} 지정가 매수 주문 거절(선차감 환불 완료): ${errMsg}`,
+          },
+          guardrailTxDeps
+        );
+        return false;
+      }
+
+      if (resp.status !== 200 && resp.status !== 201) {
+        // HTTP 5xx 등 생성 여부 불명확 -> 절대 즉시 재주문/환불 금지, UNKNOWN_TIMEOUT 잠금
+        const errData = await resp.json().catch(() => ({}));
+        const errMsg = errData?.error?.message || `HTTP ${resp.status}`;
+        await markLiveIntentUnknownTimeout(
+          db,
+          { intentId, botId: bot.bot_id, market, errorMessage: `Upbit uncertain status ${resp.status}: ${errMsg}` },
+          guardrailTxDeps
+        );
+        return false;
+      }
+
+      const orderData = await resp.json();
+      orderUuid = orderData?.uuid || "";
+      if (!orderUuid) {
+        await markLiveIntentUnknownTimeout(
+          db,
+          { intentId, botId: bot.bot_id, market, errorMessage: "Upbit 200/201 response missing uuid" },
+          guardrailTxDeps
+        );
+        return false;
+      }
+
+      await markLiveIntentSubmitted(db, { intentId, upbitOrderUuid: orderUuid }, guardrailTxDeps);
+
       await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
-        `${market} 지정가 매수 주문 실패: ${errMsg}`,
+        `${market} 매수 1호가(${bestBidPrice.toLocaleString("ko-KR")}원) 지정가 주문 접수 — 체결 대기 중(최대 40초)`,
         nowKSTString(),
         bot.bot_id
       );
-      return false;
-    }
-    const orderData = await resp.json();
-    orderUuid = orderData?.uuid || "";
-    if (!orderUuid) return false;
 
-    await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
-      `${market} 매수 1호가(${bestBidPrice.toLocaleString("ko-KR")}원) 지정가 주문 접수 — 체결 대기 중(최대 40초)`,
-      nowKSTString(),
-      bot.bot_id
-    );
-
-    // 30초~1분(40초) 동안 체결 확인 후 미체결 시 주문 취소(cancel_order) 실행
-    let isOrderDone = false;
-    for (let attempt = 0; attempt < 10; attempt++) {
-      await new Promise((r) => setTimeout(r, 4000));
-      try {
-        const qParams = { uuid: orderUuid };
-        const qToken = createUpbitJwt(String(cfg.access_key).trim(), String(cfg.secret_key).trim(), qParams);
-        const oResp = await fetch(
-          `https://api.upbit.com/v1/order?uuid=${encodeURIComponent(orderUuid)}`,
-          {
-            headers: {
-              Authorization: `Bearer ${qToken}`,
-              Accept: "application/json",
-            },
-            signal: AbortSignal.timeout(8000),
+      // 30초~1분(40초) 동안 체결 확인 후 미체결 시 주문 취소(cancel_order) 실행
+      let isOrderDone = false;
+      let confirmedCancelZero = false;
+      for (let attempt = 0; attempt < pollAttempts; attempt++) {
+        if (pollIntervalMs > 0) await new Promise((r) => setTimeout(r, pollIntervalMs));
+        try {
+          const qParams = { uuid: orderUuid };
+          const qToken = createUpbitJwt(String(cfg.access_key).trim(), String(cfg.secret_key).trim(), qParams);
+          const oResp = await fetch(
+            `https://api.upbit.com/v1/order?uuid=${encodeURIComponent(orderUuid)}`,
+            {
+              headers: {
+                Authorization: `Bearer ${qToken}`,
+                Accept: "application/json",
+              },
+              signal: AbortSignal.timeout(8000),
+            }
+          );
+          if (oResp.status === 200) {
+            const oDetail = await oResp.json();
+            const state = String(oDetail?.state || "");
+            const filledVol = Number(oDetail?.executed_volume || 0);
+            if (state === "done" || state === "cancel") {
+              isOrderDone = true;
+              if (filledVol > 0) {
+                execVolume = String(oDetail.executed_volume);
+                const tradesArr = Array.isArray(oDetail.trades) ? oDetail.trades : [];
+                const totalFunds = tradesArr.reduce((acc, t) => acc + Number(t.funds || 0), 0);
+                if (totalFunds > 0) {
+                  actualBuyAmount = Math.floor(totalFunds);
+                  execPrice = normalizeExecPrice(totalFunds / filledVol, bestBidPrice);
+                } else {
+                  actualBuyAmount = Math.floor(filledVol * bestBidPrice);
+                }
+                if (oDetail.paid_fee !== undefined) {
+                  fee = Math.ceil(Number(oDetail.paid_fee || fee));
+                }
+              } else {
+                execVolume = "0";
+                confirmedCancelZero = true;
+              }
+              break;
+            }
           }
-        );
-        if (oResp.status === 200) {
-          const oDetail = await oResp.json();
-          const state = String(oDetail?.state || "");
-          const filledVol = Number(oDetail?.executed_volume || 0);
-          if (state === "done" || state === "cancel") {
-            isOrderDone = true;
-            if (filledVol > 0) {
+        } catch {}
+      }
+
+      // 40초 내 미체결 시 지정가 주문 취소 (cancel_order)
+      if (!isOrderDone) {
+        await cancelUpbitOrder(orderUuid, cfg);
+        if (postCancelDelayMs > 0) await new Promise((r) => setTimeout(r, postCancelDelayMs));
+        let filledAfterCancel = 0;
+        let postCancelVerified = false;
+        try {
+          const qParams = { uuid: orderUuid };
+          const qToken = createUpbitJwt(String(cfg.access_key).trim(), String(cfg.secret_key).trim(), qParams);
+          const oResp = await fetch(
+            `https://api.upbit.com/v1/order?uuid=${encodeURIComponent(orderUuid)}`,
+            {
+              headers: {
+                Authorization: `Bearer ${qToken}`,
+                Accept: "application/json",
+              },
+              signal: AbortSignal.timeout(8000),
+            }
+          );
+          if (oResp.status === 200) {
+            const oDetail = await oResp.json();
+            const postState = String(oDetail?.state || "");
+            filledAfterCancel = Number(oDetail?.executed_volume || 0);
+            if (filledAfterCancel > 0) {
+              postCancelVerified = true;
               execVolume = String(oDetail.executed_volume);
               const tradesArr = Array.isArray(oDetail.trades) ? oDetail.trades : [];
               const totalFunds = tradesArr.reduce((acc, t) => acc + Number(t.funds || 0), 0);
               if (totalFunds > 0) {
                 actualBuyAmount = Math.floor(totalFunds);
-                execPrice = normalizeExecPrice(totalFunds / filledVol, bestBidPrice);
+                execPrice = normalizeExecPrice(totalFunds / filledAfterCancel, bestBidPrice);
+              } else {
+                actualBuyAmount = Math.floor(filledAfterCancel * bestBidPrice);
               }
               if (oDetail.paid_fee !== undefined) {
                 fee = Math.ceil(Number(oDetail.paid_fee || fee));
               }
-            } else {
+            } else if (postState === "cancel" || postState === "done") {
+              postCancelVerified = true;
+              confirmedCancelZero = true;
               execVolume = "0";
             }
-            break;
           }
-        }
-      } catch {}
-    }
+        } catch {}
 
-    // 40초 내 미체결 시 지정가 주문 취소 (cancel_order)
-    if (!isOrderDone) {
-      await cancelUpbitOrder(orderUuid, cfg);
-      await new Promise((r) => setTimeout(r, 500));
-      let filledAfterCancel = 0;
-      try {
-        const qParams = { uuid: orderUuid };
-        const qToken = createUpbitJwt(String(cfg.access_key).trim(), String(cfg.secret_key).trim(), qParams);
-        const oResp = await fetch(
-          `https://api.upbit.com/v1/order?uuid=${encodeURIComponent(orderUuid)}`,
-          {
-            headers: {
-              Authorization: `Bearer ${qToken}`,
-              Accept: "application/json",
+        if (filledAfterCancel <= 0) {
+          if (postCancelVerified && confirmedCancelZero) {
+            await refundFailedOrCanceledBuyIntentAtomic(
+              db,
+              {
+                intentId,
+                botId: bot.bot_id,
+                nextStatus: "CANCELED",
+                errorMessage: "40초 미체결 취소 확정 (0체결)",
+                statusMsg: `${market} 지정가 매수(1호가 ${bestBidPrice.toLocaleString("ko-KR")}원) 40초 미체결로 자동 취소 및 선차감 환불 완료`,
+              },
+              guardrailTxDeps
+            );
+          } else {
+            // 취소 결과를 네트워크 장애로 미확정 -> 절대 즉시 환불하지 않고 identifier 정산 대기
+            await markLiveIntentUnknownTimeout(
+              db,
+              { intentId, botId: bot.bot_id, market, errorMessage: "Post-cancel order state unconfirmed" },
+              guardrailTxDeps
+            );
+          }
+          return false;
+        }
+      }
+
+      if (Number(execVolume) <= 0) {
+        if (confirmedCancelZero) {
+          await refundFailedOrCanceledBuyIntentAtomic(
+            db,
+            {
+              intentId,
+              botId: bot.bot_id,
+              nextStatus: "CANCELED",
+              errorMessage: "지정가 매수 미체결 취소 확정",
+              statusMsg: `${market} 지정가 매수 주문이 미체결 취소되어 선차감 원화가 환불되었습니다.`,
             },
-            signal: AbortSignal.timeout(8000),
-          }
-        );
-        if (oResp.status === 200) {
-          const oDetail = await oResp.json();
-          filledAfterCancel = Number(oDetail?.executed_volume || 0);
-          if (filledAfterCancel > 0) {
-            execVolume = String(oDetail.executed_volume);
-            const tradesArr = Array.isArray(oDetail.trades) ? oDetail.trades : [];
-            const totalFunds = tradesArr.reduce((acc, t) => acc + Number(t.funds || 0), 0);
-            if (totalFunds > 0) {
-              actualBuyAmount = Math.floor(totalFunds);
-              execPrice = normalizeExecPrice(totalFunds / filledAfterCancel, bestBidPrice);
-            }
-            if (oDetail.paid_fee !== undefined) {
-              fee = Math.ceil(Number(oDetail.paid_fee || fee));
-            }
-          }
+            guardrailTxDeps
+          );
+        } else {
+          await markLiveIntentUnknownTimeout(
+            db,
+            { intentId, botId: bot.bot_id, market, errorMessage: "Executed volume unconfirmed" },
+            guardrailTxDeps
+          );
         }
-      } catch {}
-
-      if (filledAfterCancel <= 0) {
-        await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
-          `${market} 지정가 매수(1호가 ${bestBidPrice.toLocaleString("ko-KR")}원) 40초 미체결로 자동 취소됨 (슬리피지 방어)`,
-          nowKSTString(),
-          bot.bot_id
-        );
         return false;
       }
-    }
-
-    if (Number(execVolume) <= 0) {
-      await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
-        `${market} 지정가 매수 주문이 미체결 취소되었습니다.`,
-        nowKSTString(),
-        bot.bot_id
+    } catch (err) {
+      // [Step C] 네트워크 타임아웃 / ECONNRESET / AbortError 등 체결 불확실:
+      // 절대 즉시 재주문하거나 선차감 원화를 바로 환불하지 않고 UNKNOWN_TIMEOUT 잠금 -> 다음 정산 사이클에서 identifier 조회 확정
+      await markLiveIntentUnknownTimeout(
+        db,
+        { intentId, botId: bot.bot_id, market, errorMessage: `${err.name || "Error"}: ${err.message}` },
+        guardrailTxDeps
       );
       return false;
     }
-  } catch (err) {
-    await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
-      `${market} 지정가 매수 API 통신 오류: ${err.message}`,
-      nowKSTString(),
-      bot.bot_id
-    );
-    return false;
-  }
   }
 
-  const now = nowKSTString();
   const expectedPrice = Number(currentPrice || execPrice);
   const slippageBps = computeSlippageBps(expectedPrice, execPrice);
   const atrSizingMult = Number.isFinite(Number(options?.atrSizingMult))
     ? Number(Number(options.atrSizingMult).toFixed(4))
     : 1.0;
 
-  const newVirtual = Math.max(0, Math.floor(Number(latestBot.virtual_krw) - actualBuyAmount - fee));
-  const newAllocated = newVirtual + Math.floor(currentInvested + Number(actualBuyAmount || 0));
-  await db.prepare("UPDATE bots SET allocated_capital = ?, virtual_krw = ?, last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
-    newAllocated,
-    newVirtual,
-    `${market} 최유리 지정가(1호가 ${execPrice.toLocaleString("ko-KR")}원) 매수 체결 (${actualBuyAmount.toLocaleString("ko-KR")}원 · 슬리피지 ${slippageBps >= 0 ? "+" : ""}${slippageBps}bps)`,
-    now,
-    bot.bot_id
-  );
-  const trRes = await db
-    .prepare(`
-      INSERT INTO trades (
-        bot_id, market, buy_order_uuid, sell_order_uuid,
-        buy_price, buy_volume, buy_amount, buy_date,
-        sell_price, sell_volume, sell_amount, sell_date,
-        profit_krw, profit_pct, status,
-        expected_price, slippage_bps, atr_sizing_mult
-      ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, 'HOLDING', ?, ?, ?)
-    `)
-    .run(
-      bot.bot_id,
+  // [Step C] 체결 확정 + 미사용 선차감 잔여분 단 1회 정산 + trades/bot_positions 멱등 기록
+  const confirmed = await confirmBuyIntentAndRecordPositionAtomic(
+    db,
+    {
+      intentId,
+      botId: bot.bot_id,
       market,
       orderUuid,
       execPrice,
       execVolume,
       actualBuyAmount,
-      now,
+      fee,
+      reservedKrw,
+      stepLevel,
+      buyReason: buyReason || null,
       expectedPrice,
       slippageBps,
-      atrSizingMult
-    );
-
-  await db.prepare(`
-    INSERT INTO bot_positions (
-      bot_id, market, ticker, order_uuid, volume, avg_buy_price, buy_amount, buy_fee, trade_id, status, created_at, buy_reason,
-      expected_price, slippage_bps, atr_sizing_mult
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?)
-  `).run(
-    bot.bot_id,
-    market,
-    market,
-    orderUuid,
-    execVolume,
-    execPrice,
-    actualBuyAmount,
-    fee,
-    trRes.lastInsertRowid,
-    now,
-    buyReason || null,
-    expectedPrice,
-    slippageBps,
-    atrSizingMult
+      atrSizingMult,
+      statusMsg: `${market} 최유리 지정가(1호가 ${execPrice.toLocaleString("ko-KR")}원) 매수 체결 (${actualBuyAmount.toLocaleString("ko-KR")}원 · 슬리피지 ${slippageBps >= 0 ? "+" : ""}${slippageBps}bps)`,
+    },
+    guardrailTxDeps
   );
+
+  if (!confirmed?.confirmed) {
+    return false;
+  }
 
   dispatchMultiChannelNotification(
     db,
@@ -9105,30 +9270,35 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
     return true;
   }
 
-  // [실거래 모드 (Live Trading)]
-  // 이미 이전 루프 등에서 CLOSED 처리된 포지션이면 스킵
-  const currentPos = await db
-    .prepare("SELECT * FROM bot_positions WHERE id = ? AND bot_id = ? AND status = 'OPEN'")
-    .get(pos.id, bot.bot_id);
-  if (!currentPos) {
+  // [실거래 모드 (Live Trading)] — Layer 1(단일 소유자+리스) + Layer 3(동일 order_uuid 중복 매도 차단)
+  // 주의: 매수 쿨다운/상한 및 Graceful Drain(is_selected_for_live = 0) / 비상 정지 상태에서도 보유 포지션 청산 매도는 절대 차단하지 않음!
+  const cfg = getRuntimeConfig();
+  const sellGuardrailDeps = {
+    runtimeConfig: cfg,
+    withDbWriteLock,
+    beginWriteTx,
+    commitWriteTx,
+    rollbackWriteTx,
+  };
+
+  // [Step A] 단일 BEGIN IMMEDIATE 트랜잭션으로 closing_lock=1 및 live_order_intents(SELL, sell:<order_uuid>) 원자적 선점
+  const sellClaim = await claimLiveSellIntentAtomic(
+    db,
+    {
+      botId: bot.bot_id,
+      positionId: pos.id,
+      sellPrice,
+      floorTo8DecimalsStr,
+      options,
+    },
+    sellGuardrailDeps
+  );
+  if (!sellClaim || !sellClaim.ok) {
     return false;
   }
 
-  // 개별 order_uuid 기준 정밀 매도: 단, 평가금액 < 5,500원 소액 포지션만 업비트 최소주문금액 회피를 위해 통합
-  const sameMarketOpenPositions = await db
-    .prepare("SELECT * FROM bot_positions WHERE bot_id = ? AND market = ? AND status = 'OPEN' ORDER BY id ASC")
-    .all(bot.bot_id, currentPos.market);
-
-  const singleEvalKrw = Number(currentPos.volume || 0) * Number(sellPrice || 0);
-  const targetPositions =
-    sameMarketOpenPositions.length > 1 && singleEvalKrw < 5500
-      ? sameMarketOpenPositions
-      : [currentPos];
-
-  const dbSumVolume = targetPositions.reduce((acc, p) => acc + Number(p.volume || 0), 0);
-  if (dbSumVolume <= 0) {
-    return false;
-  }
+  const { intentId: sellIntentId, targetPositionUuid, currentPos, targetPositions, dbSumVolume } = sellClaim;
+  const targetPositionIds = targetPositions.map((p) => p.id);
 
   // 시뮬레이션/테스트 모드에서는 외부 업비트 주문 없이 해당 포지션 volume만 정확히 체결 정산
   if (options?.skipUpbitApi) {
@@ -9137,26 +9307,38 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
     const safePrice = Number.isFinite(Number(sellPrice)) && Number(sellPrice) > 0 ? Number(sellPrice) : 0;
     const actualTotalFunds = Math.max(0, Math.floor(sellVolNum * safePrice));
     const actualTotalFee = Math.max(0, Math.floor(actualTotalFunds * 0.0005));
-    const settled = await settleLiveSellOrderInDb({
-      db,
-      bot,
-      targetPositions,
-      sellUuid,
-      sellPrice: safePrice,
-      actualTotalFunds,
-      actualTotalFee,
-      reasonLabel,
-    });
-    liveBotCooldownMap.set(`${bot.bot_id}|${currentPos.market}`, Date.now());
-    if (settled.isDrainingBot) {
-      console.log(
-        `[Graceful Drain 정산 이관] 탈락 봇 ${bot.bot_id} ${currentPos.market} ${reasonLabel} 정산금 ${settled.netProceeds.toLocaleString("ko-KR")}원 이관 (잔여 ${settled.remainingOpenCnt}건)`
+    try {
+      const settled = await settleLiveSellOrderInDb({
+        db,
+        bot,
+        targetPositions,
+        sellUuid,
+        sellPrice: safePrice,
+        actualTotalFunds,
+        actualTotalFee,
+        reasonLabel,
+      });
+      await confirmSellIntentAtomic(
+        db,
+        { intentId: sellIntentId, upbitOrderUuid: sellUuid, targetPositionIds },
+        sellGuardrailDeps
       );
+      liveBotCooldownMap.set(`${bot.bot_id}|${currentPos.market}`, Date.now());
+      if (settled.isDrainingBot) {
+        console.log(
+          `[Graceful Drain 정산 이관] 탈락 봇 ${bot.bot_id} ${currentPos.market} ${reasonLabel} 정산금 ${settled.netProceeds.toLocaleString("ko-KR")}원 이관 (잔여 ${settled.remainingOpenCnt}건)`
+        );
+      }
+      return true;
+    } catch (simErr) {
+      await releaseFailedSellIntentAtomic(
+        db,
+        { intentId: sellIntentId, targetPositionIds, targetPositionUuid, errorMessage: simErr.message },
+        sellGuardrailDeps
+      );
+      return false;
     }
-    return true;
   }
-
-  const cfg = getRuntimeConfig();
 
   // 업비트 실계좌 보유 수량 조회 — 절대 계좌 전량을 매도하지 않고 본인 봇/order_uuid 기록 volume(소수점 8자리 내림 ROUND_DOWN)만 사용
   const currency = String(currentPos.market || "").split("-")[1] || "";
@@ -9166,6 +9348,7 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
   let otherBotsVol = 0;
   let accountFetched = false;
   let maxAvailableForThisBot = 0;
+  const sellRateDelayMs = options?.skipDelay ? 0 : 120;
 
   try {
     const otherBotsRow = await db
@@ -9175,7 +9358,7 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
       .get(bot.bot_id, currentPos.market);
     otherBotsVol = Number(otherBotsRow?.other_vol || 0);
 
-    await new Promise((r) => setTimeout(r, 120));
+    if (sellRateDelayMs > 0) await new Promise((r) => setTimeout(r, sellRateDelayMs));
     const acctToken = createUpbitJwt(String(cfg.access_key).trim(), String(cfg.secret_key).trim());
     const acctResp = await fetch("https://api.upbit.com/v1/accounts", {
       headers: {
@@ -9200,8 +9383,19 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
     console.warn(`[ExecuteSell] ${currentPos.market} /v1/accounts 조회 실패(포지션 보존 후 다음 사이클 재시도):`, acctErr.message);
   }
 
-  // [방어로직 0] /v1/accounts 조회 자체 실패 시 실계좌 0원으로 오판해 DB 포지션을 파괴(manual-sync)하지 않고 안전 중단
+  // [방어로직 0] /v1/accounts 조회 자체 실패 시 실계좌 0원으로 오판해 DB 포지션을 파괴(manual-sync)하지 않고 안전 중단 + 락 해제
   if (!accountFetched) {
+    await releaseFailedSellIntentAtomic(
+      db,
+      {
+        intentId: sellIntentId,
+        targetPositionIds,
+        targetPositionUuid,
+        nextStatus: "FAILED_NOT_CREATED",
+        errorMessage: "Upbit /v1/accounts unavailable before sell",
+      },
+      sellGuardrailDeps
+    );
     await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
       `${currentPos.market} 실계좌 잔고 확인 일시 지연 — 포지션 보존 후 재시도`,
       nowKSTString(),
@@ -9219,7 +9413,7 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
     const nowSync = nowKSTString();
     let syncTotalProfitKrw = 0;
     for (const p of targetPositions) {
-      await db.prepare("UPDATE bot_positions SET status = 'CLOSED', closed_at = ? WHERE id = ? AND bot_id = ?").run(
+      await db.prepare("UPDATE bot_positions SET status = 'CLOSED', closing_lock = 0, closed_at = ? WHERE id = ? AND bot_id = ?").run(
         nowSync,
         p.id,
         bot.bot_id
@@ -9245,12 +9439,28 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
         .prepare("UPDATE bot_accounts SET total_realized_pnl = total_realized_pnl + ?, updated_at = ? WHERE bot_id = ?")
         .run(syncTotalProfitKrw, nowSync, bot.bot_id);
     } catch {}
+    await confirmSellIntentAtomic(
+      db,
+      { intentId: sellIntentId, upbitOrderUuid: "manual-sync", targetPositionIds },
+      sellGuardrailDeps
+    );
     await syncDynamicLiveCapitalFromUpbit(true);
     return true;
   }
 
   if (Number(sellVolumeStr) <= 0) {
     console.warn(`[ExecuteSell] ${currentPos.market} 매도 가능 수량 0(잠금=${actualCoinLocked}) — 미체결 정리 대기`);
+    await releaseFailedSellIntentAtomic(
+      db,
+      {
+        intentId: sellIntentId,
+        targetPositionIds,
+        targetPositionUuid,
+        nextStatus: "FAILED_NOT_CREATED",
+        errorMessage: "Available sell volume is 0 (locked in open order)",
+      },
+      sellGuardrailDeps
+    );
     return false;
   }
 
@@ -9262,10 +9472,10 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
   let executedSellAvgPrice = Number(sellPrice);
 
   // [방어로직 2] 평가금액이 업비트 최소주문금액(5,000원) 미만인 경우의 데드락 방어:
-  // 무한 5,500원 보충 매수 루프 방지를 위해 포지션당 15분 쿨다운 적용 + 보충 매수 체결 수량을 DB에 선반영
+  // 무한 5,500원 보충 매수 루프 방지를 위해 포지션당 15분 쿨다운 적용 + identifier 부여 + 보충 매수 체결 수량을 DB에 선반영
   const cleanseGuardKey = `${bot.bot_id}|${currentPos.id}`;
   const lastCleanseAt = cleanseAttemptMap.get(cleanseGuardKey) || 0;
-  if (orderEvalFunds < 5000 && Date.now() - lastCleanseAt >= 15 * 60 * 1000) {
+  if (orderEvalFunds < 5000 && Date.now() - lastCleanseAt >= 15 * 60 * 1000 && getLiveExecutorOwner(cfg) === "node") {
     cleanseAttemptMap.set(cleanseGuardKey, Date.now());
     console.warn(`[Smart Cleanse] ${currentPos.market} 평가액(${orderEvalFunds}원)이 업비트 최소주문(5,000원) 미만입니다. 청산용 보충 매수(Buy-to-Cleanse)를 시도합니다.`);
     try {
@@ -9279,6 +9489,7 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
           side: "bid",
           price: String(topupKrw),
           ord_type: "price",
+          identifier: crypto.randomUUID(),
         };
         const buyToken = createUpbitJwt(String(cfg.access_key).trim(), String(cfg.secret_key).trim(), buyParams);
         const buyResp = await fetch("https://api.upbit.com/v1/orders", {
@@ -9369,10 +9580,21 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
     }
   }
 
-  // 여전히 5,000원 미만이면 업비트 API가 거절하므로 에러 상태 기록 후 안전 종료
+  // 여전히 5,000원 미만이면 업비트 API가 거절하므로 에러 상태 기록 및 closing_lock 해제 후 안전 종료
   if (orderEvalFunds < 5000) {
     const errMsg = `평가금액(${orderEvalFunds.toLocaleString("ko-KR")}원)이 업비트 최소주문(5,000원) 미만입니다. 업비트 앱의 '소액 코인 정리' 기능으로 정리하시면 봇이 자동 감지하여 청산 완료합니다.`;
     console.warn(`[ExecuteSell] ${currentPos.market} 매도 보류: ${errMsg}`);
+    await releaseFailedSellIntentAtomic(
+      db,
+      {
+        intentId: sellIntentId,
+        targetPositionIds,
+        targetPositionUuid,
+        nextStatus: "FAILED_NOT_CREATED",
+        errorMessage: "Order notional below 5,000 KRW Upbit floor",
+      },
+      sellGuardrailDeps
+    );
     await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
       `[청산 대기] ${errMsg}`,
       nowKSTString(),
@@ -9381,13 +9603,21 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
     return false;
   }
 
+  const sellPollIntervalMs = Number.isFinite(Number(options?.sellPollIntervalMs))
+    ? Math.max(0, Number(options.sellPollIntervalMs))
+    : options?.skipDelay
+    ? 0
+    : 400;
+
   try {
-    await new Promise((r) => setTimeout(r, 120));
+    if (sellRateDelayMs > 0) await new Promise((r) => setTimeout(r, sellRateDelayMs));
+    // [Step B] 업비트 POST /v1/orders 매도 요청에 반드시 identifier: sellIntentId 포함 (절대 맹목 재시도 금지)
     const params = {
       market: currentPos.market,
       side: "ask",
       volume: sellVolumeStr,
       ord_type: "market",
+      identifier: sellIntentId,
     };
     const token = createUpbitJwt(String(cfg.access_key).trim(), String(cfg.secret_key).trim(), params);
     const resp = await fetch("https://api.upbit.com/v1/orders", {
@@ -9400,9 +9630,21 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
       body: JSON.stringify(params),
       signal: AbortSignal.timeout(8000),
     });
-    if (resp.status !== 200 && resp.status !== 201) {
+
+    if (resp.status >= 400 && resp.status < 500) {
       const errData = await resp.json().catch(() => ({}));
       const errMsg = errData?.error?.message || `HTTP ${resp.status}`;
+      await releaseFailedSellIntentAtomic(
+        db,
+        {
+          intentId: sellIntentId,
+          targetPositionIds,
+          targetPositionUuid,
+          nextStatus: "FAILED_NOT_CREATED",
+          errorMessage: `Upbit 4xx(${resp.status}): ${errMsg}`,
+        },
+        sellGuardrailDeps
+      );
       await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
         `${currentPos.market} 매도 주문 실패: ${errMsg}`,
         nowKSTString(),
@@ -9410,13 +9652,34 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
       );
       return false;
     }
+
+    if (resp.status !== 200 && resp.status !== 201) {
+      // HTTP 5xx 등 불확실 응답: 중복 매도 방지를 위해 closing_lock=1 유지 + UNKNOWN_TIMEOUT 정산 대기
+      const errData = await resp.json().catch(() => ({}));
+      const errMsg = errData?.error?.message || `HTTP ${resp.status}`;
+      await markLiveIntentUnknownTimeout(
+        db,
+        { intentId: sellIntentId, botId: bot.bot_id, market: currentPos.market, errorMessage: `Sell uncertain HTTP ${resp.status}: ${errMsg}` },
+        sellGuardrailDeps
+      );
+      return false;
+    }
+
     const orderData = await resp.json();
-    if (!orderData?.uuid) return false;
+    if (!orderData?.uuid) {
+      await markLiveIntentUnknownTimeout(
+        db,
+        { intentId: sellIntentId, botId: bot.bot_id, market: currentPos.market, errorMessage: "Sell response missing uuid" },
+        sellGuardrailDeps
+      );
+      return false;
+    }
     sellUuid = orderData.uuid;
+    await markLiveIntentSubmitted(db, { intentId: sellIntentId, upbitOrderUuid: sellUuid }, sellGuardrailDeps);
 
     // 매도 주문 체결 상세 조회 (GET /v1/order?uuid=...)
     for (let attempt = 0; attempt < 3; attempt++) {
-      await new Promise((r) => setTimeout(r, 400));
+      if (sellPollIntervalMs > 0) await new Promise((r) => setTimeout(r, sellPollIntervalMs));
       try {
         const qParams = { uuid: sellUuid };
         const qToken = createUpbitJwt(String(cfg.access_key).trim(), String(cfg.secret_key).trim(), qParams);
@@ -9447,10 +9710,11 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
       } catch {}
     }
   } catch (err) {
-    await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
-      `${currentPos.market} 매도 통신 오류: ${err.message}`,
-      nowKSTString(),
-      bot.bot_id
+    // 네트워크 타임아웃 등 불확실 예외: 절대 즉시 중복 매도 금지 -> closing_lock=1 유지 + UNKNOWN_TIMEOUT 정산 대기
+    await markLiveIntentUnknownTimeout(
+      db,
+      { intentId: sellIntentId, botId: bot.bot_id, market: currentPos.market, errorMessage: `Sell timeout/error: ${err.message}` },
+      sellGuardrailDeps
     );
     return false;
   }
@@ -9465,6 +9729,11 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
     actualTotalFee,
     reasonLabel,
   });
+  await confirmSellIntentAtomic(
+    db,
+    { intentId: sellIntentId, upbitOrderUuid: sellUuid, targetPositionIds },
+    sellGuardrailDeps
+  );
   cleanseAttemptMap.delete(cleanseGuardKey);
   liveBotCooldownMap.set(`${bot.bot_id}|${currentPos.market}`, Date.now());
 
@@ -9488,8 +9757,10 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
 
 // ============================================================================
 // 1. 실거래 매매 스케줄러 (선택된 1~3개 실전 봇 전용 - 기존 LLM/Regime 필터 100% 보존)
+//    + 5중 하드 가드레일(Re-entrancy Mutex · Lease Lock · Timeout Reconciliation)
 // ============================================================================
 let isLiveCycleRunning = false;
+let liveCycleStartedAtMs = 0;
 const liveBotPeakMap = new Map();
 const liveBotCooldownMap = new Map();
 const cleanseAttemptMap = new Map();
@@ -9498,6 +9769,82 @@ const inFlightTickExitSet = new Set();
 const circuitBreakerNotifiedDateMap = new Map();
 const LIVE_REENTRY_COOLDOWN_MS = 15 * 60 * 1000;
 const TICK_EXIT_DEBOUNCE_MS = 1500;
+
+function getLiveCycleMutexState() {
+  return {
+    isRunning: isLiveCycleRunning,
+    startedAtMs: liveCycleStartedAtMs,
+    elapsedMs: isLiveCycleRunning && liveCycleStartedAtMs > 0 ? Math.max(0, Date.now() - liveCycleStartedAtMs) : 0,
+  };
+}
+
+function clearLiveCooldownCache() {
+  liveBotCooldownMap.clear();
+}
+
+async function acquireLiveExecutorLease(options = {}) {
+  const db = getDb();
+  if (!db) return { ok: false, code: "NO_DB", reason: "DB not initialized" };
+  return await acquireOrRenewLiveExecutorLease(
+    db,
+    {
+      runtimeConfig: getRuntimeConfig(),
+      withDbWriteLock,
+      beginWriteTx,
+      commitWriteTx,
+      rollbackWriteTx,
+    },
+    { engine: "node", ...options }
+  );
+}
+
+async function releaseLiveExecutorLeaseNow(options = {}) {
+  const db = getDb();
+  if (!db) return false;
+  return await releaseLiveExecutorLease(
+    db,
+    {
+      withDbWriteLock,
+      beginWriteTx,
+      commitWriteTx,
+      rollbackWriteTx,
+    },
+    { engine: "node", ...options }
+  );
+}
+
+async function reconcileLiveOrderIntents(options = {}) {
+  const db = getDb();
+  if (!db) return { checked: 0, confirmed: 0, refunded: 0, pending: 0 };
+  return await reconcileUnknownTimeoutIntents(
+    db,
+    {
+      runtimeConfig: getRuntimeConfig(),
+      createUpbitJwt,
+      cancelUpbitOrder,
+      normalizeExecPrice,
+      settleLiveSellOrderInDb,
+      syncBotAccountsFromBots,
+      withDbWriteLock,
+      beginWriteTx,
+      commitWriteTx,
+      rollbackWriteTx,
+    },
+    options
+  );
+}
+
+async function getLiveGuardrailStatusPayload() {
+  const db = getDb();
+  if (!db) {
+    return {
+      ok: false,
+      live_executor_owner: getLiveExecutorOwner(getRuntimeConfig()),
+      emergency_halted: false,
+    };
+  }
+  return await getGuardrailStatus(db, getRuntimeConfig(), getLiveCycleMutexState());
+}
 
 export async function triggerTickReactiveSmartExit(tickEvent = {}) {
   const market = String(tickEvent?.market || "").trim().toUpperCase();
@@ -9620,10 +9967,43 @@ upbitWsHub.onTickerTick((tickEvent) => {
 
 export async function runLiveTradingBotsCycle(options = {}) {
   // 가상거래 모드에서는 Always-On Arena(runAlwaysOnPaperArenaCycle)가 10대 봇을 독립 운용하므로 실전 루프의 paper_* 교차 오염을 원천 차단
-  if (!isLiveMode() && !options?.allowPaperMode) return;
-  if (isLiveCycleRunning) return;
+  if (!isLiveMode() && !options?.allowPaperMode) return { skipped: true, reason: "NOT_LIVE_MODE" };
+
+  // [Phase 3] 비동기 루프 중첩 방지 (Re-entrancy Mutex + 시작 타임스탬프 + 180초 초과 비정상 고착 안전 복구)
+  if (isLiveCycleRunning) {
+    const elapsedMs = liveCycleStartedAtMs > 0 ? Date.now() - liveCycleStartedAtMs : 0;
+    if (elapsedMs > LIVE_CYCLE_STALE_WARN_MS) {
+      console.warn(
+        `[LiveCycleMutex] WARNING: 이전 실전 사이클이 ${Math.round(elapsedMs / 1000)}초(>180초) 동안 종료되지 않아 안전 복구 후 재진입합니다.`
+      );
+      isLiveCycleRunning = false;
+      liveCycleStartedAtMs = 0;
+    } else {
+      return { skipped: true, reason: "LIVE_CYCLE_MUTEX_ACTIVE", elapsed_ms: elapsedMs };
+    }
+  }
+
   isLiveCycleRunning = true;
+  liveCycleStartedAtMs = Date.now();
   try {
+    // [Phase 1] 단일 실전 실행 주체(LIVE_EXECUTOR_OWNER) + SQLite 프로세스 리스 락(TTL 30초) 획득/갱신
+    const leaseRes = await acquireLiveExecutorLease({
+      ownerId: options?.leaseOwnerId || "node",
+      pid: options?.leasePid,
+      host: options?.leaseHost,
+    });
+    if (!leaseRes.ok) {
+      console.warn(`[LiveTradingCycle][Guardrail] 리스 락 미획득으로 사이클 건너뜀 (${leaseRes.code}): ${leaseRes.reason}`);
+      return { skipped: true, reason: leaseRes.code, detail: leaseRes.reason };
+    }
+
+    // [Phase 2] 미해결 UNKNOWN_TIMEOUT 인텐트 업비트 identifier 정산 우선 수행
+    if (!options?.skipUpbitApi || options?.reconcileTimeoutIntents) {
+      await reconcileLiveOrderIntents().catch((recErr) => {
+        console.warn("[LiveTradingCycle] Timeout intent reconciliation warning:", recErr.message);
+      });
+    }
+
     // 업비트 실계좌 잔고 기반 90% 동적 운영원금 동기화 (테스트/오프라인 skipUpbitApi 시 건너뜀)
     if (!options?.skipUpbitApi) {
       await syncDynamicLiveCapitalFromUpbit();
@@ -9945,6 +10325,9 @@ export async function runLiveTradingBotsCycle(options = {}) {
           if (orderKrw >= 5000) {
             const ok = await executeBotBuyOrder(refreshedBot, mkt, orderKrw, md.price, sig.reason, {
               ...sellOpts,
+              stepIndex: held.length + 1,
+              ignoreCooldown: Boolean(options?.ignoreCooldown),
+              ignoreMinInterval: Boolean(options?.ignoreMinInterval),
               atrSizingMult: atrInfo.atr_sizing_mult,
             });
             if (ok) {
@@ -9956,22 +10339,28 @@ export async function runLiveTradingBotsCycle(options = {}) {
       }
 
       if (!actionMsg) {
-        const holdCnt = heldSet.size;
-        const multPct = Math.round(Number(regimeInfo.multiplier ?? 1.0) * 100);
-        const statusText = holdCnt > 0
-          ? `실시간 감시 중 (${holdCnt}건 포지션 보유 · 익절/손절 감시 · AI 비중 ${multPct}%)`
-          : `🟢 AI 신규매수 허용 (비중 ${multPct}%) · 진입 시그널 탐색`;
-        await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
-          statusText,
-          now,
-          bot.bot_id
-        );
+        const postBotRow = await db.prepare("SELECT is_running, last_status_msg FROM bots WHERE bot_id = ?").get(bot.bot_id);
+        const postMsg = String(postBotRow?.last_status_msg || "");
+        const isGuardrailMsg = postMsg.includes("가드레일") || postMsg.includes("타임아웃 정산");
+        if (Number(postBotRow?.is_running ?? 1) === 1 && !isGuardrailMsg) {
+          const holdCnt = heldSet.size;
+          const multPct = Math.round(Number(regimeInfo.multiplier ?? 1.0) * 100);
+          const statusText = holdCnt > 0
+            ? `실시간 감시 중 (${holdCnt}건 포지션 보유 · 익절/손절 감시 · AI 비중 ${multPct}%)`
+            : `🟢 AI 신규매수 허용 (비중 ${multPct}%) · 진입 시그널 탐색`;
+          await db.prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?").run(
+            statusText,
+            now,
+            bot.bot_id
+          );
+        }
       }
     }
   } catch (err) {
     console.error("[LiveTradingCycle] Error:", err.message);
   } finally {
     isLiveCycleRunning = false;
+    liveCycleStartedAtMs = 0;
   }
 }
 
@@ -10208,6 +10597,7 @@ startBackgroundWorkers = async function() {
       syncNewsToDatabase(getDb()).catch((err) => console.warn("[News] Initial sync error:", err.message));
     } catch {}
 
+    await reconcileLiveOrderIntents().catch(() => {});
     await reconcileOpenPositionsWithUpbit().catch(() => {});
     await runAlwaysOnPaperArenaCycle().catch(() => {});
     await runLiveTradingBotsCycle().catch(() => {});
@@ -10292,6 +10682,19 @@ export {
   decryptSecret,
   safeDecryptSecret,
   migrateConfigSecrets,
+  // 5중 실전 중복 주문 가드레일 Export
+  getLiveExecutorOwner,
+  getGuardrailConfig,
+  ensureLiveGuardrailTables,
+  acquireLiveExecutorLease,
+  releaseLiveExecutorLeaseNow,
+  reconcileLiveOrderIntents,
+  getLiveGuardrailStatusPayload,
+  getLiveCycleMutexState,
+  resetGuardrailEmergencyState,
+  clearLiveCooldownCache,
+  buildBuyIntentBucket,
+  buildSellIntentBucket,
 };
 
 

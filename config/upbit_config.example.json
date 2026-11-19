@@ -9,6 +9,13 @@
   "use_local_ollama_news": true,
   "ollama_base_url": "http://192.168.0.100:11434",
   "ollama_news_model": "qwen3-news",
-  "ollama_timeout_ms": 120000
+  "ollama_timeout_ms": 120000,
+  "live_executor_owner": "node",
+  "live_lease_ttl_sec": 30,
+  "live_reentry_cooldown_sec": 900,
+  "live_min_buy_interval_sec": 60,
+  "live_max_buys_per_bot_hour": 3,
+  "live_max_buys_per_bot_day": 12,
+  "live_max_total_buys_day": 30
 }
 

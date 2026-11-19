@@ -27,7 +27,8 @@
     "test:execq": "node tests/verify_execution_quality_and_sizing.mjs",
     "test:notify": "node tests/verify_notification_hub_and_journal.mjs",
     "test:vault": "node tests/verify_crypto_vault.mjs",
-    "test:enhancements": "node tests/verify_upbit_ws_hub.mjs && node tests/verify_backtest_engine.mjs && node tests/verify_execution_quality_and_sizing.mjs && node tests/verify_notification_hub_and_journal.mjs && node tests/verify_crypto_vault.mjs",
+    "test:guardrail": "node tests/verify_duplicate_order_guard.mjs",
+    "test:enhancements": "node tests/verify_upbit_ws_hub.mjs && node tests/verify_backtest_engine.mjs && node tests/verify_execution_quality_and_sizing.mjs && node tests/verify_notification_hub_and_journal.mjs && node tests/verify_crypto_vault.mjs && node tests/verify_duplicate_order_guard.mjs",
     "test:all": "npm test && npm run test:enhancements && npm run test:py",
     "test:py": "python3 tests/qa_python_verification.py"
   },

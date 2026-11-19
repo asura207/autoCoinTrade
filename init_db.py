@@ -363,7 +363,8 @@ def init_database(db_path: Optional[str] = None) -> None:
                 buy_reason TEXT,
                 expected_price {real_type},
                 slippage_bps {real_type},
-                atr_sizing_mult {real_type}
+                atr_sizing_mult {real_type},
+                closing_lock INTEGER NOT NULL DEFAULT 0
             );
             """
         )
@@ -383,6 +384,7 @@ def init_database(db_path: Optional[str] = None) -> None:
             ("expected_price", real_type),
             ("slippage_bps", real_type),
             ("atr_sizing_mult", real_type),
+            ("closing_lock", "INTEGER NOT NULL DEFAULT 0"),
         ]
         if sqlite_mode:
             existing_pos_cols = {
@@ -874,6 +876,65 @@ def init_database(db_path: Optional[str] = None) -> None:
             );
             """
         )
+
+        # 9-3. 실전 중복 주문 원천 차단 5중 가드레일 테이블 (리스 락 · 주문 의도 원장 · 차단 이벤트)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS live_executor_lease (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                owner_id TEXT NOT NULL,
+                pid INTEGER NOT NULL,
+                host TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS live_order_intents (
+                intent_id TEXT PRIMARY KEY,
+                bot_id TEXT NOT NULL,
+                market TEXT NOT NULL,
+                side TEXT NOT NULL,
+                intent_bucket TEXT NOT NULL,
+                requested_krw INTEGER DEFAULT 0,
+                requested_volume TEXT DEFAULT '0',
+                target_position_uuid TEXT,
+                upbit_order_uuid TEXT,
+                status TEXT NOT NULL,
+                refunded INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(bot_id, market, side, intent_bucket)
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_live_order_intents_bot_mkt_status ON live_order_intents (bot_id, market, side, status);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_live_order_intents_created ON live_order_intents (bot_id, side, created_at);"
+        )
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS live_guardrail_events (
+                id {id_primary_key},
+                bot_id TEXT NOT NULL,
+                market TEXT DEFAULT '',
+                side TEXT DEFAULT 'BUY',
+                block_code TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_live_guardrail_events_bot_created ON live_guardrail_events (bot_id, created_at);"
+        )
+
         now_kst = _now_kst_str()
         next_rot = _compute_next_rotation_kst(1, 9)
         ollama_defaults = (
@@ -881,6 +942,13 @@ def init_database(db_path: Optional[str] = None) -> None:
             ("ollama_base_url", os.getenv("OLLAMA_BASE_URL", "http://192.168.0.100:11434")),
             ("ollama_news_model", os.getenv("OLLAMA_NEWS_MODEL", "qwen3-news")),
             ("ollama_timeout_ms", os.getenv("OLLAMA_TIMEOUT_MS", "120000")),
+            ("live_executor_owner", os.getenv("LIVE_EXECUTOR_OWNER", "node")),
+            ("live_reentry_cooldown_sec", os.getenv("LIVE_REENTRY_COOLDOWN_SEC", "900")),
+            ("live_min_buy_interval_sec", os.getenv("LIVE_MIN_BUY_INTERVAL_SEC", "60")),
+            ("live_max_buys_per_bot_hour", os.getenv("LIVE_MAX_BUYS_PER_BOT_HOUR", "3")),
+            ("live_max_buys_per_bot_day", os.getenv("LIVE_MAX_BUYS_PER_BOT_DAY", "12")),
+            ("live_max_total_buys_day", os.getenv("LIVE_MAX_TOTAL_BUYS_DAY", "30")),
+            ("guardrail_emergency_halted", "0"),
         )
         for s_key, s_val in ollama_defaults:
             conn.execute(

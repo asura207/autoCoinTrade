@@ -825,7 +825,7 @@ async function runTests() {
     reportRows.push({ suite: "LiveGuards", bot: "bot_05/bot_10", check: "Daily -4% Circuit Breaker + 15m Cooldown", status: "PASS" });
 
     // 5-D. 실계좌 소액(53,000원 단일 봇 + AI 50% 비중) 실전 체결 & 5,000원 미만 손절 데드락 방어 버퍼 검증
-    await db.exec("DELETE FROM bot_positions; DELETE FROM trades;");
+    await db.exec("DELETE FROM bot_positions; DELETE FROM trades; DELETE FROM live_order_intents; DELETE FROM live_guardrail_events;");
     await db.prepare("UPDATE bots SET is_selected_for_live = 0, is_running = 0, allocation_ratio = 0, allocated_capital = 0, virtual_krw = 0").run();
     await db.prepare("UPDATE bots SET is_selected_for_live = 1, is_running = 1, allocation_ratio = 100, allocated_capital = 53000, virtual_krw = 53000 WHERE bot_id = 'bot_10'").run();
     await db.prepare(`

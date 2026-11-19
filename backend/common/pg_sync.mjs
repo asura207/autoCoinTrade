@@ -348,6 +348,7 @@ export class PgSyncManager {
           ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS expected_price NUMERIC(20,8);
           ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS slippage_bps NUMERIC(12,4);
           ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS atr_sizing_mult NUMERIC(10,4);
+          ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS closing_lock INTEGER NOT NULL DEFAULT 0;
         `);
       } catch {}
 
@@ -949,6 +950,106 @@ export class PgSyncManager {
                 d.allocations_json || "[]",
                 Number(d.remaining_positions_count || 0),
                 d.created_at || null,
+              ]
+            );
+          }
+        } catch {}
+      } catch {}
+
+      // 12. live_executor_lease & live_order_intents (5중 가드레일 리스 및 주문 의도 원장 동기화)
+      try {
+        await this.pool.query(`
+          CREATE TABLE IF NOT EXISTS live_executor_lease (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            owner_id TEXT NOT NULL,
+            pid INTEGER NOT NULL,
+            host TEXT NOT NULL,
+            acquired_at TEXT NOT NULL,
+            heartbeat_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS live_order_intents (
+            intent_id TEXT PRIMARY KEY,
+            bot_id TEXT NOT NULL,
+            market TEXT NOT NULL,
+            side TEXT NOT NULL,
+            intent_bucket TEXT NOT NULL,
+            requested_krw INTEGER DEFAULT 0,
+            requested_volume TEXT DEFAULT '0',
+            target_position_uuid TEXT,
+            upbit_order_uuid TEXT,
+            status TEXT NOT NULL,
+            refunded INTEGER NOT NULL DEFAULT 0,
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(bot_id, market, side, intent_bucket)
+          );
+          CREATE INDEX IF NOT EXISTS idx_pg_live_order_intents_bot_mkt_status
+            ON live_order_intents (bot_id, market, side, status);
+          CREATE INDEX IF NOT EXISTS idx_pg_live_order_intents_created
+            ON live_order_intents (bot_id, side, created_at);
+        `);
+
+        try {
+          const leaseRow = sqliteDb.prepare("SELECT * FROM live_executor_lease WHERE id = 1").get();
+          if (leaseRow) {
+            await this.pool.query(
+              `INSERT INTO live_executor_lease (id, owner_id, pid, host, acquired_at, heartbeat_at, expires_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT (id) DO UPDATE SET
+                 owner_id = EXCLUDED.owner_id,
+                 pid = EXCLUDED.pid,
+                 host = EXCLUDED.host,
+                 acquired_at = EXCLUDED.acquired_at,
+                 heartbeat_at = EXCLUDED.heartbeat_at,
+                 expires_at = EXCLUDED.expires_at`,
+              [
+                1,
+                leaseRow.owner_id || "node",
+                Number(leaseRow.pid || 0),
+                leaseRow.host || "",
+                leaseRow.acquired_at || "",
+                leaseRow.heartbeat_at || "",
+                leaseRow.expires_at || "",
+              ]
+            );
+          }
+        } catch {}
+
+        try {
+          const intents = sqliteDb
+            .prepare("SELECT * FROM live_order_intents ORDER BY created_at DESC LIMIT 300")
+            .all();
+          for (const it of intents) {
+            await this.pool.query(
+              `INSERT INTO live_order_intents (
+                 intent_id, bot_id, market, side, intent_bucket,
+                 requested_krw, requested_volume, target_position_uuid, upbit_order_uuid,
+                 status, refunded, error_message, created_at, updated_at
+               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+               ON CONFLICT (intent_id) DO UPDATE SET
+                 intent_bucket = EXCLUDED.intent_bucket,
+                 upbit_order_uuid = EXCLUDED.upbit_order_uuid,
+                 status = EXCLUDED.status,
+                 refunded = EXCLUDED.refunded,
+                 error_message = EXCLUDED.error_message,
+                 updated_at = EXCLUDED.updated_at`,
+              [
+                it.intent_id,
+                it.bot_id,
+                it.market,
+                it.side,
+                it.intent_bucket,
+                Math.floor(Number(it.requested_krw || 0)),
+                String(it.requested_volume || "0"),
+                it.target_position_uuid ?? null,
+                it.upbit_order_uuid ?? null,
+                it.status,
+                Number(it.refunded || 0),
+                it.error_message ?? null,
+                it.created_at,
+                it.updated_at,
               ]
             );
           }

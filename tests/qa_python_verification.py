@@ -43,6 +43,7 @@ class TestPythonQaVerification(unittest.TestCase):
             "AUTOCOIN_DB_PATH": os.environ.get("AUTOCOIN_DB_PATH"),
             "DRY_RUN": os.environ.get("DRY_RUN"),
             "LOCAL_PG_HOST": os.environ.get("LOCAL_PG_HOST"),
+            "LIVE_EXECUTOR_OWNER": os.environ.get("LIVE_EXECUTOR_OWNER"),
         }
         os.environ["DB_MODE"] = "sqlite"
         os.environ["PG_SYNC_ENABLED"] = "false"
@@ -242,6 +243,16 @@ class TestPythonQaVerification(unittest.TestCase):
                 }
 
         os.environ["DRY_RUN"] = "False"
+        # Layer 1 Guardrail 검증: 기본 LIVE_EXECUTOR_OWNER='node' 상태에서는 Python 실전 매도 원천 차단
+        os.environ["LIVE_EXECUTOR_OWNER"] = "node"
+        with patch.object(bots, "is_backend_running", return_value=False), patch.object(
+            bots, "get_upbit_client", return_value=DummyUpbit()
+        ), patch.object(bots, "get_safe_current_price", return_value=5200000.0):
+            blocked_res = bots.execute_sell_order(pos_id, reason="QA_OWNER_BLOCK", db_path=self.db_path)
+            self.assertIsNone(blocked_res, "Python live sell must be hard-blocked when LIVE_EXECUTOR_OWNER=node")
+
+        # 명시적으로 LIVE_EXECUTOR_OWNER='python' 인 경우에만 Python 실전 매도 허용
+        os.environ["LIVE_EXECUTOR_OWNER"] = "python"
         with patch.object(bots, "is_backend_running", return_value=False), patch.object(
             bots, "get_upbit_client", return_value=DummyUpbit()
         ), patch.object(bots, "get_safe_current_price", return_value=5200000.0), patch.object(
