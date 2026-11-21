@@ -7,7 +7,7 @@
  * 1. 단일 실전 실행 주체(LIVE_EXECUTOR_OWNER) + SQLite 원자적 프로세스 리스 락(live_executor_lease, TTL 30s)
  * 2. 주문 실행 최하단 2단계 커밋 (live_order_intents PENDING 선점 + virtual_krw 원자적 선차감 + Upbit identifier 멱등성 + UNKNOWN_TIMEOUT 정산)
  * 3. 동일 포지션(order_uuid) 중복 매도 차단 (closing_lock + sell:<uuid> 버킷) & Graceful Drain 매도 비차단 보장
- * 4. 최후 하드 상한 (청산 후 15분 재진입 쿨다운 · 최소 매수 간격 60s/분할 30s · 봇별 시간당 3회/일 12회 · 전체 일 30회)
+ * 4. 최후 하드 상한 (청산 후 15분 재진입 쿨다운 · 최소 매수 간격 30s/분할 30s · 봇별 시간당 3회/일 12회 · 전체 일 30회)
  * 5. 이상 연속 주문 시도 감지 시 자동 비상 정지(Auto Kill-Switch: 5분 내 5회 차단 / virtual_krw < 0 / 미해결 UNKNOWN_TIMEOUT 2건 이상)
  */
 
@@ -17,7 +17,7 @@ import os from "node:os";
 export const DEFAULT_LIVE_EXECUTOR_OWNER = "node";
 export const DEFAULT_LIVE_LEASE_TTL_SEC = 30;
 export const DEFAULT_LIVE_REENTRY_COOLDOWN_SEC = 900;
-export const DEFAULT_LIVE_MIN_BUY_INTERVAL_SEC = 60;
+export const DEFAULT_LIVE_MIN_BUY_INTERVAL_SEC = 30;
 export const DEFAULT_LIVE_SPLIT_BUY_INTERVAL_SEC = 30;
 export const DEFAULT_LIVE_MAX_BUYS_PER_BOT_HOUR = 3;
 export const DEFAULT_LIVE_MAX_BUYS_PER_BOT_DAY = 12;
@@ -349,7 +349,8 @@ export async function releaseLiveExecutorLease(db, deps = {}, options = {}) {
         .run(ownerId, pid, host);
       await commitWriteTx(db);
       return true;
-    } catch {
+    } catch (err) {
+      console.warn("[Guardrail] releaseLiveExecutorLease failed:", err?.message || err);
       await rollbackWriteTx(db);
       return false;
     }
@@ -533,7 +534,7 @@ export async function precheckLiveBuyPaceLimits(
     }
   }
 
-  // 2. 동일 봇 최소 매수 간격 (일반 60초, 분할 추가 30초)
+  // 2. 동일 봇 최소 매수 간격 (일반 30초, 분할 추가 30초)
   if (!ignoreMinInterval) {
     const minIntervalSec = isSplitBot && openCount > 0 ? cfg.split_min_buy_interval_sec : cfg.min_buy_interval_sec;
     const intervalCutoffIso = new Date(nowMs - minIntervalSec * 1000).toISOString();
@@ -859,7 +860,7 @@ export async function claimLiveBuyIntentAtomic(db, params, deps = {}) {
         }
       }
 
-      // 5-2. 동일 봇 최소 매수 간격 (일반 60초, bot_06/bot_10 추가 분할 차수 30초)
+      // 5-2. 동일 봇 최소 매수 간격 (일반 30초, bot_06/bot_10 추가 분할 차수 30초)
       if (!options?.ignoreMinInterval) {
         const minIntervalSec = isSplitBot && openCount > 0 ? cfg.split_min_buy_interval_sec : cfg.min_buy_interval_sec;
         const intervalCutoffIso = new Date(nowMs - minIntervalSec * 1000).toISOString();
@@ -1134,7 +1135,8 @@ export async function markLiveIntentSubmitted(db, { intentId, upbitOrderUuid }, 
         .run(upbitOrderUuid || null, nowIso, intentId);
       await commitWriteTx(db);
       return true;
-    } catch {
+    } catch (err) {
+      console.warn("[Guardrail] markLiveIntentSubmitted failed:", err?.message || err);
       await rollbackWriteTx(db);
       return false;
     }
@@ -1611,7 +1613,8 @@ export async function releaseFailedSellIntentAtomic(
       }
       await commitWriteTx(db);
       return true;
-    } catch {
+    } catch (err) {
+      console.warn("[Guardrail] releaseFailedSellIntentAtomic failed:", err?.message || err);
       await rollbackWriteTx(db);
       return false;
     }
@@ -1642,7 +1645,8 @@ export async function confirmSellIntentAtomic(db, { intentId, upbitOrderUuid = n
       }
       await commitWriteTx(db);
       return true;
-    } catch {
+    } catch (err) {
+      console.warn("[Guardrail] confirmSellIntentAtomic failed:", err?.message || err);
       await rollbackWriteTx(db);
       return false;
     }
@@ -1697,10 +1701,12 @@ export async function reconcileUnknownTimeoutIntents(db, deps = {}, options = {}
   for (const intent of targets) {
     summary.checked++;
     const intentId = intent.intent_id;
+    const retryIdMatch = String(intent.error_message || "").match(/identifier=([A-Za-z0-9_-]{8,64})/);
+    const lookupIdentifier = retryIdMatch?.[1] || intentId;
     try {
-      const qParams = { identifier: intentId };
+      const qParams = { identifier: lookupIdentifier };
       const qToken = createUpbitJwt(accessKey, secretKey, qParams);
-      const resp = await fetchImpl(`https://api.upbit.com/v1/order?identifier=${encodeURIComponent(intentId)}`, {
+      const resp = await fetchImpl(`https://api.upbit.com/v1/order?identifier=${encodeURIComponent(lookupIdentifier)}`, {
         headers: {
           Authorization: `Bearer ${qToken}`,
           Accept: "application/json",
@@ -1759,15 +1765,19 @@ export async function reconcileUnknownTimeoutIntents(db, deps = {}, options = {}
           await cancelUpbitOrder(orderUuid, cfg);
           try {
             const reToken = createUpbitJwt(accessKey, secretKey, qParams);
-            const reResp = await fetchImpl(`https://api.upbit.com/v1/order?identifier=${encodeURIComponent(intentId)}`, {
+            const reResp = await fetchImpl(`https://api.upbit.com/v1/order?identifier=${encodeURIComponent(lookupIdentifier)}`, {
               headers: { Authorization: `Bearer ${reToken}`, Accept: "application/json" },
               signal: AbortSignal.timeout(8000),
             });
             if (reResp.status === 200) {
               detail = await reResp.json();
               state = String(detail?.state || "").toLowerCase();
+            } else {
+              console.warn(`[Guardrail][Reconcile] 취소 후 재조회 비정상 응답 (identifier=${lookupIdentifier}, HTTP ${reResp.status})`);
             }
-          } catch {}
+          } catch (reErr) {
+            console.warn(`[Guardrail][Reconcile] 취소 후 재조회 실패 (identifier=${lookupIdentifier}):`, reErr?.message || reErr);
+          }
         }
 
         const filledVol = Number(detail?.executed_volume || 0);

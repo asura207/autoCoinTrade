@@ -62,6 +62,8 @@ try {
     getDb,
     getBots,
     getSafeOrderKrw,
+    getUpbitKrwTickSize,
+    normalizeUpbitKrwTick,
     extractStructuredRegimeFromLlmText,
     normalizeLlmRegimeDecision,
     normalizeBlacklistTickers,
@@ -231,6 +233,17 @@ BTC 일봉 20MA 하회 BEAR 장세. 역추세·눌림목 봇(05, 06, 08, 10)만 
     assert.equal(synthProFlashHalt.final_position_multiplier, 0.5);
     assert.equal(synthProFlashHalt.final_bot_overrides.bot_10, "ALLOW");
 
+    // 4-C2b. Pro slot running on gemini-3.5-flash WITH genuine black-swan keyword (해킹/출금정지) -> MUST enforce full HALT!
+    const flashProGenuineBlackSwan = {
+      ...flashFallbackProHalt,
+      reason: "대형 거래소 해킹 및 출금정지 발생으로 신규 매수 전면 중단",
+    };
+    const synthProFlashBlackSwan = synthesizeDualAiDecision(ollamaRes, flashProGenuineBlackSwan);
+    assert.equal(synthProFlashBlackSwan.final_risk_alert, 1, "Pro gemini-3.5-flash with genuine black-swan keyword MUST trigger full HALT");
+    assert.equal(synthProFlashBlackSwan.recommended_action, "HALT_NEW_BUYS");
+    assert.equal(synthProFlashBlackSwan.final_position_multiplier, 0.0);
+    assert.equal(synthProFlashBlackSwan.final_bot_overrides.bot_10, "BLOCK");
+
     // 4-C3. Local Ollama(qwen3-news) unilateral HALT on ordinary bearish news while Pro says REDUCE_SIZE -> softened
     const ollamaNoBlackSwanHalt = {
       ...genuineHalt,
@@ -330,10 +343,77 @@ BTC 일봉 20MA 하회 BEAR 장세. 역추세·눌림목 봇(05, 06, 08, 10)만 
   assert.equal(cleanedRegime.recommended_action, "REDUCE_SIZE");
   assert.deepEqual(JSON.parse(cleanedRegime.blacklist_tickers_json), [], "loadSideState must strip legacy KRW-티커");
   assert.equal(cleanedRegime.updated_at, cleanedRegime.pro_updated_at, "market_regime_filter.updated_at must use KST matching pro_updated_at");
+
+  // 4-F2. Expired Flash HALT state (>90m old) must be ignored via TTL so it cannot sticky-lock fresh Pro REDUCE_SIZE
+  const expiredHaltFlash = {
+    sentiment_score: -0.95,
+    market_regime: "HIGH_VOLATILITY_SHOCK",
+    risk_alert: true,
+    recommended_action: "HALT_NEW_BUYS",
+    position_size_multiplier: 0.0,
+    bot_overrides: Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`bot_${String(i + 1).padStart(2, "0")}`, "BLOCK"])),
+    blacklist_tickers: [],
+    reason: "대형 거래소 해킹 발생 (과거 만료 상태)",
+  };
+  await db
+    .prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('dual_ai_flash_state_json', ?, '2026-11-19 00:00:00')")
+    .run(JSON.stringify(expiredHaltFlash));
+  const ttlCleanedRegime = await updateMarketRegimeFilterFromAnalysis({
+    isPro: true,
+    provider: "gemini",
+    model: "gemini-3.5-flash",
+    decision: parsedPro,
+  });
+  assert.equal(Number(ttlCleanedRegime.final_risk_alert), 0, "Expired Flash HALT (>90m) must NOT sticky-block fresh Pro REDUCE_SIZE");
+  assert.equal(ttlCleanedRegime.recommended_action, "REDUCE_SIZE");
+  assert.equal(ttlCleanedRegime.final_bot_overrides.bot_10, "ALLOW");
+
+  // Low-priced coin tick helper for ask1 retry (e.g. KRW-DOGE 72.7 -> tick 0.1, +3 ticks = 73.0)
+  assert.equal(getUpbitKrwTickSize(72.7), 0.1, "KRW-DOGE 72.7 KRW tick size must be 0.1");
+  assert.equal(normalizeUpbitKrwTick(72.78), 72.7, "normalizeUpbitKrwTick(72.78) must align with 0.1 tick size");
+  assert.equal(getUpbitKrwTickSize(3983), 1, "KRW-NEAR 3983 KRW tick size must be 1");
+  assert.equal(getUpbitKrwTickSize(82800000), 1000, "KRW-BTC tick size must be 1000");
+
+  // Korean negation ("않") in black-swan keyword filter must NOT trigger false-positive HALT
+  const negatedBlackSwanSynth = synthesizeDualAiDecision(
+    {
+      provider: "ollama",
+      model: "qwen3-news",
+      sentiment_score: -0.5,
+      market_regime: "BEAR",
+      risk_alert: true,
+      recommended_action: "HALT_NEW_BUYS",
+      position_size_multiplier: 0.0,
+      bot_overrides: Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`bot_${String(i + 1).padStart(2, "0")}`, "BLOCK"])),
+      reason: "거래소 해킹은 발생하지 않았으며 단순 약세 조정입니다.",
+    },
+    {
+      provider: "gemini",
+      model: "gemini-3.5-flash",
+      sentiment_score: -0.3,
+      market_regime: "BEAR",
+      risk_alert: false,
+      recommended_action: "REDUCE_SIZE",
+      position_size_multiplier: 0.5,
+      bot_overrides: {
+        bot_01: "BLOCK", bot_02: "BLOCK", bot_03: "BLOCK", bot_04: "BLOCK",
+        bot_05: "ALLOW", bot_06: "ALLOW", bot_07: "BLOCK", bot_08: "ALLOW",
+        bot_09: "BLOCK", bot_10: "ALLOW",
+      },
+      reason: "돌발 악재는 감지되지 않았습니다. 역추세 0.5x 허용.",
+    }
+  );
+  assert.equal(negatedBlackSwanSynth.recommended_action, "REDUCE_SIZE", "Korean negation ('발생하지 않았') must NOT false-positive as black-swan HALT");
+  assert.equal(negatedBlackSwanSynth.final_bot_overrides.bot_10, "ALLOW", "bot_10 must stay ALLOW when black-swan phrase is negated");
+
+  // ai_market_briefings.decision_json column exists
+  const ambCols = (await db.prepare("PRAGMA table_info(ai_market_briefings)").all()).map((r) => r.name);
+  assert.ok(ambCols.includes("decision_json"), "ai_market_briefings must have decision_json column for audit parity");
+
   report.push({
     check: "EchoLoopAndLegacyStateCleanup",
     status: "PASS",
-    detail: "Prompt echo removed, legacy Flash state re-normalized, updated_at unified to KST",
+    detail: "Prompt echo removed, TTL expiry verified, tick-size helper & decision_json schema OK",
   });
 
   // 4-G. Guardrail bucket archiving on CANCELED + MIN_BUY_INTERVAL non-kill-switch + precheck + bot_06 max_splits

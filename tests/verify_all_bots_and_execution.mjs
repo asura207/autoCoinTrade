@@ -852,18 +852,18 @@ async function runTests() {
     assert.deepEqual(
       proModels.slice(0, 7),
       [
-        "gemini-3.1-pro-preview",
-        "gemini-pro-latest",
-        "gemini-3.8-flash",
-        "gemini-flash-latest",
         "gemini-3.5-flash",
+        "gemini-3.8-flash",
         "gemini-3.5-flash-lite",
         "gemini-flash-lite-latest",
+        "gemini-flash-latest",
+        "gemini-3.1-pro-preview",
+        "gemini-pro-latest",
       ],
-      "Pro candidate list must include 3.5 Flash/Lite working fallback models after Pro/3.8 tiers"
+      "Pro candidate list must prioritize stable working flash models before quota-limited Pro preview models"
     );
     assert.equal(new Set(proModels).size, proModels.length, "Pro candidate models must not contain duplicates");
-    assert.equal(flashModels[0], "gemini-3.8-flash");
+    assert.equal(flashModels[0], "gemini-3.5-flash");
     assert.ok(flashModels.includes("gemini-3.5-flash-lite"));
     const customPro = getDualAiCandidateModels(true, "gemini-custom-pro");
     assert.equal(customPro[0], "gemini-custom-pro");

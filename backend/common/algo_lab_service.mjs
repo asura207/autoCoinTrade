@@ -481,9 +481,16 @@ export function buildIndicators(marketData) {
     ind.m15.kellogg = kellogg;
   }
   ind.atr = ind.m15?.atr14 || ind.m60?.atr14 || null;
-  const m60Bullish = ind.m60 ? Boolean(ind.m60.ema20 >= ind.m60.ema60 || ind.m60.supertrend?.isUp) : null;
-  const m240Bullish = ind.m240 ? Boolean((ind.m240.ma20 && price >= ind.m240.ma20) || ind.m240.supertrend?.isUp) : null;
-  const dayBullish = ind.day?.ma20 ? price >= ind.day.ma20 : null;
+  const m60Bullish = ind.m60
+    ? Boolean(
+        (Number.isFinite(ind.m60.ema20) && Number.isFinite(ind.m60.ema60) && ind.m60.ema20 >= ind.m60.ema60) ||
+          ind.m60.supertrend?.isUp
+      )
+    : null;
+  const m240Bullish = ind.m240
+    ? Boolean((Number.isFinite(ind.m240.ma20) && ind.m240.ma20 > 0 && price >= ind.m240.ma20) || ind.m240.supertrend?.isUp)
+    : null;
+  const dayBullish = Number.isFinite(ind.day?.ma20) && ind.day.ma20 > 0 ? price >= ind.day.ma20 : null;
   const htfChecks = [m60Bullish, m240Bullish, dayBullish].filter((v) => v !== null);
   const htfAlignedUp = htfChecks.length === 0 ? true : htfChecks.some(Boolean);
   const htfStronglyBearish =
@@ -582,7 +589,7 @@ function parseKstTimestampMs(timeStr) {
 /**
  * 횡보장 자금 잠김(Position Lock) 해소를 위한 3단계 스마트 청산(Exit) 엔진
  * 1) 본절 스탑 (Breakeven Stop): 최고 수익률 +1.2% 이상 도달 후 +0.25% 이하로 하락 시 수익 반납 방지 익절
- * 2) 시간 제한 청산 (Time-Stop): 단타 봇(bot_01, bot_04, bot_05, bot_09, bot_10)이 6시간(실전)/2시간(가상) 경과 후 -0.6%~+0.8% 박스권 & RVOL < 1.0 시 자금 회수
+ * 2) 시간 제한 청산 (Time-Stop): 단타 봇(bot_01, bot_04, bot_05, bot_09, bot_10)이 4시간(실전)/2시간(가상) 경과 후 -0.6%~+0.8% 박스권 & RVOL < 1.0 시 자금 회수
  * 3) ATR 기반 동적 트레일링 스탑: 진입가 대비 -2.2*ATR 하드 손절(분할 그리드 bot_06 제외), 최고가 수익 +1.0% 이상 도달 후 수익 구간 내 -1.8*ATR 트레일링 스탑
  */
 export function evaluateSmartExit({
@@ -620,7 +627,7 @@ export function evaluateSmartExit({
       const entryTs = parseKstTimestampMs(timeStr);
       if (!isNaN(entryTs)) {
         const holdHours = (Date.now() - entryTs) / (3600 * 1000);
-        const maxHoldHours = isLive ? 6.0 : 2.0;
+        const maxHoldHours = isLive ? 4.0 : 2.0;
 
         const inBox = pnlPct >= -0.6 && pnlPct <= 0.8;
         const rawRvol =
@@ -946,8 +953,7 @@ const ko = (n) => Math.floor(Number(n || 0)).toLocaleString("ko-KR");
 
 const STRATEGIES = {
   // bot_01: 변동성 돌파
-  bot_01({ price, ind, held, params, options = {} }) {
-    const isLive = Boolean(options.isLive);
+  bot_01({ price, ind, held, params }) {
     const d = ind.day;
     if (!d) return hold("일봉 데이터 부족");
     if (held.length > 0) {
@@ -998,7 +1004,6 @@ const STRATEGIES = {
 
   // bot_03: 듀얼 모멘텀
   bot_03({ price, ind, held, params, options = {} }) {
-    const isLive = Boolean(options.isLive);
     const info = options.momentumRank?.[options.market];
     if (!info) return hold("모멘텀 순위 산출 대기");
     const absTh = Number(params.abs_momentum_threshold_pct ?? 1.2);
@@ -1020,8 +1025,7 @@ const STRATEGIES = {
   },
 
   // bot_04: 볼린저 스퀴즈 돌파
-  bot_04({ price, ind, held, params, options = {} }) {
-    const isLive = Boolean(options.isLive);
+  bot_04({ price, ind, held, params }) {
     const m = ind.m15;
     if (!m || !m.bb) return hold("15분봉 데이터 부족");
     if (held.length > 0) {
@@ -1044,8 +1048,7 @@ const STRATEGIES = {
   },
 
   // bot_05: 볼린저 역추세 반등
-  bot_05({ price, ind, held, params, options = {} }) {
-    const isLive = Boolean(options.isLive);
+  bot_05({ price, ind, held, params }) {
     const m = ind.m15;
     if (!m || !m.bb) return hold("15분봉 데이터 부족");
     if (held.length > 0) return hold("보유 중 (+3.5% 익절 / -2.0% 손절 감시)");
@@ -1058,8 +1061,7 @@ const STRATEGIES = {
   },
 
   // bot_06: 다단계 분할 매수 그리드
-  bot_06({ price, ind, held, params, options = {} }) {
-    const isLive = Boolean(options.isLive);
+  bot_06({ price, ind, held, params }) {
     const m = ind.m15;
     const tp = Number(params.take_profit_pct ?? 1.8);
     const maxSplits = Math.max(1, Number(params.max_splits ?? 3));
@@ -1103,6 +1105,7 @@ const STRATEGIES = {
     if (!m || !m.macdSeries || !h) return hold("15분/60분봉 데이터 부족");
     const { macd, signal } = m.macdSeries;
     const n = macd.length;
+    if (n < 3) return hold("MACD 시계열 부족");
     if (held.length > 0) {
       const crossDown = macd[n - 2] >= signal[n - 2] && macd[n - 1] < signal[n - 1];
       if (crossDown) return sell("MACD 데드크로스 청산");
@@ -1123,8 +1126,7 @@ const STRATEGIES = {
   },
 
   // bot_08: 정배열 20일선 눌림목
-  bot_08({ price, ind, held, params, options = {} }) {
-    const isLive = Boolean(options.isLive);
+  bot_08({ price, ind, held, params }) {
     const d = ind.day;
     const h4 = ind.m240;
     if (!d || !h4 || d.ma60 === null || h4.ma60 === null) return hold("일봉/4시간봉 데이터 부족");
@@ -1155,12 +1157,15 @@ const STRATEGIES = {
 
   // bot_09: 거래량 폭발 모멘텀 스캘퍼
   bot_09({ price, ind, held, params, options = {} }) {
-    const isLive = Boolean(options.isLive);
     const trailPct = Number(params.trailing_stop_pct ?? 1.5);
     if (held.length > 0) {
+      const totalCost = held.reduce((acc, p) => acc + Number(p.buy_amount || Number(p.volume || 0) * Number(p.avg_buy_price || 0)), 0);
+      const totalVol = held.reduce((acc, p) => acc + Number(p.volume || 0), 0);
+      const avgBuyPrice = totalVol > 0 ? totalCost / totalVol : Number(held[0].avg_buy_price || 0);
       const peak = Math.max(Number(options.peakPrice || 0), price);
-      if (peak > 0 && price <= peak * (1 - trailPct / 100)) {
-        return sell(`고점 대비 -${trailPct}% 트레일링 스탑`);
+      const peakPnl = avgBuyPrice > 0 ? pctChange(peak, avgBuyPrice) : 0;
+      if (peak > 0 && peakPnl > 0 && price <= peak * (1 - trailPct / 100)) {
+        return sell(`고점 대비 -${trailPct}% 트레일링 스탑 (최고 +${fmt(peakPnl)}%)`);
       }
       return hold("보유 중 (트레일링 스탑 감시)");
     }

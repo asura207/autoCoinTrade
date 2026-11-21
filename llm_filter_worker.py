@@ -331,23 +331,27 @@ BTC 현재가 대비 일봉 20MA / 4시간봉 60MA 이격도, 공포·탐욕 지
 8. reason: 거시 장세 체제와 실전 선택 봇별 적합성 판단 근거를 한국어로 논리적으로 작성
 """
 
-# 모델 후보군 정의 (30분 gemini-3.8-flash / 1시간 gemini-3.1-pro-preview 및 호환 모델 폴백)
+# 모델 후보군 정의 (무료 티어 정상 작동 Flash 계열 우선 + Pro 프리뷰 후순위 폴백, 폐기된 gemini-2.5-* 제외)
 FLASH_MODELS = [
     "gemini-3.8-flash",
     "gemini-flash-latest",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
     "gemini-flash-lite-latest",
-    "gemini-2.5-flash",
 ]
-PRO_MODELS = [
-    "gemini-3.1-pro-preview",
-    "gemini-pro-latest",
-    "gemini-3.8-flash",
-    "gemini-flash-latest",
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-]
+PRO_MODELS = (
+    [
+        "gemini-3.1-pro-preview",
+        "gemini-pro-latest",
+        *FLASH_MODELS,
+    ]
+    if str(os.getenv("GEMINI_ENABLE_PRO_PREVIEW", "")).strip().lower() == "true"
+    else [
+        *FLASH_MODELS,
+        "gemini-3.1-pro-preview",
+        "gemini-pro-latest",
+    ]
+)
 
 
 # ==============================================================================
