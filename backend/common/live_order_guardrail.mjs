@@ -28,6 +28,8 @@ export const DEFAULT_LIVE_ANOMALY_TIMEOUT_THRESHOLD = 2;
 export const LIVE_CYCLE_STALE_WARN_MS = 180 * 1000;
 
 export const SPLIT_ALLOWED_BOTS = new Set(["bot_06", "bot_10"]);
+// 정상 속도 제어(최소 매수 간격 · 청산 후 재진입 쿨다운)는 반복 이상 비상 정지(Auto Kill-Switch) 누적 대상에서 분리
+export const NON_ANOMALY_PACE_BLOCK_CODES = new Set(["MIN_BUY_INTERVAL", "REENTRY_COOLDOWN"]);
 
 function formatKstDateTimeLocal(dateObj = new Date()) {
   const kst = new Date(dateObj.getTime() + 9 * 3600 * 1000);
@@ -436,13 +438,14 @@ async function recordBlockAndMaybeKillSwitchInTx(db, cfg, { botId, market, side 
     .prepare(
       `SELECT COUNT(*) AS cnt
        FROM live_guardrail_events
-       WHERE bot_id = ? AND side = 'BUY' AND created_at >= ?`
+       WHERE bot_id = ? AND side = 'BUY' AND created_at >= ?
+         AND block_code NOT IN ('MIN_BUY_INTERVAL', 'REENTRY_COOLDOWN')`
     )
     .get(botId, windowCutoffIso);
   const blockCount = Number(cntRow?.cnt || 0);
 
   let killSwitch = null;
-  if (blockCount >= cfg.anomaly_block_threshold) {
+  if (!NON_ANOMALY_PACE_BLOCK_CODES.has(code) && blockCount >= cfg.anomaly_block_threshold) {
     killSwitch = await tripGuardrailKillSwitchInTx(db, {
       botIds: [botId],
       haltAllLiveBots: false,
@@ -456,6 +459,163 @@ async function recordBlockAndMaybeKillSwitchInTx(db, cfg, { botId, market, side 
   }
 
   return { blockCount, killSwitch };
+}
+
+/**
+ * [Layer 4 선검사 (Read-Only)]
+ * 10초 주기 실전 루프(runLiveTradingBotsCycle) 진입 전 정상적 속도 제어(재진입 쿨다운 / 최소 매수 간격 / 시간당·일일·전체 상한)를
+ * 비파괴적으로 선확인하여 live_guardrail_events 불필요 누적 및 Auto Kill-Switch 오발동을 원천 방지합니다.
+ */
+export async function precheckLiveBuyPaceLimits(
+  db,
+  {
+    botId,
+    market,
+    openCount = 0,
+    nowMs = Date.now(),
+    runtimeConfig = {},
+    inMemoryCooldownMap = null,
+    ignoreCooldown = false,
+    ignoreMinInterval = false,
+  } = {}
+) {
+  if (!db) return { ok: true };
+  const normBotId = String(botId || "").trim();
+  const normMkt = String(market || "").trim().toUpperCase();
+  const cfg = await getGuardrailConfig(db, runtimeConfig);
+  const isSplitBot = SPLIT_ALLOWED_BOTS.has(normBotId);
+
+  // 1. 청산 후 재진입 쿨다운 (기본 900초)
+  if (openCount === 0 && !ignoreCooldown) {
+    const cooldownMs = cfg.reentry_cooldown_sec * 1000;
+    const memSellMs = inMemoryCooldownMap ? Number(inMemoryCooldownMap.get(`${normBotId}|${normMkt}`) || 0) : 0;
+    if (memSellMs > 0 && nowMs - memSellMs < cooldownMs) {
+      const remSec = Math.ceil((cooldownMs - (nowMs - memSellMs)) / 1000);
+      return {
+        ok: false,
+        code: "REENTRY_COOLDOWN",
+        reason: `${normMkt} 매도 청산 후 재진입 쿨다운(${cfg.reentry_cooldown_sec}초, 잔여 약 ${remSec}초) 미경과`,
+      };
+    }
+    const cutoffKst = formatKstDateTimeLocal(new Date(nowMs - cooldownMs));
+    const recentTradeSell = await db
+      .prepare(
+        `SELECT sell_date FROM trades
+         WHERE bot_id = ? AND market = ? AND status = 'COMPLETED' AND sell_date >= ?
+         ORDER BY sell_date DESC LIMIT 1`
+      )
+      .get(normBotId, normMkt, cutoffKst);
+    const recentPosSell = !recentTradeSell
+      ? await db
+          .prepare(
+            `SELECT closed_at FROM bot_positions
+             WHERE bot_id = ? AND market = ? AND status = 'CLOSED' AND closed_at >= ?
+             ORDER BY closed_at DESC LIMIT 1`
+          )
+          .get(normBotId, normMkt, cutoffKst)
+      : null;
+    const cutoffIso = new Date(nowMs - cooldownMs).toISOString();
+    const recentIntentSell = !recentTradeSell && !recentPosSell
+      ? await db
+          .prepare(
+            `SELECT updated_at FROM live_order_intents
+             WHERE bot_id = ? AND market = ? AND side = 'SELL' AND status = 'CONFIRMED' AND updated_at >= ?
+             ORDER BY updated_at DESC LIMIT 1`
+          )
+          .get(normBotId, normMkt, cutoffIso)
+      : null;
+    if (recentTradeSell || recentPosSell || recentIntentSell) {
+      return {
+        ok: false,
+        code: "REENTRY_COOLDOWN",
+        reason: `${normMkt} 매도 청산 후 재진입 쿨다운(${cfg.reentry_cooldown_sec}초) 미경과`,
+      };
+    }
+  }
+
+  // 2. 동일 봇 최소 매수 간격 (일반 60초, 분할 추가 30초)
+  if (!ignoreMinInterval) {
+    const minIntervalSec = isSplitBot && openCount > 0 ? cfg.split_min_buy_interval_sec : cfg.min_buy_interval_sec;
+    const intervalCutoffIso = new Date(nowMs - minIntervalSec * 1000).toISOString();
+    const recentBuyRow = await db
+      .prepare(
+        `SELECT intent_id, market, created_at
+         FROM live_order_intents
+         WHERE bot_id = ? AND side = 'BUY'
+           AND status IN ('PENDING', 'SUBMITTED', 'UNKNOWN_TIMEOUT', 'CONFIRMED')
+           AND created_at >= ?
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .get(normBotId, intervalCutoffIso);
+    if (recentBuyRow) {
+      return {
+        ok: false,
+        code: "MIN_BUY_INTERVAL",
+        reason: `${normBotId} 최소 실전 매수 간격(${minIntervalSec}초) 미경과(직전 매수: ${recentBuyRow.market})`,
+      };
+    }
+  }
+
+  // 3. 봇별 시간당 매수 상한
+  const hourCutoffIso = new Date(nowMs - 3600 * 1000).toISOString();
+  const hourRow = await db
+    .prepare(
+      `SELECT COUNT(*) AS cnt
+       FROM live_order_intents
+       WHERE bot_id = ? AND side = 'BUY'
+         AND status IN ('PENDING', 'SUBMITTED', 'UNKNOWN_TIMEOUT', 'CONFIRMED')
+         AND created_at >= ?`
+    )
+    .get(normBotId, hourCutoffIso);
+  const botHourBuys = Number(hourRow?.cnt || 0);
+  if (botHourBuys >= cfg.max_buys_per_bot_hour) {
+    return {
+      ok: false,
+      code: "BOT_HOURLY_BUY_CAP",
+      reason: `${normBotId} 시간당 실전 매수 상한(${botHourBuys}/${cfg.max_buys_per_bot_hour}회) 도달 대기`,
+    };
+  }
+
+  // 4. 봇별 당일(00:00 KST) 매수 상한
+  const todayStartUtcIso = getTodayStartKstUtcIso(nowMs);
+  const botDayRow = await db
+    .prepare(
+      `SELECT COUNT(*) AS cnt
+       FROM live_order_intents
+       WHERE bot_id = ? AND side = 'BUY'
+         AND status IN ('PENDING', 'SUBMITTED', 'UNKNOWN_TIMEOUT', 'CONFIRMED')
+         AND created_at >= ?`
+    )
+    .get(normBotId, todayStartUtcIso);
+  const botDayBuys = Number(botDayRow?.cnt || 0);
+  if (botDayBuys >= cfg.max_buys_per_bot_day) {
+    return {
+      ok: false,
+      code: "BOT_DAILY_BUY_CAP",
+      reason: `${normBotId} 일일 실전 매수 상한(${botDayBuys}/${cfg.max_buys_per_bot_day}회) 도달 대기`,
+    };
+  }
+
+  // 5. 전체 실전 풀 당일 매수 상한
+  const totalDayRow = await db
+    .prepare(
+      `SELECT COUNT(*) AS cnt
+       FROM live_order_intents
+       WHERE side = 'BUY'
+         AND status IN ('PENDING', 'SUBMITTED', 'UNKNOWN_TIMEOUT', 'CONFIRMED')
+         AND created_at >= ?`
+    )
+    .get(todayStartUtcIso);
+  const totalDayBuys = Number(totalDayRow?.cnt || 0);
+  if (totalDayBuys >= cfg.max_total_buys_day) {
+    return {
+      ok: false,
+      code: "GLOBAL_DAILY_BUY_CAP",
+      reason: `전체 실전 풀 일일 매수 상한(${totalDayBuys}/${cfg.max_total_buys_day}회) 도달 대기`,
+    };
+  }
+
+  return { ok: true };
 }
 
 /**
@@ -601,7 +761,7 @@ export async function claimLiveBuyIntentAtomic(db, params, deps = {}) {
       const isSplitBot = SPLIT_ALLOWED_BOTS.has(normBotId);
       const maxSteps =
         normBotId === "bot_06"
-          ? Math.min(5, Math.max(1, parsePositiveInt(botCfg.max_steps, 3)))
+          ? Math.min(5, Math.max(1, parsePositiveInt(botCfg.max_splits ?? botCfg.max_steps, 3)))
           : normBotId === "bot_10"
           ? 2
           : 1;
@@ -1066,13 +1226,21 @@ export async function refundFailedOrCanceledBuyIntentAtomic(
         return { refunded: false, amount: 0, reason: "INTENT_NOT_FOUND" };
       }
 
+      const statusSlug = String(nextStatus || "FAILED_NOT_CREATED").trim().toLowerCase();
+      const shortId = String(intentId || "").slice(0, 8);
+      const curBucket = String(intentRow.intent_bucket || "");
+      const archivedBucket =
+        curBucket && !curBucket.includes(`:${statusSlug}:${shortId}`)
+          ? `${curBucket}:${statusSlug}:${shortId}`
+          : curBucket;
+
       const upd = await db
         .prepare(
           `UPDATE live_order_intents
-           SET status = ?, refunded = 1, error_message = COALESCE(?, error_message), updated_at = ?
+           SET status = ?, intent_bucket = ?, refunded = 1, error_message = COALESCE(?, error_message), updated_at = ?
            WHERE intent_id = ? AND refunded = 0`
         )
-        .run(nextStatus, errorMessage ? String(errorMessage).slice(0, 400) : null, nowIso, intentId);
+        .run(nextStatus, archivedBucket, errorMessage ? String(errorMessage).slice(0, 400) : null, nowIso, intentId);
 
       const refundKrw = Math.max(0, Math.floor(Number(intentRow.requested_krw || 0)));
       const targetBotId = botId || intentRow.bot_id;

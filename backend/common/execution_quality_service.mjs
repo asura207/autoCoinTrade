@@ -12,7 +12,11 @@ export const BREAKOUT_BOT_IDS = new Set(["bot_01", "bot_02", "bot_03", "bot_04",
 
 export function analyzeOrderbookQuality(orderbook, orderKrw = 0, options = {}) {
   const botId = String(options.botId || "").trim();
-  const isBreakoutBot = BREAKOUT_BOT_IDS.has(botId) || options.enforceObi !== false;
+  // 돌파형 봇(bot_01~04, 07, 09) 또는 명시적 enforceObi=true (또는 botId 미지정 일반 검사)일 때만 매도벽 OBI 차단 적용
+  // 역추세·그리드·눌림목 봇(bot_05, 06, 08, 10)은 과매도 하락 구간 반등 진입 특성상 매도벽 OBI로 차단하지 않음(스프레드 가드는 유지)
+  const enforceObi =
+    options.enforceObi === true ||
+    (options.enforceObi !== false && (BREAKOUT_BOT_IDS.has(botId) || !botId));
   const maxSpreadPct = Number(options.maxSpreadPct ?? 0.35);
   const minObi = Number(options.minObi ?? -0.45);
 
@@ -109,7 +113,7 @@ export function analyzeOrderbookQuality(orderbook, orderKrw = 0, options = {}) {
     };
   }
 
-  if (isBreakoutBot && obi < minObi) {
+  if (enforceObi && obi < minObi) {
     return {
       ok: false,
       blocked: true,

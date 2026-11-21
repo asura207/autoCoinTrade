@@ -43,7 +43,10 @@ export class UpbitWsHub extends EventEmitter {
     this.lastError = "";
 
     this.subscribedMarkets = new Set(
-      (options.initialMarkets || ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-DOGE", "KRW-SUI", "KRW-ADA", "KRW-AVAX"])
+      (options.initialMarkets || [
+        "KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-DOGE",
+        "KRW-SUI", "KRW-AVAX", "KRW-SHIB", "KRW-ADA", "KRW-NEAR",
+      ])
         .map((m) => String(m || "").trim().toUpperCase())
         .filter((m) => m.startsWith("KRW-"))
     );
@@ -157,6 +160,7 @@ export class UpbitWsHub extends EventEmitter {
 
   getLatestOrderbook(market) {
     const m = String(market || "").trim().toUpperCase();
+    if (this.isStale()) return null;
     return this.orderbookMap.get(m) || null;
   }
 

@@ -193,10 +193,25 @@ try {
     { telegramApiBaseUrl: mockBase }
   );
   assert.equal(riskSent.telegram.sent, true, "CIRCUIT_BREAKER must still send when notify_on_risk=true");
+
+  const quotaSent = await dispatchMultiChannelNotification(
+    db,
+    {
+      eventType: "GEMINI_QUOTA_EXCEEDED",
+      source: "AI 시장 분석 (Pro)",
+      trigger_type: "AUTO",
+      fallback_tier: "MECHANICAL_20MA",
+      reason: "HTTP 429 Quota Exceeded",
+    },
+    { telegramApiBaseUrl: mockBase }
+  );
+  assert.equal(quotaSent.telegram.sent, true, "GEMINI_QUOTA_EXCEEDED must send to Telegram when notify_on_risk=true");
+  const lastTgMsg = receivedTelegram[receivedTelegram.length - 1]?.body?.text || "";
+  assert.ok(lastTgMsg.includes("Gemini API 호출 한도 초과"), "Telegram message must include Gemini quota exceeded header");
   results.push({
     check: "Event Filter Toggles",
     status: "PASS",
-    detail: "notify_on_trade=false skipped LIVE_BUY; CIRCUIT_BREAKER delivered",
+    detail: "notify_on_trade=false skipped LIVE_BUY; CIRCUIT_BREAKER & GEMINI_QUOTA_EXCEEDED delivered",
   });
 
   // 4. Candlestick + VWAP/LRC/20MA + BUY/SELL Trade-Marker Chart Builder

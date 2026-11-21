@@ -77,6 +77,14 @@ try {
   assert.equal(sellWallRes.blocked, true, "Extreme sell wall (OBI < -0.45) must block breakout buy");
   assert.ok(sellWallRes.obi < -0.45);
 
+  // 역추세·그리드 봇(bot_05, bot_06, bot_08, bot_10)은 매도벽 OBI로 차단되지 않되, 스프레드 과다는 여전히 차단
+  const reversalSellWallRes = analyzeOrderbookQuality(sellWallOb, 50000, { botId: "bot_10" });
+  assert.equal(reversalSellWallRes.blocked, false, "Reversal bot_10 must NOT be blocked by sell-wall OBI");
+  const reversalWideSpreadRes = analyzeOrderbookQuality(wideSpreadOb, 50000, { botId: "bot_10" });
+  assert.equal(reversalWideSpreadRes.blocked, true, "Reversal bot_10 must STILL be blocked by wide spread (>0.35%)");
+  const explicitEnforceRes = analyzeOrderbookQuality(sellWallOb, 50000, { botId: "bot_10", enforceObi: true });
+  assert.equal(explicitEnforceRes.blocked, true, "Explicit enforceObi=true must still enforce OBI guard");
+
   const healthyOb = {
     orderbook_units: [
       { ask_price: 100050, bid_price: 100000, ask_size: 12, bid_size: 15 },

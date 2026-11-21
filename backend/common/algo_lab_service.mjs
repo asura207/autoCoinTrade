@@ -623,14 +623,17 @@ export function evaluateSmartExit({
         const maxHoldHours = isLive ? 6.0 : 2.0;
 
         const inBox = pnlPct >= -0.6 && pnlPct <= 0.8;
-        const rvol = Number(
+        const rawRvol =
           indicators?.kellogg?.rvol ??
           indicators?.m15?.curVolRatio ??
           indicators?.m15?.closedVolRatio ??
-          0.8
-        );
+          null;
+        const rvol =
+          rawRvol !== null && rawRvol !== undefined && Number.isFinite(Number(rawRvol))
+            ? Number(rawRvol)
+            : null;
 
-        if (holdHours >= maxHoldHours && inBox && rvol < 1.0) {
+        if (holdHours >= maxHoldHours && inBox && rvol !== null && rvol < 1.0) {
           return {
             signal: "SELL",
             exitType: "TIME_STOP",
@@ -647,7 +650,10 @@ export function evaluateSmartExit({
     // 3-1. 진입가 대비 2.2 * ATR 하락 시 손절
     // (분할 그리드 bot_06 및 Jack Kellogg Setup B 2분할 반등 포지션은 자체 분할/기준선 손절을 사용하므로 15m ATR 선손절 제외)
     const buyReasonStr = String(position?.buy_reason || "");
-    const isBot10SetupB = normId === "bot_10" && (buyReasonStr.includes("반등") || buyReasonStr.includes("Setup B"));
+    const vwapRef = Number(indicators?.kellogg?.vwap || 0);
+    const inferredBot10Dip = normId === "bot_10" && !buyReasonStr && vwapRef > 0 && avgBuy < vwapRef;
+    const isBot10SetupB =
+      normId === "bot_10" && (buyReasonStr.includes("반등") || buyReasonStr.includes("Setup B") || inferredBot10Dip);
     if (normId !== "bot_06" && !isBot10SetupB) {
       const hardStopPrice = avgBuy - 2.2 * atr;
       if (curPrice <= hardStopPrice) {
@@ -806,7 +812,7 @@ export const ARENA_BOT_DEFS = [
     min_volume_krw: 8000000000,
     stop_loss_pct: 2.0,
     take_profit_pct: 3.5,
-    config: { bb_period: 20, bb_std: 2.0, bb_stddev: 2.0, candle_unit: "minutes/15", order_krw: 15000, order_ratio: 0.45, max_positions: 2 },
+    config: { bb_period: 20, bb_std: 2.0, bb_stddev: 2.0, rsi_threshold: 35, candle_unit: "minutes/15", order_krw: 15000, order_ratio: 0.45, max_positions: 2 },
   },
   {
     bot_id: "bot_06",
@@ -883,15 +889,15 @@ export const ARENA_BOT_DEFS = [
     strategy_sub_label: "VWAP·LRC 올라운더",
     strategy_rule: "VWAP/회귀 채널 멀티 레짐 ALLOW, 패닉 쇼크 BLOCK",
     description: "4대 핵심 지표(VWAP, 20봉 선형회귀 채널 LRC ±2σ, 거래량 폭발 RVOL, 당일시가/전일고저) 기반 돌파 및 과매도 2분할 반등 매매",
-    min_volume_krw: 10000000000,
+    min_volume_krw: 5000000000,
     stop_loss_pct: 2.5,
     take_profit_pct: 5.0,
     config: {
       rvol_breakout_arena: 1.4,
-      rvol_breakout_live: 1.8,
+      rvol_breakout_live: 1.4,
       rvol_dip: 1.3,
       vwap_gap_arena: 2.0,
-      vwap_gap_live: 2.8,
+      vwap_gap_live: 2.0,
       order_ratio: 0.3,
       max_positions: 3,
     },
@@ -951,9 +957,9 @@ const STRATEGIES = {
       }
       return hold("보유 중 (목표 수익/익일 시가 청산 대기)");
     }
-    const k = Number(params.k_value ?? (isLive ? 0.45 : 0.35));
+    const k = Number(params.k_value ?? 0.35);
     const target = d.todayOpen + (d.prevHigh - d.prevLow) * k;
-    const volMult = Number(params.volume_multiplier ?? (isLive ? 1.5 : 1.2));
+    const volMult = Number(params.volume_multiplier ?? 1.2);
     const volOk = ind.m15 ? ind.m15.volSurge5 >= volMult : true;
     const trendOk = d.ma20 !== null && d.ma20 !== undefined ? price >= d.ma20 : true;
     if (price >= target && price > d.todayOpen && trendOk && volOk) {
@@ -967,9 +973,8 @@ const STRATEGIES = {
 
   // bot_02: SuperTrend + ATR 트레일링
   bot_02({ price, ind, held, params, options = {} }) {
-    const isLive = Boolean(options.isLive);
     const mult = Number(params.atr_multiplier ?? 2.5);
-    const volMult = Number(params.volume_multiplier ?? (isLive ? 2.0 : 1.4));
+    const volMult = Number(params.volume_multiplier ?? 1.4);
     if (held.length > 0) {
       const atr = ind.m60?.atr14;
       const peak = Math.max(Number(options.peakPrice || 0), price);
@@ -996,7 +1001,7 @@ const STRATEGIES = {
     const isLive = Boolean(options.isLive);
     const info = options.momentumRank?.[options.market];
     if (!info) return hold("모멘텀 순위 산출 대기");
-    const absTh = Number(params.abs_momentum_threshold_pct ?? (isLive ? 2.0 : 1.2));
+    const absTh = Number(params.abs_momentum_threshold_pct ?? 1.2);
     const topN = Number(params.top_n ?? 2);
     if (held.length > 0) {
       if (info.momPct < 0) return sell(`모멘텀 이탈 (7일 ${fmt(info.momPct)}%)`);
@@ -1028,7 +1033,7 @@ const STRATEGIES = {
     const recent6Min = Math.min(...bw.slice(-7, -1));
     const min20 = Math.min(...bw.slice(-22, -1));
     const squeezed = recent6Min <= min20 * 1.1;
-    const volMult = Number(params.volume_multiplier ?? (isLive ? 2.0 : 1.4));
+    const volMult = Number(params.volume_multiplier ?? 1.4);
     const volRatio = Math.max(m.curVolRatio, m.closedVolRatio);
     if (squeezed && volRatio >= volMult && price > m.bb.upper) {
       const filter = checkUpperWickAndOverextension(m.cur || m.closed, price, m.bb.mid, m.vwap);
@@ -1044,7 +1049,7 @@ const STRATEGIES = {
     const m = ind.m15;
     if (!m || !m.bb) return hold("15분봉 데이터 부족");
     if (held.length > 0) return hold("보유 중 (+3.5% 익절 / -2.0% 손절 감시)");
-    const rsiTh = Number(params.rsi_threshold ?? (isLive ? 30 : 38));
+    const rsiTh = Number(params.rsi_threshold ?? 38);
     const touched = m.minLow2 <= m.bb.lower;
     if (touched && m.curBullish && price > m.bb.lower && m.rsiMin3 <= rsiTh) {
       return buy(`BB 하단 터치 후 양봉 복귀 · RSI ${fmt(m.rsiMin3, 1)} ≤ ${rsiTh} 과매도 반등`);
@@ -1081,7 +1086,7 @@ const STRATEGIES = {
       return hold(`그리드 보유 ${held.length}분할`);
     }
     if (!m || !m.bb) return hold("15분봉 데이터 부족");
-    const rsiEntry = Number(params.rsi_entry ?? (isLive ? 30 : 38));
+    const rsiEntry = Number(params.rsi_entry ?? 38);
     if (m.rsi <= rsiEntry && price <= m.bb.lower * 1.005) {
       return buy(`단기 과매도 그리드 1차 진입 (RSI ${fmt(m.rsi, 1)} ≤ ${rsiEntry}, BB 하단 부근)`, {
         splitIndex: 1,
@@ -1137,7 +1142,7 @@ const STRATEGIES = {
     }
     const dayAligned = d.ma5 > d.ma20 && d.ma20 > d.ma60;
     const h4Aligned = h4.ma5 > h4.ma20 && h4.ma20 > h4.ma60;
-    const band = Number(params.pullback_band_pct ?? (isLive ? 1.5 : 2.2));
+    const band = Number(params.pullback_band_pct ?? 2.2);
     const gap = pctChange(price, d.ma20);
     const volDecline = h4.lastClosedVolRatio < 1.0;
     const roomToTargetPct = targetHighPrice > 0 && price > 0 ? ((targetHighPrice - price) / price) * 100 : Infinity;
@@ -1161,7 +1166,7 @@ const STRATEGIES = {
     }
     const m = ind.m15;
     if (!m) return hold("15분봉 데이터 부족");
-    const spike = Number(params.volume_spike_multiplier ?? (isLive ? 2.0 : 1.4));
+    const spike = Number(params.volume_spike_multiplier ?? 1.4);
     const closedClose = Number(m.closed.trade_price);
     if (m.closedVolRatio >= spike && m.closedBullish && price >= closedClose && pctChange(price, closedClose) <= 1.5) {
       const filter = checkUpperWickAndOverextension(m.closed, price, m.ema20, m.vwap);
@@ -1180,15 +1185,11 @@ const STRATEGIES = {
     const rawRvolBreakout = (isLive ? params.rvol_breakout_live : params.rvol_breakout_arena) ?? params.rvol_breakout;
     const rvolBreakoutTh = Number.isFinite(Number(rawRvolBreakout))
       ? Number(rawRvolBreakout)
-      : isLive
-      ? 1.8
       : 1.4;
     const rvolDipTh = Number.isFinite(Number(params.rvol_dip)) ? Number(params.rvol_dip) : 1.3;
     const rawDipGap = (isLive ? params.vwap_gap_live : params.vwap_gap_arena) ?? params.vwap_gap;
     const dipGapTh = Number.isFinite(Number(rawDipGap))
       ? -Math.abs(Number(rawDipGap))
-      : isLive
-      ? -2.8
       : -2.0;
     const trailingPct = Number.isFinite(Number(params.trailing_stop_pct)) ? Number(params.trailing_stop_pct) : 1.5;
     const minLrcTpPct = Number.isFinite(Number(params.min_lrc_tp_pct)) ? Number(params.min_lrc_tp_pct) : 0.6;
@@ -1369,6 +1370,7 @@ export function evaluateStrategy(botId, marketData, indicators, position, option
     }
     return res;
   } catch (err) {
+    console.warn(`[evaluateStrategy][${normId}][${options.market || marketData?.market || ""}] 지표 계산 오류:`, err?.message || err);
     return hold(`지표 계산 오류: ${err.message}`);
   }
 }
@@ -1392,7 +1394,9 @@ async function getCandlesCached(market, spec, fetchCandlesFn) {
   let rows = [];
   try {
     rows = await fetchCandlesFn(market, spec.unit, spec.count);
-  } catch {}
+  } catch (err) {
+    console.warn(`[CandlesCache][${market}][${spec.unit}] 캔들 조회 실패:`, err?.message || err);
+  }
   if (Array.isArray(rows) && rows.length > 0) {
     candleCache.set(cacheKey, { at: nowMs, rows });
     return rows;
@@ -1572,7 +1576,7 @@ export async function seedArenaBots(db, { hadSelectionColumn = true } = {}) {
     SET nickname = '잭 켈로그 프라이스액션',
         name = '잭 켈로그 프라이스액션 (Jack Kellogg Price Action)',
         strategy_type = 'JACK_KELLOGG_PRICE_ACTION',
-        min_volume_krw = 10000000000
+        min_volume_krw = 5000000000
     WHERE bot_id = 'bot_10' AND (nickname = 'VWAP봇-이오타' OR nickname = '' OR nickname LIKE '%이오타%' OR name LIKE '%RSI%')
   `).run();
 
