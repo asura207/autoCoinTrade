@@ -507,6 +507,10 @@ def init_database(db_path: Optional[str] = None) -> None:
             ("paper_peak_equity", "BIGINT NOT NULL DEFAULT 1000000"),
             ("paper_mdd_pct", "NUMERIC(8,2) NOT NULL DEFAULT 0"),
             ("paper_status_msg", "TEXT NOT NULL DEFAULT '시그널 대기 중'"),
+            ("target_capital_krw", f"{real_type} DEFAULT 0"),
+            ("drain_status", "TEXT DEFAULT 'NONE'"),
+            ("replaced_by_bot_id", "TEXT DEFAULT NULL"),
+            ("drain_started_at", "TEXT DEFAULT NULL"),
         ]
         if sqlite_mode:
             bot_cols = {
@@ -829,20 +833,39 @@ def init_database(db_path: Optional[str] = None) -> None:
 
         # 9-2. 주간 전략별 1위 봇 자동 선출 설정 및 이력 테이블
         conn.execute(
-            """
+            f"""
             CREATE TABLE IF NOT EXISTS auto_rotation_config (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 is_enabled INTEGER DEFAULT 1,
                 rotation_day_of_week INTEGER DEFAULT 1,
                 rotation_hour_kst INTEGER DEFAULT 9,
-                allocation_mode TEXT DEFAULT 'RANK_WEIGHTED_40_35_25',
+                allocation_mode TEXT DEFAULT 'EQUAL_BY_CAPITAL_TIER',
                 min_weekly_trades INTEGER DEFAULT 2,
+                capital_tier_1_max {real_type} DEFAULT 400000,
+                capital_tier_2_max {real_type} DEFAULT 700000,
+                max_deploy_ratio {real_type} DEFAULT 0.90,
                 last_rotated_at TEXT,
                 next_rotation_at TEXT,
                 updated_at TEXT
             );
             """
         )
+        rot_cfg_alter_cols = [
+            ("capital_tier_1_max", f"{real_type} DEFAULT 400000"),
+            ("capital_tier_2_max", f"{real_type} DEFAULT 700000"),
+            ("max_deploy_ratio", f"{real_type} DEFAULT 0.90"),
+        ]
+        if sqlite_mode:
+            rc_cols = {
+                dict(r)["name"]
+                for r in conn.execute("PRAGMA table_info(auto_rotation_config);").fetchall()
+            }
+            for col_name, col_def in rot_cfg_alter_cols:
+                if col_name not in rc_cols:
+                    conn.execute(f"ALTER TABLE auto_rotation_config ADD COLUMN {col_name} {col_def};")
+        else:
+            for col_name, col_def in rot_cfg_alter_cols:
+                conn.execute(f"ALTER TABLE auto_rotation_config ADD COLUMN IF NOT EXISTS {col_name} {col_def};")
         conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS auto_rotation_history (
@@ -873,6 +896,22 @@ def init_database(db_path: Optional[str] = None) -> None:
                 allocations_json TEXT,
                 remaining_positions_count INTEGER DEFAULT 0,
                 created_at TEXT
+            );
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS capital_restoration_logs (
+                id {id_primary_key},
+                source_bot_id TEXT NOT NULL,
+                target_bot_id TEXT,
+                order_uuid TEXT,
+                settled_net_krw {real_type} NOT NULL,
+                restored_krw {real_type} NOT NULL,
+                surplus_reserve_krw {real_type} DEFAULT 0,
+                total_used_after_krw {real_type} NOT NULL,
+                global_cap_krw {real_type} NOT NULL,
+                created_at TEXT NOT NULL
             );
             """
         )

@@ -235,6 +235,10 @@ export class PgSyncManager {
           ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_peak_equity BIGINT NOT NULL DEFAULT 1000000;
           ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_mdd_pct NUMERIC(8,2) NOT NULL DEFAULT 0.0;
           ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_status_msg TEXT NOT NULL DEFAULT '시그널 대기 중';
+          ALTER TABLE bots ADD COLUMN IF NOT EXISTS target_capital_krw DOUBLE PRECISION DEFAULT 0;
+          ALTER TABLE bots ADD COLUMN IF NOT EXISTS drain_status VARCHAR(32) DEFAULT 'NONE';
+          ALTER TABLE bots ADD COLUMN IF NOT EXISTS replaced_by_bot_id VARCHAR(64) DEFAULT NULL;
+          ALTER TABLE bots ADD COLUMN IF NOT EXISTS drain_started_at TEXT DEFAULT NULL;
         `);
       } catch {}
 
@@ -247,8 +251,9 @@ export class PgSyncManager {
              min_volume_krw, stop_loss_pct, take_profit_pct, config_json,
              last_status_msg, updated_at,
              is_selected_for_live, paper_initial_capital, paper_virtual_krw,
-             paper_is_running, paper_peak_equity, paper_mdd_pct, paper_status_msg
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+             paper_is_running, paper_peak_equity, paper_mdd_pct, paper_status_msg,
+             target_capital_krw, drain_status, replaced_by_bot_id, drain_started_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
            ON CONFLICT (bot_id) DO UPDATE SET
              name = EXCLUDED.name,
              nickname = EXCLUDED.nickname,
@@ -271,7 +276,11 @@ export class PgSyncManager {
              paper_is_running = EXCLUDED.paper_is_running,
              paper_peak_equity = EXCLUDED.paper_peak_equity,
              paper_mdd_pct = EXCLUDED.paper_mdd_pct,
-             paper_status_msg = EXCLUDED.paper_status_msg`,
+             paper_status_msg = EXCLUDED.paper_status_msg,
+             target_capital_krw = EXCLUDED.target_capital_krw,
+             drain_status = EXCLUDED.drain_status,
+             replaced_by_bot_id = EXCLUDED.replaced_by_bot_id,
+             drain_started_at = EXCLUDED.drain_started_at`,
           [
             b.bot_id, b.name, b.nickname, b.strategy_type, b.strategy_group || "TREND_SWING", b.description || "",
             Number(b.allocation_ratio || 0), Math.floor(Number(b.allocated_capital || 0)),
@@ -285,7 +294,11 @@ export class PgSyncManager {
             Number(b.paper_is_running ?? 1),
             Math.floor(Number(b.paper_peak_equity || 1000000)),
             Number(b.paper_mdd_pct || 0),
-            b.paper_status_msg || "시그널 대기 중"
+            b.paper_status_msg || "시그널 대기 중",
+            Math.floor(Number(b.target_capital_krw || 0)),
+            b.drain_status || "NONE",
+            b.replaced_by_bot_id || null,
+            b.drain_started_at || null
           ]
         );
       }
@@ -838,12 +851,18 @@ export class PgSyncManager {
             is_enabled INT DEFAULT 1,
             rotation_day_of_week INT DEFAULT 1,
             rotation_hour_kst INT DEFAULT 9,
-            allocation_mode VARCHAR(64) DEFAULT 'RANK_WEIGHTED_40_35_25',
+            allocation_mode VARCHAR(64) DEFAULT 'EQUAL_BY_CAPITAL_TIER',
             min_weekly_trades INT DEFAULT 2,
+            capital_tier_1_max DOUBLE PRECISION DEFAULT 400000,
+            capital_tier_2_max DOUBLE PRECISION DEFAULT 700000,
+            max_deploy_ratio DOUBLE PRECISION DEFAULT 0.90,
             last_rotated_at TEXT,
             next_rotation_at TEXT,
             updated_at TEXT
           );
+          ALTER TABLE auto_rotation_config ADD COLUMN IF NOT EXISTS capital_tier_1_max DOUBLE PRECISION DEFAULT 400000;
+          ALTER TABLE auto_rotation_config ADD COLUMN IF NOT EXISTS capital_tier_2_max DOUBLE PRECISION DEFAULT 700000;
+          ALTER TABLE auto_rotation_config ADD COLUMN IF NOT EXISTS max_deploy_ratio DOUBLE PRECISION DEFAULT 0.90;
           CREATE TABLE IF NOT EXISTS auto_rotation_history (
             id BIGINT PRIMARY KEY,
             trigger_type TEXT,
@@ -869,20 +888,36 @@ export class PgSyncManager {
             remaining_positions_count INT DEFAULT 0,
             created_at TEXT
           );
+          CREATE TABLE IF NOT EXISTS capital_restoration_logs (
+            id BIGINT PRIMARY KEY,
+            source_bot_id VARCHAR(50) NOT NULL,
+            target_bot_id VARCHAR(50),
+            order_uuid VARCHAR(128),
+            settled_net_krw DOUBLE PRECISION NOT NULL,
+            restored_krw DOUBLE PRECISION NOT NULL,
+            surplus_reserve_krw DOUBLE PRECISION DEFAULT 0,
+            total_used_after_krw DOUBLE PRECISION NOT NULL,
+            global_cap_krw DOUBLE PRECISION NOT NULL,
+            created_at TEXT NOT NULL
+          );
         `);
         const rotCfg = sqliteDb.prepare("SELECT * FROM auto_rotation_config WHERE id = 1").get();
         if (rotCfg) {
           await this.pool.query(
             `INSERT INTO auto_rotation_config (
                id, is_enabled, rotation_day_of_week, rotation_hour_kst,
-               allocation_mode, min_weekly_trades, last_rotated_at, next_rotation_at, updated_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+               allocation_mode, min_weekly_trades, capital_tier_1_max, capital_tier_2_max, max_deploy_ratio,
+               last_rotated_at, next_rotation_at, updated_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              ON CONFLICT (id) DO UPDATE SET
                is_enabled = EXCLUDED.is_enabled,
                rotation_day_of_week = EXCLUDED.rotation_day_of_week,
                rotation_hour_kst = EXCLUDED.rotation_hour_kst,
                allocation_mode = EXCLUDED.allocation_mode,
                min_weekly_trades = EXCLUDED.min_weekly_trades,
+               capital_tier_1_max = EXCLUDED.capital_tier_1_max,
+               capital_tier_2_max = EXCLUDED.capital_tier_2_max,
+               max_deploy_ratio = EXCLUDED.max_deploy_ratio,
                last_rotated_at = EXCLUDED.last_rotated_at,
                next_rotation_at = EXCLUDED.next_rotation_at,
                updated_at = EXCLUDED.updated_at`,
@@ -891,8 +926,11 @@ export class PgSyncManager {
               Number(rotCfg.is_enabled ?? 1),
               Number(rotCfg.rotation_day_of_week ?? 1),
               Number(rotCfg.rotation_hour_kst ?? 9),
-              rotCfg.allocation_mode || "RANK_WEIGHTED_40_35_25",
+              rotCfg.allocation_mode || "EQUAL_BY_CAPITAL_TIER",
               Number(rotCfg.min_weekly_trades ?? 2),
+              Number(rotCfg.capital_tier_1_max ?? 400000),
+              Number(rotCfg.capital_tier_2_max ?? 700000),
+              Number(rotCfg.max_deploy_ratio ?? 0.9),
               rotCfg.last_rotated_at || null,
               rotCfg.next_rotation_at || null,
               rotCfg.updated_at || null,
@@ -950,6 +988,31 @@ export class PgSyncManager {
                 d.allocations_json || "[]",
                 Number(d.remaining_positions_count || 0),
                 d.created_at || null,
+              ]
+            );
+          }
+        } catch {}
+        try {
+          const restLogs = sqliteDb.prepare("SELECT * FROM capital_restoration_logs").all();
+          for (const r of restLogs) {
+            await this.pool.query(
+              `INSERT INTO capital_restoration_logs (
+                 id, source_bot_id, target_bot_id, order_uuid,
+                 settled_net_krw, restored_krw, surplus_reserve_krw,
+                 total_used_after_krw, global_cap_krw, created_at
+               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+               ON CONFLICT (id) DO NOTHING`,
+              [
+                r.id,
+                r.source_bot_id || "",
+                r.target_bot_id || null,
+                r.order_uuid || null,
+                Number(r.settled_net_krw || 0),
+                Number(r.restored_krw || 0),
+                Number(r.surplus_reserve_krw || 0),
+                Number(r.total_used_after_krw || 0),
+                Number(r.global_cap_krw || 0),
+                r.created_at || "",
               ]
             );
           }

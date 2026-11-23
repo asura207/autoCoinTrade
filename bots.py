@@ -470,6 +470,9 @@ def _py_trip_kill_switch_in_tx(conn, bot_id: str, code: str, reason: str, halt_a
         )
 
 
+NON_ANOMALY_PACE_BLOCK_CODES = frozenset({"MIN_BUY_INTERVAL", "REENTRY_COOLDOWN"})
+
+
 def _py_record_block_in_tx(conn, bot_id: str, ticker: str, code: str, reason: str) -> None:
     now_iso = _now_utc_iso()
     conn.execute(
@@ -480,11 +483,11 @@ def _py_record_block_in_tx(conn, bot_id: str, ticker: str, code: str, reason: st
     thresh = _get_guardrail_int(conn, "live_anomaly_block_threshold", "LIVE_ANOMALY_BLOCK_THRESHOLD", 5)
     cutoff_iso = datetime.datetime.fromtimestamp(time.time() - win_sec, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
     cnt_row = conn.execute(
-        "SELECT COUNT(*) AS cnt FROM live_guardrail_events WHERE bot_id = ? AND side = 'BUY' AND created_at >= ?;",
+        "SELECT COUNT(*) AS cnt FROM live_guardrail_events WHERE bot_id = ? AND side = 'BUY' AND created_at >= ? AND block_code NOT IN ('MIN_BUY_INTERVAL', 'REENTRY_COOLDOWN');",
         (bot_id, cutoff_iso),
     ).fetchone()
     cnt = int(dict(cnt_row).get("cnt") or 0) if cnt_row else 0
-    if cnt >= thresh:
+    if code not in NON_ANOMALY_PACE_BLOCK_CODES and cnt >= thresh:
         _py_trip_kill_switch_in_tx(
             conn,
             bot_id,
@@ -682,7 +685,7 @@ def evaluate_smart_exit(
                     dt_str = raw_ts.replace("T", " ").split(".")[0]
                     entry_dt = datetime.datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST_TZ)
                 elapsed_hours = (datetime.datetime.now(KST_TZ) - entry_dt).total_seconds() / 3600.0
-                max_hours = 6.0 if is_live else 2.0
+                max_hours = 4.0 if is_live else 2.0
 
                 in_box = (-0.6 <= pnl_pct <= 0.8)
                 if elapsed_hours >= max_hours and in_box and rvol < 1.0:
@@ -877,11 +880,11 @@ def can_enter_position(
                     f"CIRCUIT_BREAKER_ACTIVE: Daily loss {daily_profit:,.0f} KRW exceeded -4.0% limit ({loss_limit:,.0f} KRW)",
                 )
 
-        # 0-2. 실전 선택 봇 & 가동 상태 확인 (Graceful Drain 중인 해제 봇은 신규 매수 절대 차단)
+        # 0-2. 실전 선택 봇 & 가동 상태 & 최소 주문금액(5,050원) 복원 대기 확인 (Graceful Drain 중인 해제 봇은 신규 매수 절대 차단)
         if not is_paper and not is_dry_run():
             try:
                 live_bot_row = conn.execute(
-                    "SELECT is_selected_for_live, is_running FROM bots WHERE bot_id = ?;",
+                    "SELECT is_selected_for_live, is_running, COALESCE(virtual_krw, 0) AS virtual_krw FROM bots WHERE bot_id = ?;",
                     (norm_id,),
                 ).fetchone()
                 if live_bot_row is not None:
@@ -891,6 +894,13 @@ def can_enter_position(
                             False,
                             0.0,
                             f"Live Gateway Blocked: {norm_id} is inactive or in Graceful Drain (existing positions still monitored)",
+                        )
+                    v_krw = float(lb.get("virtual_krw") or 0.0)
+                    if 0 <= v_krw < 5050.0:
+                        return (
+                            False,
+                            0.0,
+                            f"WAITING_CAPITAL_RESTORE: {norm_id} virtual_krw ({v_krw:,.0f}) < 5,050 KRW safe minimum",
                         )
                 else:
                     acc_live_row = conn.execute(
@@ -1782,12 +1792,20 @@ def execute_sell_order(
             is_selected_live = int(dict(bot_live_row).get("is_selected_for_live") or 0) == 1 if bot_live_row is not None else True
 
             if not is_selected_live:
-                # 탈락(Draining) 봇: 실현 손익 누적만 기록하고, 회수 원화(+미사용 잔고)는 현재 활성 실전 봇들의 allocation_ratio 비율대로 안전 이관
+                # 탈락(Draining) 봇: 실현 손익 누적만 기록하고, 회수 원화는 원금 90% 상한 불변식 하에 후임 봇 우선 복원
                 prev_cash_row = conn.execute(
                     "SELECT COALESCE(virtual_krw, 0) AS vkrw FROM bot_accounts WHERE bot_id = ?;",
                     (norm_bot_id,),
                 ).fetchone()
                 prev_cash = max(0, math.floor(float(dict(prev_cash_row).get("vkrw") or 0))) if prev_cash_row else 0
+                drain_meta_row = conn.execute(
+                    "SELECT replaced_by_bot_id, drain_started_at FROM bots WHERE bot_id = ?;",
+                    (norm_bot_id,),
+                ).fetchone()
+                drain_meta = dict(drain_meta_row) if drain_meta_row else {}
+                replaced_by_id = drain_meta.get("replaced_by_bot_id")
+                drain_started_at = drain_meta.get("drain_started_at")
+
                 remaining_open_row = conn.execute(
                     "SELECT COUNT(*) AS open_cnt, COALESCE(SUM(buy_amount), 0) AS open_used FROM bot_positions WHERE (bot_id = ? OR bot_id = ?) AND status = 'OPEN';",
                     (bot_id, norm_bot_id),
@@ -1801,7 +1819,9 @@ def execute_sell_order(
 
                 active_rows = conn.execute(
                     """
-                    SELECT bot_id, COALESCE(allocation_ratio, 0) AS allocation_ratio
+                    SELECT bot_id, COALESCE(allocation_ratio, 0) AS allocation_ratio,
+                           COALESCE(target_capital_krw, 0) AS target_capital_krw,
+                           COALESCE(virtual_krw, 0) AS virtual_krw
                     FROM bots
                     WHERE is_selected_for_live = 1
                     ORDER BY allocation_ratio DESC, bot_id ASC;
@@ -1810,7 +1830,9 @@ def execute_sell_order(
                 if not active_rows:
                     active_rows = conn.execute(
                         """
-                        SELECT bot_id, COALESCE(allocation_ratio, 0) AS allocation_ratio
+                        SELECT bot_id, COALESCE(allocation_ratio, 0) AS allocation_ratio,
+                               0 AS target_capital_krw,
+                               COALESCE(virtual_krw, 0) AS virtual_krw
                         FROM bot_accounts
                         WHERE is_selected_for_live = 1
                         ORDER BY allocation_ratio DESC, bot_id ASC;
@@ -1818,9 +1840,50 @@ def execute_sell_order(
                     ).fetchall()
 
                 active_list = [dict(r) for r in active_rows if r["bot_id"] != norm_bot_id]
-                # 활성 봇이 0대인 예외 상황에서는 원화를 증발(0원화)시키지 않고 탈락 봇 계좌에 안전 보전(Zero-Sum)
+                # 원금 90% 상한 조회
+                principal_row = conn.execute("SELECT value FROM system_settings WHERE key = 'total_capital';").fetchone()
+                principal_krw = max(0, math.floor(float(dict(principal_row).get("value") or 0))) if principal_row else 0
+                rot_cfg_row = conn.execute("SELECT max_deploy_ratio FROM auto_rotation_config WHERE id = 1;").fetchone()
+                max_deploy_ratio = float(dict(rot_cfg_row).get("max_deploy_ratio") or 0.90) if rot_cfg_row else 0.90
+                global_cap_krw = math.floor(principal_krw * max_deploy_ratio) if principal_krw > 0 else 0
+
+                # 잔여 전체 Draining 봇 오픈 원금 및 선출 봇 사용액 산출
+                rem_drain_all_row = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(bp.buy_amount), 0) AS rem_locked
+                    FROM bot_positions bp
+                    JOIN bots b ON bp.bot_id = b.bot_id
+                    WHERE bp.status = 'OPEN' AND b.is_selected_for_live = 0;
+                    """
+                ).fetchone()
+                rem_drain_locked_all = max(0, math.floor(float(dict(rem_drain_all_row).get("rem_locked") or 0))) if rem_drain_all_row else 0
+
+                elected_states = []
+                total_elected_used = 0
+                for ab in active_list:
+                    ab_open_row = conn.execute(
+                        "SELECT COALESCE(SUM(buy_amount), 0) AS open_used FROM bot_positions WHERE bot_id = ? AND status = 'OPEN';",
+                        (ab["bot_id"],),
+                    ).fetchone()
+                    ab_locked = max(0, math.floor(float(dict(ab_open_row).get("open_used") or 0))) if ab_open_row else 0
+                    ab_vkrw = max(0, math.floor(float(ab.get("virtual_krw") or 0)))
+                    ab_target = max(0, math.floor(float(ab.get("target_capital_krw") or 0)))
+                    if ab_target <= 0 and global_cap_krw > 0 and active_list:
+                        ab_target = math.floor(global_cap_krw / len(active_list))
+                    total_elected_used += ab_locked + ab_vkrw
+                    elected_states.append({
+                        "bot_id": ab["bot_id"],
+                        "allocation_ratio": float(ab.get("allocation_ratio") or 0.0),
+                        "target_capital_krw": ab_target,
+                        "open_locked_krw": ab_locked,
+                        "virtual_krw": ab_vkrw,
+                    })
+
                 retained_cash = floored_proceeds if not active_list else 0
                 retained_alloc = remaining_open_used + retained_cash
+                next_drain_status = "DRAINING" if remaining_open_cnt > 0 else "COMPLETED"
+                next_replaced_by = replaced_by_id if remaining_open_cnt > 0 else None
+                next_drain_started = drain_started_at if remaining_open_cnt > 0 else None
 
                 conn.execute(
                     """
@@ -1839,60 +1902,137 @@ def execute_sell_order(
                     UPDATE bots
                     SET virtual_krw = ?,
                         allocated_capital = ?,
+                        target_capital_krw = 0,
                         is_selected_for_live = 0,
+                        drain_status = ?,
+                        replaced_by_bot_id = ?,
+                        drain_started_at = ?,
                         updated_at = ?
                     WHERE bot_id = ?;
                     """,
-                    (retained_cash, retained_alloc, now_kst, norm_bot_id),
+                    (retained_cash, retained_alloc, next_drain_status, next_replaced_by, next_drain_started, now_kst, norm_bot_id),
                 )
 
-                ratio_sum = sum(
-                    max(0.0, float(r.get("allocation_ratio") or 0.0))
-                    for r in active_list
-                    if math.isfinite(float(r.get("allocation_ratio") or 0.0))
-                )
                 transfer_logs = []
                 alloc_summary = []
-                if active_list and floored_proceeds > 0:
-                    base_shares = []
-                    for active_bot in active_list:
-                        raw_ratio = float(active_bot.get("allocation_ratio") or 0.0)
-                        ratio_val = max(0.0, raw_ratio) if math.isfinite(raw_ratio) else 0.0
-                        if ratio_sum > 0:
-                            share = max(0, math.floor(floored_proceeds * (ratio_val / ratio_sum)))
-                        else:
-                            share = max(0, math.floor(floored_proceeds / len(active_list)))
-                        base_shares.append(share)
-                    # Math.floor 나머지 자투리 원화(1~2원)는 1위 활성 봇(idx == 0)에 합산하여 Zero-Sum 보장
-                    remainder = floored_proceeds - sum(base_shares)
-                    if remainder > 0 and base_shares:
-                        base_shares[0] += remainder
+                total_restored = 0
+                surplus_reserve = 0
 
-                    for active_bot, share in zip(active_list, base_shares):
-                        if share > 0:
-                            target_id = active_bot["bot_id"]
+                if elected_states and floored_proceeds > 0:
+                    if global_cap_krw > 0:
+                        global_headroom = max(0, global_cap_krw - (rem_drain_locked_all + total_elected_used))
+                        restorable_pool = min(floored_proceeds, global_headroom)
+                    else:
+                        restorable_pool = floored_proceeds
+
+                    transfers_map: Dict[str, int] = {}
+
+                    # 1순위: 직접 연결된 후임 봇(replaced_by_bot_id) 우선 복원
+                    if restorable_pool > 0 and replaced_by_id:
+                        for es in elected_states:
+                            if es["bot_id"] == replaced_by_id:
+                                deficit = max(0, es["target_capital_krw"] - (es["open_locked_krw"] + es["virtual_krw"]))
+                                amt = min(restorable_pool, deficit) if es["target_capital_krw"] > 0 else restorable_pool
+                                if amt > 0:
+                                    transfers_map[es["bot_id"]] = transfers_map.get(es["bot_id"], 0) + amt
+                                    restorable_pool -= amt
+                                break
+
+                    # 2순위: 목표 한도 미달인 다른 선출 봇들에게 부족분 비례 분배
+                    if restorable_pool > 0:
+                        needy = []
+                        for es in elected_states:
+                            already = transfers_map.get(es["bot_id"], 0)
+                            deficit = max(0, es["target_capital_krw"] - (es["open_locked_krw"] + es["virtual_krw"] + already))
+                            if deficit > 0:
+                                needy.append((es["bot_id"], deficit))
+                        total_deficit = sum(d for _, d in needy)
+                        if total_deficit > 0:
+                            pool_to_share = min(restorable_pool, total_deficit)
+                            distributed = 0
+                            for bid, deficit in needy:
+                                share = min(deficit, math.floor((deficit * pool_to_share) / total_deficit))
+                                if share > 0:
+                                    transfers_map[bid] = transfers_map.get(bid, 0) + share
+                                    distributed += share
+                            restorable_pool -= distributed
+
+                    for target_id, share in transfers_map.items():
+                        if share <= 0:
+                            continue
+                        total_restored += share
+                        conn.execute(
+                            """
+                            UPDATE bot_accounts
+                            SET virtual_krw = virtual_krw + ?,
+                                allocated_capital = allocated_capital + ?,
+                                updated_at = ?
+                            WHERE bot_id = ?;
+                            """,
+                            (share, share, now_kst, target_id),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE bots
+                            SET virtual_krw = virtual_krw + ?,
+                                allocated_capital = allocated_capital + ?,
+                                updated_at = ?
+                            WHERE bot_id = ?;
+                            """,
+                            (share, share, now_kst, target_id),
+                        )
+                        transfer_logs.append(f"{target_id}+{share:,}원")
+                        alloc_summary.append({"bot_id": target_id, "amount_krw": share})
+
+                    surplus_reserve = max(0, floored_proceeds - total_restored)
+                    total_used_after = rem_drain_locked_all + total_elected_used + total_restored
+                    if global_cap_krw > 0 and total_used_after > global_cap_krw:
+                        raise RuntimeError(
+                            f"[INVARIANT_VIOLATION] Python drain restoration exceeded 90% cap ({total_used_after} > {global_cap_krw})"
+                        )
+
+                    try:
+                        if transfers_map:
+                            for target_id, share in transfers_map.items():
+                                conn.execute(
+                                    """
+                                    INSERT INTO capital_restoration_logs (
+                                        source_bot_id, target_bot_id, order_uuid, settled_net_krw,
+                                        restored_krw, surplus_reserve_krw, total_used_after_krw, global_cap_krw, created_at
+                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                                    """,
+                                    (
+                                        norm_bot_id,
+                                        target_id,
+                                        sell_order_uuid,
+                                        float(floored_proceeds),
+                                        float(share),
+                                        float(surplus_reserve),
+                                        float(total_used_after),
+                                        float(global_cap_krw),
+                                        now_kst,
+                                    ),
+                                )
+                        else:
                             conn.execute(
                                 """
-                                UPDATE bot_accounts
-                                SET virtual_krw = virtual_krw + ?,
-                                    allocated_capital = allocated_capital + ?,
-                                    updated_at = ?
-                                WHERE bot_id = ?;
+                                INSERT INTO capital_restoration_logs (
+                                    source_bot_id, target_bot_id, order_uuid, settled_net_krw,
+                                    restored_krw, surplus_reserve_krw, total_used_after_krw, global_cap_krw, created_at
+                                ) VALUES (?, 'RESERVE', ?, ?, 0, ?, ?, ?, ?);
                                 """,
-                                (share, share, now_kst, target_id),
+                                (
+                                    norm_bot_id,
+                                    sell_order_uuid,
+                                    float(floored_proceeds),
+                                    float(surplus_reserve),
+                                    float(total_used_after),
+                                    float(global_cap_krw),
+                                    now_kst,
+                                ),
                             )
-                            conn.execute(
-                                """
-                                UPDATE bots
-                                SET virtual_krw = virtual_krw + ?,
-                                    allocated_capital = allocated_capital + ?,
-                                    updated_at = ?
-                                WHERE bot_id = ?;
-                                """,
-                                (share, share, now_kst, target_id),
-                            )
-                            transfer_logs.append(f"{target_id}+{share:,}원")
-                            alloc_summary.append({"bot_id": target_id, "amount_krw": share})
+                    except Exception as rest_log_exc:
+                        logger.warning("[%s] Failed to insert capital_restoration_logs: %s", norm_bot_id, rest_log_exc)
 
                 try:
                     conn.execute(
@@ -1922,9 +2062,9 @@ def execute_sell_order(
                     logger.warning("[%s] Failed to insert drain_handoff_logs: %s", norm_bot_id, log_exc)
 
                 logger.info(
-                    f"[{norm_bot_id}] [Graceful Drain 정산 이관] 탈락 봇 {ticker} 매도 정산금 {floored_proceeds:,}원 "
-                    f"(실현손익 {safe_realized_pnl:+,.0f}원, 잔여포지션 {remaining_open_cnt}건) 회수 -> 활성 실전 봇 충전: "
-                    f"{', '.join(transfer_logs) if transfer_logs else '이관 대상 없음(자체 보전)'}"
+                    f"[{norm_bot_id}] [Graceful Drain 정산 복원] 탈락 봇 {ticker} 매도 정산금 {floored_proceeds:,}원 "
+                    f"(복원 {total_restored:,}원, 예비비 유보 {surplus_reserve:,}원, 실현손익 {safe_realized_pnl:+,.0f}원, 잔여포지션 {remaining_open_cnt}건) -> "
+                    f"{', '.join(transfer_logs) if transfer_logs else '예비비 유보'}"
                 )
             else:
                 # 일반 활성 봇: bot_accounts & bots 가상 원화 복원 및 실현 손익 누적

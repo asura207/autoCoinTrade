@@ -9,6 +9,8 @@
  *     (실제거래 원장 trades / bot_positions 와는 완전히 분리)
  */
 
+import { analyzeOrderbookQuality } from "./execution_quality_service.mjs";
+
 export const PAPER_FEE_RATE = 0.0005;
 export const PAPER_MIN_ORDER_KRW = 5000;
 export const DEFAULT_PAPER_CAPITAL = 1000000;
@@ -481,9 +483,16 @@ export function buildIndicators(marketData) {
     ind.m15.kellogg = kellogg;
   }
   ind.atr = ind.m15?.atr14 || ind.m60?.atr14 || null;
-  const m60Bullish = ind.m60 ? Boolean(ind.m60.ema20 >= ind.m60.ema60 || ind.m60.supertrend?.isUp) : null;
-  const m240Bullish = ind.m240 ? Boolean((ind.m240.ma20 && price >= ind.m240.ma20) || ind.m240.supertrend?.isUp) : null;
-  const dayBullish = ind.day?.ma20 ? price >= ind.day.ma20 : null;
+  const m60Bullish = ind.m60
+    ? Boolean(
+        (Number.isFinite(ind.m60.ema20) && Number.isFinite(ind.m60.ema60) && ind.m60.ema20 >= ind.m60.ema60) ||
+          ind.m60.supertrend?.isUp
+      )
+    : null;
+  const m240Bullish = ind.m240
+    ? Boolean((Number.isFinite(ind.m240.ma20) && ind.m240.ma20 > 0 && price >= ind.m240.ma20) || ind.m240.supertrend?.isUp)
+    : null;
+  const dayBullish = Number.isFinite(ind.day?.ma20) && ind.day.ma20 > 0 ? price >= ind.day.ma20 : null;
   const htfChecks = [m60Bullish, m240Bullish, dayBullish].filter((v) => v !== null);
   const htfAlignedUp = htfChecks.length === 0 ? true : htfChecks.some(Boolean);
   const htfStronglyBearish =
@@ -582,7 +591,7 @@ function parseKstTimestampMs(timeStr) {
 /**
  * 횡보장 자금 잠김(Position Lock) 해소를 위한 3단계 스마트 청산(Exit) 엔진
  * 1) 본절 스탑 (Breakeven Stop): 최고 수익률 +1.2% 이상 도달 후 +0.25% 이하로 하락 시 수익 반납 방지 익절
- * 2) 시간 제한 청산 (Time-Stop): 단타 봇(bot_01, bot_04, bot_05, bot_09, bot_10)이 6시간(실전)/2시간(가상) 경과 후 -0.6%~+0.8% 박스권 & RVOL < 1.0 시 자금 회수
+ * 2) 시간 제한 청산 (Time-Stop): 단타 봇(bot_01, bot_04, bot_05, bot_09, bot_10)이 4시간(실전)/2시간(가상) 경과 후 -0.6%~+0.8% 박스권 & RVOL < 1.0 시 자금 회수
  * 3) ATR 기반 동적 트레일링 스탑: 진입가 대비 -2.2*ATR 하드 손절(분할 그리드 bot_06 제외), 최고가 수익 +1.0% 이상 도달 후 수익 구간 내 -1.8*ATR 트레일링 스탑
  */
 export function evaluateSmartExit({
@@ -620,17 +629,20 @@ export function evaluateSmartExit({
       const entryTs = parseKstTimestampMs(timeStr);
       if (!isNaN(entryTs)) {
         const holdHours = (Date.now() - entryTs) / (3600 * 1000);
-        const maxHoldHours = isLive ? 6.0 : 2.0;
+        const maxHoldHours = isLive ? 4.0 : 2.0;
 
         const inBox = pnlPct >= -0.6 && pnlPct <= 0.8;
-        const rvol = Number(
+        const rawRvol =
           indicators?.kellogg?.rvol ??
           indicators?.m15?.curVolRatio ??
           indicators?.m15?.closedVolRatio ??
-          0.8
-        );
+          null;
+        const rvol =
+          rawRvol !== null && rawRvol !== undefined && Number.isFinite(Number(rawRvol))
+            ? Number(rawRvol)
+            : null;
 
-        if (holdHours >= maxHoldHours && inBox && rvol < 1.0) {
+        if (holdHours >= maxHoldHours && inBox && rvol !== null && rvol < 1.0) {
           return {
             signal: "SELL",
             exitType: "TIME_STOP",
@@ -647,7 +659,10 @@ export function evaluateSmartExit({
     // 3-1. 진입가 대비 2.2 * ATR 하락 시 손절
     // (분할 그리드 bot_06 및 Jack Kellogg Setup B 2분할 반등 포지션은 자체 분할/기준선 손절을 사용하므로 15m ATR 선손절 제외)
     const buyReasonStr = String(position?.buy_reason || "");
-    const isBot10SetupB = normId === "bot_10" && (buyReasonStr.includes("반등") || buyReasonStr.includes("Setup B"));
+    const vwapRef = Number(indicators?.kellogg?.vwap || 0);
+    const inferredBot10Dip = normId === "bot_10" && !buyReasonStr && vwapRef > 0 && avgBuy < vwapRef;
+    const isBot10SetupB =
+      normId === "bot_10" && (buyReasonStr.includes("반등") || buyReasonStr.includes("Setup B") || inferredBot10Dip);
     if (normId !== "bot_06" && !isBot10SetupB) {
       const hardStopPrice = avgBuy - 2.2 * atr;
       if (curPrice <= hardStopPrice) {
@@ -691,11 +706,452 @@ export function evaluateSmartExit({
 export const STRATEGY_GROUP_ORDER = ["TREND_SWING", "VOLATILITY_BREAKOUT", "REVERSAL_GRID"];
 
 export const ALLOCATION_MODE_WEIGHTS = {
+  EQUAL_BY_CAPITAL_TIER: [100],
   SINGLE_MARKET_FIT_100: [100],
   RANK_WEIGHTED_40_35_25: [40, 35, 25],
   RANK_WEIGHTED_40_40_20: [40, 40, 20],
   EQUAL_34_33_33: [34, 33, 33],
 };
+
+// ============================================================================
+// 3-1. 투자 원금 구간별 주간 봇 차등 선정(1~3개 균등 배분),
+//      교체 봇 자금 차감·복원(Graceful Drain) 및 총자금 원금 90% 상한 엔진
+// ============================================================================
+export const MIN_LIVE_ORDER_SAFE_KRW = 5050;
+export const DEFAULT_CAPITAL_TIER_1_MAX = 400000;
+export const DEFAULT_CAPITAL_TIER_2_MAX = 700000;
+export const DEFAULT_MAX_DEPLOY_RATIO = 0.9;
+
+/**
+ * 1. 투자 원금 구간별 주간 선출 봇 개수 결정
+ * - < 10,000원: 0개 (최소 주문 불가 원금)
+ * - <= 400,000원: 1개
+ * - 400,000원 초과 ~ 700,000원 미만: 2개
+ * - >= 700,000원: 3개
+ */
+export function getTargetBotCountByPrincipal(
+  principalKrw,
+  { tier1Max = DEFAULT_CAPITAL_TIER_1_MAX, tier2Max = DEFAULT_CAPITAL_TIER_2_MAX } = {}
+) {
+  const principal = Math.floor(Number(principalKrw) || 0);
+  const t1 = Math.max(10000, Math.floor(Number(tier1Max) || DEFAULT_CAPITAL_TIER_1_MAX));
+  const t2 = Math.max(t1 + 1, Math.floor(Number(tier2Max) || DEFAULT_CAPITAL_TIER_2_MAX));
+  if (principal < 10000) return 0;
+  if (principal <= t1) return 1;
+  if (principal < t2) return 2;
+  return 3;
+}
+
+export function getCapitalTierSummary(
+  principalKrw,
+  { tier1Max = DEFAULT_CAPITAL_TIER_1_MAX, tier2Max = DEFAULT_CAPITAL_TIER_2_MAX, maxDeployRatio = DEFAULT_MAX_DEPLOY_RATIO } = {}
+) {
+  const principal = Math.max(0, Math.floor(Number(principalKrw) || 0));
+  const ratio = Number.isFinite(Number(maxDeployRatio)) && Number(maxDeployRatio) > 0 && Number(maxDeployRatio) <= 1
+    ? Number(maxDeployRatio)
+    : DEFAULT_MAX_DEPLOY_RATIO;
+  const globalCapKrw = Math.floor(principal * ratio);
+  const reserveMinKrw = Math.max(0, principal - globalCapKrw);
+  const botCount = getTargetBotCountByPrincipal(principal, { tier1Max, tier2Max });
+  const perBotTargetKrw = botCount > 0 ? Math.floor(globalCapKrw / botCount) : 0;
+  let tierLabel = "최소 원금(10,000원) 미달 — 신규 선출 불가";
+  if (botCount === 1) {
+    tierLabel = `40만 원 이하 구간 → 1개 봇 (균등 100% / 원금 ${Math.round(ratio * 100)}% 한도)`;
+  } else if (botCount === 2) {
+    tierLabel = `40만 원 초과 ~ 70만 원 미만 구간 → 2개 봇 (균등 50% : 50% / 원금 ${Math.round(ratio * 100)}% 한도)`;
+  } else if (botCount === 3) {
+    tierLabel = `70만 원 이상 구간 → 3개 봇 (균등 33.33%씩 / 원금 ${Math.round(ratio * 100)}% 한도)`;
+  }
+  return {
+    principalKrw: principal,
+    globalCapKrw,
+    reserveMinKrw,
+    botCount,
+    perBotTargetKrw,
+    maxDeployRatio: ratio,
+    tierLabel,
+  };
+}
+
+/**
+ * 총 투입/배정 자금이 원금 90% 상한을 단 1원도 초과하지 않음을 검증하는 불변식 함수
+ */
+export function assertGlobal90CapInvariant({
+  principalKrw,
+  totalUsedCapital,
+  maxDeployRatio = DEFAULT_MAX_DEPLOY_RATIO,
+  context = "",
+}) {
+  const ratio = Number.isFinite(Number(maxDeployRatio)) && Number(maxDeployRatio) > 0 && Number(maxDeployRatio) <= 1
+    ? Number(maxDeployRatio)
+    : DEFAULT_MAX_DEPLOY_RATIO;
+  const globalCapKrw = Math.floor(Math.max(0, Number(principalKrw) || 0) * ratio);
+  const used = Math.floor(Number(totalUsedCapital) || 0);
+  if (used > globalCapKrw) {
+    throw new Error(
+      `[INVARIANT_VIOLATION]${context ? ` [${context}]` : ""} Total capital (${used}) exceeded ${Math.round(
+        ratio * 100
+      )}% cap (${globalCapKrw})`
+    );
+  }
+  return { ok: true, globalCapKrw, totalUsedCapital: used };
+}
+
+/**
+ * 2. 전략군 1위 후보들 중 목표 개수(1~3개)만큼 전략 분산 선출 + 동일 비율 설정
+ * @param {Array} groupChampions - 3대 전략군(TREND_SWING, VOLATILITY_BREAKOUT, REVERSAL_GRID) 각 1위 배열
+ * @param {number} principalKrw - 실전 투자 원금
+ */
+export function selectTieredEqualChampions(groupChampions, principalKrw, options = {}) {
+  const tier1Max = Number(options?.tier1Max || DEFAULT_CAPITAL_TIER_1_MAX);
+  const tier2Max = Number(options?.tier2Max || DEFAULT_CAPITAL_TIER_2_MAX);
+  const maxDeployRatio =
+    Number.isFinite(Number(options?.maxDeployRatio)) && Number(options.maxDeployRatio) > 0 && Number(options.maxDeployRatio) <= 1
+      ? Number(options.maxDeployRatio)
+      : DEFAULT_MAX_DEPLOY_RATIO;
+  const targetCount = getTargetBotCountByPrincipal(principalKrw, { tier1Max, tier2Max });
+  const globalCapKrw = Math.floor(Math.max(0, Number(principalKrw) || 0) * maxDeployRatio);
+  if (targetCount === 0 || !Array.isArray(groupChampions) || groupChampions.length === 0) {
+    return { targetCount: 0, globalCapKrw, perBotTargetKrw: 0, elected: [] };
+  }
+
+  // 전략군 중복 방지를 위해 그룹별 1위만 추린 뒤 종합 점수(rotation_score) 내림차순 정렬
+  const uniqueByGroup = new Map();
+  for (const cand of groupChampions) {
+    const grp = cand.strategy_group_code || cand.strategy_group || "UNKNOWN";
+    const prev = uniqueByGroup.get(grp);
+    if (!prev || (cand.rotation_score ?? -Infinity) > (prev.rotation_score ?? -Infinity)) {
+      uniqueByGroup.set(grp, cand);
+    }
+  }
+
+  const ranked = Array.from(uniqueByGroup.values()).sort(
+    (a, b) =>
+      (b.rotation_score ?? 0) - (a.rotation_score ?? 0) ||
+      (b.eval_return_pct ?? 0) - (a.eval_return_pct ?? 0) ||
+      String(a.bot_id || "").localeCompare(String(b.bot_id || ""))
+  );
+  const electedList = ranked.slice(0, Math.min(targetCount, ranked.length));
+  const actualCount = electedList.length;
+
+  // 동일 비율(균등) 목표 원화 계산 (항상 actualCount * perBotTargetKrw <= globalCapKrw 보장)
+  const perBotTargetKrw = actualCount > 0 ? Math.floor(globalCapKrw / actualCount) : 0;
+  const equalRatio = actualCount > 0 ? Number((1 / actualCount).toFixed(4)) : 0;
+  const equalRatioPct =
+    actualCount === 1 ? 100 : actualCount === 2 ? 50 : actualCount === 3 ? 33.33 : Number((100 / actualCount).toFixed(2));
+
+  return {
+    targetCount: actualCount,
+    globalCapKrw,
+    perBotTargetKrw,
+    elected: electedList.map((bot, idx) => ({
+      ...bot,
+      champion_rank: idx + 1,
+      allocation_ratio: equalRatio,
+      recommended_ratio: equalRatioPct,
+      target_capital_krw: perBotTargetKrw,
+    })),
+  };
+}
+
+/**
+ * 3. 교체/추가 시 기존 Draining 봇 포지션 차감 및 원금 90% 상한 엄수 배분 계산기
+ * @param {Object} params
+ * @param {number} params.principalKrw - 투자 원금
+ * @param {Array} params.allBots - 전체 10개 봇 현재 상태 [{ bot_id, strategy_group, is_selected_for_live, open_locked_krw, replaced_by_bot_id }]
+ * @param {Array} params.electedBots - selectTieredEqualChampions().elected 결과
+ * @param {number|null} params.actualAvailableKrw - 실거래 모드 시 업비트 실계좌 주문 가능 원화 (가상/테스트 시 null)
+ */
+export function computeRotationAllocationsWith90Cap({
+  principalKrw,
+  allBots,
+  electedBots,
+  actualAvailableKrw = null,
+  maxDeployRatio = DEFAULT_MAX_DEPLOY_RATIO,
+}) {
+  const ratio =
+    Number.isFinite(Number(maxDeployRatio)) && Number(maxDeployRatio) > 0 && Number(maxDeployRatio) <= 1
+      ? Number(maxDeployRatio)
+      : DEFAULT_MAX_DEPLOY_RATIO;
+  const globalCapKrw = Math.floor(Math.max(0, Number(principalKrw) || 0) * ratio);
+  const electedMap = new Map(electedBots.map((b) => [b.bot_id, b]));
+  const perBotTargetKrw =
+    electedBots.length > 0 ? Math.floor(globalCapKrw / electedBots.length) : 0;
+
+  const retainedIds = new Set();
+  const newlyElected = [];
+  const drainingBots = [];
+
+  for (const bot of allBots) {
+    const isNowElected = electedMap.has(bot.bot_id);
+    const wasLive = Number(bot.is_selected_for_live) === 1;
+    const locked = Math.max(0, Math.floor(Number(bot.open_locked_krw ?? bot.used_capital) || 0));
+
+    if (isNowElected) {
+      if (wasLive) retainedIds.add(bot.bot_id);
+      else newlyElected.push(bot);
+    } else if (locked > 0) {
+      drainingBots.push({ ...bot, open_locked_krw: locked });
+    }
+  }
+
+  // 3-1. 탈락(Draining) 봇 -> 신규 진입 봇 1:1 우선 매핑 (동일 전략군 우선, 없으면 미매핑 신규 봇)
+  const usedNewBotIds = new Set();
+  const linkedDrainSumBySuccessor = new Map();
+  const drainingAssignments = [];
+
+  for (const dBot of drainingBots) {
+    const dGroup = dBot.strategy_group_code || dBot.strategy_group || "";
+    // 이미 유효한 현행 선출 봇과 매핑되어 있으면 유지
+    let successor =
+      dBot.replaced_by_bot_id && electedMap.has(dBot.replaced_by_bot_id)
+        ? electedMap.get(dBot.replaced_by_bot_id)
+        : null;
+
+    // 1순위: 같은 전략군에 새로 진입한 봇
+    if (!successor) {
+      successor = newlyElected.find(
+        (nb) => (nb.strategy_group_code || nb.strategy_group || "") === dGroup && !usedNewBotIds.has(nb.bot_id)
+      );
+    }
+    // 2순위: 전략군 무관 새로 진입한 미매핑 봇
+    if (!successor) {
+      successor = newlyElected.find((nb) => !usedNewBotIds.has(nb.bot_id));
+    }
+
+    const successorId = successor ? successor.bot_id : null;
+    if (successorId) {
+      usedNewBotIds.add(successorId);
+      linkedDrainSumBySuccessor.set(
+        successorId,
+        (linkedDrainSumBySuccessor.get(successorId) || 0) + dBot.open_locked_krw
+      );
+    }
+
+    drainingAssignments.push({
+      bot_id: dBot.bot_id,
+      open_locked_krw: dBot.open_locked_krw,
+      replaced_by_bot_id: successorId,
+      virtual_krw: 0, // 탈락 봇 신규 매수 절대 차단
+      drain_status: "DRAINING",
+    });
+  }
+
+  // 3-2. 각 선출 봇의 희망 가용 예산 계산 (본인 보유 포지션 + 연결된 탈락 봇 포지션 차감)
+  let totalDrainingLocked = 0;
+  for (const d of drainingAssignments) totalDrainingLocked += d.open_locked_krw;
+
+  let totalElectedLocked = 0;
+  const botStates = electedBots.map((eb) => {
+    const current = allBots.find((b) => b.bot_id === eb.bot_id) || {};
+    const ownLocked = Math.max(0, Math.floor(Number(current.open_locked_krw ?? current.used_capital) || 0));
+    const linkedDrainLocked = linkedDrainSumBySuccessor.get(eb.bot_id) || 0;
+    totalElectedLocked += ownLocked;
+
+    // 교체 봇 자금은 기존 탈락 봇의 미매도 원금만큼 차감 (음수 방어)
+    const desiredVirtualKrw = Math.max(0, perBotTargetKrw - ownLocked - linkedDrainLocked);
+    return {
+      bot_id: eb.bot_id,
+      strategy_group: eb.strategy_group_code || eb.strategy_group,
+      allocation_ratio: eb.allocation_ratio,
+      target_capital_krw: perBotTargetKrw,
+      own_locked_krw: ownLocked,
+      linked_drain_locked_krw: linkedDrainLocked,
+      desired_virtual_krw: desiredVirtualKrw,
+      virtual_krw: desiredVirtualKrw,
+    };
+  });
+
+  // 3-3. 글로벌 90% 상한 + 실계좌 가용 원화 이중 캡 적용
+  const globalCashHeadroom = Math.max(0, globalCapKrw - totalDrainingLocked - totalElectedLocked);
+  const maxAllocatableCash =
+    actualAvailableKrw !== null && actualAvailableKrw !== undefined && Number.isFinite(Number(actualAvailableKrw))
+      ? Math.min(globalCashHeadroom, Math.max(0, Math.floor(Number(actualAvailableKrw))))
+      : globalCashHeadroom;
+
+  const totalDesired = botStates.reduce((acc, b) => acc + b.desired_virtual_krw, 0);
+
+  if (totalDesired > maxAllocatableCash && totalDesired > 0) {
+    // 90% 상한 초과 시 비례 축소 (무조건 버림 Math.floor)
+    let allocated = 0;
+    for (const b of botStates) {
+      b.virtual_krw = Math.floor((b.desired_virtual_krw * maxAllocatableCash) / totalDesired);
+      allocated += b.virtual_krw;
+    }
+    // 내림 자투리(1~2원)는 90% 한도 및 개별 희망액 내에서 부족분이 큰 봇부터 1원씩 보정
+    let remainder = maxAllocatableCash - allocated;
+    const sortedByGap = [...botStates].sort(
+      (a, b) => (b.desired_virtual_krw - b.virtual_krw) - (a.desired_virtual_krw - a.virtual_krw)
+    );
+    for (const b of sortedByGap) {
+      if (remainder <= 0) break;
+      if (b.virtual_krw < b.desired_virtual_krw) {
+        b.virtual_krw += 1;
+        remainder -= 1;
+      }
+    }
+  }
+
+  // 3-4. 최종 불변식 검증 (절대 90% 초과 불가)
+  const totalAllocatedCash = botStates.reduce((acc, b) => acc + b.virtual_krw, 0);
+  const totalUsedCapital = totalDrainingLocked + totalElectedLocked + totalAllocatedCash;
+  assertGlobal90CapInvariant({
+    principalKrw,
+    totalUsedCapital,
+    maxDeployRatio: ratio,
+    context: "computeRotationAllocationsWith90Cap",
+  });
+
+  return {
+    principalKrw: Math.floor(principalKrw),
+    globalCapKrw,
+    perBotTargetKrw,
+    totalDrainingLocked,
+    totalElectedLocked,
+    totalAllocatedCash,
+    totalUsedCapital,
+    reservedCashKrw: Math.floor(principalKrw) - totalUsedCapital,
+    electedAllocations: botStates.map((b) => ({
+      ...b,
+      funding_status:
+        b.virtual_krw < MIN_LIVE_ORDER_SAFE_KRW &&
+        b.own_locked_krw === 0 &&
+        (b.linked_drain_locked_krw > 0 || totalDrainingLocked > 0)
+          ? "WAITING_CAPITAL_RESTORE"
+          : "READY",
+    })),
+    drainingAssignments,
+  };
+}
+
+/**
+ * 4. Draining(탈락) 봇 포지션 매도 정산 시 교체 봇 자금 자동 복원 계산기
+ * - 익절 시 90% 상한 초과분은 계좌 예비비(Reserve)로 유보
+ * - 손절 시 실제 회수 순원화 한도 내에서만 복원 (유령 자금 방지)
+ */
+export function computeDrainSellCapitalRestoration({
+  principalKrw,
+  drainingBot,
+  settledNetKrw,
+  remainingDrainingLockedAll,
+  electedBotsNow,
+  actualAvailableKrw = null,
+  maxDeployRatio = DEFAULT_MAX_DEPLOY_RATIO,
+}) {
+  const ratio =
+    Number.isFinite(Number(maxDeployRatio)) && Number(maxDeployRatio) > 0 && Number(maxDeployRatio) <= 1
+      ? Number(maxDeployRatio)
+      : DEFAULT_MAX_DEPLOY_RATIO;
+  const globalCapKrw = Math.floor(Math.max(0, Number(principalKrw) || 0) * ratio);
+  const netRecovered = Math.max(0, Math.floor(Number(settledNetKrw) || 0));
+
+  const totalElectedUsed = electedBotsNow.reduce(
+    (acc, b) =>
+      acc +
+      Math.max(0, Math.floor(Number(b.open_locked_krw ?? b.used_capital) || 0)) +
+      Math.max(0, Math.floor(Number(b.virtual_krw) || 0)),
+    0
+  );
+
+  // 현재 시점 90% 상한 내 추가 배정 가능한 절대 여유 한도
+  const globalHeadroom = Math.max(
+    0,
+    globalCapKrw - (Math.max(0, Math.floor(Number(remainingDrainingLockedAll) || 0)) + totalElectedUsed)
+  );
+
+  let restorablePool = Math.min(netRecovered, globalHeadroom);
+  if (actualAvailableKrw !== null && actualAvailableKrw !== undefined && Number.isFinite(Number(actualAvailableKrw))) {
+    restorablePool = Math.min(restorablePool, Math.max(0, Math.floor(Number(actualAvailableKrw))));
+  }
+
+  const transfers = [];
+  const targetPerBot =
+    electedBotsNow.length > 0 ? Math.floor(globalCapKrw / electedBotsNow.length) : 0;
+
+  const getDeficit = (bot) => {
+    const target = Math.max(0, Math.floor(Number(bot.target_capital_krw) || targetPerBot));
+    const used =
+      Math.max(0, Math.floor(Number(bot.open_locked_krw ?? bot.used_capital) || 0)) +
+      Math.max(0, Math.floor(Number(bot.virtual_krw) || 0));
+    return Math.max(0, target - used);
+  };
+
+  // 1순위: 직접 교체 연결된 후임 봇(replaced_by_bot_id) 우선 복원
+  if (restorablePool > 0 && drainingBot?.replaced_by_bot_id) {
+    const successor = electedBotsNow.find((b) => b.bot_id === drainingBot.replaced_by_bot_id);
+    if (successor) {
+      const deficit = getDeficit(successor);
+      const amount = Math.min(restorablePool, deficit);
+      if (amount > 0) {
+        transfers.push({ bot_id: successor.bot_id, restored_krw: amount, priority: "DIRECT_SUCCESSOR" });
+        restorablePool -= amount;
+      }
+    }
+  }
+
+  // 2순위: 잔여 복원 풀을 아직 목표 한도 미달인 다른 선출 봇들에게 부족분 비례 분배
+  if (restorablePool > 0) {
+    const transferredMap = new Map(transfers.map((t) => [t.bot_id, t.restored_krw]));
+    const needyBots = electedBotsNow
+      .map((b) => ({
+        bot_id: b.bot_id,
+        deficit: Math.max(0, getDeficit(b) - (transferredMap.get(b.bot_id) || 0)),
+      }))
+      .filter((b) => b.deficit > 0);
+
+    const totalDeficit = needyBots.reduce((acc, b) => acc + b.deficit, 0);
+    if (totalDeficit > 0) {
+      let distributed = 0;
+      const poolToShare = Math.min(restorablePool, totalDeficit);
+      for (const nb of needyBots) {
+        const share = Math.min(nb.deficit, Math.floor((nb.deficit * poolToShare) / totalDeficit));
+        if (share > 0) {
+          transfers.push({ bot_id: nb.bot_id, restored_krw: share, priority: "POOL_REBALANCE" });
+          distributed += share;
+        }
+      }
+      // 자투리 1~2원도 90% 상한 및 개별 부족분 내에서 보정
+      let rem = poolToShare - distributed;
+      if (rem > 0) {
+        const addedMap = new Map(transfers.map((t) => [t.bot_id, t.restored_krw]));
+        for (const nb of needyBots) {
+          if (rem <= 0) break;
+          const already = addedMap.get(nb.bot_id) || 0;
+          if (already < nb.deficit) {
+            const existing = transfers.find((t) => t.bot_id === nb.bot_id);
+            if (existing) existing.restored_krw += 1;
+            else transfers.push({ bot_id: nb.bot_id, restored_krw: 1, priority: "POOL_REBALANCE" });
+            addedMap.set(nb.bot_id, already + 1);
+            distributed += 1;
+            rem -= 1;
+          }
+        }
+      }
+      restorablePool -= distributed;
+    }
+  }
+
+  const totalRestoredKrw = transfers.reduce((acc, t) => acc + t.restored_krw, 0);
+  const surplusToReserveKrw = Math.max(0, netRecovered - totalRestoredKrw);
+  const totalUsedAfterKrw =
+    Math.max(0, Math.floor(Number(remainingDrainingLockedAll) || 0)) + totalElectedUsed + totalRestoredKrw;
+
+  assertGlobal90CapInvariant({
+    principalKrw,
+    totalUsedCapital: totalUsedAfterKrw,
+    maxDeployRatio: ratio,
+    context: "computeDrainSellCapitalRestoration",
+  });
+
+  return {
+    globalCapKrw,
+    settledNetKrw: netRecovered,
+    totalRestoredKrw,
+    surplusToReserveKrw,
+    totalUsedAfterKrw,
+    transfers,
+  };
+}
 
 export const STRATEGY_GROUP_META = {
   TREND_SWING: {
@@ -806,7 +1262,7 @@ export const ARENA_BOT_DEFS = [
     min_volume_krw: 8000000000,
     stop_loss_pct: 2.0,
     take_profit_pct: 3.5,
-    config: { bb_period: 20, bb_std: 2.0, bb_stddev: 2.0, candle_unit: "minutes/15", order_krw: 15000, order_ratio: 0.45, max_positions: 2 },
+    config: { bb_period: 20, bb_std: 2.0, bb_stddev: 2.0, rsi_threshold: 35, candle_unit: "minutes/15", order_krw: 15000, order_ratio: 0.45, max_positions: 2 },
   },
   {
     bot_id: "bot_06",
@@ -883,15 +1339,15 @@ export const ARENA_BOT_DEFS = [
     strategy_sub_label: "VWAP·LRC 올라운더",
     strategy_rule: "VWAP/회귀 채널 멀티 레짐 ALLOW, 패닉 쇼크 BLOCK",
     description: "4대 핵심 지표(VWAP, 20봉 선형회귀 채널 LRC ±2σ, 거래량 폭발 RVOL, 당일시가/전일고저) 기반 돌파 및 과매도 2분할 반등 매매",
-    min_volume_krw: 10000000000,
+    min_volume_krw: 5000000000,
     stop_loss_pct: 2.5,
     take_profit_pct: 5.0,
     config: {
       rvol_breakout_arena: 1.4,
-      rvol_breakout_live: 1.8,
+      rvol_breakout_live: 1.4,
       rvol_dip: 1.3,
       vwap_gap_arena: 2.0,
-      vwap_gap_live: 2.8,
+      vwap_gap_live: 2.0,
       order_ratio: 0.3,
       max_positions: 3,
     },
@@ -940,8 +1396,7 @@ const ko = (n) => Math.floor(Number(n || 0)).toLocaleString("ko-KR");
 
 const STRATEGIES = {
   // bot_01: 변동성 돌파
-  bot_01({ price, ind, held, params, options = {} }) {
-    const isLive = Boolean(options.isLive);
+  bot_01({ price, ind, held, params }) {
     const d = ind.day;
     if (!d) return hold("일봉 데이터 부족");
     if (held.length > 0) {
@@ -951,9 +1406,9 @@ const STRATEGIES = {
       }
       return hold("보유 중 (목표 수익/익일 시가 청산 대기)");
     }
-    const k = Number(params.k_value ?? (isLive ? 0.45 : 0.35));
+    const k = Number(params.k_value ?? 0.35);
     const target = d.todayOpen + (d.prevHigh - d.prevLow) * k;
-    const volMult = Number(params.volume_multiplier ?? (isLive ? 1.5 : 1.2));
+    const volMult = Number(params.volume_multiplier ?? 1.2);
     const volOk = ind.m15 ? ind.m15.volSurge5 >= volMult : true;
     const trendOk = d.ma20 !== null && d.ma20 !== undefined ? price >= d.ma20 : true;
     if (price >= target && price > d.todayOpen && trendOk && volOk) {
@@ -967,9 +1422,8 @@ const STRATEGIES = {
 
   // bot_02: SuperTrend + ATR 트레일링
   bot_02({ price, ind, held, params, options = {} }) {
-    const isLive = Boolean(options.isLive);
     const mult = Number(params.atr_multiplier ?? 2.5);
-    const volMult = Number(params.volume_multiplier ?? (isLive ? 2.0 : 1.4));
+    const volMult = Number(params.volume_multiplier ?? 1.4);
     if (held.length > 0) {
       const atr = ind.m60?.atr14;
       const peak = Math.max(Number(options.peakPrice || 0), price);
@@ -993,10 +1447,9 @@ const STRATEGIES = {
 
   // bot_03: 듀얼 모멘텀
   bot_03({ price, ind, held, params, options = {} }) {
-    const isLive = Boolean(options.isLive);
     const info = options.momentumRank?.[options.market];
     if (!info) return hold("모멘텀 순위 산출 대기");
-    const absTh = Number(params.abs_momentum_threshold_pct ?? (isLive ? 2.0 : 1.2));
+    const absTh = Number(params.abs_momentum_threshold_pct ?? 1.2);
     const topN = Number(params.top_n ?? 2);
     if (held.length > 0) {
       if (info.momPct < 0) return sell(`모멘텀 이탈 (7일 ${fmt(info.momPct)}%)`);
@@ -1015,8 +1468,7 @@ const STRATEGIES = {
   },
 
   // bot_04: 볼린저 스퀴즈 돌파
-  bot_04({ price, ind, held, params, options = {} }) {
-    const isLive = Boolean(options.isLive);
+  bot_04({ price, ind, held, params }) {
     const m = ind.m15;
     if (!m || !m.bb) return hold("15분봉 데이터 부족");
     if (held.length > 0) {
@@ -1028,7 +1480,7 @@ const STRATEGIES = {
     const recent6Min = Math.min(...bw.slice(-7, -1));
     const min20 = Math.min(...bw.slice(-22, -1));
     const squeezed = recent6Min <= min20 * 1.1;
-    const volMult = Number(params.volume_multiplier ?? (isLive ? 2.0 : 1.4));
+    const volMult = Number(params.volume_multiplier ?? 1.4);
     const volRatio = Math.max(m.curVolRatio, m.closedVolRatio);
     if (squeezed && volRatio >= volMult && price > m.bb.upper) {
       const filter = checkUpperWickAndOverextension(m.cur || m.closed, price, m.bb.mid, m.vwap);
@@ -1039,12 +1491,11 @@ const STRATEGIES = {
   },
 
   // bot_05: 볼린저 역추세 반등
-  bot_05({ price, ind, held, params, options = {} }) {
-    const isLive = Boolean(options.isLive);
+  bot_05({ price, ind, held, params }) {
     const m = ind.m15;
     if (!m || !m.bb) return hold("15분봉 데이터 부족");
     if (held.length > 0) return hold("보유 중 (+3.5% 익절 / -2.0% 손절 감시)");
-    const rsiTh = Number(params.rsi_threshold ?? (isLive ? 30 : 38));
+    const rsiTh = Number(params.rsi_threshold ?? 38);
     const touched = m.minLow2 <= m.bb.lower;
     if (touched && m.curBullish && price > m.bb.lower && m.rsiMin3 <= rsiTh) {
       return buy(`BB 하단 터치 후 양봉 복귀 · RSI ${fmt(m.rsiMin3, 1)} ≤ ${rsiTh} 과매도 반등`);
@@ -1053,8 +1504,7 @@ const STRATEGIES = {
   },
 
   // bot_06: 다단계 분할 매수 그리드
-  bot_06({ price, ind, held, params, options = {} }) {
-    const isLive = Boolean(options.isLive);
+  bot_06({ price, ind, held, params }) {
     const m = ind.m15;
     const tp = Number(params.take_profit_pct ?? 1.8);
     const maxSplits = Math.max(1, Number(params.max_splits ?? 3));
@@ -1081,7 +1531,7 @@ const STRATEGIES = {
       return hold(`그리드 보유 ${held.length}분할`);
     }
     if (!m || !m.bb) return hold("15분봉 데이터 부족");
-    const rsiEntry = Number(params.rsi_entry ?? (isLive ? 30 : 38));
+    const rsiEntry = Number(params.rsi_entry ?? 38);
     if (m.rsi <= rsiEntry && price <= m.bb.lower * 1.005) {
       return buy(`단기 과매도 그리드 1차 진입 (RSI ${fmt(m.rsi, 1)} ≤ ${rsiEntry}, BB 하단 부근)`, {
         splitIndex: 1,
@@ -1098,6 +1548,7 @@ const STRATEGIES = {
     if (!m || !m.macdSeries || !h) return hold("15분/60분봉 데이터 부족");
     const { macd, signal } = m.macdSeries;
     const n = macd.length;
+    if (n < 3) return hold("MACD 시계열 부족");
     if (held.length > 0) {
       const crossDown = macd[n - 2] >= signal[n - 2] && macd[n - 1] < signal[n - 1];
       if (crossDown) return sell("MACD 데드크로스 청산");
@@ -1118,8 +1569,7 @@ const STRATEGIES = {
   },
 
   // bot_08: 정배열 20일선 눌림목
-  bot_08({ price, ind, held, params, options = {} }) {
-    const isLive = Boolean(options.isLive);
+  bot_08({ price, ind, held, params }) {
     const d = ind.day;
     const h4 = ind.m240;
     if (!d || !h4 || d.ma60 === null || h4.ma60 === null) return hold("일봉/4시간봉 데이터 부족");
@@ -1137,7 +1587,7 @@ const STRATEGIES = {
     }
     const dayAligned = d.ma5 > d.ma20 && d.ma20 > d.ma60;
     const h4Aligned = h4.ma5 > h4.ma20 && h4.ma20 > h4.ma60;
-    const band = Number(params.pullback_band_pct ?? (isLive ? 1.5 : 2.2));
+    const band = Number(params.pullback_band_pct ?? 2.2);
     const gap = pctChange(price, d.ma20);
     const volDecline = h4.lastClosedVolRatio < 1.0;
     const roomToTargetPct = targetHighPrice > 0 && price > 0 ? ((targetHighPrice - price) / price) * 100 : Infinity;
@@ -1150,18 +1600,21 @@ const STRATEGIES = {
 
   // bot_09: 거래량 폭발 모멘텀 스캘퍼
   bot_09({ price, ind, held, params, options = {} }) {
-    const isLive = Boolean(options.isLive);
     const trailPct = Number(params.trailing_stop_pct ?? 1.5);
     if (held.length > 0) {
+      const totalCost = held.reduce((acc, p) => acc + Number(p.buy_amount || Number(p.volume || 0) * Number(p.avg_buy_price || 0)), 0);
+      const totalVol = held.reduce((acc, p) => acc + Number(p.volume || 0), 0);
+      const avgBuyPrice = totalVol > 0 ? totalCost / totalVol : Number(held[0].avg_buy_price || 0);
       const peak = Math.max(Number(options.peakPrice || 0), price);
-      if (peak > 0 && price <= peak * (1 - trailPct / 100)) {
-        return sell(`고점 대비 -${trailPct}% 트레일링 스탑`);
+      const peakPnl = avgBuyPrice > 0 ? pctChange(peak, avgBuyPrice) : 0;
+      if (peak > 0 && peakPnl > 0 && price <= peak * (1 - trailPct / 100)) {
+        return sell(`고점 대비 -${trailPct}% 트레일링 스탑 (최고 +${fmt(peakPnl)}%)`);
       }
       return hold("보유 중 (트레일링 스탑 감시)");
     }
     const m = ind.m15;
     if (!m) return hold("15분봉 데이터 부족");
-    const spike = Number(params.volume_spike_multiplier ?? (isLive ? 2.0 : 1.4));
+    const spike = Number(params.volume_spike_multiplier ?? 1.4);
     const closedClose = Number(m.closed.trade_price);
     if (m.closedVolRatio >= spike && m.closedBullish && price >= closedClose && pctChange(price, closedClose) <= 1.5) {
       const filter = checkUpperWickAndOverextension(m.closed, price, m.ema20, m.vwap);
@@ -1180,15 +1633,11 @@ const STRATEGIES = {
     const rawRvolBreakout = (isLive ? params.rvol_breakout_live : params.rvol_breakout_arena) ?? params.rvol_breakout;
     const rvolBreakoutTh = Number.isFinite(Number(rawRvolBreakout))
       ? Number(rawRvolBreakout)
-      : isLive
-      ? 1.8
       : 1.4;
     const rvolDipTh = Number.isFinite(Number(params.rvol_dip)) ? Number(params.rvol_dip) : 1.3;
     const rawDipGap = (isLive ? params.vwap_gap_live : params.vwap_gap_arena) ?? params.vwap_gap;
     const dipGapTh = Number.isFinite(Number(rawDipGap))
       ? -Math.abs(Number(rawDipGap))
-      : isLive
-      ? -2.8
       : -2.0;
     const trailingPct = Number.isFinite(Number(params.trailing_stop_pct)) ? Number(params.trailing_stop_pct) : 1.5;
     const minLrcTpPct = Number.isFinite(Number(params.min_lrc_tp_pct)) ? Number(params.min_lrc_tp_pct) : 0.6;
@@ -1369,6 +1818,7 @@ export function evaluateStrategy(botId, marketData, indicators, position, option
     }
     return res;
   } catch (err) {
+    console.warn(`[evaluateStrategy][${normId}][${options.market || marketData?.market || ""}] 지표 계산 오류:`, err?.message || err);
     return hold(`지표 계산 오류: ${err.message}`);
   }
 }
@@ -1392,7 +1842,9 @@ async function getCandlesCached(market, spec, fetchCandlesFn) {
   let rows = [];
   try {
     rows = await fetchCandlesFn(market, spec.unit, spec.count);
-  } catch {}
+  } catch (err) {
+    console.warn(`[CandlesCache][${market}][${spec.unit}] 캔들 조회 실패:`, err?.message || err);
+  }
   if (Array.isArray(rows) && rows.length > 0) {
     candleCache.set(cacheKey, { at: nowMs, rows });
     return rows;
@@ -1572,7 +2024,7 @@ export async function seedArenaBots(db, { hadSelectionColumn = true } = {}) {
     SET nickname = '잭 켈로그 프라이스액션',
         name = '잭 켈로그 프라이스액션 (Jack Kellogg Price Action)',
         strategy_type = 'JACK_KELLOGG_PRICE_ACTION',
-        min_volume_krw = 10000000000
+        min_volume_krw = 5000000000
     WHERE bot_id = 'bot_10' AND (nickname = 'VWAP봇-이오타' OR nickname = '' OR nickname LIKE '%이오타%' OR name LIKE '%RSI%')
   `).run();
 
@@ -1690,7 +2142,7 @@ function normalizedOrderRatio(cfg, fallback = 0.3) {
 const COOLDOWN_MS = 15 * 60 * 1000;
 
 export async function runPaperBot(db, bot, ctx) {
-  const { mdMap, universe, rankMap, tickerMap } = ctx;
+  const { mdMap, universe, rankMap, tickerMap, getOrderbook } = ctx;
   const cfg = parseCfg(bot);
   const params = {
     ...cfg,
@@ -1825,6 +2277,16 @@ export async function runPaperBot(db, bot, ctx) {
     // paperBuy 내부에서 (1 + PAPER_FEE_RATE) 수수료 완충 나눗셈을 1회만 수행하므로 여기서는 원금 상한만 전달
     const budget = Math.min(Math.floor(initial * ratio), Math.floor(cash));
     if (Math.floor(budget / (1 + PAPER_FEE_RATE)) < PAPER_MIN_ORDER_KRW) break;
+    const candidateOb = md?.orderbook || (typeof getOrderbook === "function" ? getOrderbook(market) : null);
+    if (candidateOb) {
+      const obQuality = analyzeOrderbookQuality(candidateOb, budget, { botId: bot.bot_id });
+      if (obQuality.blocked) {
+        if (!firstNote) {
+          firstNote = `${market.replace("KRW-", "")}: [호가 품질 가드] ${obQuality.reason}`;
+        }
+        continue;
+      }
+    }
     const filled = await paperBuy(db, bot, market, md.price, budget, sig.reason);
     if (filled) {
       lastAction = `[가상매수] ${market} ${sig.reason} (${ko(filled.buyAmount)}원)`;
@@ -2061,11 +2523,26 @@ export async function evaluateWeeklyStrategyChampions(db, options = {}) {
   const minWeeklyTrades = Number.isFinite(rawMinTrades) ? Math.max(0, Math.floor(rawMinTrades)) : 2;
   const allocationMode = ALLOCATION_MODE_WEIGHTS[options.allocationMode]
     ? options.allocationMode
-    : "RANK_WEIGHTED_40_35_25";
+    : "EQUAL_BY_CAPITAL_TIER";
   const isSingleMarketFitMode = allocationMode === "SINGLE_MARKET_FIT_100";
+  const isCapitalTierMode = allocationMode === "EQUAL_BY_CAPITAL_TIER";
   const weights = ALLOCATION_MODE_WEIGHTS[allocationMode];
   const cutoff7d = formatKstDateTime(new Date(Date.now() - 7 * 24 * 3600 * 1000));
   const evaluatedAt = nowKSTString();
+
+  let resolvedPrincipalKrw = Number(options.principalKrw || 0);
+  if (!(resolvedPrincipalKrw > 0)) {
+    try {
+      const capRow = await db.prepare("SELECT value FROM system_settings WHERE key = 'total_capital'").get();
+      resolvedPrincipalKrw = Math.floor(Number(capRow?.value || 0));
+    } catch {}
+  }
+  const tier1Max = Number(options.tier1Max || DEFAULT_CAPITAL_TIER_1_MAX);
+  const tier2Max = Number(options.tier2Max || DEFAULT_CAPITAL_TIER_2_MAX);
+  const maxDeployRatio =
+    Number.isFinite(Number(options.maxDeployRatio)) && Number(options.maxDeployRatio) > 0 && Number(options.maxDeployRatio) <= 1
+      ? Number(options.maxDeployRatio)
+      : DEFAULT_MAX_DEPLOY_RATIO;
 
   const bots = await db.prepare("SELECT * FROM bots ORDER BY bot_id ASC").all();
   const allPaperTrades = await db
@@ -2225,22 +2702,57 @@ export async function evaluateWeeklyStrategyChampions(db, options = {}) {
       a.bot_id.localeCompare(b.bot_id)
   );
 
-  let assignedTotal = 0;
-  champions.forEach((champ, idx) => {
-    let assignedRatio = 0;
-    if (champions.length === 1) {
-      assignedRatio = 100;
-    } else if (idx === champions.length - 1) {
-      assignedRatio = Math.max(0, 100 - assignedTotal);
-    } else if (champions.length === 2) {
-      assignedRatio = idx === 0 ? 55 : 45;
-    } else {
-      assignedRatio = weights[idx] ?? Math.floor(100 / Math.max(1, champions.length));
+  const tierInfo = getCapitalTierSummary(resolvedPrincipalKrw, { tier1Max, tier2Max, maxDeployRatio });
+  let activeTierBotCount = champions.length;
+  let perBotTargetKrw = 0;
+
+  if (isCapitalTierMode) {
+    const tiered = selectTieredEqualChampions(champions, resolvedPrincipalKrw > 0 ? resolvedPrincipalKrw : 1000000, {
+      tier1Max,
+      tier2Max,
+      maxDeployRatio,
+    });
+    const electedIds = new Set(tiered.elected.map((e) => e.bot_id));
+    const electedLookup = new Map(tiered.elected.map((e) => [e.bot_id, e]));
+    champions.length = 0;
+    for (const eb of tiered.elected) {
+      champions.push(eb);
     }
-    assignedTotal += assignedRatio;
-    champ.champion_rank = idx + 1;
-    champ.recommended_ratio = assignedRatio;
-  });
+    for (const b of enrichedBots) {
+      if (electedIds.has(b.bot_id)) {
+        const matched = electedLookup.get(b.bot_id);
+        b.champion_rank = matched.champion_rank;
+        b.recommended_ratio = matched.recommended_ratio;
+        b.target_capital_krw = matched.target_capital_krw;
+      } else {
+        b.champion_rank = null;
+        b.recommended_ratio = 0;
+        b.target_capital_krw = 0;
+      }
+    }
+    activeTierBotCount = tiered.targetCount;
+    perBotTargetKrw = tiered.perBotTargetKrw;
+  } else {
+    let assignedTotal = 0;
+    champions.forEach((champ, idx) => {
+      let assignedRatio = 0;
+      if (champions.length === 1) {
+        assignedRatio = 100;
+      } else if (idx === champions.length - 1) {
+        assignedRatio = Math.max(0, 100 - assignedTotal);
+      } else if (champions.length === 2) {
+        assignedRatio = idx === 0 ? 55 : 45;
+      } else {
+        assignedRatio = weights[idx] ?? Math.floor(100 / Math.max(1, champions.length));
+      }
+      assignedTotal += assignedRatio;
+      champ.champion_rank = idx + 1;
+      champ.recommended_ratio = assignedRatio;
+    });
+    activeTierBotCount = champions.length;
+    perBotTargetKrw =
+      champions.length > 0 && tierInfo.globalCapKrw > 0 ? Math.floor(tierInfo.globalCapKrw / champions.length) : 0;
+  }
 
   const byBotId = {};
   for (const b of enrichedBots) {
@@ -2251,7 +2763,14 @@ export async function evaluateWeeklyStrategyChampions(db, options = {}) {
     evaluated_at: evaluatedAt,
     cutoff_7d: cutoff7d,
     allocation_mode: allocationMode,
-    is_single_bot_mode: isSingleMarketFitMode,
+    is_single_bot_mode: isSingleMarketFitMode || activeTierBotCount === 1,
+    is_capital_tier_mode: isCapitalTierMode,
+    principal_krw: tierInfo.principalKrw,
+    global_cap_krw: tierInfo.globalCapKrw,
+    reserve_min_krw: tierInfo.reserveMinKrw,
+    active_tier_bot_count: activeTierBotCount,
+    per_bot_target_krw: perBotTargetKrw,
+    tier_label: tierInfo.tierLabel,
     market_regime_context: marketRegimeContext,
     selection_reason: singleSelectionReason,
     single_eligible_bot_ids: singleEligibleBotIds,
@@ -2353,7 +2872,13 @@ export async function runArenaCycle(db, deps) {
   const statusMap = {};
   for (const bot of bots) {
     try {
-      statusMap[bot.bot_id] = await runPaperBot(db, bot, { mdMap, universe, rankMap, tickerMap });
+      statusMap[bot.bot_id] = await runPaperBot(db, bot, {
+        mdMap,
+        universe,
+        rankMap,
+        tickerMap,
+        getOrderbook: deps?.getOrderbook,
+      });
     } catch (err) {
       statusMap[bot.bot_id] = `사이클 오류: ${err.message}`;
     }
