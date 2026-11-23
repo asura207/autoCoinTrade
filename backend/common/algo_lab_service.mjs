@@ -706,6 +706,7 @@ export function evaluateSmartExit({
 export const STRATEGY_GROUP_ORDER = ["TREND_SWING", "VOLATILITY_BREAKOUT", "REVERSAL_GRID"];
 
 export const ALLOCATION_MODE_WEIGHTS = {
+  EQUAL_BY_EQUITY_TIER: [100],
   EQUAL_BY_CAPITAL_TIER: [100],
   SINGLE_MARKET_FIT_100: [100],
   RANK_WEIGHTED_40_35_25: [40, 35, 25],
@@ -714,58 +715,106 @@ export const ALLOCATION_MODE_WEIGHTS = {
 };
 
 // ============================================================================
-// 3-1. 투자 원금 구간별 주간 봇 차등 선정(1~3개 균등 배분),
-//      교체 봇 자금 차감·복원(Graceful Drain) 및 총자금 원금 90% 상한 엔진
+// 3-1. 실시간 업비트 총 평가자산 기준 주간 봇 차등 선정(1~3개 균등 배분),
+//      단일 90% 상한 통합, 자동 원금 동기화 충돌 방지 및 교체 봇 자금 차감·복원 엔진
 // ============================================================================
 export const MIN_LIVE_ORDER_SAFE_KRW = 5050;
 export const DEFAULT_CAPITAL_TIER_1_MAX = 400000;
 export const DEFAULT_CAPITAL_TIER_2_MAX = 700000;
 export const DEFAULT_MAX_DEPLOY_RATIO = 0.9;
 
+export function isEquityTierAllocationMode(mode) {
+  return mode === "EQUAL_BY_EQUITY_TIER" || mode === "EQUAL_BY_CAPITAL_TIER";
+}
+
 /**
- * 1. 투자 원금 구간별 주간 선출 봇 개수 결정
+ * 0. 실시간 총 평가자산(E_total) 및 단일 90% 상한(C_max) 해석기
+ * - 절대 90%를 이중 적용(0.9 * 0.9 = 81%)하지 않음
+ */
+export function resolveTotalEquityAndSingle90Cap({
+  liveTotalEquityKrw = null,
+  cachedTotalEquityKrw = null,
+  legacyAuto90PrincipalKrw = null,
+  maxDeployRatio = DEFAULT_MAX_DEPLOY_RATIO,
+} = {}) {
+  const ratio =
+    Number.isFinite(Number(maxDeployRatio)) && Number(maxDeployRatio) > 0 && Number(maxDeployRatio) <= 1
+      ? Number(maxDeployRatio)
+      : DEFAULT_MAX_DEPLOY_RATIO;
+
+  let totalEquityKrw = 0;
+  let source = "NONE";
+
+  if (liveTotalEquityKrw !== null && liveTotalEquityKrw !== undefined && Number.isFinite(Number(liveTotalEquityKrw)) && Number(liveTotalEquityKrw) > 0) {
+    totalEquityKrw = Math.floor(Number(liveTotalEquityKrw));
+    source = "UPBIT_LIVE_EQUITY";
+  } else if (cachedTotalEquityKrw !== null && cachedTotalEquityKrw !== undefined && Number.isFinite(Number(cachedTotalEquityKrw)) && Number(cachedTotalEquityKrw) > 0) {
+    totalEquityKrw = Math.floor(Number(cachedTotalEquityKrw));
+    source = "CACHED_EQUITY_FALLBACK";
+  } else if (legacyAuto90PrincipalKrw !== null && legacyAuto90PrincipalKrw !== undefined && Number.isFinite(Number(legacyAuto90PrincipalKrw)) && Number(legacyAuto90PrincipalKrw) > 0) {
+    // 레거시 값이 이미 90%가 곱해진 값이라면 역산하여 원 총자산 복원
+    totalEquityKrw = Math.floor(Number(legacyAuto90PrincipalKrw) / ratio);
+    source = "LEGACY_PRINCIPAL_INFERRED";
+  }
+
+  // 단일 90% 상한 계산 (단 1회만 곱함)
+  const globalCapKrw = Math.floor(totalEquityKrw * ratio);
+  const minReserveKrw = Math.max(0, totalEquityKrw - globalCapKrw);
+
+  return {
+    totalEquityKrw,
+    globalCapKrw,
+    minReserveKrw,
+    maxDeployRatio: ratio,
+    source,
+  };
+}
+
+/**
+ * 1. 실시간 총 평가자산(E_total) 구간별 주간 선출 봇 개수 결정
  * - < 10,000원: 0개 (최소 주문 불가 원금)
  * - <= 400,000원: 1개
  * - 400,000원 초과 ~ 700,000원 미만: 2개
  * - >= 700,000원: 3개
  */
-export function getTargetBotCountByPrincipal(
-  principalKrw,
+export function getTargetBotCountByTotalEquity(
+  totalEquityKrw,
   { tier1Max = DEFAULT_CAPITAL_TIER_1_MAX, tier2Max = DEFAULT_CAPITAL_TIER_2_MAX } = {}
 ) {
-  const principal = Math.floor(Number(principalKrw) || 0);
+  const equity = Math.floor(Number(totalEquityKrw) || 0);
   const t1 = Math.max(10000, Math.floor(Number(tier1Max) || DEFAULT_CAPITAL_TIER_1_MAX));
   const t2 = Math.max(t1 + 1, Math.floor(Number(tier2Max) || DEFAULT_CAPITAL_TIER_2_MAX));
-  if (principal < 10000) return 0;
-  if (principal <= t1) return 1;
-  if (principal < t2) return 2;
+  if (equity < 10000) return 0;
+  if (equity <= t1) return 1;
+  if (equity < t2) return 2;
   return 3;
 }
 
+export function getTargetBotCountByPrincipal(principalKrw, options = {}) {
+  return getTargetBotCountByTotalEquity(principalKrw, options);
+}
+
 export function getCapitalTierSummary(
-  principalKrw,
+  totalEquityKrw,
   { tier1Max = DEFAULT_CAPITAL_TIER_1_MAX, tier2Max = DEFAULT_CAPITAL_TIER_2_MAX, maxDeployRatio = DEFAULT_MAX_DEPLOY_RATIO } = {}
 ) {
-  const principal = Math.max(0, Math.floor(Number(principalKrw) || 0));
-  const ratio = Number.isFinite(Number(maxDeployRatio)) && Number(maxDeployRatio) > 0 && Number(maxDeployRatio) <= 1
-    ? Number(maxDeployRatio)
-    : DEFAULT_MAX_DEPLOY_RATIO;
-  const globalCapKrw = Math.floor(principal * ratio);
-  const reserveMinKrw = Math.max(0, principal - globalCapKrw);
-  const botCount = getTargetBotCountByPrincipal(principal, { tier1Max, tier2Max });
+  const { totalEquityKrw: safeEquity, globalCapKrw, minReserveKrw, maxDeployRatio: ratio } =
+    resolveTotalEquityAndSingle90Cap({ liveTotalEquityKrw: totalEquityKrw, maxDeployRatio });
+  const botCount = getTargetBotCountByTotalEquity(safeEquity, { tier1Max, tier2Max });
   const perBotTargetKrw = botCount > 0 ? Math.floor(globalCapKrw / botCount) : 0;
-  let tierLabel = "최소 원금(10,000원) 미달 — 신규 선출 불가";
+  let tierLabel = "최소 총자산(10,000원) 미달 — 신규 선출 불가";
   if (botCount === 1) {
-    tierLabel = `40만 원 이하 구간 → 1개 봇 (균등 100% / 원금 ${Math.round(ratio * 100)}% 한도)`;
+    tierLabel = `총 평가자산 40만 원 이하 → 1개 봇 (균등 100% / 총자산 ${Math.round(ratio * 100)}% 단일 상한)`;
   } else if (botCount === 2) {
-    tierLabel = `40만 원 초과 ~ 70만 원 미만 구간 → 2개 봇 (균등 50% : 50% / 원금 ${Math.round(ratio * 100)}% 한도)`;
+    tierLabel = `총 평가자산 40만 원 초과 ~ 70만 원 미만 → 2개 봇 (균등 50% : 50% / 총자산 ${Math.round(ratio * 100)}% 단일 상한)`;
   } else if (botCount === 3) {
-    tierLabel = `70만 원 이상 구간 → 3개 봇 (균등 33.33%씩 / 원금 ${Math.round(ratio * 100)}% 한도)`;
+    tierLabel = `총 평가자산 70만 원 이상 → 3개 봇 (균등 33.33%씩 / 총자산 ${Math.round(ratio * 100)}% 단일 상한)`;
   }
   return {
-    principalKrw: principal,
+    totalEquityKrw: safeEquity,
+    principalKrw: safeEquity,
     globalCapKrw,
-    reserveMinKrw,
+    reserveMinKrw: minReserveKrw,
     botCount,
     perBotTargetKrw,
     maxDeployRatio: ratio,
@@ -774,22 +823,24 @@ export function getCapitalTierSummary(
 }
 
 /**
- * 총 투입/배정 자금이 원금 90% 상한을 단 1원도 초과하지 않음을 검증하는 불변식 함수
+ * 총 투입/배정 자금이 총 평가자산의 단일 90% 상한을 단 1원도 초과하지 않음을 검증하는 불변식 함수
  */
 export function assertGlobal90CapInvariant({
-  principalKrw,
+  totalEquityKrw = null,
+  principalKrw = null,
   totalUsedCapital,
   maxDeployRatio = DEFAULT_MAX_DEPLOY_RATIO,
   context = "",
 }) {
-  const ratio = Number.isFinite(Number(maxDeployRatio)) && Number(maxDeployRatio) > 0 && Number(maxDeployRatio) <= 1
-    ? Number(maxDeployRatio)
-    : DEFAULT_MAX_DEPLOY_RATIO;
-  const globalCapKrw = Math.floor(Math.max(0, Number(principalKrw) || 0) * ratio);
+  const rawEquity = totalEquityKrw !== null && totalEquityKrw !== undefined ? totalEquityKrw : principalKrw;
+  const { globalCapKrw, maxDeployRatio: ratio } = resolveTotalEquityAndSingle90Cap({
+    liveTotalEquityKrw: rawEquity,
+    maxDeployRatio,
+  });
   const used = Math.floor(Number(totalUsedCapital) || 0);
   if (used > globalCapKrw) {
     throw new Error(
-      `[INVARIANT_VIOLATION]${context ? ` [${context}]` : ""} Total capital (${used}) exceeded ${Math.round(
+      `[INVARIANT_VIOLATION]${context ? ` [${context}]` : ""} Total capital (${used}) exceeded single ${Math.round(
         ratio * 100
       )}% cap (${globalCapKrw})`
     );
@@ -799,20 +850,17 @@ export function assertGlobal90CapInvariant({
 
 /**
  * 2. 전략군 1위 후보들 중 목표 개수(1~3개)만큼 전략 분산 선출 + 동일 비율 설정
- * @param {Array} groupChampions - 3대 전략군(TREND_SWING, VOLATILITY_BREAKOUT, REVERSAL_GRID) 각 1위 배열
- * @param {number} principalKrw - 실전 투자 원금
  */
-export function selectTieredEqualChampions(groupChampions, principalKrw, options = {}) {
+export function selectTieredEqualChampions(groupChampions, totalEquityKrw, options = {}) {
   const tier1Max = Number(options?.tier1Max || DEFAULT_CAPITAL_TIER_1_MAX);
   const tier2Max = Number(options?.tier2Max || DEFAULT_CAPITAL_TIER_2_MAX);
-  const maxDeployRatio =
-    Number.isFinite(Number(options?.maxDeployRatio)) && Number(options.maxDeployRatio) > 0 && Number(options.maxDeployRatio) <= 1
-      ? Number(options.maxDeployRatio)
-      : DEFAULT_MAX_DEPLOY_RATIO;
-  const targetCount = getTargetBotCountByPrincipal(principalKrw, { tier1Max, tier2Max });
-  const globalCapKrw = Math.floor(Math.max(0, Number(principalKrw) || 0) * maxDeployRatio);
+  const { totalEquityKrw: safeEquity, globalCapKrw } = resolveTotalEquityAndSingle90Cap({
+    liveTotalEquityKrw: totalEquityKrw,
+    maxDeployRatio: options?.maxDeployRatio,
+  });
+  const targetCount = getTargetBotCountByTotalEquity(safeEquity, { tier1Max, tier2Max });
   if (targetCount === 0 || !Array.isArray(groupChampions) || groupChampions.length === 0) {
-    return { targetCount: 0, globalCapKrw, perBotTargetKrw: 0, elected: [] };
+    return { targetCount: 0, totalEquityKrw: safeEquity, globalCapKrw, perBotTargetKrw: 0, elected: [] };
   }
 
   // 전략군 중복 방지를 위해 그룹별 1위만 추린 뒤 종합 점수(rotation_score) 내림차순 정렬
@@ -834,7 +882,7 @@ export function selectTieredEqualChampions(groupChampions, principalKrw, options
   const electedList = ranked.slice(0, Math.min(targetCount, ranked.length));
   const actualCount = electedList.length;
 
-  // 동일 비율(균등) 목표 원화 계산 (항상 actualCount * perBotTargetKrw <= globalCapKrw 보장)
+  // 단일 90% 상한(globalCapKrw)을 동일 비율로 분배
   const perBotTargetKrw = actualCount > 0 ? Math.floor(globalCapKrw / actualCount) : 0;
   const equalRatio = actualCount > 0 ? Number((1 / actualCount).toFixed(4)) : 0;
   const equalRatioPct =
@@ -842,6 +890,7 @@ export function selectTieredEqualChampions(groupChampions, principalKrw, options
 
   return {
     targetCount: actualCount,
+    totalEquityKrw: safeEquity,
     globalCapKrw,
     perBotTargetKrw,
     elected: electedList.map((bot, idx) => ({
@@ -855,30 +904,122 @@ export function selectTieredEqualChampions(groupChampions, principalKrw, options
 }
 
 /**
- * 3. 교체/추가 시 기존 Draining 봇 포지션 차감 및 원금 90% 상한 엄수 배분 계산기
- * @param {Object} params
- * @param {number} params.principalKrw - 투자 원금
- * @param {Array} params.allBots - 전체 10개 봇 현재 상태 [{ bot_id, strategy_group, is_selected_for_live, open_locked_krw, replaced_by_bot_id }]
- * @param {Array} params.electedBots - selectTieredEqualChampions().elected 결과
- * @param {number|null} params.actualAvailableKrw - 실거래 모드 시 업비트 실계좌 주문 가능 원화 (가상/테스트 시 null)
+ * 내부 공용 불변식 적용기: 단일 90% 상한 + 실계좌 가용 원화 이중 캡
+ */
+function _applySingle90CapToElected({
+  totalEquityKrw,
+  globalCapKrw,
+  perBotTargetKrw,
+  allBots,
+  electedBots,
+  drainingAssignments,
+  linkedDrainSumBySuccessor,
+  actualAvailableKrw,
+  maxDeployRatio = DEFAULT_MAX_DEPLOY_RATIO,
+}) {
+  let totalDrainingLocked = 0;
+  for (const d of drainingAssignments) totalDrainingLocked += d.open_locked_krw;
+
+  let totalElectedLocked = 0;
+  const botStates = electedBots.map((eb) => {
+    const current = allBots.find((b) => b.bot_id === eb.bot_id) || eb;
+    const ownLocked = Math.max(0, Math.floor(Number(current.open_locked_krw ?? current.used_capital) || 0));
+    const linkedDrainLocked = linkedDrainSumBySuccessor.get(eb.bot_id) || 0;
+    totalElectedLocked += ownLocked;
+
+    const desiredVirtualKrw = Math.max(0, perBotTargetKrw - ownLocked - linkedDrainLocked);
+    return {
+      bot_id: eb.bot_id,
+      strategy_group: eb.strategy_group_code || eb.strategy_group,
+      allocation_ratio: eb.allocation_ratio,
+      target_capital_krw: perBotTargetKrw,
+      own_locked_krw: ownLocked,
+      linked_drain_locked_krw: linkedDrainLocked,
+      desired_virtual_krw: desiredVirtualKrw,
+      virtual_krw: desiredVirtualKrw,
+    };
+  });
+
+  const globalCashHeadroom = Math.max(0, globalCapKrw - totalDrainingLocked - totalElectedLocked);
+  const maxAllocatableCash =
+    actualAvailableKrw !== null && actualAvailableKrw !== undefined && Number.isFinite(Number(actualAvailableKrw))
+      ? Math.min(globalCashHeadroom, Math.max(0, Math.floor(Number(actualAvailableKrw))))
+      : globalCashHeadroom;
+
+  const totalDesired = botStates.reduce((acc, b) => acc + b.desired_virtual_krw, 0);
+
+  if (totalDesired > maxAllocatableCash && totalDesired > 0) {
+    let allocated = 0;
+    for (const b of botStates) {
+      b.virtual_krw = Math.floor((b.desired_virtual_krw * maxAllocatableCash) / totalDesired);
+      allocated += b.virtual_krw;
+    }
+    let remainder = maxAllocatableCash - allocated;
+    const sortedByGap = [...botStates].sort(
+      (a, b) => (b.desired_virtual_krw - b.virtual_krw) - (a.desired_virtual_krw - a.virtual_krw)
+    );
+    for (const b of sortedByGap) {
+      if (remainder <= 0) break;
+      if (b.virtual_krw < b.desired_virtual_krw) {
+        b.virtual_krw += 1;
+        remainder -= 1;
+      }
+    }
+  }
+
+  const totalAllocatedCash = botStates.reduce((acc, b) => acc + b.virtual_krw, 0);
+  const totalUsedCapital = totalDrainingLocked + totalElectedLocked + totalAllocatedCash;
+
+  assertGlobal90CapInvariant({
+    totalEquityKrw,
+    totalUsedCapital,
+    maxDeployRatio,
+    context: "_applySingle90CapToElected",
+  });
+
+  return {
+    totalEquityKrw,
+    principalKrw: totalEquityKrw,
+    globalCapKrw,
+    perBotTargetKrw,
+    totalDrainingLocked,
+    totalElectedLocked,
+    totalAllocatedCash,
+    totalUsedCapital,
+    reservedCashKrw: Math.max(0, totalEquityKrw - totalUsedCapital),
+    electedAllocations: botStates.map((b) => ({
+      ...b,
+      funding_status:
+        b.virtual_krw < MIN_LIVE_ORDER_SAFE_KRW &&
+        b.own_locked_krw === 0 &&
+        (b.linked_drain_locked_krw > 0 || totalDrainingLocked > 0)
+          ? "WAITING_CAPITAL_RESTORE"
+          : "READY",
+    })),
+    drainingAssignments,
+  };
+}
+
+/**
+ * 3. 주간 로테이션 시 기존 Draining 봇 포지션 차감 및 단일 90% 상한 엄수 배분 계산기
  */
 export function computeRotationAllocationsWith90Cap({
-  principalKrw,
+  totalEquityKrw = null,
+  principalKrw = null,
   allBots,
   electedBots,
   actualAvailableKrw = null,
   maxDeployRatio = DEFAULT_MAX_DEPLOY_RATIO,
 }) {
-  const ratio =
-    Number.isFinite(Number(maxDeployRatio)) && Number(maxDeployRatio) > 0 && Number(maxDeployRatio) <= 1
-      ? Number(maxDeployRatio)
-      : DEFAULT_MAX_DEPLOY_RATIO;
-  const globalCapKrw = Math.floor(Math.max(0, Number(principalKrw) || 0) * ratio);
+  const rawEquity = totalEquityKrw !== null && totalEquityKrw !== undefined ? totalEquityKrw : principalKrw;
+  const { totalEquityKrw: safeEquity, globalCapKrw, maxDeployRatio: ratio } = resolveTotalEquityAndSingle90Cap({
+    liveTotalEquityKrw: rawEquity,
+    maxDeployRatio,
+  });
   const electedMap = new Map(electedBots.map((b) => [b.bot_id, b]));
   const perBotTargetKrw =
     electedBots.length > 0 ? Math.floor(globalCapKrw / electedBots.length) : 0;
 
-  const retainedIds = new Set();
   const newlyElected = [];
   const drainingBots = [];
 
@@ -888,33 +1029,29 @@ export function computeRotationAllocationsWith90Cap({
     const locked = Math.max(0, Math.floor(Number(bot.open_locked_krw ?? bot.used_capital) || 0));
 
     if (isNowElected) {
-      if (wasLive) retainedIds.add(bot.bot_id);
-      else newlyElected.push(bot);
+      if (!wasLive) newlyElected.push(bot);
     } else if (locked > 0) {
       drainingBots.push({ ...bot, open_locked_krw: locked });
     }
   }
 
-  // 3-1. 탈락(Draining) 봇 -> 신규 진입 봇 1:1 우선 매핑 (동일 전략군 우선, 없으면 미매핑 신규 봇)
+  // 3-1. 탈락(Draining) 봇 -> 신규 진입 봇 1:1 우선 매핑
   const usedNewBotIds = new Set();
   const linkedDrainSumBySuccessor = new Map();
   const drainingAssignments = [];
 
   for (const dBot of drainingBots) {
     const dGroup = dBot.strategy_group_code || dBot.strategy_group || "";
-    // 이미 유효한 현행 선출 봇과 매핑되어 있으면 유지
     let successor =
       dBot.replaced_by_bot_id && electedMap.has(dBot.replaced_by_bot_id)
         ? electedMap.get(dBot.replaced_by_bot_id)
         : null;
 
-    // 1순위: 같은 전략군에 새로 진입한 봇
     if (!successor) {
       successor = newlyElected.find(
         (nb) => (nb.strategy_group_code || nb.strategy_group || "") === dGroup && !usedNewBotIds.has(nb.bot_id)
       );
     }
-    // 2순위: 전략군 무관 새로 진입한 미매핑 봇
     if (!successor) {
       successor = newlyElected.find((nb) => !usedNewBotIds.has(nb.bot_id));
     }
@@ -937,100 +1074,95 @@ export function computeRotationAllocationsWith90Cap({
     });
   }
 
-  // 3-2. 각 선출 봇의 희망 가용 예산 계산 (본인 보유 포지션 + 연결된 탈락 봇 포지션 차감)
-  let totalDrainingLocked = 0;
-  for (const d of drainingAssignments) totalDrainingLocked += d.open_locked_krw;
-
-  let totalElectedLocked = 0;
-  const botStates = electedBots.map((eb) => {
-    const current = allBots.find((b) => b.bot_id === eb.bot_id) || {};
-    const ownLocked = Math.max(0, Math.floor(Number(current.open_locked_krw ?? current.used_capital) || 0));
-    const linkedDrainLocked = linkedDrainSumBySuccessor.get(eb.bot_id) || 0;
-    totalElectedLocked += ownLocked;
-
-    // 교체 봇 자금은 기존 탈락 봇의 미매도 원금만큼 차감 (음수 방어)
-    const desiredVirtualKrw = Math.max(0, perBotTargetKrw - ownLocked - linkedDrainLocked);
-    return {
-      bot_id: eb.bot_id,
-      strategy_group: eb.strategy_group_code || eb.strategy_group,
-      allocation_ratio: eb.allocation_ratio,
-      target_capital_krw: perBotTargetKrw,
-      own_locked_krw: ownLocked,
-      linked_drain_locked_krw: linkedDrainLocked,
-      desired_virtual_krw: desiredVirtualKrw,
-      virtual_krw: desiredVirtualKrw,
-    };
-  });
-
-  // 3-3. 글로벌 90% 상한 + 실계좌 가용 원화 이중 캡 적용
-  const globalCashHeadroom = Math.max(0, globalCapKrw - totalDrainingLocked - totalElectedLocked);
-  const maxAllocatableCash =
-    actualAvailableKrw !== null && actualAvailableKrw !== undefined && Number.isFinite(Number(actualAvailableKrw))
-      ? Math.min(globalCashHeadroom, Math.max(0, Math.floor(Number(actualAvailableKrw))))
-      : globalCashHeadroom;
-
-  const totalDesired = botStates.reduce((acc, b) => acc + b.desired_virtual_krw, 0);
-
-  if (totalDesired > maxAllocatableCash && totalDesired > 0) {
-    // 90% 상한 초과 시 비례 축소 (무조건 버림 Math.floor)
-    let allocated = 0;
-    for (const b of botStates) {
-      b.virtual_krw = Math.floor((b.desired_virtual_krw * maxAllocatableCash) / totalDesired);
-      allocated += b.virtual_krw;
-    }
-    // 내림 자투리(1~2원)는 90% 한도 및 개별 희망액 내에서 부족분이 큰 봇부터 1원씩 보정
-    let remainder = maxAllocatableCash - allocated;
-    const sortedByGap = [...botStates].sort(
-      (a, b) => (b.desired_virtual_krw - b.virtual_krw) - (a.desired_virtual_krw - a.virtual_krw)
-    );
-    for (const b of sortedByGap) {
-      if (remainder <= 0) break;
-      if (b.virtual_krw < b.desired_virtual_krw) {
-        b.virtual_krw += 1;
-        remainder -= 1;
-      }
-    }
-  }
-
-  // 3-4. 최종 불변식 검증 (절대 90% 초과 불가)
-  const totalAllocatedCash = botStates.reduce((acc, b) => acc + b.virtual_krw, 0);
-  const totalUsedCapital = totalDrainingLocked + totalElectedLocked + totalAllocatedCash;
-  assertGlobal90CapInvariant({
-    principalKrw,
-    totalUsedCapital,
-    maxDeployRatio: ratio,
-    context: "computeRotationAllocationsWith90Cap",
-  });
-
-  return {
-    principalKrw: Math.floor(principalKrw),
+  return _applySingle90CapToElected({
+    totalEquityKrw: safeEquity,
     globalCapKrw,
     perBotTargetKrw,
-    totalDrainingLocked,
-    totalElectedLocked,
-    totalAllocatedCash,
-    totalUsedCapital,
-    reservedCashKrw: Math.floor(principalKrw) - totalUsedCapital,
-    electedAllocations: botStates.map((b) => ({
-      ...b,
-      funding_status:
-        b.virtual_krw < MIN_LIVE_ORDER_SAFE_KRW &&
-        b.own_locked_krw === 0 &&
-        (b.linked_drain_locked_krw > 0 || totalDrainingLocked > 0)
-          ? "WAITING_CAPITAL_RESTORE"
-          : "READY",
-    })),
+    allBots,
+    electedBots,
     drainingAssignments,
-  };
+    linkedDrainSumBySuccessor,
+    actualAvailableKrw,
+    maxDeployRatio: ratio,
+  });
 }
 
 /**
- * 4. Draining(탈락) 봇 포지션 매도 정산 시 교체 봇 자금 자동 복원 계산기
- * - 익절 시 90% 상한 초과분은 계좌 예비비(Reserve)로 유보
- * - 손절 시 실제 회수 순원화 한도 내에서만 복원 (유령 자금 방지)
+ * 4. [방식 A 핵심] 기존 '총 평가자산 90% 자동 원금 동기화' 함수용 통합 정산기
+ * - 주중 자동 동기화가 호출되어도 선출 봇 구성(1~3개)을 임의로 바꾸지 않음
+ * - Draining 봇의 virtual_krw = 0 및 replaced_by_bot_id 차감액을 절대 덮어쓰지 않음
+ * - 변경된 E_total의 단일 90% 상한(globalCapKrw) 내에서만 안전하게 목표 한도와 가용 원화를 재조정
+ */
+export function reconcileAutoSyncedBudgetsWith90Cap({
+  totalEquityKrw,
+  allBots,
+  actualAvailableKrw = null,
+  maxDeployRatio = DEFAULT_MAX_DEPLOY_RATIO,
+}) {
+  const { totalEquityKrw: safeEquity, globalCapKrw, maxDeployRatio: ratio } = resolveTotalEquityAndSingle90Cap({
+    liveTotalEquityKrw: totalEquityKrw,
+    maxDeployRatio,
+  });
+
+  const electedBots = allBots.filter((b) => Number(b.is_selected_for_live) === 1);
+  const perBotTargetKrw =
+    electedBots.length > 0 ? Math.floor(globalCapKrw / electedBots.length) : 0;
+  const equalRatio =
+    electedBots.length > 0 ? Number((1 / electedBots.length).toFixed(4)) : 0;
+
+  const electedMap = new Map(electedBots.map((b) => [b.bot_id, b]));
+  const linkedDrainSumBySuccessor = new Map();
+  const drainingAssignments = [];
+
+  for (const bot of allBots) {
+    const isElected = electedMap.has(bot.bot_id);
+    const locked = Math.max(0, Math.floor(Number(bot.open_locked_krw ?? bot.used_capital) || 0));
+    if (!isElected && locked > 0) {
+      const validSuccessor =
+        bot.replaced_by_bot_id && electedMap.has(bot.replaced_by_bot_id)
+          ? bot.replaced_by_bot_id
+          : null;
+      if (validSuccessor) {
+        linkedDrainSumBySuccessor.set(
+          validSuccessor,
+          (linkedDrainSumBySuccessor.get(validSuccessor) || 0) + locked
+        );
+      }
+      drainingAssignments.push({
+        bot_id: bot.bot_id,
+        open_locked_krw: locked,
+        replaced_by_bot_id: validSuccessor,
+        virtual_krw: 0,
+        drain_status: "DRAINING",
+      });
+    }
+  }
+
+  return _applySingle90CapToElected({
+    totalEquityKrw: safeEquity,
+    globalCapKrw,
+    perBotTargetKrw,
+    allBots,
+    electedBots: electedBots.map((b) => ({
+      ...b,
+      allocation_ratio: equalRatio,
+      target_capital_krw: perBotTargetKrw,
+    })),
+    drainingAssignments,
+    linkedDrainSumBySuccessor,
+    actualAvailableKrw,
+    maxDeployRatio: ratio,
+  });
+}
+
+/**
+ * 5. Draining(탈락) 봇 포지션 매도 정산 시 교체 봇 자금 자동 복원 계산기
+ * - 단일 90% 상한(globalCapKrw = floor(totalEquityKrw * 0.90)) 엄수
+ * - 익절 초과분은 계좌 예비비(Reserve) 유보, 손절 시 실회수액 한도만 복원
  */
 export function computeDrainSellCapitalRestoration({
-  principalKrw,
+  totalEquityKrw = null,
+  principalKrw = null,
   drainingBot,
   settledNetKrw,
   remainingDrainingLockedAll,
@@ -1038,11 +1170,11 @@ export function computeDrainSellCapitalRestoration({
   actualAvailableKrw = null,
   maxDeployRatio = DEFAULT_MAX_DEPLOY_RATIO,
 }) {
-  const ratio =
-    Number.isFinite(Number(maxDeployRatio)) && Number(maxDeployRatio) > 0 && Number(maxDeployRatio) <= 1
-      ? Number(maxDeployRatio)
-      : DEFAULT_MAX_DEPLOY_RATIO;
-  const globalCapKrw = Math.floor(Math.max(0, Number(principalKrw) || 0) * ratio);
+  const rawEquity = totalEquityKrw !== null && totalEquityKrw !== undefined ? totalEquityKrw : principalKrw;
+  const { totalEquityKrw: safeEquity, globalCapKrw, maxDeployRatio: ratio } = resolveTotalEquityAndSingle90Cap({
+    liveTotalEquityKrw: rawEquity,
+    maxDeployRatio,
+  });
   const netRecovered = Math.max(0, Math.floor(Number(settledNetKrw) || 0));
 
   const totalElectedUsed = electedBotsNow.reduce(
@@ -1053,7 +1185,6 @@ export function computeDrainSellCapitalRestoration({
     0
   );
 
-  // 현재 시점 90% 상한 내 추가 배정 가능한 절대 여유 한도
   const globalHeadroom = Math.max(
     0,
     globalCapKrw - (Math.max(0, Math.floor(Number(remainingDrainingLockedAll) || 0)) + totalElectedUsed)
@@ -1089,7 +1220,7 @@ export function computeDrainSellCapitalRestoration({
     }
   }
 
-  // 2순위: 잔여 복원 풀을 아직 목표 한도 미달인 다른 선출 봇들에게 부족분 비례 분배
+  // 2순위: 잔여 복원 풀을 목표 한도 미달인 다른 선출 봇들에게 부족분 비례 분배
   if (restorablePool > 0) {
     const transferredMap = new Map(transfers.map((t) => [t.bot_id, t.restored_krw]));
     const needyBots = electedBotsNow
@@ -1110,7 +1241,6 @@ export function computeDrainSellCapitalRestoration({
           distributed += share;
         }
       }
-      // 자투리 1~2원도 90% 상한 및 개별 부족분 내에서 보정
       let rem = poolToShare - distributed;
       if (rem > 0) {
         const addedMap = new Map(transfers.map((t) => [t.bot_id, t.restored_krw]));
@@ -1137,13 +1267,14 @@ export function computeDrainSellCapitalRestoration({
     Math.max(0, Math.floor(Number(remainingDrainingLockedAll) || 0)) + totalElectedUsed + totalRestoredKrw;
 
   assertGlobal90CapInvariant({
-    principalKrw,
+    totalEquityKrw: safeEquity,
     totalUsedCapital: totalUsedAfterKrw,
     maxDeployRatio: ratio,
     context: "computeDrainSellCapitalRestoration",
   });
 
   return {
+    totalEquityKrw: safeEquity,
     globalCapKrw,
     settledNetKrw: netRecovered,
     totalRestoredKrw,
@@ -2523,26 +2654,35 @@ export async function evaluateWeeklyStrategyChampions(db, options = {}) {
   const minWeeklyTrades = Number.isFinite(rawMinTrades) ? Math.max(0, Math.floor(rawMinTrades)) : 2;
   const allocationMode = ALLOCATION_MODE_WEIGHTS[options.allocationMode]
     ? options.allocationMode
-    : "EQUAL_BY_CAPITAL_TIER";
+    : "EQUAL_BY_EQUITY_TIER";
   const isSingleMarketFitMode = allocationMode === "SINGLE_MARKET_FIT_100";
-  const isCapitalTierMode = allocationMode === "EQUAL_BY_CAPITAL_TIER";
+  const isCapitalTierMode = isEquityTierAllocationMode(allocationMode);
   const weights = ALLOCATION_MODE_WEIGHTS[allocationMode];
   const cutoff7d = formatKstDateTime(new Date(Date.now() - 7 * 24 * 3600 * 1000));
   const evaluatedAt = nowKSTString();
 
-  let resolvedPrincipalKrw = Number(options.principalKrw || 0);
-  if (!(resolvedPrincipalKrw > 0)) {
-    try {
-      const capRow = await db.prepare("SELECT value FROM system_settings WHERE key = 'total_capital'").get();
-      resolvedPrincipalKrw = Math.floor(Number(capRow?.value || 0));
-    } catch {}
-  }
   const tier1Max = Number(options.tier1Max || DEFAULT_CAPITAL_TIER_1_MAX);
   const tier2Max = Number(options.tier2Max || DEFAULT_CAPITAL_TIER_2_MAX);
   const maxDeployRatio =
     Number.isFinite(Number(options.maxDeployRatio)) && Number(options.maxDeployRatio) > 0 && Number(options.maxDeployRatio) <= 1
       ? Number(options.maxDeployRatio)
       : DEFAULT_MAX_DEPLOY_RATIO;
+
+  let cachedEquity = null;
+  let legacyCap = null;
+  try {
+    const eqRow = await db.prepare("SELECT value FROM system_settings WHERE key = 'last_synced_total_equity_krw'").get();
+    if (eqRow && Number(eqRow.value) > 0) cachedEquity = Number(eqRow.value);
+    const capRow = await db.prepare("SELECT value FROM system_settings WHERE key = 'total_capital'").get();
+    if (capRow && Number(capRow.value) > 0) legacyCap = Number(capRow.value);
+  } catch {}
+  const resolvedEquityObj = resolveTotalEquityAndSingle90Cap({
+    liveTotalEquityKrw: options.totalEquityKrw ?? options.principalKrw ?? null,
+    cachedTotalEquityKrw: cachedEquity,
+    legacyAuto90PrincipalKrw: legacyCap,
+    maxDeployRatio,
+  });
+  const resolvedPrincipalKrw = resolvedEquityObj.totalEquityKrw;
 
   const bots = await db.prepare("SELECT * FROM bots ORDER BY bot_id ASC").all();
   const allPaperTrades = await db

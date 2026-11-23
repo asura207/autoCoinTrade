@@ -2233,7 +2233,7 @@ export default function App() {
     is_enabled: 1,
     rotation_day_of_week: 1,
     rotation_hour_kst: 9,
-    allocation_mode: "EQUAL_BY_CAPITAL_TIER",
+    allocation_mode: "EQUAL_BY_EQUITY_TIER",
     min_weekly_trades: 2,
   });
   const [rotationSaving, setRotationSaving] = useState(false);
@@ -10755,7 +10755,8 @@ export default function App() {
                     onChange={(e) => setRotationConfigDraft((prev) => ({ ...prev, allocation_mode: e.target.value }))}
                     style={{ width: "100%", padding: "8px 10px" }}
                   >
-                    <option value="EQUAL_BY_CAPITAL_TIER">원금 구간별 자동(1~3개 균등 · 원금 90% 상한 · 기본값)</option>
+                    <option value="EQUAL_BY_EQUITY_TIER">실시간 총 평가자산 구간별 자동(1~3개 균등 · 단일 90% 상한 · 기본값)</option>
+                    <option value="EQUAL_BY_CAPITAL_TIER">원금 구간별 자동(1~3개 균등 · 단일 90% 상한)</option>
                     <option value="SINGLE_MARKET_FIT_100">시장 상황 맞춤 1개 집중 (100% · 단일 봇)</option>
                     <option value="RANK_WEIGHTED_40_35_25">성적순 차등 A (40% : 35% : 25%)</option>
                     <option value="RANK_WEIGHTED_40_40_20">성적순 차등 B (40% : 40% : 20%)</option>
@@ -10790,31 +10791,34 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 원금 구간별 자동 봇 수 & 전체 자금 90% 상한 게이지 카드 */}
+              {/* 실시간 총 평가자산(E_total) 구간 배지 & 단일 90% 상한 게이지 카드 (이중 차감 없음) */}
               {(() => {
-                const livePrincipal = Math.max(
-                  0,
-                  Math.floor(Number(totalCapitalInput || rotationStatus?.principal_krw || 0))
+                const liveUpbitAsset = Math.floor(
+                  Number(upbitAccount?.total_asset_krw ?? upbitAccount?.krw_total ?? upbitAccount?.krw_balance ?? 0)
                 );
-                const globalCap = Math.floor(livePrincipal * 0.9);
-                const reserveMin = Math.max(0, livePrincipal - globalCap);
+                const liveTotalEquity =
+                  liveUpbitAsset > 0
+                    ? liveUpbitAsset
+                    : Math.floor(Number(rotationStatus?.total_equity_krw || rotationStatus?.principal_krw || 0));
+                const globalCap = Math.floor(liveTotalEquity * 0.9);
+                const reserveMin = Math.max(0, liveTotalEquity - globalCap);
                 const tierBotCount =
-                  livePrincipal < 10000 ? 0 : livePrincipal <= 400000 ? 1 : livePrincipal < 700000 ? 2 : 3;
+                  liveTotalEquity < 10000 ? 0 : liveTotalEquity <= 400000 ? 1 : liveTotalEquity < 700000 ? 2 : 3;
                 const tierBadgeText =
                   tierBotCount === 0
-                    ? "⚠️ 최소 원금(10,000원) 미달 — 신규 선출 불가"
+                    ? "⚠️ 최소 총 평가자산(10,000원) 미달 — 신규 선출 불가"
                     : tierBotCount === 1
-                    ? "1개 봇 (균등 100% / 원금 90% 한도)"
+                    ? "총 평가자산 40만 원 이하 → 1개 봇 (균등 100% / 총자산 90% 한도)"
                     : tierBotCount === 2
-                    ? "2개 봇 (균등 50% : 50% / 원금 90% 한도)"
-                    : "3개 봇 (균등 33.33%씩 / 원금 90% 한도)";
+                    ? "총 평가자산 40만 초과 ~ 70만 미만 → 2개 봇 (균등 50% : 50% / 총자산 90% 한도)"
+                    : "총 평가자산 70만 원 이상 → 3개 봇 (균등 1/3씩 / 총자산 90% 한도)";
                 const perBotQuota = tierBotCount > 0 ? Math.floor(globalCap / tierBotCount) : 0;
                 const drainLocked = Math.max(0, Math.floor(Number(rotationStatus?.total_draining_locked_krw || 0)));
                 const electedLocked = Math.max(0, Math.floor(Number(rotationStatus?.total_elected_locked_krw || 0)));
                 const electedCash = Math.max(0, Math.floor(Number(rotationStatus?.total_elected_cash_krw || 0)));
                 const totalUsed = drainLocked + electedLocked + electedCash;
-                const actualReserve = Math.max(0, livePrincipal - totalUsed);
-                const pctOf = (v) => (livePrincipal > 0 ? Math.min(100, Number(((v / livePrincipal) * 100).toFixed(2))) : 0);
+                const actualReserve = Math.max(0, liveTotalEquity - totalUsed);
+                const pctOf = (v) => (liveTotalEquity > 0 ? Math.min(100, Number(((v / liveTotalEquity) * 100).toFixed(2))) : 0);
                 const drainPct = pctOf(drainLocked);
                 const electedLockedPct = pctOf(electedLocked);
                 const electedCashPct = pctOf(electedCash);
@@ -10831,10 +10835,10 @@ export default function App() {
                       marginBottom: "16px",
                     }}
                   >
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "8px", marginBottom: "10px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "8px", marginBottom: "8px" }}>
                       <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
                         <strong style={{ fontSize: "13.5px", color: "#f8fafc" }}>
-                          🛡️ 투자 원금 구간별 자동 봇 수 &amp; 원금 90% 상한 자금 게이지
+                          🛡️ 실시간 업비트 총 평가자산 구간 &amp; 단일 90% 상한 자금 게이지
                         </strong>
                         <span
                           style={{
@@ -10850,12 +10854,16 @@ export default function App() {
                           {tierBadgeText}
                         </span>
                       </div>
-                      <div style={{ fontSize: "12px", color: "#cbd5e1" }}>
-                        원금 <strong>{livePrincipal.toLocaleString("ko-KR")}원</strong> · 90% 상한{" "}
-                        <strong style={{ color: "#38bdf8" }}>{globalCap.toLocaleString("ko-KR")}원</strong> · 봇당 목표{" "}
-                        <strong style={{ color: "#a5b4fc" }}>{perBotQuota.toLocaleString("ko-KR")}원</strong> · 최소 예비비(10%){" "}
-                        <strong style={{ color: "#4ade80" }}>{reserveMin.toLocaleString("ko-KR")}원</strong>
-                      </div>
+                      <span style={{ fontSize: "11px", color: "#86efac", fontWeight: 700 }}>
+                        ✓ 총 평가자산 기준 봇 개수 판정 · 90% 단일 상한(이중 차감 없음)
+                      </span>
+                    </div>
+
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: "14px", fontSize: "12px", color: "#cbd5e1", marginBottom: "10px" }}>
+                      <span>실시간 총 평가자산(E_total): <strong style={{ color: "#f8fafc" }}>{liveTotalEquity.toLocaleString("ko-KR")}원</strong></span>
+                      <span>단일 90% 운용 한도(C_max): <strong style={{ color: "#38bdf8" }}>{globalCap.toLocaleString("ko-KR")}원</strong></span>
+                      <span>봇당 균등 목표: <strong style={{ color: "#a5b4fc" }}>{perBotQuota.toLocaleString("ko-KR")}원</strong></span>
+                      <span>최소 현금 예비비(10%): <strong style={{ color: "#4ade80" }}>{reserveMin.toLocaleString("ko-KR")}원</strong></span>
                     </div>
 
                     {/* 누적 막대(Stacked Bar): Draining + 선출 보유 + 선출 가용 + 현금 예비비 */}
@@ -10904,7 +10912,7 @@ export default function App() {
                           width: "2px",
                           background: "#ef4444",
                         }}
-                        title="글로벌 90% 투입 상한선"
+                        title="글로벌 단일 90% 투입 상한선"
                       />
                     </div>
 
@@ -10913,10 +10921,10 @@ export default function App() {
                         <span><span style={{ color: "#f59e0b" }}>■</span> Draining 묶인 자금: {drainLocked.toLocaleString("ko-KR")}원 ({drainPct}%)</span>
                         <span><span style={{ color: "#6366f1" }}>■</span> 선출 봇 보유: {electedLocked.toLocaleString("ko-KR")}원 ({electedLockedPct}%)</span>
                         <span><span style={{ color: "#0ea5e9" }}>■</span> 선출 봇 가용: {electedCash.toLocaleString("ko-KR")}원 ({electedCashPct}%)</span>
-                        <span><span style={{ color: "#4ade80" }}>■</span> 현금 예비비: {actualReserve.toLocaleString("ko-KR")}원 ({reservePct}%)</span>
+                        <span><span style={{ color: "#4ade80" }}>■</span> 최소 10% 현금 예비비: {actualReserve.toLocaleString("ko-KR")}원 ({reservePct}%)</span>
                       </div>
                       <strong style={{ color: utilPct > 90 ? "#ef4444" : "#38bdf8" }}>
-                        총 투입·배정률: {utilPct}% / 상한 90.0%
+                        총 평가자산 대비 투입·배정률: {utilPct}% / 상한 90.0%
                       </strong>
                     </div>
                   </div>

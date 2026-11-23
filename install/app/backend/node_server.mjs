@@ -23,11 +23,15 @@ import {
   DEFAULT_CAPITAL_TIER_1_MAX,
   DEFAULT_CAPITAL_TIER_2_MAX,
   DEFAULT_MAX_DEPLOY_RATIO,
+  isEquityTierAllocationMode,
+  resolveTotalEquityAndSingle90Cap,
+  getTargetBotCountByTotalEquity,
   getTargetBotCountByPrincipal,
   getCapitalTierSummary,
   assertGlobal90CapInvariant,
   selectTieredEqualChampions,
   computeRotationAllocationsWith90Cap,
+  reconcileAutoSyncedBudgetsWith90Cap,
   computeDrainSellCapitalRestoration,
   ARENA_BOT_DEFS,
   ARENA_BOT_IDS,
@@ -1097,7 +1101,7 @@ export async function initializeDatabase() {
       is_enabled INTEGER DEFAULT 1,
       rotation_day_of_week INTEGER DEFAULT 1,
       rotation_hour_kst INTEGER DEFAULT 9,
-      allocation_mode TEXT DEFAULT 'EQUAL_BY_CAPITAL_TIER',
+      allocation_mode TEXT DEFAULT 'EQUAL_BY_EQUITY_TIER',
       min_weekly_trades INTEGER DEFAULT 2,
       capital_tier_1_max DOUBLE PRECISION DEFAULT 400000,
       capital_tier_2_max DOUBLE PRECISION DEFAULT 700000,
@@ -1144,8 +1148,10 @@ export async function initializeDatabase() {
       surplus_reserve_krw DOUBLE PRECISION DEFAULT 0,
       total_used_after_krw DOUBLE PRECISION NOT NULL,
       global_cap_krw DOUBLE PRECISION NOT NULL,
+      total_equity_snapshot_krw DOUBLE PRECISION DEFAULT 0,
       created_at TEXT NOT NULL
     );
+    ALTER TABLE capital_restoration_logs ADD COLUMN IF NOT EXISTS total_equity_snapshot_krw DOUBLE PRECISION DEFAULT 0;
     ALTER TABLE bots ADD COLUMN IF NOT EXISTS strategy_group TEXT DEFAULT 'TREND_SWING';
     ALTER TABLE bots ADD COLUMN IF NOT EXISTS is_selected_for_live INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE bots ADD COLUMN IF NOT EXISTS paper_initial_capital BIGINT NOT NULL DEFAULT 1000000;
@@ -1275,10 +1281,17 @@ export async function initializeDatabase() {
            id, is_enabled, rotation_day_of_week, rotation_hour_kst,
            allocation_mode, min_weekly_trades, capital_tier_1_max, capital_tier_2_max, max_deploy_ratio,
            last_rotated_at, next_rotation_at, updated_at
-         ) VALUES (1, 1, 1, 9, 'EQUAL_BY_CAPITAL_TIER', 2, 400000, 700000, 0.90, NULL, ?, ?)
+         ) VALUES (1, 1, 1, 9, 'EQUAL_BY_EQUITY_TIER', 2, 400000, 700000, 0.90, NULL, ?, ?)
          ON CONFLICT (id) DO NOTHING`
       )
       .run(defaultNextRot, nowInit);
+    await db
+      .prepare(
+        `INSERT INTO system_settings (key, value, updated_at)
+         VALUES ('capital_basis_mode', 'LIVE_TOTAL_EQUITY_90CAP', ?)
+         ON CONFLICT (key) DO NOTHING`
+      )
+      .run(nowInit);
   } catch (rotSeedErr) {
     console.warn("[DB Migration] auto_rotation_config seed warning:", rotSeedErr.message);
   }
@@ -2029,66 +2042,174 @@ async function fetchUpbitAccountBalance() {
 }
 
 // ============================================================================
-// 업비트 실계좌 잔고의 90%를 자동 계산하여 총 운영원금으로 설정하고 각 실전 봇에 실시간 분배
+// [방식 A 통합] 업비트 실시간 총 평가자산(E_total) 기반 단일 90% 상한(C_max) 자동 동기화
+// - 90% 이중 차감(0.9 * 0.9 = 81%) 원천 금지: E_total과 C_max를 분리 저장
+// - 주중 자동 동기화는 선출 봇 개수(1~3개)를 임의 변경하지 않으며,
+//   reconcileAutoSyncedBudgetsWith90Cap()을 통해 Draining 차감액을 절대 덮어쓰지 않음
 // ============================================================================
 let lastDynamicSyncMs = 0;
-async function syncDynamicLiveCapitalFromUpbit(force = false, preloadedAccount = null) {
+export async function syncDynamicLiveCapitalFromUpbit(force = false, preloadedAccount = null) {
   const nowMs = Date.now();
   if (!force && !preloadedAccount && nowMs - lastDynamicSyncMs < 3000) {
-    const currentCap = Math.floor(Number(await getSetting("total_capital", "0")));
-    return { success: true, total_capital: currentCap, cached: true };
+    const currentCap = Math.floor(Number(await getSetting("deployable_capital_cap_krw", await getSetting("total_capital", "0"))));
+    const cachedEquity = Math.floor(Number(await getSetting("last_synced_total_equity_krw", "0")));
+    return { success: true, total_asset_krw: cachedEquity, total_capital: currentCap, cached: true };
+  }
+  if (isCapitalRebalancing) {
+    const currentCap = Math.floor(Number(await getSetting("deployable_capital_cap_krw", await getSetting("total_capital", "0"))));
+    const cachedEquity = Math.floor(Number(await getSetting("last_synced_total_equity_krw", "0")));
+    return { success: true, total_asset_krw: cachedEquity, total_capital: currentCap, skipped_rebalancing: true };
   }
   lastDynamicSyncMs = nowMs;
 
   try {
     const accountInfo = preloadedAccount || (await fetchUpbitAccountBalance());
     if (!accountInfo || !accountInfo.success) {
-      const currentCap = Math.floor(Number(await getSetting("total_capital", "0")));
-      return { success: false, total_capital: currentCap, reason: accountInfo?.message || "업비트 계좌 조회 실패" };
+      const currentCap = Math.floor(Number(await getSetting("deployable_capital_cap_krw", await getSetting("total_capital", "0"))));
+      const cachedEquity = Math.floor(Number(await getSetting("last_synced_total_equity_krw", "0")));
+      return {
+        success: false,
+        total_asset_krw: cachedEquity,
+        total_capital: currentCap,
+        reason: accountInfo?.message || "업비트 계좌 조회 실패 (직전 정상 총 평가자산 Fallback 유지)",
+      };
     }
 
     const rawAsset = Number(accountInfo.total_asset_krw ?? accountInfo.krw_total ?? accountInfo.krw_balance ?? 0);
     const totalAsset = Math.floor(rawAsset);
+    const actualOrderableKrw =
+      accountInfo.orderable_krw !== null && accountInfo.orderable_krw !== undefined && Number.isFinite(Number(accountInfo.orderable_krw))
+        ? Math.max(0, Math.floor(Number(accountInfo.orderable_krw)))
+        : null;
 
     const now = nowKSTString();
     const db = getDb();
 
     if (totalAsset <= 0) {
       await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('total_capital', '0', ?)").run(now);
+      await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('deployable_capital_cap_krw', '0', ?)").run(now);
       await checkAndHaltIfZeroBalance("live");
-      return { success: false, total_capital: 0, reason: "업비트 잔고가 0원 이하입니다." };
+      return { success: false, total_asset_krw: 0, total_capital: 0, reason: "업비트 잔고가 0원 이하입니다." };
     }
 
-    // 업비트 실 계좌 잔고를 계산하여 90%를 자동으로 운영원금으로 설정
-    const dynamicTotalCapital = Math.floor(totalAsset * 0.9);
+    const rotCfg = await getAutoRotationConfig(db);
+    const { totalEquityKrw, globalCapKrw: dynamicTotalCapital, maxDeployRatio } = resolveTotalEquityAndSingle90Cap({
+      liveTotalEquityKrw: totalAsset,
+      maxDeployRatio: rotCfg.max_deploy_ratio,
+    });
 
-    await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('total_capital', ?, ?)").run(
-      String(dynamicTotalCapital),
-      now
-    );
-    await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('capital_configured', '1', ?)").run(
-      now
-    );
-    if (dynamicTotalCapital >= 5253 && (await getSetting("zero_balance_halted", "0")) === "1") {
-      await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('zero_balance_halted', '0', ?)").run(now);
-      await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('zero_balance_reason', '', ?)").run(now);
-    }
+    const allocResult = await withDbWriteLock(async () => {
+      if (isCapitalRebalancing) {
+        return { skipped_rebalancing: true };
+      }
+      isCapitalRebalancing = true;
+      try {
+        await beginWriteTx(db);
+        await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('last_synced_total_equity_krw', ?, ?)").run(
+          String(totalEquityKrw),
+          now
+        );
+        await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('deployable_capital_cap_krw', ?, ?)").run(
+          String(dynamicTotalCapital),
+          now
+        );
+        await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('total_capital', ?, ?)").run(
+          String(dynamicTotalCapital),
+          now
+        );
+        await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('capital_basis_mode', 'LIVE_TOTAL_EQUITY_90CAP', ?)").run(now);
+        await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('capital_configured', '1', ?)").run(now);
+        if (dynamicTotalCapital >= 5253 && (await getSetting("zero_balance_halted", "0")) === "1") {
+          await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('zero_balance_halted', '0', ?)").run(now);
+          await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('zero_balance_reason', '', ?)").run(now);
+        }
 
-    // 각 실전 봇에 비율대로 실시간 분배
-    const allocResult = await recalculateAndApplyBotAllocations(dynamicTotalCapital, null, "live");
+        let resObj = null;
+        if (isEquityTierAllocationMode(rotCfg.allocation_mode)) {
+          const liveBotsAll = await getBots("live");
+          const botsInput = liveBotsAll.map((b) => ({
+            bot_id: b.bot_id,
+            strategy_group: b.strategy_group_code || b.strategy_group || getBotStrategyMeta(b.bot_id).strategy_group_code,
+            is_selected_for_live: Number(b.is_selected_for_live || 0),
+            open_locked_krw: Math.max(0, Math.floor(Number(b.used_capital || 0))),
+            replaced_by_bot_id: b.replaced_by_bot_id || null,
+          }));
+          const reconciled = reconcileAutoSyncedBudgetsWith90Cap({
+            totalEquityKrw,
+            allBots: botsInput,
+            actualAvailableKrw: actualOrderableKrw,
+            maxDeployRatio,
+          });
+          for (const ea of reconciled.electedAllocations) {
+            const nextAllocCap = ea.own_locked_krw + ea.virtual_krw;
+            const ratioPct =
+              reconciled.electedAllocations.length === 1
+                ? 100
+                : reconciled.electedAllocations.length === 2
+                ? 50
+                : Number((100 / reconciled.electedAllocations.length).toFixed(2));
+            await db
+              .prepare(
+                `UPDATE bots
+                 SET allocation_ratio = ?, target_capital_krw = ?, allocated_capital = ?, virtual_krw = ?, updated_at = ?
+                 WHERE bot_id = ?`
+              )
+              .run(ratioPct, ea.target_capital_krw, nextAllocCap, ea.virtual_krw, now, ea.bot_id);
+          }
+          for (const da of reconciled.drainingAssignments) {
+            await db
+              .prepare(
+                `UPDATE bots
+                 SET is_selected_for_live = 0, is_running = 0, allocation_ratio = 0,
+                     target_capital_krw = 0, allocated_capital = ?, virtual_krw = 0,
+                     drain_status = 'DRAINING', replaced_by_bot_id = ?, updated_at = ?
+                 WHERE bot_id = ?`
+              )
+              .run(da.open_locked_krw, da.replaced_by_bot_id, now, da.bot_id);
+          }
+          // 커밋 전 DB 단일 90% 불변식 검증
+          const vBots = await db.prepare("SELECT virtual_krw FROM bots").all();
+          const vOpen = await db.prepare("SELECT COALESCE(SUM(buy_amount), 0) AS total_locked FROM bot_positions WHERE status = 'OPEN'").get();
+          const vUsed =
+            Math.max(0, Math.floor(Number(vOpen?.total_locked || 0))) +
+            vBots.reduce((acc, row) => acc + Math.max(0, Math.floor(Number(row.virtual_krw || 0))), 0);
+          assertGlobal90CapInvariant({
+            totalEquityKrw,
+            totalUsedCapital: vUsed,
+            maxDeployRatio,
+            context: "syncDynamicLiveCapitalFromUpbit:DB_COMMIT",
+          });
+          await syncBotAccountsFromBots(db);
+          resObj = reconciled;
+        } else {
+          resObj = await recalculateAndApplyBotAllocations(dynamicTotalCapital, null, "live", { skipAccountSync: true });
+          await syncBotAccountsFromBots(db);
+        }
+
+        await commitWriteTx(db);
+        return resObj;
+      } catch (txErr) {
+        await rollbackWriteTx(db);
+        throw txErr;
+      } finally {
+        isCapitalRebalancing = false;
+      }
+    });
 
     // 실전 자산 월별 스냅샷 실시간 동기화
     syncMonthlyAssetSnapshot("live", accountInfo).catch(() => {});
 
     return {
       success: true,
-      total_asset_krw: totalAsset,
+      total_asset_krw: totalEquityKrw,
+      total_equity_krw: totalEquityKrw,
+      global_cap_krw: dynamicTotalCapital,
       total_capital: dynamicTotalCapital,
       allocResult,
     };
   } catch (err) {
     console.error("[syncDynamicLiveCapitalFromUpbit] Error:", err.message);
-    const currentCap = Math.floor(Number(await getSetting("total_capital", "0")));
+    const currentCap = Math.floor(Number(await getSetting("deployable_capital_cap_krw", await getSetting("total_capital", "0"))));
     return { success: false, total_capital: currentCap, error: err.message };
   }
 }
@@ -6090,7 +6211,7 @@ async function getAutoRotationConfig(db) {
            id, is_enabled, rotation_day_of_week, rotation_hour_kst,
            allocation_mode, min_weekly_trades, capital_tier_1_max, capital_tier_2_max, max_deploy_ratio,
            last_rotated_at, next_rotation_at, updated_at
-         ) VALUES (1, 1, 1, 9, 'EQUAL_BY_CAPITAL_TIER', 2, 400000, 700000, 0.90, NULL, ?, ?)
+         ) VALUES (1, 1, 1, 9, 'EQUAL_BY_EQUITY_TIER', 2, 400000, 700000, 0.90, NULL, ?, ?)
          ON CONFLICT (id) DO NOTHING`
       )
       .run(nextStr, nowStr);
@@ -6100,7 +6221,7 @@ async function getAutoRotationConfig(db) {
   const hourKst = Math.max(0, Math.min(23, Number(row?.rotation_hour_kst ?? 9)));
   const allocMode = ALLOCATION_MODE_WEIGHTS[row?.allocation_mode]
     ? row.allocation_mode
-    : "EQUAL_BY_CAPITAL_TIER";
+    : "EQUAL_BY_EQUITY_TIER";
   const tier1Max = Math.max(10000, Math.floor(Number(row?.capital_tier_1_max ?? DEFAULT_CAPITAL_TIER_1_MAX)));
   const tier2Max = Math.max(tier1Max + 1, Math.floor(Number(row?.capital_tier_2_max ?? DEFAULT_CAPITAL_TIER_2_MAX)));
   const rawDeployRatio = Number(row?.max_deploy_ratio ?? DEFAULT_MAX_DEPLOY_RATIO);
@@ -6177,11 +6298,19 @@ async function updateAutoRotationConfig(payload = {}) {
 export async function getRotationStatusPayload(options = {}) {
   const db = getDb();
   const config = await getAutoRotationConfig(db);
-  const principalSettingKrw = Math.max(0, Math.floor(Number(await getSetting("total_capital", "0"))));
+  const cachedEquityKrw = Math.floor(Number(await getSetting("last_synced_total_equity_krw", "0")));
+  const legacyCapKrw = Math.floor(Number(await getSetting("deployable_capital_cap_krw", await getSetting("total_capital", "0"))));
+  const resolvedEq = resolveTotalEquityAndSingle90Cap({
+    liveTotalEquityKrw: options?.liveTotalEquityKrw ?? null,
+    cachedTotalEquityKrw: cachedEquityKrw > 0 ? cachedEquityKrw : null,
+    legacyAuto90PrincipalKrw: legacyCapKrw > 0 ? legacyCapKrw : null,
+    maxDeployRatio: config.max_deploy_ratio,
+  });
+  const totalEquityKrw = resolvedEq.totalEquityKrw;
   const evaluation = await evaluateWeeklyStrategyChampions(db, {
     minWeeklyTrades: config.min_weekly_trades,
     allocationMode: config.allocation_mode,
-    principalKrw: principalSettingKrw,
+    totalEquityKrw,
     tier1Max: config.capital_tier_1_max,
     tier2Max: config.capital_tier_2_max,
     maxDeployRatio: config.max_deploy_ratio,
@@ -6192,7 +6321,7 @@ export async function getRotationStatusPayload(options = {}) {
   );
   const electedLiveBots = liveBots.filter((b) => Number(b.is_selected_for_live || 0) === 1);
 
-  const tierInfo = getCapitalTierSummary(principalSettingKrw, {
+  const tierInfo = getCapitalTierSummary(totalEquityKrw, {
     tier1Max: config.capital_tier_1_max,
     tier2Max: config.capital_tier_2_max,
     maxDeployRatio: config.max_deploy_ratio,
@@ -6306,7 +6435,7 @@ export async function getRotationStatusPayload(options = {}) {
   const totalElectedCashKrw = electedLiveBots.reduce((acc, b) => acc + Math.max(0, Math.floor(Number(b.virtual_krw || 0))), 0);
   const totalUsedKrw = totalDrainingLockedKrw + totalElectedLockedKrw + totalElectedCashKrw;
   const utilizationPct =
-    principalSettingKrw > 0 ? Number(((totalUsedKrw / principalSettingKrw) * 100).toFixed(2)) : 0;
+    totalEquityKrw > 0 ? Number(((totalUsedKrw / totalEquityKrw) * 100).toFixed(2)) : 0;
 
   const electedFundingStatus = electedLiveBots.map((eb) => {
     const linkedDrains = drainingBots.filter((d) => d.replaced_by_bot_id === eb.bot_id);
@@ -6404,6 +6533,7 @@ export async function getRotationStatusPayload(options = {}) {
       surplus_reserve_krw: Math.floor(Number(r.surplus_reserve_krw || 0)),
       total_used_after_krw: Math.floor(Number(r.total_used_after_krw || 0)),
       global_cap_krw: Math.floor(Number(r.global_cap_krw || 0)),
+      total_equity_snapshot_krw: Math.floor(Number(r.total_equity_snapshot_krw || 0)),
       created_at: r.created_at,
     }));
   } catch {}
@@ -6419,7 +6549,9 @@ export async function getRotationStatusPayload(options = {}) {
   return {
     success: true,
     config,
-    principal_krw: tierInfo.principalKrw,
+    total_equity_krw: tierInfo.totalEquityKrw,
+    equity_source: resolvedEq.source,
+    principal_krw: tierInfo.totalEquityKrw,
     global_cap_krw: tierInfo.globalCapKrw,
     reserve_min_krw: tierInfo.reserveMinKrw,
     active_tier_bot_count: tierInfo.botCount,
@@ -6430,6 +6562,7 @@ export async function getRotationStatusPayload(options = {}) {
     total_elected_locked_krw: totalElectedLockedKrw,
     total_elected_cash_krw: totalElectedCashKrw,
     utilization_pct: utilizationPct,
+    utilization_pct_of_equity: utilizationPct,
     elected_funding_status: electedFundingStatus,
     strategy_groups: STRATEGY_GROUP_ORDER.map((code) => STRATEGY_GROUP_META[code]),
     allocation_modes: ALLOCATION_MODE_WEIGHTS,
@@ -6462,7 +6595,7 @@ export async function executeWeeklyBotRotation({
     const db = getDb();
     const config = await getAutoRotationConfig(db);
 
-    // 실전 투자 원금(P) 및 실계좌 가용 원화(이중 캡용) 선조회 (DB 락 밖)
+    // 실시간 업비트 총 평가자산(E_total) 및 실계좌 가용 원화(이중 캡용) 선조회 (DB 락 밖)
     let preloadedAccountInfo = null;
     if (!(Number(forcedCapital) > 0) && !skipLiveAccountSync && process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
       try {
@@ -6470,29 +6603,34 @@ export async function executeWeeklyBotRotation({
       } catch {}
     }
 
-    let principalKrw = 0;
-    if (Number(forcedCapital) > 0) {
-      principalKrw = Math.floor(Number(forcedCapital));
-    } else if (preloadedAccountInfo?.success) {
-      const rawAsset = Number(
-        preloadedAccountInfo.total_asset_krw ?? preloadedAccountInfo.krw_total ?? preloadedAccountInfo.krw_balance ?? 0
-      );
-      principalKrw = Math.floor(rawAsset);
-    }
-    if (!(principalKrw > 0)) {
-      principalKrw = Math.floor(Number(await getSetting("total_capital", "0")));
-    }
+    const liveUpbitEquity =
+      Number(forcedCapital) > 0
+        ? Math.floor(Number(forcedCapital))
+        : preloadedAccountInfo?.success
+        ? Math.floor(Number(preloadedAccountInfo.total_asset_krw ?? preloadedAccountInfo.krw_total ?? preloadedAccountInfo.krw_balance ?? 0))
+        : null;
+    const cachedEquityKrw = Math.floor(Number(await getSetting("last_synced_total_equity_krw", "0")));
+    const legacyCapKrw = Math.floor(Number(await getSetting("deployable_capital_cap_krw", await getSetting("total_capital", "0"))));
 
-    if (config.allocation_mode === "EQUAL_BY_CAPITAL_TIER" && principalKrw < 10000) {
+    const resolvedEquity = resolveTotalEquityAndSingle90Cap({
+      liveTotalEquityKrw: liveUpbitEquity && liveUpbitEquity > 0 ? liveUpbitEquity : null,
+      cachedTotalEquityKrw: cachedEquityKrw > 0 ? cachedEquityKrw : null,
+      legacyAuto90PrincipalKrw: legacyCapKrw > 0 ? legacyCapKrw : null,
+      maxDeployRatio: config.max_deploy_ratio,
+    });
+    const principalKrw = resolvedEquity.totalEquityKrw;
+    const isEquityTierMode = isEquityTierAllocationMode(config.allocation_mode);
+
+    if (isEquityTierMode && principalKrw < 10000) {
       throw new Error(
-        `실전 투자 원금(${principalKrw.toLocaleString("ko-KR")}원)이 최소 주문 불가 기준(10,000원) 미만이어서 신규 봇 선출을 중단했습니다.`
+        `실시간 총 평가자산(${principalKrw.toLocaleString("ko-KR")}원)이 최소 주문 불가 기준(10,000원) 미만이어서 신규 봇 선출을 중단했습니다.`
       );
     }
 
     const evaluation = await evaluateWeeklyStrategyChampions(db, {
       minWeeklyTrades: config.min_weekly_trades,
       allocationMode: config.allocation_mode,
-      principalKrw,
+      totalEquityKrw: principalKrw,
       tier1Max: config.capital_tier_1_max,
       tier2Max: config.capital_tier_2_max,
       maxDeployRatio: config.max_deploy_ratio,
@@ -6506,8 +6644,8 @@ export async function executeWeeklyBotRotation({
     const nowStr = nowKSTString();
     const nextRotStr = computeNextRotationKstString(config.rotation_day_of_week, config.rotation_hour_kst);
 
-    if (config.allocation_mode === "EQUAL_BY_CAPITAL_TIER") {
-      // 원금 구간별 1~3개 균등 배분 + 탈락 봇 포지션 차감 + 글로벌 90% 상한 불변식 적용
+    if (isEquityTierMode) {
+      // 실시간 총 평가자산 구간별 1~3개 균등 배분 + 탈락 봇 포지션 차감 + 단일 90% 상한 불변식 적용
       const actualAvailKrw =
         actualAvailableKrwOverride !== null && actualAvailableKrwOverride !== undefined
           ? Number(actualAvailableKrwOverride)
@@ -6545,7 +6683,7 @@ export async function executeWeeklyBotRotation({
         }));
 
         const calc = computeRotationAllocationsWith90Cap({
-          principalKrw,
+          totalEquityKrw: principalKrw,
           allBots: botsInput,
           electedBots: evaluation.champions,
           actualAvailableKrw: actualAvailKrw,
@@ -6636,7 +6774,10 @@ export async function executeWeeklyBotRotation({
             context: "executeWeeklyBotRotation:DB_COMMIT",
           });
 
-          await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('total_capital', ?, ?)").run(String(principalKrw), nowStr);
+          await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('last_synced_total_equity_krw', ?, ?)").run(String(principalKrw), nowStr);
+          await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('deployable_capital_cap_krw', ?, ?)").run(String(calc.globalCapKrw), nowStr);
+          await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('total_capital', ?, ?)").run(String(calc.globalCapKrw), nowStr);
+          await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('capital_basis_mode', 'LIVE_TOTAL_EQUITY_90CAP', ?)").run(nowStr);
           await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('capital_configured', '1', ?)").run(nowStr);
           await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('zero_balance_halted', '0', ?)").run(nowStr);
           await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('zero_balance_reason', '', ?)").run(nowStr);
@@ -8769,8 +8910,8 @@ const server = http.createServer(async (req, res) => {
           await db.prepare(`
             INSERT INTO capital_restoration_logs (
               source_bot_id, target_bot_id, order_uuid, settled_net_krw,
-              restored_krw, surplus_reserve_krw, total_used_after_krw, global_cap_krw, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              restored_krw, surplus_reserve_krw, total_used_after_krw, global_cap_krw, total_equity_snapshot_krw, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `).run(
             r.source_bot_id || "",
             r.target_bot_id || null,
@@ -8780,6 +8921,7 @@ const server = http.createServer(async (req, res) => {
             Number(r.surplus_reserve_krw || 0),
             Number(r.total_used_after_krw || 0),
             Number(r.global_cap_krw || 0),
+            Number(r.total_equity_snapshot_krw || 0),
             r.created_at || now
           );
         }
@@ -10333,9 +10475,16 @@ export async function settleLiveSellOrderInDb({
 
     let restorationNotificationText = "";
     const rotCfg = await getAutoRotationConfig(db);
-    const configuredPrincipalKrw = Math.max(0, Math.floor(Number(await getSetting("total_capital", "0"))));
+    const cachedEqKrw = Math.floor(Number(await getSetting("last_synced_total_equity_krw", "0")));
+    const legacyCapKrw = Math.floor(Number(await getSetting("deployable_capital_cap_krw", await getSetting("total_capital", "0"))));
+    const resolvedEq = resolveTotalEquityAndSingle90Cap({
+      cachedTotalEquityKrw: cachedEqKrw > 0 ? cachedEqKrw : null,
+      legacyAuto90PrincipalKrw: legacyCapKrw > 0 ? legacyCapKrw : null,
+      maxDeployRatio: rotCfg.max_deploy_ratio || 0.9,
+    });
+    const configuredPrincipalKrw = resolvedEq.totalEquityKrw;
     const use90CapRestoration =
-      rotCfg.allocation_mode === "EQUAL_BY_CAPITAL_TIER" || Boolean(freshBot?.replaced_by_bot_id);
+      isEquityTierAllocationMode(rotCfg.allocation_mode) || Boolean(freshBot?.replaced_by_bot_id);
 
     if (isDrainingBot) {
       const prevStrayCash = Math.max(0, Math.floor(Number(freshBot?.virtual_krw || 0)));
@@ -10380,7 +10529,7 @@ export async function settleLiveSellOrderInDb({
         }
 
         const restResult = computeDrainSellCapitalRestoration({
-          principalKrw: configuredPrincipalKrw,
+          totalEquityKrw: configuredPrincipalKrw,
           drainingBot: freshBot,
           settledNetKrw: distributable,
           remainingDrainingLockedAll,
@@ -10425,8 +10574,8 @@ export async function settleLiveSellOrderInDb({
                 .prepare(
                   `INSERT INTO capital_restoration_logs (
                      source_bot_id, target_bot_id, order_uuid, settled_net_krw,
-                     restored_krw, surplus_reserve_krw, total_used_after_krw, global_cap_krw, created_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                     restored_krw, surplus_reserve_krw, total_used_after_krw, global_cap_krw, total_equity_snapshot_krw, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
                 )
                 .run(
                   bot.bot_id,
@@ -10437,6 +10586,7 @@ export async function settleLiveSellOrderInDb({
                   surplusToReserveKrw,
                   totalUsedAfter,
                   globalCapAfter,
+                  configuredPrincipalKrw,
                   now
                 );
             }
@@ -10445,8 +10595,8 @@ export async function settleLiveSellOrderInDb({
               .prepare(
                 `INSERT INTO capital_restoration_logs (
                    source_bot_id, target_bot_id, order_uuid, settled_net_krw,
-                   restored_krw, surplus_reserve_krw, total_used_after_krw, global_cap_krw, created_at
-                 ) VALUES (?, 'RESERVE', ?, ?, 0, ?, ?, ?, ?)`
+                   restored_krw, surplus_reserve_krw, total_used_after_krw, global_cap_krw, total_equity_snapshot_krw, created_at
+                 ) VALUES (?, 'RESERVE', ?, ?, 0, ?, ?, ?, ?, ?)`
               )
               .run(
                 bot.bot_id,
@@ -10455,6 +10605,7 @@ export async function settleLiveSellOrderInDb({
                 surplusToReserveKrw,
                 totalUsedAfter,
                 globalCapAfter,
+                configuredPrincipalKrw,
                 now
               );
           }

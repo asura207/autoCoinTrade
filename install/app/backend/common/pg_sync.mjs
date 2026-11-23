@@ -898,8 +898,10 @@ export class PgSyncManager {
             surplus_reserve_krw DOUBLE PRECISION DEFAULT 0,
             total_used_after_krw DOUBLE PRECISION NOT NULL,
             global_cap_krw DOUBLE PRECISION NOT NULL,
+            total_equity_snapshot_krw DOUBLE PRECISION DEFAULT 0,
             created_at TEXT NOT NULL
           );
+          ALTER TABLE capital_restoration_logs ADD COLUMN IF NOT EXISTS total_equity_snapshot_krw DOUBLE PRECISION DEFAULT 0;
         `);
         const rotCfg = sqliteDb.prepare("SELECT * FROM auto_rotation_config WHERE id = 1").get();
         if (rotCfg) {
@@ -999,8 +1001,8 @@ export class PgSyncManager {
               `INSERT INTO capital_restoration_logs (
                  id, source_bot_id, target_bot_id, order_uuid,
                  settled_net_krw, restored_krw, surplus_reserve_krw,
-                 total_used_after_krw, global_cap_krw, created_at
-               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                 total_used_after_krw, global_cap_krw, total_equity_snapshot_krw, created_at
+               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                ON CONFLICT (id) DO NOTHING`,
               [
                 r.id,
@@ -1012,6 +1014,7 @@ export class PgSyncManager {
                 Number(r.surplus_reserve_krw || 0),
                 Number(r.total_used_after_krw || 0),
                 Number(r.global_cap_krw || 0),
+                Number(r.total_equity_snapshot_krw || 0),
                 r.created_at || "",
               ]
             );

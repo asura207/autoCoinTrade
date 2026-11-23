@@ -1840,12 +1840,20 @@ def execute_sell_order(
                     ).fetchall()
 
                 active_list = [dict(r) for r in active_rows if r["bot_id"] != norm_bot_id]
-                # 원금 90% 상한 조회
-                principal_row = conn.execute("SELECT value FROM system_settings WHERE key = 'total_capital';").fetchone()
-                principal_krw = max(0, math.floor(float(dict(principal_row).get("value") or 0))) if principal_row else 0
+                # 실시간 총 평가자산(E_total) 기반 단일 90% 상한 조회 (이중 차감 금지)
                 rot_cfg_row = conn.execute("SELECT max_deploy_ratio FROM auto_rotation_config WHERE id = 1;").fetchone()
                 max_deploy_ratio = float(dict(rot_cfg_row).get("max_deploy_ratio") or 0.90) if rot_cfg_row else 0.90
-                global_cap_krw = math.floor(principal_krw * max_deploy_ratio) if principal_krw > 0 else 0
+                if not (0 < max_deploy_ratio <= 1.0):
+                    max_deploy_ratio = 0.90
+                eq_row = conn.execute("SELECT value FROM system_settings WHERE key = 'last_synced_total_equity_krw';").fetchone()
+                total_equity_krw = max(0, math.floor(float(dict(eq_row).get("value") or 0))) if eq_row else 0
+                if total_equity_krw <= 0:
+                    cap_row = conn.execute("SELECT value FROM system_settings WHERE key = 'deployable_capital_cap_krw';").fetchone()
+                    if cap_row is None:
+                        cap_row = conn.execute("SELECT value FROM system_settings WHERE key = 'total_capital';").fetchone()
+                    legacy_cap = max(0, math.floor(float(dict(cap_row).get("value") or 0))) if cap_row else 0
+                    total_equity_krw = math.floor(legacy_cap / max_deploy_ratio) if legacy_cap > 0 else 0
+                global_cap_krw = math.floor(total_equity_krw * max_deploy_ratio) if total_equity_krw > 0 else 0
 
                 # 잔여 전체 Draining 봇 오픈 원금 및 선출 봇 사용액 산출
                 rem_drain_all_row = conn.execute(
@@ -1998,8 +2006,8 @@ def execute_sell_order(
                                     """
                                     INSERT INTO capital_restoration_logs (
                                         source_bot_id, target_bot_id, order_uuid, settled_net_krw,
-                                        restored_krw, surplus_reserve_krw, total_used_after_krw, global_cap_krw, created_at
-                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                                        restored_krw, surplus_reserve_krw, total_used_after_krw, global_cap_krw, total_equity_snapshot_krw, created_at
+                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                                     """,
                                     (
                                         norm_bot_id,
@@ -2010,6 +2018,7 @@ def execute_sell_order(
                                         float(surplus_reserve),
                                         float(total_used_after),
                                         float(global_cap_krw),
+                                        float(total_equity_krw),
                                         now_kst,
                                     ),
                                 )
@@ -2018,8 +2027,8 @@ def execute_sell_order(
                                 """
                                 INSERT INTO capital_restoration_logs (
                                     source_bot_id, target_bot_id, order_uuid, settled_net_krw,
-                                    restored_krw, surplus_reserve_krw, total_used_after_krw, global_cap_krw, created_at
-                                ) VALUES (?, 'RESERVE', ?, ?, 0, ?, ?, ?, ?);
+                                    restored_krw, surplus_reserve_krw, total_used_after_krw, global_cap_krw, total_equity_snapshot_krw, created_at
+                                ) VALUES (?, 'RESERVE', ?, ?, 0, ?, ?, ?, ?, ?);
                                 """,
                                 (
                                     norm_bot_id,
@@ -2028,6 +2037,7 @@ def execute_sell_order(
                                     float(surplus_reserve),
                                     float(total_used_after),
                                     float(global_cap_krw),
+                                    float(total_equity_krw),
                                     now_kst,
                                 ),
                             )

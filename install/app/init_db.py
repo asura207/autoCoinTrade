@@ -839,7 +839,7 @@ def init_database(db_path: Optional[str] = None) -> None:
                 is_enabled INTEGER DEFAULT 1,
                 rotation_day_of_week INTEGER DEFAULT 1,
                 rotation_hour_kst INTEGER DEFAULT 9,
-                allocation_mode TEXT DEFAULT 'EQUAL_BY_CAPITAL_TIER',
+                allocation_mode TEXT DEFAULT 'EQUAL_BY_EQUITY_TIER',
                 min_weekly_trades INTEGER DEFAULT 2,
                 capital_tier_1_max {real_type} DEFAULT 400000,
                 capital_tier_2_max {real_type} DEFAULT 700000,
@@ -911,10 +911,20 @@ def init_database(db_path: Optional[str] = None) -> None:
                 surplus_reserve_krw {real_type} DEFAULT 0,
                 total_used_after_krw {real_type} NOT NULL,
                 global_cap_krw {real_type} NOT NULL,
+                total_equity_snapshot_krw {real_type} DEFAULT 0,
                 created_at TEXT NOT NULL
             );
             """
         )
+        if sqlite_mode:
+            crl_cols = {
+                dict(r)["name"]
+                for r in conn.execute("PRAGMA table_info(capital_restoration_logs);").fetchall()
+            }
+            if "total_equity_snapshot_krw" not in crl_cols:
+                conn.execute(f"ALTER TABLE capital_restoration_logs ADD COLUMN total_equity_snapshot_krw {real_type} DEFAULT 0;")
+        else:
+            conn.execute(f"ALTER TABLE capital_restoration_logs ADD COLUMN IF NOT EXISTS total_equity_snapshot_krw {real_type} DEFAULT 0;")
 
         # 9-3. 실전 중복 주문 원천 차단 5중 가드레일 테이블 (리스 락 · 주문 의도 원장 · 차단 이벤트)
         conn.execute(
