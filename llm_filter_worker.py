@@ -1100,9 +1100,20 @@ def parse_and_validate_llm_json(raw_text: Optional[str], default_reason: str = "
             if raw_risk_alert and action == "NORMAL":
                 action = "REDUCE_SIZE"
             if action == "REDUCE_SIZE":
-                multiplier = (0.5 if has_any_allow_bot else 0.0) if multiplier <= 0.0 else min(0.5, 0.5 if multiplier < 0.75 else 1.0)
+                if has_any_allow_bot:
+                    multiplier = 0.5 if multiplier <= 0.0 else min(0.5, 0.5 if multiplier < 0.75 else 1.0)
+                else:
+                    if multiplier <= 0.0:
+                        for bid in ("bot_05", "bot_06", "bot_08", "bot_10"):
+                            bot_overrides[bid] = "ALLOW"
+                        multiplier = 0.5
+                    else:
+                        multiplier = min(0.5, 0.5 if multiplier < 0.75 else 1.0)
             else:
-                multiplier = 0.0 if multiplier <= 0.0 else (0.5 if multiplier < 0.75 else 1.0)
+                multiplier = 1.0 if multiplier <= 0.0 else (0.5 if multiplier < 0.75 else 1.0)
+
+        if regime in ("BEAR", "HIGH_VOLATILITY_SHOCK") and action != "NORMAL" and sentiment_score > 0:
+            sentiment_score = round(-abs(sentiment_score), 2)
 
         blacklist = normalize_blacklist_tickers(parsed.get("blacklist_tickers", []))
 
@@ -1420,8 +1431,15 @@ def synthesize_dual_decisions(
     pro_overrides = normalize_bot_overrides(pro_res.get("bot_overrides"))
     has_active_pro = bool(pro_res) and not bool(pro_res.get("_is_neutral_passthrough", False))
 
+    flash_regime = str(flash_res.get("market_regime", "SIDEWAYS")).upper()
+    pro_regime = str(pro_res.get("market_regime", "SIDEWAYS")).upper()
+
     flash_score = float(flash_res.get("sentiment_score", 0.0))
+    if flash_regime in ("BEAR", "HIGH_VOLATILITY_SHOCK") and flash_action != "NORMAL" and flash_score > 0:
+        flash_score = round(-abs(flash_score), 2)
     pro_score = float(pro_res.get("sentiment_score", 0.0))
+    if pro_regime in ("BEAR", "HIGH_VOLATILITY_SHOCK") and pro_action != "NORMAL" and pro_score > 0:
+        pro_score = round(-abs(pro_score), 2)
 
     final_bot_overrides: Dict[str, str] = {}
 
@@ -1466,10 +1484,14 @@ def synthesize_dual_decisions(
         for bot_id in ALL_BOT_IDS:
             final_bot_overrides[bot_id] = source_overrides.get(bot_id, "ALLOW")
         if all(v == "BLOCK" for v in final_bot_overrides.values()):
-            final_action = "HALT_NEW_BUYS"
-            final_multiplier = 0.0
-            synthesis_mode = "CONSERVATIVE_ALL_BOTS_BLOCKED"
+            for bid in ("bot_05", "bot_06", "bot_08", "bot_10"):
+                final_bot_overrides[bid] = "ALLOW"
+            if final_multiplier <= 0.0:
+                final_multiplier = 0.5
+            synthesis_mode = "CONSERVATIVE_REDUCE_GUARD (전봇 BLOCK 보정 · 역추세·그리드 0.5x 허용)"
         else:
+            if final_multiplier <= 0.0:
+                final_multiplier = 0.5
             synthesis_mode = "CONSERVATIVE_REDUCE (보수적 50% 비중 축소 · Pro 전략군 스위치 우선)"
 
     # 4. 두 모델 모두 NORMAL (평시 Pro 전략군 스위치 우선)
@@ -1503,8 +1525,6 @@ def synthesize_dual_decisions(
         final_sentiment_score = round(0.4 * flash_score + 0.6 * pro_score, 2)
 
     # 합성 시장 체제 (HIGH_VOLATILITY_SHOCK 또는 BEAR 우선)
-    flash_regime = str(flash_res.get("market_regime", "SIDEWAYS")).upper()
-    pro_regime = str(pro_res.get("market_regime", "SIDEWAYS")).upper()
     if "HIGH_VOLATILITY_SHOCK" in (flash_regime, pro_regime):
         final_regime = "HIGH_VOLATILITY_SHOCK"
     elif flash_regime == "BEAR" or pro_regime == "BEAR":
@@ -1513,6 +1533,9 @@ def synthesize_dual_decisions(
         final_regime = "BULL"
     else:
         final_regime = "SIDEWAYS"
+
+    if final_regime in ("BEAR", "HIGH_VOLATILITY_SHOCK") and final_action != "NORMAL" and final_sentiment_score > 0:
+        final_sentiment_score = round(-abs(final_sentiment_score), 2)
 
     # 블랙리스트 티커 합집합 (유효 KRW 영문 티커만 허용)
     combined_blacklist = normalize_blacklist_tickers(

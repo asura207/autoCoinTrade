@@ -132,7 +132,7 @@ if (fs.existsSync(ENV_PATH)) {
 const HOST = process.env.BACKEND_HOST || "127.0.0.1";
 const PORT = Number(process.env.BACKEND_PORT || process.env.PORT || 8001);
 
-let APP_VERSION = "0.0.32";
+let APP_VERSION = "0.0.33";
 try {
   const pkgJsonPath = path.join(BASE_DIR, "package.json");
   if (fs.existsSync(pkgJsonPath)) {
@@ -782,6 +782,111 @@ function synthesizeDualAiDecision(flashDecision, proDecision) {
   };
 }
 
+function isRegimeControlJsonFragment(text) {
+  if (!text || typeof text !== "string") return false;
+  const hasBotOverrides = text.includes('"bot_overrides"') || text.includes("bot_overrides");
+  const hasRegime = text.includes('"market_regime"');
+  const hasAction = text.includes('"recommended_action"');
+  const hasSentiment = text.includes('"sentiment_score"');
+  const hasMult = text.includes('"position_size_multiplier"');
+  const hasRisk = text.includes('"risk_alert"');
+  const hitCount = [hasBotOverrides, hasRegime, hasAction, hasSentiment, hasMult, hasRisk].filter(Boolean).length;
+  return hasBotOverrides || hitCount >= 2;
+}
+
+function parsePartialRegimeJson(rawJsonText) {
+  if (!rawJsonText || typeof rawJsonText !== "string") return null;
+  if (!isRegimeControlJsonFragment(rawJsonText)) return null;
+
+  const out = {};
+  const sentimentMatch = rawJsonText.match(/"sentiment_score"\s*:\s*(-?\d+(?:\.\d+)?)/);
+  if (sentimentMatch) out.sentiment_score = Number(sentimentMatch[1]);
+
+  const regimeMatch = rawJsonText.match(/"market_regime"\s*:\s*"(BULL|BEAR|SIDEWAYS|HIGH_VOLATILITY_SHOCK)"/i);
+  if (regimeMatch) out.market_regime = regimeMatch[1].toUpperCase();
+
+  const riskMatch = rawJsonText.match(/"risk_alert"\s*:\s*(true|false)/i);
+  if (riskMatch) out.risk_alert = riskMatch[1].toLowerCase() === "true";
+
+  const actionMatch = rawJsonText.match(
+    /"recommended_action"\s*:\s*"(NORMAL|REDUCE_SIZE|HALT_NEW_BUYS|EMERGENCY_CLOSE_ALL)"/i
+  );
+  if (actionMatch) out.recommended_action = actionMatch[1].toUpperCase();
+
+  const multMatch = rawJsonText.match(/"position_size_multiplier"\s*:\s*(\d+(?:\.\d+)?)/);
+  if (multMatch) out.position_size_multiplier = Number(multMatch[1]);
+
+  const botOverrides = {};
+  const botRegex = /"(bot_(?:0[1-9]|10))"\s*:\s*"(ALLOW|BLOCK)"/gi;
+  let bm;
+  while ((bm = botRegex.exec(rawJsonText)) !== null) {
+    botOverrides[bm[1].toLowerCase()] = bm[2].toUpperCase();
+  }
+  if (Object.keys(botOverrides).length > 0) {
+    out.bot_overrides = botOverrides;
+  }
+
+  const blacklistMatch = rawJsonText.match(/"blacklist_tickers"\s*:\s*\[([^\]]*)\]/);
+  if (blacklistMatch) {
+    const items = [];
+    const itemRegex = /"([^"]+)"/g;
+    let im;
+    while ((im = itemRegex.exec(blacklistMatch[1])) !== null) {
+      items.push(im[1]);
+    }
+    out.blacklist_tickers = items;
+  }
+
+  const closedReasonMatch = rawJsonText.match(/"reason"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  if (closedReasonMatch) {
+    out.reason = closedReasonMatch[1].replace(/\\"/g, '"').trim();
+  } else {
+    const partialReasonMatch = rawJsonText.match(/"reason"\s*:\s*"([^\n"]+)/);
+    if (partialReasonMatch) {
+      out.reason = partialReasonMatch[1].trim();
+    }
+  }
+
+  const hasEnoughFields =
+    Boolean(out.market_regime) ||
+    Boolean(out.recommended_action) ||
+    (out.bot_overrides && Object.keys(out.bot_overrides).length > 0);
+  return hasEnoughFields ? out : null;
+}
+
+function stripControlJsonFromBriefingText(rawText) {
+  if (!rawText || typeof rawText !== "string") return "";
+  let cleaned = rawText;
+
+  // 1) 닫힌 코드 펜스 중 제어 JSON 블록 제거
+  cleaned = cleaned.replace(/```(?:json)?\s*([\s\S]*?)```/gi, (full, body) => {
+    return isRegimeControlJsonFragment(body) ? "" : full;
+  });
+
+  // 2) 스트림/토큰 한도 등으로 닫히지 않은 제어 JSON 코드 펜스 제거
+  cleaned = cleaned.replace(/```(?:json)?\s*([\s\S]*)$/i, (full, body) => {
+    const trimmedBody = String(body || "").trim();
+    if (!trimmedBody || trimmedBody.startsWith("{") || isRegimeControlJsonFragment(trimmedBody)) {
+      return "";
+    }
+    return full;
+  });
+
+  // 3) 코드 펜스 없이 본문 끝에 붙은 원시 제어 JSON 객체(완전/미완성 모두) 제거
+  const trailingRawJsonMatch = cleaned.match(/\n\s*(\{\s*"(?:sentiment_score|market_regime|risk_alert|recommended_action|bot_overrides)"[\s\S]*)$/);
+  if (trailingRawJsonMatch && isRegimeControlJsonFragment(trailingRawJsonMatch[1])) {
+    cleaned = cleaned.slice(0, trailingRawJsonMatch.index);
+  }
+
+  // 4) 제어 JSON 블록 바로 앞에 남은 안내 헤더 및 끝 구분선 정리
+  cleaned = cleaned
+    .replace(/###\s*\[?(?:구조화|JSON\s*제어).*$/gim, "")
+    .replace(/(?:\r?\n\s*---\s*)+$/g, "")
+    .trim();
+
+  return cleaned;
+}
+
 function extractStructuredRegimeFromLlmText(rawText) {
   if (!rawText || typeof rawText !== "string") {
     return { cleanText: "", structured: null };
@@ -829,20 +934,34 @@ function extractStructuredRegimeFromLlmText(rawText) {
     }
   }
 
+  // 닫히지 않거나 중간에 잘린 제어 JSON 블록(토큰 절단 등)에서도 핵심 제어값 복구
   if (!parsedDecision) {
-    return { cleanText: rawText.trim(), structured: null };
+    const unclosedFenceMatch = rawText.match(/```(?:json)?\s*([\s\S]*)$/i);
+    if (unclosedFenceMatch && isRegimeControlJsonFragment(unclosedFenceMatch[1])) {
+      parsedDecision = parsePartialRegimeJson(unclosedFenceMatch[1]);
+      blockToStrip = unclosedFenceMatch[0];
+    } else {
+      const trailingRawMatch = rawText.match(
+        /\{\s*"(?:sentiment_score|market_regime|risk_alert|recommended_action|bot_overrides)"[\s\S]*$/
+      );
+      if (trailingRawMatch && isRegimeControlJsonFragment(trailingRawMatch[0])) {
+        parsedDecision = parsePartialRegimeJson(trailingRawMatch[0]);
+        blockToStrip = trailingRawMatch[0];
+      }
+    }
   }
-
-  const structured = normalizeLlmRegimeDecision(parsedDecision, "듀얼 AI 장세 및 봇 스위치 판단");
 
   let cleanText = rawText;
   if (blockToStrip) {
     cleanText = cleanText.replace(blockToStrip, "");
   }
-  cleanText = cleanText
-    .replace(/###\s*\[?구조화.*$/gim, "")
-    .trim();
+  cleanText = stripControlJsonFromBriefingText(cleanText);
 
+  if (!parsedDecision) {
+    return { cleanText, structured: null };
+  }
+
+  const structured = normalizeLlmRegimeDecision(parsedDecision, "듀얼 AI 장세 및 봇 스위치 판단");
   return { cleanText, structured };
 }
 
@@ -3114,10 +3233,16 @@ async function getLatestAiBriefing() {
   const ollama = await checkOllamaStatus();
   const modelMeta = await loadDualAiModelMeta(db);
   const enrichedRegime = enrichRegimeFilterRow(regimeRow, modelMeta);
+  const cleanedLatest = row
+    ? {
+        ...row,
+        briefing_text: stripControlJsonFromBriefingText(row.briefing_text),
+      }
+    : null;
   return {
     has_key: !!apiKey,
     masked_key: maskedKey,
-    latest: row || null,
+    latest: cleanedLatest,
     last_trigger_type: quota.last_trigger_type,
     regime_filter: enrichedRegime,
     quota,
@@ -9750,6 +9875,7 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, bu
       nowKSTString(),
       bot.bot_id
     );
+    markBotDiagnosticStatus(bot.bot_id);
     return false;
   }
 
@@ -9806,6 +9932,7 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, bu
         nowKSTString(),
         bot.bot_id
       );
+      markBotDiagnosticStatus(bot.bot_id);
       return false;
     }
   }
@@ -9999,6 +10126,7 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, bu
           },
           guardrailTxDeps
         );
+        markBotDiagnosticStatus(bot.bot_id);
         return false;
       }
 
@@ -10302,6 +10430,7 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, bu
               },
               guardrailTxDeps
             );
+            markBotDiagnosticStatus(bot.bot_id);
           } else {
             console.warn(`[LiveBuySkip][${bot.bot_id}][${normMkt}] 40초 취소 후 상태 미확정 -> UNKNOWN_TIMEOUT 정산 대기`);
             // 취소 결과를 네트워크 장애로 미확정 -> 절대 즉시 환불하지 않고 identifier 정산 대기
@@ -10329,6 +10458,7 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, bu
             },
             guardrailTxDeps
           );
+          markBotDiagnosticStatus(bot.bot_id);
         } else {
           console.warn(`[LiveBuySkip][${bot.bot_id}][${normMkt}] 체결 수량 미확정 -> UNKNOWN_TIMEOUT 잠금`);
           await markLiveIntentUnknownTimeout(
@@ -11578,6 +11708,12 @@ upbitWsHub.onTickerTick((tickEvent) => {
 });
 
 const livePaceSkipLogMap = new Map();
+// 진단 스킵 메시지(속도제어 대기/호가 품질 가드/미체결 등) 실제 기록 시각 추적
+// (syncDynamicLiveCapitalFromUpbit가 bots.updated_at을 6~10초마다 갱신해도 3분 TTL이 영구 연장되지 않도록 분리)
+const liveDiagnosticStatusTsMap = new Map();
+function markBotDiagnosticStatus(botId) {
+  if (botId) liveDiagnosticStatusTsMap.set(botId, Date.now());
+}
 function parseKstDateTimeMsLocal(str) {
   if (!str) return NaN;
   const s = String(str).trim();
@@ -11989,6 +12125,7 @@ export async function runLiveTradingBotsCycle(options = {}) {
               await db
                 .prepare("UPDATE bots SET last_status_msg = ?, updated_at = ? WHERE bot_id = ?")
                 .run(`[속도제어 대기:${paceCheck.code}] ${paceCheck.reason}`, now, bot.bot_id);
+              markBotDiagnosticStatus(bot.bot_id);
               continue;
             }
           }
@@ -12025,6 +12162,7 @@ export async function runLiveTradingBotsCycle(options = {}) {
               now,
               bot.bot_id
             );
+            markBotDiagnosticStatus(bot.bot_id);
           }
         }
       }
@@ -12042,8 +12180,11 @@ export async function runLiveTradingBotsCycle(options = {}) {
           postMsg.includes("최소주문 미달");
         let withinDiagnosticTtl = false;
         if (isDiagnosticSkipMsg) {
-          const updMs = parseKstDateTimeMsLocal(postBotRow?.updated_at);
-          withinDiagnosticTtl = Number.isFinite(updMs) ? Date.now() - updMs < 3 * 60 * 1000 : true;
+          const diagTs = liveDiagnosticStatusTsMap.get(bot.bot_id);
+          withinDiagnosticTtl = Number.isFinite(diagTs) ? Date.now() - diagTs < 3 * 60 * 1000 : false;
+          if (!withinDiagnosticTtl && diagTs !== undefined) {
+            liveDiagnosticStatusTsMap.delete(bot.bot_id);
+          }
         }
         const shouldPreserveMsg = isHardPreservedMsg || withinDiagnosticTtl;
         if (Number(postBotRow?.is_running ?? 1) === 1 && !shouldPreserveMsg) {
@@ -12164,9 +12305,46 @@ async function reconcileOpenPositionsWithUpbit() {
 //    - 1시간 단위(3600초) Gemini Pro 심층 퀀트 분석
 // ============================================================================
 let isScheduledAiAnalysisRunning = false;
-let lastScheduledMarketAiFailureMs = 0;
-let lastScheduledNewsAiFailureMs = 0;
-let lastScheduledProAiFailureMs = 0;
+const AI_SLOT_RETRY_BACKOFF_MS = 15 * 60 * 1000; // 일시 오류(503/타임아웃) 시 15분 쿨다운 후 최대 1회 재시도
+const AI_SLOT_QUOTA_COOLDOWN_MS = 30 * 60 * 1000; // 429/할당량 소진 시 최소 30분 쿨다운 및 해당 슬롯 재시도 중단
+const AI_SLOT_MAX_RETRIES_PER_SLOT = 1;
+const aiSlotFailureState = {
+  market: { slotKey: "", failCount: 0, nextRetryAtMs: 0, skipSlot: false },
+  news: { slotKey: "", failCount: 0, nextRetryAtMs: 0, skipSlot: false },
+  pro: { slotKey: "", failCount: 0, nextRetryAtMs: 0, skipSlot: false },
+};
+
+function canAttemptAiSlot(track, slotKey, nowMs = Date.now()) {
+  const st = aiSlotFailureState[track];
+  if (!st || st.slotKey !== slotKey) return true;
+  if (st.skipSlot) return false;
+  if (st.failCount > AI_SLOT_MAX_RETRIES_PER_SLOT) return false;
+  return nowMs >= st.nextRetryAtMs;
+}
+
+function clearAiSlotFailure(track) {
+  aiSlotFailureState[track] = { slotKey: "", failCount: 0, nextRetryAtMs: 0, skipSlot: false };
+}
+
+function recordAiSlotFailure(track, slotKey, resultOrErr) {
+  const nowMs = Date.now();
+  const prev = aiSlotFailureState[track];
+  const failCount = prev && prev.slotKey === slotKey ? prev.failCount + 1 : 1;
+  const errCode = String(resultOrErr?.error || "").toUpperCase();
+  const errMsg = String(resultOrErr?.message || resultOrErr || "");
+  const isQuotaOr429 =
+    errCode === "DAILY_QUOTA_EXCEEDED" ||
+    /429|quota|rate limit|cooldown/i.test(errMsg);
+  const skipSlot = isQuotaOr429 || failCount > AI_SLOT_MAX_RETRIES_PER_SLOT;
+  const cooldownMs = isQuotaOr429 ? AI_SLOT_QUOTA_COOLDOWN_MS : AI_SLOT_RETRY_BACKOFF_MS * failCount;
+  aiSlotFailureState[track] = {
+    slotKey,
+    failCount,
+    nextRetryAtMs: nowMs + cooldownMs,
+    skipSlot,
+  };
+  return { failCount, skipSlot, cooldownMin: Math.round(cooldownMs / 60000), isQuotaOr429 };
+}
 
 async function checkAndRunScheduledAiMarketAnalysis() {
   if (isScheduledAiAnalysisRunning) return;
@@ -12177,7 +12355,8 @@ async function checkAndRunScheduledAiMarketAnalysis() {
 
     const pad = (n) => String(n).padStart(2, "0");
     // 15분 / 45분 슬롯 기준 (다른 봇의 정각/30분 호출과 경합 방지)
-    const shiftedParts = getKstCalendarParts(Date.now() - 15 * 60 * 1000);
+    const nowMs = Date.now();
+    const shiftedParts = getKstCalendarParts(nowMs - 15 * 60 * 1000);
     const slotDate = shiftedParts.dateStr;
     const slotHour = shiftedParts.hour;
     const slotMin = shiftedParts.minute >= 30 ? 45 : 15;
@@ -12190,16 +12369,14 @@ async function checkAndRunScheduledAiMarketAnalysis() {
     const lastProAutoSlot = await getSetting("ai_pro_briefing_last_auto_slot", "");
 
     const needFlashMarket =
-      lastMarketAutoSlot !== flashSlotKey &&
-      !(lastScheduledMarketAiFailureMs > 0 && Date.now() - lastScheduledMarketAiFailureMs < 5 * 60 * 1000);
+      lastMarketAutoSlot !== flashSlotKey && canAttemptAiSlot("market", flashSlotKey, nowMs);
     const needFlashNews =
-      lastNewsAutoSlot !== flashSlotKey &&
-      !(lastScheduledNewsAiFailureMs > 0 && Date.now() - lastScheduledNewsAiFailureMs < 5 * 60 * 1000);
+      lastNewsAutoSlot !== flashSlotKey && canAttemptAiSlot("news", flashSlotKey, nowMs);
     const needProInDepth =
       Boolean(apiKey) &&
       isProHour &&
       lastProAutoSlot !== proSlotKey &&
-      !(lastScheduledProAiFailureMs > 0 && Date.now() - lastScheduledProAiFailureMs < 5 * 60 * 1000);
+      canAttemptAiSlot("pro", proSlotKey, nowMs);
 
     if (!needFlashMarket && !needFlashNews && !needProInDepth) {
       return;
@@ -12224,7 +12401,7 @@ async function checkAndRunScheduledAiMarketAnalysis() {
       console.log(`[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) ${engineLabel} 자동 시장 분석을 시작합니다...`);
       const marketResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: flashSlotKey, preferredModel: "gemini-3.8-flash" });
       if (marketResult.success) {
-        lastScheduledMarketAiFailureMs = 0;
+        clearAiSlotFailure("market");
         if (marketResult.provider === "ollama" && marketResult.ollamaResult) {
           sharedOllamaResult = marketResult.ollamaResult;
           sharedOllamaMarketContext = marketResult.ollamaMarketContext || null;
@@ -12234,8 +12411,11 @@ async function checkAndRunScheduledAiMarketAnalysis() {
           `[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) 완료 (엔진: ${marketResult.briefing?.provider}, 모델: ${marketResult.briefing?.model})`
         );
       } else {
-        lastScheduledMarketAiFailureMs = Date.now();
-        console.warn(`[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) 실패:`, marketResult.message);
+        const failMeta = recordAiSlotFailure("market", flashSlotKey, marketResult);
+        console.warn(
+          `[AI Auto Flash Analysis] 30분 정기 슬롯(${flashSlotKey}) 실패 (${failMeta.skipSlot ? "현재 슬롯 재시도 중단 · 다음 정규 슬롯 대기" : `${failMeta.cooldownMin}분 후 재시도`}):`,
+          marketResult.message
+        );
       }
     }
 
@@ -12255,13 +12435,16 @@ async function checkAndRunScheduledAiMarketAnalysis() {
         precomputedRegimeFilter: sharedRegimeFilter,
       });
       if (newsResult.success) {
-        lastScheduledNewsAiFailureMs = 0;
+        clearAiSlotFailure("news");
         console.log(
           `[AI Auto News Analysis] 30분 정기 슬롯(${flashSlotKey}) 완료 (엔진: ${newsResult.briefing?.provider}, 모델: ${newsResult.briefing?.model})`
         );
       } else {
-        lastScheduledNewsAiFailureMs = Date.now();
-        console.warn(`[AI Auto News Analysis] 30분 정기 슬롯(${flashSlotKey}) 실패:`, newsResult.message);
+        const failMeta = recordAiSlotFailure("news", flashSlotKey, newsResult);
+        console.warn(
+          `[AI Auto News Analysis] 30분 정기 슬롯(${flashSlotKey}) 실패 (${failMeta.skipSlot ? "현재 슬롯 재시도 중단 · 다음 정규 슬롯 대기" : `${failMeta.cooldownMin}분 후 재시도`}):`,
+          newsResult.message
+        );
       }
     }
 
@@ -12270,19 +12453,26 @@ async function checkAndRunScheduledAiMarketAnalysis() {
       console.log(`[AI Auto Pro Analysis] 1시간 정각 심층 슬롯(${proSlotKey}) Gemini Pro 심층 퀀트 분석을 시작합니다...`);
       const proResult = await generateAiMarketAnalysis({ triggerType: "AUTO", slotKey: proSlotKey, preferredModel: "gemini-3.1-pro-preview", modelType: "pro" });
       if (proResult.success) {
-        lastScheduledProAiFailureMs = 0;
+        clearAiSlotFailure("pro");
         const db = getDb();
         await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('ai_pro_briefing_last_auto_slot', ?, ?)").run(proSlotKey, nowKSTString());
         console.log(`[AI Auto Pro Analysis] 1시간 정각 심층 슬롯(${proSlotKey}) 완료 (모델: ${proResult.briefing?.model})`);
       } else {
-        lastScheduledProAiFailureMs = Date.now();
-        console.warn(`[AI Auto Pro Analysis] 1시간 정각 심층 슬롯(${proSlotKey}) 실패:`, proResult.message);
+        const failMeta = recordAiSlotFailure("pro", proSlotKey, proResult);
+        console.warn(
+          `[AI Auto Pro Analysis] 1시간 정각 심층 슬롯(${proSlotKey}) 실패 (${failMeta.skipSlot ? "현재 슬롯 재시도 중단 · 다음 정규 슬롯 대기" : `${failMeta.cooldownMin}분 후 재시도`}):`,
+          proResult.message
+        );
       }
     }
   } catch (err) {
-    lastScheduledMarketAiFailureMs = Date.now();
-    lastScheduledNewsAiFailureMs = Date.now();
-    lastScheduledProAiFailureMs = Date.now();
+    const shiftedErr = getKstCalendarParts(Date.now() - 15 * 60 * 1000);
+    const padErr = (n) => String(n).padStart(2, "0");
+    const errFlashSlot = `${shiftedErr.dateStr}_${padErr(shiftedErr.hour)}:${shiftedErr.minute >= 30 ? 45 : 15}`;
+    const errProSlot = `${shiftedErr.dateStr}_${padErr(shiftedErr.hour)}:15_pro`;
+    recordAiSlotFailure("market", errFlashSlot, err);
+    recordAiSlotFailure("news", errFlashSlot, err);
+    recordAiSlotFailure("pro", errProSlot, err);
     console.warn("[AI Auto Analysis] Scheduler error:", err.message);
   } finally {
     isScheduledAiAnalysisRunning = false;

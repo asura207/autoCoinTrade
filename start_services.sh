@@ -77,16 +77,16 @@ if command -v node >/dev/null 2>&1; then
     node "$PROJECT_ROOT/backend/common/log_rotator.mjs" --startup >/dev/null 2>&1 || true
 fi
 
-# 4. 백엔드 실행 (Node.js Server)
+# 4. 백엔드 실행 (Node.js Server - 타 프로젝트의 전역 pkill -f "backend/node_server.mjs" 오폭 방지를 위해 ./ 분리 경로 사용)
 echo "[1/2] 백엔드 서비스 시작 중 (Port ${BACKEND_PORT})..."
-setsid node backend/node_server.mjs </dev/null >> logs/backend.log 2>&1 &
+setsid node "$PROJECT_ROOT/backend/./node_server.mjs" </dev/null >> logs/backend.log 2>&1 &
 BACKEND_PID=$!
 echo "$BACKEND_PID" > logs/.backend.pid
 echo "  -> 백엔드 PID: $BACKEND_PID (로그: logs/backend.log)"
 
 # 4. 프론트엔드 실행 (보안 정적 파일 + API 프록시 서버)
 echo "[2/2] 프론트엔드 서비스 시작 중 (${FRONTEND_HOST}:${FRONTEND_PORT})..."
-setsid env FRONTEND_HOST="${FRONTEND_HOST}" FRONTEND_PORT="${FRONTEND_PORT}" BACKEND_URL="http://127.0.0.1:${BACKEND_PORT}" node frontend/server.mjs </dev/null >> logs/frontend.log 2>&1 &
+setsid env FRONTEND_HOST="${FRONTEND_HOST}" FRONTEND_PORT="${FRONTEND_PORT}" BACKEND_URL="http://127.0.0.1:${BACKEND_PORT}" node "$PROJECT_ROOT/frontend/./server.mjs" </dev/null >> logs/frontend.log 2>&1 &
 FRONTEND_PID=$!
 echo "$FRONTEND_PID" > logs/.frontend.pid
 echo "  -> 프론트엔드 PID: $FRONTEND_PID (로그: logs/frontend.log)"

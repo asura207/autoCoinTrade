@@ -245,7 +245,9 @@ FLASH_SYSTEM_PROMPT = """당신은 암호화폐 단기 시황 분석 및 리스�
 [핵심 원칙 - 포지션 보호]
 - 봇 교체를 지시하거나 보유 포지션을 임의로 시장가 강제 청산하지 마십시오.
 - 'BLOCK'은 해당 봇의 [신규 매수 진입]만 일시 보류하며, 이미 보유 중인 물량은 봇 고유의 익절/손절/트레일링 스탑 로직에 의해 정상 감시·청산됩니다.
-- 평시에는 거시 추세(Pro 판단)를 존중하되, 해킹·디페깅·전쟁 속보·급격한 패닉 투매·특정 코인 유의종목/상장폐지 감지 시 즉각 risk_alert=true, position_size_multiplier=0.0(또는 0.5), blacklist_tickers 추가 및 돌파형 봇(bot_01,bot_02,bot_03,bot_04,bot_07,bot_09) 즉시 'BLOCK'으로 오버라이드하십시오.
+- 평시(단순 BEAR·SIDEWAYS·단기 휩소)에는 risk_alert=false, recommended_action='REDUCE_SIZE', position_size_multiplier=0.5로 두고 거시 추세(Pro 판단)를 존중하십시오.
+- 해킹·디페깅·전쟁 속보·급격한 패닉 투매(HIGH_VOLATILITY_SHOCK) 등 모든 봇의 신규 매수를 즉시 중단해야 하는 돌발 위기 시에만 risk_alert=true, recommended_action='HALT_NEW_BUYS', position_size_multiplier=0.0 및 전체 봇 'BLOCK'을 선언하십시오.
+- 특정 코인 유의종목/상장폐지/해킹 악재가 뉴스에 명시된 경우에만 blacklist_tickers에 해당 영문 티커를 추가하고, 해당 사항이 없으면 반드시 빈 배열 []을 반환하십시오.
 
 반드시 다른 설명 없이 아래 JSON 스키마 형식으로만 유효한 JSON을 반환하십시오:
 {
@@ -329,23 +331,27 @@ BTC 현재가 대비 일봉 20MA / 4시간봉 60MA 이격도, 공포·탐욕 지
 8. reason: 거시 장세 체제와 실전 선택 봇별 적합성 판단 근거를 한국어로 논리적으로 작성
 """
 
-# 모델 후보군 정의 (30분 gemini-3.8-flash / 1시간 gemini-3.1-pro-preview 및 호환 모델 폴백)
+# 모델 후보군 정의 (무료 티어 정상 작동 Flash 계열 우선 + Pro 프리뷰 후순위 폴백, 폐기된 gemini-2.5-* 제외)
 FLASH_MODELS = [
     "gemini-3.8-flash",
     "gemini-flash-latest",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
     "gemini-flash-lite-latest",
-    "gemini-2.5-flash",
 ]
-PRO_MODELS = [
-    "gemini-3.1-pro-preview",
-    "gemini-pro-latest",
-    "gemini-3.8-flash",
-    "gemini-flash-latest",
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-]
+PRO_MODELS = (
+    [
+        "gemini-3.1-pro-preview",
+        "gemini-pro-latest",
+        *FLASH_MODELS,
+    ]
+    if str(os.getenv("GEMINI_ENABLE_PRO_PREVIEW", "")).strip().lower() == "true"
+    else [
+        *FLASH_MODELS,
+        "gemini-3.1-pro-preview",
+        "gemini-pro-latest",
+    ]
+)
 
 
 # ==============================================================================
@@ -847,6 +853,13 @@ def _call_gemini_api_with_model(
             if model in unavailable_404:
                 continue
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key}"
+            gen_cfg: Dict[str, Any] = {
+                "temperature": 0.2,
+                "responseMimeType": "application/json",
+            }
+            use_no_thinking = ("flash" in model.lower()) and ("lite" not in model.lower())
+            if use_no_thinking:
+                gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
             payload = {
                 "contents": [
                     {
@@ -855,13 +868,13 @@ def _call_gemini_api_with_model(
                         ]
                     }
                 ],
-                "generationConfig": {
-                    "temperature": 0.2,
-                    "responseMimeType": "application/json",
-                },
+                "generationConfig": gen_cfg,
             }
             try:
-                resp = requests.post(url, json=payload, timeout=25.0)
+                resp = requests.post(url, json=payload, timeout=55.0)
+                if resp.status_code == 400 and use_no_thinking and "thinking" in (resp.text or "").lower():
+                    gen_cfg.pop("thinkingConfig", None)
+                    resp = requests.post(url, json=payload, timeout=55.0)
                 if resp.status_code == 200:
                     result = resp.json()
                     candidates = result.get("candidates", [])
@@ -977,6 +990,47 @@ def _format_live_context_for_prompt(
     return f"- 현재 사용자 선택 실전 담당 봇(is_selected_for_live=1):\n{bots_block}\n- 현재 보유 오픈 포지션: {pos_str}"
 
 
+BLACKLIST_PLACEHOLDER_TICKERS = {
+    "KRW-TICKER",
+    "KRW-COIN",
+    "KRW-SYMBOL",
+    "KRW-TOKEN",
+    "KRW-NONE",
+    "KRW-NULL",
+    "KRW-NA",
+    "KRW-EXAMPLE",
+    "KRW-TEST",
+}
+
+
+def normalize_blacklist_tickers(raw_blacklist: Any) -> List[str]:
+    """업비트 표준 영문 KRW 티커 형식(KRW-[A-Z0-9]{2,10})만 통과시켜 프롬프트 예시 문자열 오염을 차단합니다."""
+    items = raw_blacklist
+    if isinstance(items, str):
+        try:
+            items = json.loads(items)
+        except Exception:
+            items = []
+    if not isinstance(items, list):
+        return []
+    blacklist_set = set()
+    for item in items:
+        t = str(item or "").strip().upper()
+        if not t:
+            continue
+        if t.startswith("KRW-"):
+            cand = t
+        elif "-" in t:
+            cand = f"KRW-{t.split('-')[-1]}"
+        else:
+            cand = f"KRW-{t}"
+        if cand in BLACKLIST_PLACEHOLDER_TICKERS:
+            continue
+        if re.fullmatch(r"KRW-[A-Z0-9]{2,10}", cand):
+            blacklist_set.add(cand)
+    return sorted(blacklist_set)
+
+
 def parse_and_validate_llm_json(raw_text: Optional[str], default_reason: str = "Analysis completed") -> Optional[Dict[str, Any]]:
     """
     LLM 응답 텍스트에서 JSON 블록을 추출하고 표준 10대 봇(bot_01~bot_10) 스키마로 정규화/검증합니다.
@@ -1010,45 +1064,58 @@ def parse_and_validate_llm_json(raw_text: Optional[str], default_reason: str = "
         if regime not in ("BULL", "BEAR", "SIDEWAYS", "HIGH_VOLATILITY_SHOCK"):
             regime = "SIDEWAYS"
 
-        risk_alert = _parse_bool_flag(parsed.get("risk_alert"), False)
+        raw_risk_alert = _parse_bool_flag(parsed.get("risk_alert"), False)
 
         action = str(parsed.get("recommended_action", "NORMAL") or "NORMAL").upper()
         if action not in ("NORMAL", "REDUCE_SIZE", "HALT_NEW_BUYS", "EMERGENCY_CLOSE_ALL"):
             action = "NORMAL"
 
         try:
-            raw_mult = parsed.get("position_size_multiplier", 1.0)
-            multiplier = float(1.0 if raw_mult is None else raw_mult)
+            raw_mult = parsed.get("position_size_multiplier", 0.5 if action == "REDUCE_SIZE" else 1.0)
+            multiplier = float((0.5 if action == "REDUCE_SIZE" else 1.0) if raw_mult is None else raw_mult)
             if not math.isfinite(multiplier):
-                multiplier = 1.0
+                multiplier = 0.5 if action == "REDUCE_SIZE" else 1.0
         except (TypeError, ValueError):
-            multiplier = 1.0
-        if risk_alert or action in ("HALT_NEW_BUYS", "EMERGENCY_CLOSE_ALL"):
-            multiplier = 0.0
-        elif multiplier <= 0.0:
-            multiplier = 0.0
-        elif multiplier < 0.75:
-            multiplier = 0.5
-        else:
-            multiplier = 1.0
+            multiplier = 0.5 if action == "REDUCE_SIZE" else 1.0
 
-        bot_overrides = normalize_bot_overrides(parsed.get("bot_overrides"))
-        if risk_alert or action in ("HALT_NEW_BUYS", "EMERGENCY_CLOSE_ALL"):
+        raw_overrides_input = parsed.get("bot_overrides")
+        has_explicit_overrides = isinstance(raw_overrides_input, dict) and len(raw_overrides_input) > 0
+        bot_overrides = normalize_bot_overrides(raw_overrides_input)
+        has_any_allow_bot = any(bot_overrides.get(bot_id) == "ALLOW" for bot_id in ALL_BOT_IDS)
+
+        is_hard_halt = (
+            action in ("HALT_NEW_BUYS", "EMERGENCY_CLOSE_ALL")
+            or (raw_risk_alert and regime == "HIGH_VOLATILITY_SHOCK")
+            or (raw_risk_alert and has_explicit_overrides and not has_any_allow_bot and multiplier <= 0.0)
+        )
+
+        if is_hard_halt:
+            risk_alert = True
+            if action != "EMERGENCY_CLOSE_ALL":
+                action = "HALT_NEW_BUYS"
+            multiplier = 0.0
             bot_overrides = {bot_id: "BLOCK" for bot_id in ALL_BOT_IDS}
-
-        raw_blacklist = parsed.get("blacklist_tickers", [])
-        blacklist_set = set()
-        if isinstance(raw_blacklist, list):
-            for item in raw_blacklist:
-                t = str(item or "").strip().upper()
-                if t:
-                    if t.startswith("KRW-"):
-                        blacklist_set.add(t)
-                    elif "-" in t:
-                        blacklist_set.add(f"KRW-{t.split('-')[-1]}")
+        else:
+            risk_alert = False
+            if raw_risk_alert and action == "NORMAL":
+                action = "REDUCE_SIZE"
+            if action == "REDUCE_SIZE":
+                if has_any_allow_bot:
+                    multiplier = 0.5 if multiplier <= 0.0 else min(0.5, 0.5 if multiplier < 0.75 else 1.0)
+                else:
+                    if multiplier <= 0.0:
+                        for bid in ("bot_05", "bot_06", "bot_08", "bot_10"):
+                            bot_overrides[bid] = "ALLOW"
+                        multiplier = 0.5
                     else:
-                        blacklist_set.add(f"KRW-{t}")
-        blacklist = sorted(blacklist_set)
+                        multiplier = min(0.5, 0.5 if multiplier < 0.75 else 1.0)
+            else:
+                multiplier = 1.0 if multiplier <= 0.0 else (0.5 if multiplier < 0.75 else 1.0)
+
+        if regime in ("BEAR", "HIGH_VOLATILITY_SHOCK") and action != "NORMAL" and sentiment_score > 0:
+            sentiment_score = round(-abs(sentiment_score), 2)
+
+        blacklist = normalize_blacklist_tickers(parsed.get("blacklist_tickers", []))
 
         reason = str(parsed.get("reason", default_reason))
 
@@ -1103,20 +1170,19 @@ def call_local_ollama_coin_news_analyzer(
             compact_lines.append(f"{idx}.{re.sub(r'\s+', ' ', str(item or '')).strip()[:90]}")
 
     compact_news_text = "\n".join(compact_lines) if compact_lines else "특이 속보 없음"
-    active_bot_desc = (
-        ",".join(str(b.get("bot_id")) for b in live_bots)
-        if live_bots
-        else "bot_01~bot_10"
-    )
     fng_val = (fng or {}).get("value", "N/A")
     fng_cls = (fng or {}).get("classification", "N/A")
 
     user_prompt = f"""업비트 30분 시황·뉴스 JSON 분석:
-[시황] KRW-BTC={btc_summary.get('current_price', 'N/A')}원(24h {btc_summary.get('change_rate_24h', 'N/A')}%) | 일봉20MA={btc_summary.get('ma20', 'N/A')} | 4h60MA={btc_summary.get('ma60_4h', 'N/A')} | 공포탐욕={fng_val}({fng_cls}) | 가동봇={active_bot_desc} | 보유={','.join(open_positions) if open_positions else '없음'}
+[시황] KRW-BTC={btc_summary.get('current_price', 'N/A')}원(24h {btc_summary.get('change_rate_24h', 'N/A')}%) | 일봉20MA={btc_summary.get('ma20', 'N/A')} | 4h60MA={btc_summary.get('ma60_4h', 'N/A')} | 공포탐욕={fng_val}({fng_cls}) | 전략군=돌파형(bot_01,02,03,04,07,09)/역추세·그리드(bot_05,06,08,10) | 보유={','.join(open_positions) if open_positions else '없음'}
 [뉴스]
 {compact_news_text}
+[판단 규칙]
+- risk_alert=true 및 HALT_NEW_BUYS는 해킹·디페깅·상폐·패닉폭락(HIGH_VOLATILITY_SHOCK) 때만 사용(전체 BLOCK, mult=0.0).
+- 단순 약세(BEAR)·횡보(SIDEWAYS)는 risk_alert=false, recommended_action="REDUCE_SIZE", position_size_multiplier=0.5, 돌파형(bot_01,02,03,04,07,09)="BLOCK", 역추세·그리드(bot_05,06,08,10)="ALLOW".
+- blacklist_tickers는 뉴스에 특정 코인의 해킹·상폐·유의종목 악재가 직접 명시된 경우에만 영문 티커(예: "KRW-XRP")를 넣고, 무관하거나 불확실하면 반드시 빈 배열 []로 출력.
 [JSON 스키마]
-{{"sentiment_score":-1.0~1.0,"market_regime":"BULL|SIDEWAYS|BEAR|HIGH_VOLATILITY_SHOCK","risk_alert":false,"recommended_action":"NORMAL|REDUCE_SIZE|HALT_NEW_BUYS|EMERGENCY_CLOSE_ALL","position_size_multiplier":1.0,"bot_overrides":{{"bot_01":"ALLOW|BLOCK","bot_02":"ALLOW|BLOCK","bot_03":"ALLOW|BLOCK","bot_04":"ALLOW|BLOCK","bot_05":"ALLOW|BLOCK","bot_06":"ALLOW|BLOCK","bot_07":"ALLOW|BLOCK","bot_08":"ALLOW|BLOCK","bot_09":"ALLOW|BLOCK","bot_10":"ALLOW|BLOCK"}},"blacklist_tickers":["KRW-티커"],"reason":"한국어 1~2문장(70자이내) 요약"}}"""
+{{"sentiment_score":-1.0~1.0,"market_regime":"BULL|SIDEWAYS|BEAR|HIGH_VOLATILITY_SHOCK","risk_alert":false,"recommended_action":"NORMAL|REDUCE_SIZE|HALT_NEW_BUYS|EMERGENCY_CLOSE_ALL","position_size_multiplier":1.0,"bot_overrides":{{"bot_01":"ALLOW|BLOCK","bot_02":"ALLOW|BLOCK","bot_03":"ALLOW|BLOCK","bot_04":"ALLOW|BLOCK","bot_05":"ALLOW|BLOCK","bot_06":"ALLOW|BLOCK","bot_07":"ALLOW|BLOCK","bot_08":"ALLOW|BLOCK","bot_09":"ALLOW|BLOCK","bot_10":"ALLOW|BLOCK"}},"blacklist_tickers":[],"reason":"한국어 1~2문장(70자이내) 요약"}}"""
 
     started_ms = int(time.time() * 1000)
     resp = requests.post(
@@ -1126,6 +1192,7 @@ def call_local_ollama_coin_news_analyzer(
             "stream": False,
             "think": False,
             "format": "json",
+            "keep_alive": "35m",
             "messages": [
                 {"role": "system", "content": "업비트 암호화폐 30분 단기 시황·뉴스 JSON 분석기. 지정 JSON 스키마만 간결히 출력."},
                 {"role": "user", "content": user_prompt},
@@ -1227,8 +1294,8 @@ def call_flash_fast_analysis(
 {chr(10).join(f"- {h}" for h in headline_strings) if headline_strings else '- 최근 특이 속보 없음'}
 
 [판단 지침]
-- 단기 돌발 악재(해킹, 디페깅, 전쟁 속보, 패닉 투매, 업비트 유의종목/상장폐지 공시)가 없으면 거시 기조를 유지하되 단기 휩소 위험 봇만 조정하십시오.
-- 돌발 악재 감지 시 즉각 risk_alert=true, position_size_multiplier=0.0(또는 0.5), blacklist_tickers 추가 및 돌파형 봇(bot_01,bot_02,bot_03,bot_04,bot_07,bot_09) BLOCK으로 응답하십시오.
+- 단기 돌발 악재(해킹, 디페깅, 전쟁 속보, 패닉 투매, 업비트 유의종목/상장폐지 공시)가 없으면 거시 기조를 유지하며, 단순 BEAR·SIDEWAYS 방어 시에는 반드시 risk_alert=false, recommended_action='REDUCE_SIZE', position_size_multiplier=0.5로 응답하십시오.
+- 전 시장 신규 매수를 즉시 중단해야 하는 돌발 쇼크(HIGH_VOLATILITY_SHOCK) 감지 시에만 risk_alert=true, recommended_action='HALT_NEW_BUYS', position_size_multiplier=0.0 및 전체 봇 BLOCK으로 응답하고, 특정 코인 악재는 blacklist_tickers에 영문 티커만 추가(없으면 [])하십시오.
 - 보유 포지션 강제 청산이 아닌 신규 매수 게이트(bot_01~bot_10)만 JSON으로 반환하십시오."""
 
     raw_response = None
@@ -1354,17 +1421,25 @@ def synthesize_dual_decisions(
     """
     flash_action = str(flash_res.get("recommended_action", "NORMAL")).upper()
     pro_action = str(pro_res.get("recommended_action", "NORMAL")).upper()
-    flash_alert = bool(flash_res.get("risk_alert", False))
-    pro_alert = bool(pro_res.get("risk_alert", False))
+    flash_alert = _parse_bool_flag(flash_res.get("risk_alert", False), False)
+    pro_alert = _parse_bool_flag(pro_res.get("risk_alert", False), False)
 
     flash_mult = float(flash_res.get("position_size_multiplier", 1.0))
     pro_mult = float(pro_res.get("position_size_multiplier", 1.0))
 
     flash_overrides = normalize_bot_overrides(flash_res.get("bot_overrides"))
     pro_overrides = normalize_bot_overrides(pro_res.get("bot_overrides"))
+    has_active_pro = bool(pro_res) and not bool(pro_res.get("_is_neutral_passthrough", False))
+
+    flash_regime = str(flash_res.get("market_regime", "SIDEWAYS")).upper()
+    pro_regime = str(pro_res.get("market_regime", "SIDEWAYS")).upper()
 
     flash_score = float(flash_res.get("sentiment_score", 0.0))
+    if flash_regime in ("BEAR", "HIGH_VOLATILITY_SHOCK") and flash_action != "NORMAL" and flash_score > 0:
+        flash_score = round(-abs(flash_score), 2)
     pro_score = float(pro_res.get("sentiment_score", 0.0))
+    if pro_regime in ("BEAR", "HIGH_VOLATILITY_SHOCK") and pro_action != "NORMAL" and pro_score > 0:
+        pro_score = round(-abs(pro_score), 2)
 
     final_bot_overrides: Dict[str, str] = {}
 
@@ -1392,7 +1467,8 @@ def synthesize_dual_decisions(
         final_bot_overrides = {bot_id: "BLOCK" for bot_id in ALL_BOT_IDS}
         synthesis_mode = "FLASH_SHOCK_DEFENSE (단기 돌발 충격 감지로 신규 매수 차단)"
 
-    # 3. 비중 축소 / 보수적 교차 검증 운용
+    # 3. 비중 축소 / 평시 권한 분리:
+    #    Flash는 돌발 쇼크/블랙리스트 방패 역할에 집중하고, 평시(BEAR/SIDEWAYS/REDUCE_SIZE)의 10대 봇 전략군 스위치는 거시 전략가(Pro) 판정 우선
     elif (
         flash_action == "REDUCE_SIZE"
         or pro_action == "REDUCE_SIZE"
@@ -1404,28 +1480,28 @@ def synthesize_dual_decisions(
         final_risk_alert = False
         final_action = "REDUCE_SIZE"
         final_multiplier = round(max(0.0, min(flash_mult, pro_mult, 0.5)), 2)
+        source_overrides = pro_overrides if has_active_pro else flash_overrides
         for bot_id in ALL_BOT_IDS:
-            if flash_overrides.get(bot_id) == "BLOCK" or pro_overrides.get(bot_id) == "BLOCK":
-                final_bot_overrides[bot_id] = "BLOCK"
-            else:
-                final_bot_overrides[bot_id] = "ALLOW"
+            final_bot_overrides[bot_id] = source_overrides.get(bot_id, "ALLOW")
         if all(v == "BLOCK" for v in final_bot_overrides.values()):
-            final_action = "HALT_NEW_BUYS"
-            final_multiplier = 0.0
-            synthesis_mode = "CONSERVATIVE_ALL_BOTS_BLOCKED"
+            for bid in ("bot_05", "bot_06", "bot_08", "bot_10"):
+                final_bot_overrides[bid] = "ALLOW"
+            if final_multiplier <= 0.0:
+                final_multiplier = 0.5
+            synthesis_mode = "CONSERVATIVE_REDUCE_GUARD (전봇 BLOCK 보정 · 역추세·그리드 0.5x 허용)"
         else:
-            synthesis_mode = "CONSERVATIVE_REDUCE (보수적 50% 비중 축소 및 선별적 봇 허용)"
+            if final_multiplier <= 0.0:
+                final_multiplier = 0.5
+            synthesis_mode = "CONSERVATIVE_REDUCE (보수적 50% 비중 축소 · Pro 전략군 스위치 우선)"
 
-    # 4. 두 모델 모두 NORMAL & 개별 봇도 양쪽 모두 ALLOW일 때만 100% 허용
+    # 4. 두 모델 모두 NORMAL (평시 Pro 전략군 스위치 우선)
     elif flash_action == "NORMAL" and pro_action == "NORMAL":
         final_risk_alert = False
         final_action = "NORMAL"
         final_multiplier = round(max(0.0, min(flash_mult, pro_mult, 1.0)), 2)
+        source_overrides = pro_overrides if has_active_pro else flash_overrides
         for bot_id in ALL_BOT_IDS:
-            if flash_overrides.get(bot_id) == "ALLOW" and pro_overrides.get(bot_id) == "ALLOW":
-                final_bot_overrides[bot_id] = "ALLOW"
-            else:
-                final_bot_overrides[bot_id] = "BLOCK"
+            final_bot_overrides[bot_id] = source_overrides.get(bot_id, "ALLOW")
         if all(v == "BLOCK" for v in final_bot_overrides.values()):
             final_action = "HALT_NEW_BUYS"
             final_multiplier = 0.0
@@ -1437,11 +1513,9 @@ def synthesize_dual_decisions(
         final_risk_alert = False
         final_action = "REDUCE_SIZE"
         final_multiplier = 0.5
+        source_overrides = pro_overrides if has_active_pro else flash_overrides
         for bot_id in ALL_BOT_IDS:
-            if flash_overrides.get(bot_id) == "BLOCK" or pro_overrides.get(bot_id) == "BLOCK":
-                final_bot_overrides[bot_id] = "BLOCK"
-            else:
-                final_bot_overrides[bot_id] = "ALLOW"
+            final_bot_overrides[bot_id] = source_overrides.get(bot_id, "ALLOW")
         synthesis_mode = "CONSERVATIVE_DEFAULT"
 
     # 합성 감성 점수 (Pro 심층 60% + Flash 단기 40%, 극단치 반영)
@@ -1451,8 +1525,6 @@ def synthesize_dual_decisions(
         final_sentiment_score = round(0.4 * flash_score + 0.6 * pro_score, 2)
 
     # 합성 시장 체제 (HIGH_VOLATILITY_SHOCK 또는 BEAR 우선)
-    flash_regime = str(flash_res.get("market_regime", "SIDEWAYS")).upper()
-    pro_regime = str(pro_res.get("market_regime", "SIDEWAYS")).upper()
     if "HIGH_VOLATILITY_SHOCK" in (flash_regime, pro_regime):
         final_regime = "HIGH_VOLATILITY_SHOCK"
     elif flash_regime == "BEAR" or pro_regime == "BEAR":
@@ -1462,10 +1534,13 @@ def synthesize_dual_decisions(
     else:
         final_regime = "SIDEWAYS"
 
-    # 블랙리스트 티커 합집합
-    combined_blacklist = sorted(list(set(
-        flash_res.get("blacklist_tickers", []) + pro_res.get("blacklist_tickers", [])
-    )))
+    if final_regime in ("BEAR", "HIGH_VOLATILITY_SHOCK") and final_action != "NORMAL" and final_sentiment_score > 0:
+        final_sentiment_score = round(-abs(final_sentiment_score), 2)
+
+    # 블랙리스트 티커 합집합 (유효 KRW 영문 티커만 허용)
+    combined_blacklist = normalize_blacklist_tickers(
+        list(flash_res.get("blacklist_tickers", []) or []) + list(pro_res.get("blacklist_tickers", []) or [])
+    )
 
     # 한국어 상세 종합 사유
     reason_str = (

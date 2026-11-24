@@ -1094,11 +1094,73 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
   );
 }
 
+function isControlJsonSnippet(text) {
+  if (!text || typeof text !== "string") return false;
+  const hasBotOverrides = text.includes('"bot_overrides"') || text.includes("bot_overrides");
+  const hasRegime = text.includes('"market_regime"');
+  const hasAction = text.includes('"recommended_action"');
+  const hasSentiment = text.includes('"sentiment_score"');
+  const hasMult = text.includes('"position_size_multiplier"');
+  const hasRisk = text.includes('"risk_alert"');
+  const hitCount = [hasBotOverrides, hasRegime, hasAction, hasSentiment, hasMult, hasRisk].filter(Boolean).length;
+  return hasBotOverrides || hitCount >= 2;
+}
+
+function sanitizeBriefingMarkdown(content, isStreaming = false) {
+  if (!content || typeof content !== "string") {
+    return { cleanedText: "", isReceivingControlJson: false };
+  }
+  let cleaned = content;
+  let isReceivingControlJson = false;
+
+  // 1) 닫힌 JSON 제어 코드 블록 제거
+  cleaned = cleaned.replace(/```(?:json)?\s*([\s\S]*?)```/gi, (full, body) => {
+    return isControlJsonSnippet(body) ? "" : full;
+  });
+
+  // 2) 미완성/잘린 JSON 제어 코드 블록 제거 (스트리밍 중 제어 JSON 출력 구간 포함)
+  cleaned = cleaned.replace(/```(?:json)?\s*([\s\S]*)$/i, (full, body) => {
+    const trimmedBody = String(body || "").trim();
+    if (
+      !trimmedBody ||
+      trimmedBody.startsWith("{") ||
+      isControlJsonSnippet(trimmedBody) ||
+      (isStreaming && /^```json/i.test(full.trim()))
+    ) {
+      isReceivingControlJson = true;
+      return "";
+    }
+    return full;
+  });
+
+  // 3) 코드 펜스 없이 본문 끝에 붙은 원시 제어 JSON 객체 제거
+  const trailingRawJsonMatch = cleaned.match(
+    /\n\s*(\{\s*"(?:sentiment_score|market_regime|risk_alert|recommended_action|bot_overrides)"[\s\S]*)$/
+  );
+  if (trailingRawJsonMatch && isControlJsonSnippet(trailingRawJsonMatch[1])) {
+    isReceivingControlJson = true;
+    cleaned = cleaned.slice(0, trailingRawJsonMatch.index);
+  }
+
+  // 4) 제어 JSON 블록 앞의 안내 헤더 및 끝 구분선 정리
+  cleaned = cleaned
+    .replace(/###\s*\[?(?:구조화|JSON\s*제어).*$/gim, "")
+    .replace(/(?:\r?\n\s*---\s*)+$/g, "")
+    .trim();
+
+  return { cleanedText: cleaned, isReceivingControlJson };
+}
+
 function MarkdownViewer({ content, isStreaming = false }) {
   if (!content) return null;
-  const lines = content.split("\n");
+  const { cleanedText, isReceivingControlJson } = sanitizeBriefingMarkdown(content, isStreaming);
+  if (!cleanedText && !isReceivingControlJson) return null;
+
+  const lines = cleanedText.split("\n");
   const elements = [];
   let currentList = [];
+  let inCodeBlock = false;
+  let codeBlockLines = [];
 
   const flushList = () => {
     if (currentList.length > 0) {
@@ -1113,11 +1175,52 @@ function MarkdownViewer({ content, isStreaming = false }) {
     }
   };
 
+  const flushCodeBlock = () => {
+    if (codeBlockLines.length > 0) {
+      elements.push(
+        <pre
+          key={`pre-${elements.length}`}
+          style={{
+            margin: "8px 0 12px",
+            padding: "10px 12px",
+            borderRadius: "6px",
+            background: "rgba(15, 23, 42, 0.85)",
+            border: "1px solid rgba(148, 163, 184, 0.2)",
+            overflowX: "auto",
+            fontSize: "12px",
+            lineHeight: "1.55",
+            color: "#cbd5e1",
+          }}
+        >
+          <code>{codeBlockLines.join("\n")}</code>
+        </pre>
+      );
+      codeBlockLines = [];
+    }
+  };
+
   const renderFormattedText = (text) => {
-    const parts = text.split(/(\*\*[^*]+\*\*)/g);
+    const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
     return parts.map((part, i) => {
       if (part.startsWith("**") && part.endsWith("**")) {
         return <strong key={i} style={{ color: "#38bdf8", fontWeight: 700 }}>{part.slice(2, -2)}</strong>;
+      }
+      if (part.startsWith("`") && part.endsWith("`")) {
+        return (
+          <code
+            key={i}
+            style={{
+              background: "rgba(99, 102, 241, 0.16)",
+              color: "#e0e7ff",
+              padding: "1px 5px",
+              borderRadius: "4px",
+              fontSize: "12px",
+              fontFamily: "monospace",
+            }}
+          >
+            {part.slice(1, -1)}
+          </code>
+        );
       }
       return part;
     });
@@ -1125,31 +1228,56 @@ function MarkdownViewer({ content, isStreaming = false }) {
 
   lines.forEach((rawLine, index) => {
     const line = rawLine.trimEnd();
-    if (line.startsWith("- ") || line.startsWith("* ")) {
-      currentList.push(line.slice(2));
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith("```")) {
+      flushList();
+      if (inCodeBlock) {
+        flushCodeBlock();
+        inCodeBlock = false;
+      } else {
+        inCodeBlock = true;
+      }
+      return;
+    }
+
+    if (inCodeBlock) {
+      codeBlockLines.push(rawLine);
+      return;
+    }
+
+    if (/^\s*[-*]\s+/.test(line)) {
+      currentList.push(line.replace(/^\s*[-*]\s+/, ""));
       return;
     }
     flushList();
 
-    if (line.startsWith("### ")) {
+    if (trimmed === "---" || trimmed === "***") {
+      elements.push(
+        <hr
+          key={index}
+          style={{ border: "none", borderTop: "1px solid rgba(255, 255, 255, 0.08)", margin: "12px 0" }}
+        />
+      );
+    } else if (trimmed.startsWith("### ")) {
       elements.push(
         <h4 key={index} style={{ fontSize: "15px", fontWeight: 700, color: "#cbd5e1", margin: "14px 0 6px" }}>
-          {renderFormattedText(line.slice(4))}
+          {renderFormattedText(trimmed.slice(4))}
         </h4>
       );
-    } else if (line.startsWith("## ")) {
+    } else if (trimmed.startsWith("## ")) {
       elements.push(
         <h3 key={index} style={{ fontSize: "16px", fontWeight: 700, color: "#f8fafc", margin: "18px 0 8px", borderBottom: "1px solid rgba(255,255,255,0.08)", paddingBottom: "6px" }}>
-          {renderFormattedText(line.slice(3))}
+          {renderFormattedText(trimmed.slice(3))}
         </h3>
       );
-    } else if (line.startsWith("# ")) {
+    } else if (trimmed.startsWith("# ")) {
       elements.push(
         <h2 key={index} style={{ fontSize: "18px", fontWeight: 800, color: "#38bdf8", margin: "20px 0 10px" }}>
-          {renderFormattedText(line.slice(2))}
+          {renderFormattedText(trimmed.slice(2))}
         </h2>
       );
-    } else if (line.trim().length === 0) {
+    } else if (trimmed.length === 0) {
       elements.push(<div key={index} style={{ height: "6px" }} />);
     } else {
       elements.push(
@@ -1161,9 +1289,15 @@ function MarkdownViewer({ content, isStreaming = false }) {
   });
 
   flushList();
+  flushCodeBlock();
   return (
     <div style={{ fontSize: "13.5px", color: "#e2e8f0" }}>
       {elements}
+      {isStreaming && isReceivingControlJson && (
+        <div style={{ marginTop: "8px", fontSize: "12px", color: "#94a3b8" }}>
+          ⚙️ 10대 봇 AI 게이트웨이 제어 파라미터 반영 중...
+        </div>
+      )}
       {isStreaming && (
         <span
           style={{
@@ -1308,7 +1442,7 @@ export default function App() {
   const [gateError, setGateError] = useState("");
 
   // 프로젝트 버전 및 히스토리 모달 상태
-  const [appVersion, setAppVersion] = useState("0.0.32");
+  const [appVersion, setAppVersion] = useState("0.0.33");
   const [historyModalOpen, setHistoryModalOpen] = useState(false);
   const [historyContent, setHistoryContent] = useState("");
   const [historyLoading, setHistoryLoading] = useState(false);

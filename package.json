@@ -1,6 +1,6 @@
 {
   "name": "auto-coin-trade",
-  "version": "0.0.32",
+  "version": "0.0.33",
   "description": "Upbit Open API & Dual AI(Ollama qwen3-news / Google Gemini Flash·Pro) 기반 10대 알고리즘 상시 가상 경쟁(Arena) 및 선택형(1~3개) 동적 실전 코인 자동매매 웹 플랫폼 (Windows/Linux 원클릭 설치 지원)",
   "keywords": [
     "upbit",
@@ -28,7 +28,9 @@
     "test:notify": "node tests/verify_notification_hub_and_journal.mjs",
     "test:vault": "node tests/verify_crypto_vault.mjs",
     "test:guardrail": "node tests/verify_duplicate_order_guard.mjs",
-    "test:enhancements": "node tests/verify_upbit_ws_hub.mjs && node tests/verify_backtest_engine.mjs && node tests/verify_execution_quality_and_sizing.mjs && node tests/verify_notification_hub_and_journal.mjs && node tests/verify_crypto_vault.mjs && node tests/verify_duplicate_order_guard.mjs",
+    "test:dualai": "node tests/verify_dual_ai_and_live_universe.mjs",
+    "test:cap90": "node tests/verify_capital_tier_rotation_90cap.mjs",
+    "test:enhancements": "node tests/verify_upbit_ws_hub.mjs && node tests/verify_backtest_engine.mjs && node tests/verify_execution_quality_and_sizing.mjs && node tests/verify_notification_hub_and_journal.mjs && node tests/verify_crypto_vault.mjs && node tests/verify_duplicate_order_guard.mjs && node tests/verify_dual_ai_and_live_universe.mjs && node tests/verify_capital_tier_rotation_90cap.mjs",
     "test:all": "npm test && npm run test:enhancements && npm run test:py",
     "test:py": "python3 tests/qa_python_verification.py"
   },

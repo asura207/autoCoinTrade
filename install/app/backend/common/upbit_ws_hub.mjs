@@ -43,7 +43,10 @@ export class UpbitWsHub extends EventEmitter {
     this.lastError = "";
 
     this.subscribedMarkets = new Set(
-      (options.initialMarkets || ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-DOGE", "KRW-SUI", "KRW-ADA", "KRW-AVAX"])
+      (options.initialMarkets || [
+        "KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-DOGE",
+        "KRW-SUI", "KRW-AVAX", "KRW-SHIB", "KRW-ADA", "KRW-NEAR",
+      ])
         .map((m) => String(m || "").trim().toUpperCase())
         .filter((m) => m.startsWith("KRW-"))
     );
@@ -157,6 +160,7 @@ export class UpbitWsHub extends EventEmitter {
 
   getLatestOrderbook(market) {
     const m = String(market || "").trim().toUpperCase();
+    if (this.isStale()) return null;
     return this.orderbookMap.get(m) || null;
   }
 
@@ -350,6 +354,7 @@ export class UpbitWsHub extends EventEmitter {
         acc_trade_price_24h: Number(msg.acc_trade_price_24h ?? msg.atp24h ?? prevTicker?.acc_trade_price_24h ?? 0),
         acc_trade_volume_24h: Number(msg.acc_trade_volume_24h ?? msg.atv24h ?? prevTicker?.acc_trade_volume_24h ?? 0),
         trade_volume: Number(msg.trade_volume ?? msg.tv ?? 0),
+        is_partial_trade_only: false,
         timestamp: exchangeTs || nowMs,
         updated_at_ms: nowMs,
       };
@@ -402,6 +407,7 @@ export class UpbitWsHub extends EventEmitter {
           signed_change_rate: 0,
           acc_trade_price_24h: 0,
           acc_trade_volume_24h: 0,
+          is_partial_trade_only: true,
           timestamp: exchangeTs || nowMs,
           updated_at_ms: nowMs,
         });
@@ -430,7 +436,10 @@ export class UpbitWsHub extends EventEmitter {
     for (const fn of this.tickHandlers) {
       try {
         fn(tickEvent);
-      } catch {}
+      } catch (tickHandlerErr) {
+        this.lastError = `Tick handler error: ${tickHandlerErr?.message || tickHandlerErr}`;
+        console.warn("[UpbitWsHub] Tick handler error:", tickHandlerErr?.message || tickHandlerErr);
+      }
     }
   }
 }

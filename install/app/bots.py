@@ -1946,23 +1946,52 @@ def execute_sell_order(
                                     restorable_pool -= amt
                                 break
 
-                    # 2순위: 목표 한도 미달인 다른 선출 봇들에게 부족분 비례 분배
+                    # 2순위: 목표 한도 미달인 다른 선출 봇들에게 부족분 비례 분배 (단, global_cap/target 미설정 레거시 DB는 allocation_ratio Zero-Sum 분배)
                     if restorable_pool > 0:
-                        needy = []
-                        for es in elected_states:
-                            already = transfers_map.get(es["bot_id"], 0)
-                            deficit = max(0, es["target_capital_krw"] - (es["open_locked_krw"] + es["virtual_krw"] + already))
-                            if deficit > 0:
-                                needy.append((es["bot_id"], deficit))
-                        total_deficit = sum(d for _, d in needy)
-                        if total_deficit > 0:
-                            pool_to_share = min(restorable_pool, total_deficit)
+                        has_any_target = any(es["target_capital_krw"] > 0 for es in elected_states)
+                        if global_cap_krw > 0 or has_any_target:
+                            needy = []
+                            for es in elected_states:
+                                already = transfers_map.get(es["bot_id"], 0)
+                                deficit = max(0, es["target_capital_krw"] - (es["open_locked_krw"] + es["virtual_krw"] + already))
+                                if deficit > 0:
+                                    needy.append([es["bot_id"], deficit])
+                            total_deficit = sum(d for _, d in needy)
+                            if total_deficit > 0:
+                                pool_to_share = min(restorable_pool, total_deficit)
+                                distributed = 0
+                                for idx, (bid, deficit) in enumerate(needy):
+                                    share = min(deficit, math.floor((deficit * pool_to_share) / total_deficit))
+                                    if share > 0:
+                                        transfers_map[bid] = transfers_map.get(bid, 0) + share
+                                        distributed += share
+                                        needy[idx][1] -= share
+                                # floor 절삭 자투리(1~2원)를 잔여 부족분이 남은 선출 봇에게 순차 배분
+                                rem = pool_to_share - distributed
+                                for bid, rem_def in needy:
+                                    if rem <= 0:
+                                        break
+                                    if rem_def > 0:
+                                        add_amt = min(rem, rem_def)
+                                        transfers_map[bid] = transfers_map.get(bid, 0) + add_amt
+                                        distributed += add_amt
+                                        rem -= add_amt
+                                restorable_pool -= distributed
+                        else:
+                            # 레거시 / 미동기화 DB(global_cap_krw == 0 & target_capital_krw == 0): allocation_ratio 비율 기반 Zero-Sum 분배 (1원 오차 없음)
+                            ratio_sum = sum(max(0.0, es["allocation_ratio"]) for es in elected_states)
                             distributed = 0
-                            for bid, deficit in needy:
-                                share = min(deficit, math.floor((deficit * pool_to_share) / total_deficit))
+                            for es in elected_states:
+                                weight = (max(0.0, es["allocation_ratio"]) / ratio_sum) if ratio_sum > 0 else (1.0 / len(elected_states))
+                                share = math.floor(restorable_pool * weight)
                                 if share > 0:
-                                    transfers_map[bid] = transfers_map.get(bid, 0) + share
+                                    transfers_map[es["bot_id"]] = transfers_map.get(es["bot_id"], 0) + share
                                     distributed += share
+                            rem = restorable_pool - distributed
+                            if rem > 0 and elected_states:
+                                top_bid = elected_states[0]["bot_id"]
+                                transfers_map[top_bid] = transfers_map.get(top_bid, 0) + rem
+                                distributed += rem
                             restorable_pool -= distributed
 
                     for target_id, share in transfers_map.items():

@@ -1,0 +1,163 @@
+# ============================================================================
+# AutoCoinTrade - Docker Compose Stack (Backend + Frontend + PostgreSQL 16 DB)
+# ============================================================================
+# 기본 실행: docker compose up -d --build
+# 선택 워커 포함: docker compose --profile workers up -d --build
+# ============================================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: autocoin-postgres
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Seoul
+      POSTGRES_DB: ${PGDATABASE:-coin_trader}
+      POSTGRES_USER: ${PGUSER:-coin_trader}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-autocoin_pg_pass}
+    ports:
+      - "${PGPORT:-5432}:5432"
+    volumes:
+      - autocoin_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-coin_trader} -d ${PGDATABASE:-coin_trader}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  autocoin-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: autocoin-trade:latest
+    container_name: autocoin-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${BACKEND_PORT:-8001}:8001"
+    environment:
+      TZ: Asia/Seoul
+      NODE_ENV: production
+      BACKEND_HOST: 0.0.0.0
+      BACKEND_PORT: 8001
+      LIVE_EXECUTOR_OWNER: ${LIVE_EXECUTOR_OWNER:-node}
+      DRY_RUN: ${DRY_RUN:-True}
+      INITIAL_TOTAL_CAPITAL: ${INITIAL_TOTAL_CAPITAL:-1000000}
+      GATE_CODE: ${GATE_CODE:-stock}
+      ENTRY_CODE: ${ENTRY_CODE:-stock}
+      DB_MODE: ${DB_MODE:-postgres_hybrid}
+      PG_SYNC_ENABLED: ${PG_SYNC_ENABLED:-true}
+      DB_PATH: data/auto_coin_trade.db
+      LOCATION: local
+      LOCAL_PG_HOST: postgres
+      LOCAL_PG_PORT: 5432
+      LOCAL_PG_DATABASE: ${PGDATABASE:-coin_trader}
+      LOCAL_PG_USER: ${PGUSER:-coin_trader}
+      LOCAL_PG_PASSWORD: ${PGPASSWORD:-autocoin_pg_pass}
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${PGDATABASE:-coin_trader}
+      PGUSER: ${PGUSER:-coin_trader}
+      PGPASSWORD: ${PGPASSWORD:-autocoin_pg_pass}
+      DATABASE_URL: postgresql://${PGUSER:-coin_trader}:${PGPASSWORD:-autocoin_pg_pass}@postgres:5432/${PGDATABASE:-coin_trader}
+      UPBIT_ACCESS_KEY: ${UPBIT_ACCESS_KEY:-}
+      UPBIT_SECRET_KEY: ${UPBIT_SECRET_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      AUTOCOIN_MASTER_KEY: ${AUTOCOIN_MASTER_KEY:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      USE_LOCAL_OLLAMA_NEWS: ${USE_LOCAL_OLLAMA_NEWS:-true}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_NEWS_MODEL: ${OLLAMA_NEWS_MODEL:-qwen3-news}
+      OLLAMA_TIMEOUT_MS: ${OLLAMA_TIMEOUT_MS:-180000}
+      LLM_FILTER_INTERVAL_SEC: ${LLM_FILTER_INTERVAL_SEC:-3600}
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-7}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/api/version"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+
+  autocoin-frontend:
+    image: autocoin-trade:latest
+    container_name: autocoin-frontend
+    restart: unless-stopped
+    command: ["node", "frontend/server.mjs"]
+    depends_on:
+      autocoin-backend:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-9000}:9000"
+    environment:
+      TZ: Asia/Seoul
+      NODE_ENV: production
+      FRONTEND_HOST: 0.0.0.0
+      FRONTEND_PORT: 9000
+      BACKEND_URL: http://autocoin-backend:8001
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-7}
+    volumes:
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  llm-filter-worker:
+    image: autocoin-trade:latest
+    container_name: autocoin-llm-worker
+    profiles: ["workers"]
+    restart: unless-stopped
+    command: ["/app/.venv/bin/python", "/app/llm_filter_worker.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      autocoin-backend:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Seoul
+      DB_MODE: ${DB_MODE:-postgres_hybrid}
+      PG_SYNC_ENABLED: ${PG_SYNC_ENABLED:-true}
+      DB_PATH: data/auto_coin_trade.db
+      LOCATION: local
+      LOCAL_PG_HOST: postgres
+      LOCAL_PG_PORT: 5432
+      LOCAL_PG_DATABASE: ${PGDATABASE:-coin_trader}
+      LOCAL_PG_USER: ${PGUSER:-coin_trader}
+      LOCAL_PG_PASSWORD: ${PGPASSWORD:-autocoin_pg_pass}
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${PGDATABASE:-coin_trader}
+      PGUSER: ${PGUSER:-coin_trader}
+      PGPASSWORD: ${PGPASSWORD:-autocoin_pg_pass}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      AUTOCOIN_MASTER_KEY: ${AUTOCOIN_MASTER_KEY:-}
+      USE_LOCAL_OLLAMA_NEWS: ${USE_LOCAL_OLLAMA_NEWS:-true}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_NEWS_MODEL: ${OLLAMA_NEWS_MODEL:-qwen3-news}
+      OLLAMA_TIMEOUT_MS: ${OLLAMA_TIMEOUT_MS:-180000}
+      LLM_FILTER_INTERVAL_SEC: ${LLM_FILTER_INTERVAL_SEC:-3600}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./logs:/app/logs
+
+volumes:
+  autocoin_pgdata:

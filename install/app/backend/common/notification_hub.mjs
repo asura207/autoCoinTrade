@@ -2,7 +2,7 @@
  * backend/common/notification_hub.mjs
  *
  * 멀티채널 실시간 알림 허브 (Telegram Bot API · Discord Webhook · WebPush 연동)
- * - 이벤트 유형: LIVE_BUY, LIVE_SELL, DRAIN_HANDOFF, CIRCUIT_BREAKER, ZERO_BALANCE_HALT, WEEKLY_ROTATION, DAILY_SUMMARY, TEST
+ * - 이벤트 유형: LIVE_BUY, LIVE_SELL, DRAIN_HANDOFF, CIRCUIT_BREAKER, ZERO_BALANCE_HALT, WEEKLY_ROTATION, DAILY_SUMMARY, GEMINI_QUOTA_EXCEEDED, TEST
  * - 매매 루프 지연을 원천 차단하는 비동기 논블로킹 발송 (AbortSignal.timeout(4000) + 최대 2회 지수 백오프 재시도)
  * - 민감 토큰(telegram_bot_token, discord_webhook_url) AES-256-GCM 암호화 저장 및 UI 조회 시 마스킹 처리
  */
@@ -17,11 +17,12 @@ export const NOTIFICATION_EVENT_TYPES = {
   ZERO_BALANCE_HALT: "ZERO_BALANCE_HALT",
   WEEKLY_ROTATION: "WEEKLY_ROTATION",
   DAILY_SUMMARY: "DAILY_SUMMARY",
+  GEMINI_QUOTA_EXCEEDED: "GEMINI_QUOTA_EXCEEDED",
   TEST: "TEST",
 };
 
 const TRADE_EVENTS = new Set(["LIVE_BUY", "LIVE_SELL", "DRAIN_HANDOFF"]);
-const RISK_EVENTS = new Set(["CIRCUIT_BREAKER", "ZERO_BALANCE_HALT", "WEEKLY_ROTATION"]);
+const RISK_EVENTS = new Set(["CIRCUIT_BREAKER", "ZERO_BALANCE_HALT", "WEEKLY_ROTATION", "GEMINI_QUOTA_EXCEEDED"]);
 const REPORT_EVENTS = new Set(["DAILY_SUMMARY"]);
 
 const PLACEHOLDER_NOTIFICATION_VALUES = new Set([
@@ -300,6 +301,19 @@ export function formatNotificationMessage(eventType, data = {}) {
           `• 전일 실현손익: ${Number(data.daily_profit_krw || 0) >= 0 ? "+" : ""}${Math.trunc(Number(data.daily_profit_krw || 0)).toLocaleString("ko-KR")}원 (체결 ${data.trade_count ?? 0}건)`,
           `• 현재 오픈 포지션: ${data.open_positions_count ?? 0}건`,
         ].join("\n"),
+      };
+    case "GEMINI_QUOTA_EXCEEDED":
+      return {
+        title: `⚠️ [Gemini API 호출 한도 초과]`,
+        text: [
+          `⚠️ [Gemini API 호출 한도 초과 (429 / Quota Exceeded)]`,
+          data.source ? `• 발생 위치: ${data.source}` : null,
+          data.trigger_type ? `• 실행 유형: ${data.trigger_type}` : null,
+          data.fallback_tier ? `• 폴백 조치: ${data.fallback_tier}` : null,
+          data.reason ? `• 상세: ${data.reason}` : null,
+        ]
+          .filter(Boolean)
+          .join("\n"),
       };
     default:
       return {

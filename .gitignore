@@ -16,6 +16,9 @@ frontend/dist/
 data/*.db
 data/*.db-shm
 data/*.db-wal
+install/data/*.db
+install/data/*.db-shm
+install/data/*.db-wal
 install/app/data/*.db
 install/app/data/*.db-shm
 install/app/data/*.db-wal
@@ -45,6 +48,12 @@ install/app/logs/.orchestrator.pid
 config/upbit_config.json
 data/.session_secret
 data/.vault_master_key
+install/.env
+install/.env.*
+!install/.env.example
+install/config/upbit_config.json
+install/data/.session_secret
+install/data/.vault_master_key
 install/app/.env
 install/app/.env.*
 !install/app/.env.example

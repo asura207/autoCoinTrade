@@ -47,7 +47,7 @@ jobs:
 
       - name: Secret leak guard (tracked repository files)
         run: |
-          if git ls-files | grep -E '(^\.env$|^install/app/\.env$|^config/upbit_config\.json$|^install/app/config/upbit_config\.json$|data/.*\.db$|data/\.session_secret$|data/\.vault_master_key$)'; then
+          if git ls-files | grep -E '(^\.env$|^install/\.env$|^install/app/\.env$|^config/upbit_config\.json$|^install/config/upbit_config\.json$|^install/app/config/upbit_config\.json$|data/.*\.db$|data/\.session_secret$|data/\.vault_master_key$)'; then
             echo "ERROR: Sensitive runtime file is tracked in git!"
             exit 1
           fi
@@ -72,11 +72,7 @@ jobs:
       - name: Run Node.js core & enhancement test suites
         run: |
           npm test
-          node tests/verify_upbit_ws_hub.mjs
-          node tests/verify_backtest_engine.mjs
-          node tests/verify_execution_quality_and_sizing.mjs
-          node tests/verify_notification_hub_and_journal.mjs
-          node tests/verify_crypto_vault.mjs
+          npm run test:enhancements
 
       - name: Run Python QA verification suite
         run: |

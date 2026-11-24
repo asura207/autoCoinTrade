@@ -106,13 +106,13 @@ stop_pid_graceful() {
 }
 
 if command -v pgrep >/dev/null 2>&1; then
-    for pattern in "${PROJECT_ROOT}/backend/node_server.mjs" "${PROJECT_ROOT}/frontend/server.mjs" "${PROJECT_ROOT}/main_orchestrator.py" "${PROJECT_ROOT}/llm_filter_worker.py"; do
+    for pattern in "${PROJECT_ROOT}/backend/node_server.mjs" "${PROJECT_ROOT}/backend/./node_server.mjs" "${PROJECT_ROOT}/frontend/server.mjs" "${PROJECT_ROOT}/frontend/./server.mjs" "${PROJECT_ROOT}/main_orchestrator.py" "${PROJECT_ROOT}/llm_filter_worker.py"; do
         for wp in $(pgrep -f "$pattern" 2>/dev/null || true); do
             stop_pid_graceful "$wp" "$pattern"
         done
     done
     # 상대 경로(node backend/node_server.mjs 등)로 기동된 잔여 프로세스도 /proc/<pid>/cwd 일치 시에만 안전 종료
-    for rel_pat in "backend/node_server.mjs" "frontend/server.mjs" "main_orchestrator.py" "llm_filter_worker.py"; do
+    for rel_pat in "node_server.mjs" "frontend/server.mjs" "frontend/./server.mjs" "main_orchestrator.py" "llm_filter_worker.py"; do
         for wp in $(pgrep -f "$rel_pat" 2>/dev/null || true); do
             if [ -n "$wp" ] && [ "$wp" != "$$" ] && [ -L "/proc/${wp}/cwd" ]; then
                 wp_cwd=$(readlink -f "/proc/${wp}/cwd" 2>/dev/null || true)

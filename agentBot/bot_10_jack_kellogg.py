@@ -226,9 +226,15 @@ def evaluate_jack_kellogg_strategy(
     잭 켈로그 순수 수식 매매 시그널 판별 (가상/실전 공용)
     """
     params = params or {}
-    rvol_breakout_th = float(params.get("rvol_breakout", 1.8 if is_live else 1.4))
+    raw_rvol_breakout = params.get("rvol_breakout_live" if is_live else "rvol_breakout_arena")
+    if raw_rvol_breakout is None:
+        raw_rvol_breakout = params.get("rvol_breakout", 1.4)
+    rvol_breakout_th = float(raw_rvol_breakout)
     rvol_dip_th = float(params.get("rvol_dip", 1.3))
-    dip_gap_th = -abs(float(params.get("vwap_gap", 2.8 if is_live else 2.0)))
+    raw_dip_gap = params.get("vwap_gap_live" if is_live else "vwap_gap_arena")
+    if raw_dip_gap is None:
+        raw_dip_gap = params.get("vwap_gap", 2.0)
+    dip_gap_th = -abs(float(raw_dip_gap))
     trailing_pct = float(params.get("trailing_stop_pct", 1.5))
 
     held = open_positions or []

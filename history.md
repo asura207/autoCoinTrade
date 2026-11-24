@@ -10,7 +10,8 @@
 
 | 버전 (Version) | 릴리즈 일시 | 커밋 해시 | 주요 수정 내용 요약 |
 | :--- | :--- | :--- | :--- |
-| **v0.0.32** | 2026-11-19 | - | Telegram/Discord 알림 자격증명 Git 유출 원천 차단 강화: `.env.example`(및 `/install/app/.env.example`)에 예제 플레이스홀더(`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `DISCORD_WEBHOOK_URL`) 추가, `notification_hub.mjs` 예제 플레이스홀더 자동 무시(미설정 처리) 방어 로직 및 검증 테스트 추가, `.gitignore`(`install/app/.env.*`)·GitHub Actions CI(`.github/workflows/ci.yml`)에 Telegram Bot Token 및 Discord Webhook 패턴 유출 차단 가드 보강 |
+| **v0.0.33** | 2026-11-24 | - | 전수 QA 재검증(6대 영역 38항목 · 14개 자동화 스위트 전수 통과), 핵심 결함 국소 수정 및 차세대 고도화 로드맵(`docs/ENHANCEMENT_PROMPTS.md`) 수립: ① `bots.py` Graceful Drain 레거시 DB(`global_cap_krw==0`) Zero-Sum 자금 이관 누락 버그 수정 및 1원 자투리 배분 보강(`qa_python_verification.py` 7/7 PASS), ② LLM 절단/미완성 제어 JSON 블록 복구 및 브리핑 마크다운 정제(`node_server.mjs`, `App.jsx`)·`bot_10` 라이브/아레나 파라미터 분리·`llm_filter_worker.py` BEAR 감성부호/역추세 0.5x 가드 반영, ③ `/install` Docker 통합 배포 패키지(PostgreSQL 16 + Backend + Frontend) 전환 및 `.gitignore`·CI 시크릿 가드(`install/.env`, `install/config/upbit_config.json`, `install/data/*`)·전체 테스트 스위트 CI 연동, ④ 루트 미추적 오타 파일(`--sqlite`) 제거 및 원금 구간별 주간 로테이션·90% 상한(`41dccb2`~`0d9613c`) 이력 통합 |
+| **v0.0.32** | 2026-11-19 | `ef3c75d` | Telegram/Discord 알림 자격증명 Git 유출 원천 차단 강화: `.env.example`(및 `/install/app/.env.example`)에 예제 플레이스홀더(`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `DISCORD_WEBHOOK_URL`) 추가, `notification_hub.mjs` 예제 플레이스홀더 자동 무시(미설정 처리) 방어 로직 및 검증 테스트 추가, `.gitignore`(`install/app/.env.*`)·GitHub Actions CI(`.github/workflows/ci.yml`)에 Telegram Bot Token 및 Discord Webhook 패턴 유출 차단 가드 보강 |
 | **v0.0.31** | 2026-11-19 | `09b55ad` | 초기 커밋(`720f8de`) 잔존 구버전 루트 스크립트 통폐합(`start.sh/.bat`, `stop.sh/.bat` 제거, `install_startup.bat`/`uninstall_startup.bat` → `scripts/` 이동), Windows↔Linux 실행/종료/오케스트레이터/터널 스크립트 100% 대칭화(`start_services.bat` 전면 현행화·`LIVE_EXECUTOR_OWNER=node` 기본 반영·프로젝트 CWD 기준 좀비 정리), `market_hub.py`(Python 독립 전용) vs `upbit_ws_hub.mjs`(Node 메인 WebSocket 허브) 역할 명시, 전체 마크다운 문서(`README.md`, `howtorun.md`, `initRule.md`, `SETUP_GUIDE.md`, `prompt.md`, `install/README.md`, `history.md`) 전수 동기화, `/install` 원클릭 배포 패키지 재동기화(시크릿/DB 완전 제외) 및 `0.0.X` 버전 체계 마감 |
 | **v0.0.30** | 2026-11-19 | `fcc1635` | 실전 업비트 계좌 연속 결제(중복 매수·중복 매도) 원천 차단을 위한 **5중 하드 가드레일(Hard Guardrail)** 탑재 및 7대 장애 스트레스 테스트(`tests/verify_duplicate_order_guard.mjs`) 구축: ① 단일 실전 실행 주체(`LIVE_EXECUTOR_OWNER=node`) 강제 + SQLite `live_executor_lease`(TTL 30초, `BEGIN IMMEDIATE`) 원자적 프로세스 리스 락, ② `live_order_intents` 2단계 커밋(`PENDING` 선점 + `virtual_krw` 원자적 선차감 + 업비트 `identifier` UUID 멱등성 + 타임아웃 `GET /v1/order?identifier=...` 정산 및 이중 환불 방지), ③ `(bot_id, market)` Async Mutex 직렬화, ④ 재진입 `900초` 쿨다운·봇 매수 간격 `60초`·시간/일일 매수 횟수 하드 캡, ⑤ 5분 내 차단 5회 또는 타임아웃 2회 시 실전 신규 매수 자동 비상 정지(청산 매도·가상 Arena는 정상 유지) + `GET /api/guardrail/status` · `POST /api/guardrail/reset-emergency` 및 UI 헤더 보호 배지/모달 추가 |
 | **v0.0.29** | 2026-11-19 | `2e82235` | 5대 기관급 퀀트 아키텍처 고도화 일괄 구현 및 자동화 검증 스위트 5종 추가: ① 업비트 WebSocket(`wss://api.upbit.com/websocket/v1`) 실시간 스트림 허브·REST 자동 폴백·틱 반응형 즉시 스마트 청산(`1,500ms` 디바운스) 및 사이드바 `WS 실시간`/`REST 폴백` 배지, ② Zero Look-Ahead Bias 과거 캔들 백테스팅·Walk-Forward(70/30) 검증 엔진(`historical_candles`, `backtest_runs`)·SVG 자산 곡선 및 원클릭 파라미터 반영 모달, ③ 호가창 불균형(OBI)·스프레드 가드·MTF(60m/240m) 역추세 차단·ATR 변동성 역가중 포지션 사이징(`5,250원` 하한 보장)·슬리피지(`slippage_bps`) 원장·통계 UI, ④ Telegram/Discord/WebPush 멀티채널 알림 허브(AES-256-GCM 암호화 저장·이벤트 토글) 및 인터랙티브 캔들스틱+VWAP/LRC/20MA+BUY/SELL 타점 마커 차트 모달, ⑤ Node.js↔Python 호환 AES-256-GCM API 키 암호화 볼트(`crypto_vault.mjs`)·멀티스테이지 `Dockerfile`·`docker-compose.yml`·GitHub Actions CI(`.github/workflows/ci.yml`) |
@@ -46,6 +47,20 @@
 ---
 
 ## 📝 상세 버전별 변경 내역 (Detailed Changelog)
+
+### [v0.0.33] - 2026-11-24
+#### 전수 QA 검증(6대 영역 38항목) · Python Graceful Drain Zero-Sum 결함 수정 · Docker `/install` 보안 가드 · 차세대 고도화 프롬프트(`docs/ENHANCEMENT_PROMPTS.md`) 수립
+- **Python Graceful Drain Zero-Sum 복원 결함 수정 (`bots.py`)**:
+  - `global_cap_krw == 0` 및 `target_capital_krw == 0`인 레거시/미동기화 DB에서 탈락 봇 매도 시 정산 원화가 선출 봇에 배분되지 않고 `surplus_reserve`로 유실되던 결함을 수정하고, `allocation_ratio` 비례 Zero-Sum 배분 및 `floor` 자투리(1~2원) 순차 배분 폴백을 복구하여 `tests/qa_python_verification.py` 7/7 전수 통과 달성.
+- **듀얼 AI 브리핑 정제 · `bot_10` 파라미터 분리 · 원금 구간별 주간 로테이션(90% 상한) 통합 검증 (`backend/node_server.mjs`, `frontend/src/App.jsx`, `llm_filter_worker.py`, `agentBot/bot_10_jack_kellogg.py`)**:
+  - 토큰 절단/미완성 제어 JSON 블록(`parsePartialRegimeJson`, `stripControlJsonFromBriefingText`, `sanitizeBriefingMarkdown`) 복구 및 UI 노출 차단, BEAR/충격장 감성 점수 부호 보정 및 전봇 `BLOCK` 시 역추세/그리드 0.5x 보정, `bot_10`의 `rvol_breakout_live/arena`·`vwap_gap_live/arena` 파라미터 동기화 검증.
+  - 원금 구간별 주간 선출 봇 수(1~3대)·균등 배분·단일 90% 상한 가드(`41dccb2`~`0d9613c`) 및 프로세스 오폭 방지 실행 경로(`start_services.sh`/`stop_services.sh`) 통합 검증 완료.
+- **Docker `/install` 패키지 보안 격리 & CI 강화 (`.gitignore`, `.github/workflows/ci.yml`, `package.json`, `scripts/build_install_package.sh`)**:
+  - 루트 미추적 0바이트 오타 파일(`--sqlite`) 제거.
+  - Docker 통합 배포(`/install`) 런타임 시크릿(`install/.env`, `install/config/upbit_config.json`, `install/data/*.db*`, `.session_secret`, `.vault_master_key`)을 `.gitignore` 및 GitHub Actions CI 시크릿 가드에 추가.
+  - `package.json` `test:enhancements` 및 CI 워크플로우에 `verify_duplicate_order_guard.mjs`, `verify_dual_ai_and_live_universe.mjs`, `verify_capital_tier_rotation_90cap.mjs` 전수 편입.
+- **전수 QA 명세서(`docs/QA_CHECKLIST.md`) & 차세대 고도화 프롬프트(`docs/ENHANCEMENT_PROMPTS.md`) 최신화**:
+  - 6대 영역 38개 QA 항목 및 14개 자동화 테스트 결과를 `v0.0.33` 기준으로 갱신하고, 차세대 P1~P3(레짐별 동적 ATR·상관관계 가드·Walk-Forward 자동 최적화 / 슬리피지 실시간 계측 대시보드·Watchdog 자동 복구 / 멀티채널 리치 리포트·무중단 백업 배포 자동화) 실행 프롬프트 작성.
 
 ### [v0.0.32] - 2026-11-19
 #### Telegram · Discord 알림 토큰/Chat ID Git 커밋 원천 제외 및 예제 템플릿·CI 시크릿 가드 보강

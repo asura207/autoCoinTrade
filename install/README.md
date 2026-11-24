@@ -1,179 +1,100 @@
-# 🚀 AutoCoinTrade 비개발자용 원클릭 독립 배포 패키지 가이드
+# 🐳 AutoCoinTrade Docker 통합 배포 패키지 (DB 포함)
 
-> **일반 사용자(비개발자)도 복잡한 환경 설정 없이 더블 클릭 한 번으로 설치하고 웹 브라우저에서 바로 운용할 수 있는 독립 실행 패키지입니다.**
+> **현재 개발/운영 환경(Node.js 22 + Python 3 + SQLite WAL + PostgreSQL 16)과 100% 동일한 Docker 이미지를 빌드하고, DB까지 한 번에 구동하는 독립 배포 패키지입니다.**
 
-본 패키지(`/install` 폴더)는 전체 소스코드의 Git 저장소 구조를 몰라도, 이 폴더 하나만 가져가면 **Windows와 Linux 두 OS에서 100% 동일하게 모든 기능이 원활히 구동**되도록 완벽히 독립 패키징되어 있습니다.
-
----
-
-## 📑 목차
-1. [시스템 주요 기능 소개](#1-시스템-주요-기능-소개)
-2. [사전 준비 사항 (비개발자 필수 가이드)](#2-사전-준비-사항-비개발자-필수-가이드)
-   - [업비트(Upbit) Open API 키 발급 및 IP 등록](#-업비트upbit-open-api-키-발급-및-ip-등록-방법)
-   - [Google Gemini AI API 키 무료 발급](#-google-gemini-ai-api-키-무료-발급-방법)
-   - [데이터베이스(DB) 선택 기준 (SQLite vs PostgreSQL)](#-데이터베이스db-선택-기준)
-3. [OS별 원클릭 실행 및 종료 방법](#3-os별-원클릭-실행-및-종료-방법)
-   - [Windows 환경](#windows-사용자-실행-가이드)
-   - [Linux 환경](#linux-사용자-실행-가이드)
-4. [Step-by-Step 초기 설정 마법사 안내](#4-step-by-step-초기-설정-마법사-안내)
-5. [네트워크 포트 및 방화벽 / 원격 접속 안내](#5-네트워크-포트-및-방화벽--원격-접속-안내)
-6. [자주 묻는 질문 및 문제 해결 (FAQ)](#6-자주-묻는-질문-및-문제-해결-faq)
+본 `/install` 폴더만 복사하면 Windows / Linux / macOS 어디서든 Docker 한 번으로 백엔드(8001), 보안 프론트엔드(9000), 내장 PostgreSQL 16 DB(5432), SQLite WAL, Python 퀀트 가상환경(`.venv`)이 모두 동일하게 구성됩니다.
 
 ---
 
-## 1. 시스템 주요 기능 소개
+## 1. 포함 구성 (Container Stack)
 
-- **🛡️ 5중 실전 중복 주문 차단 하드 가드레일 (Hard Guardrail)**:
-  단일 실전 실행 주체(`LIVE_EXECUTOR_OWNER=node`) 및 SQLite 리스 락, DB `PENDING` 선차감 + 업비트 `identifier` 멱등성·타임아웃 정산(2PC), `(bot_id, market)` Async Mutex, 재진입 쿨다운·시간/일일 매수 횟수 하드 캡, 이상 패턴 감지 시 자동 비상 정지(보유 포지션 청산 및 가상 Arena는 정상 유지)까지 5단계로 실전 연속 결제 사고를 원천 봉쇄합니다.
-- **⚡ 업비트 WebSocket 실시간 스트림 & 틱 반응형 청산 · 백테스팅 검증기**:
-  `wss://api.upbit.com/websocket/v1` 실시간 호가/체결 스트림으로 10초 폴링 대기 없이 손절/익절 조건을 즉시 집행하며(단절 시 REST 자동 폴백), 과거 캔들 기반 Zero Look-Ahead 백테스팅(Walk-Forward 70/30)과 호가창 OBI·스프레드·MTF·ATR 변동성 역가중 포지션 사이징을 내장했습니다.
-- **🏆 10대 퀀트 알고리즘 상시 가상 경쟁 (Arena)**:
-  변동성 돌파, 추세 추종, 듀얼 모멘텀, RSI 역추세, 볼린저 밴드, MACD, 거래량 급증, 스캘핑, AI 앙상블, **Jack Kellogg 프라이스 액션(VWAP · 선형 회귀 채널, `bot_10`)** 등 10개 봇이 24시간 실시간 시세로 상시 모의투자 경쟁을 벌이며 수익률/승률 랭킹을 집계합니다.
-- **🔄 주간 전략군별 TOP 1 자동 로테이션 & Graceful Drain**:
-  매주 월요일 00:05 KST(또는 수동 즉시 로테이션) 3대 전략군(추세·스윙 / 변동성·돌파 / 역추세·그리드)별 1위 봇을 실전 봇(1~3개)으로 자동 선출하고 동적 자금을 배분합니다. 교체되는 기존 봇이 미매도 오픈 포지션을 보유 중이면 강제 청산 없이 **청산 대기(Graceful Drain)** 상태로 전환하여 익절/손절 매도 완료 후 정산금을 신규 봇에 자동 이관합니다.
-- **🤖 로컬 Ollama (`qwen3-news`) + Gemini Dual AI 3중 무중단 Fallback**:
-  30분 단기 뉴스·시황 분석은 **로컬 Ollama(`qwen3-news`) → Gemini Flash → BTC 20MA 기계적 안전 모드** 3중 Fallback으로, 1시간 심층 퀀트 분석은 Gemini Pro로 교차 검증하여 10대 봇(`bot_01`~`bot_10`) 진입 허용/차단을 개별 제어합니다(`BLOCK` 시에도 보유 포지션 청산 루프는 정상 작동).
-- **🔔 멀티채널 알림 & AES-256-GCM 암호화 볼트 · 내장 SQLite WAL**:
-  Telegram · Discord · WebPush 실시간 체결/가드레일 알림, 체결 타점 캔들스틱 차트, API 키·웹훅 AES-256-GCM(`enc:v1:...`, `0600`) 암호화 저장, 그리고 별도 DB 서버 없이 즉시 실행되는 내장 SQLite WAL(`data/auto_coin_trade.db`) 및 외부 PostgreSQL 16 자동 동기화를 모두 지원합니다.
+| 서비스 | 이미지 | 포트 | 역할 |
+| :--- | :--- | :---: | :--- |
+| **`postgres`** | `postgres:16-alpine` | `5432` | **기본 포함 PostgreSQL 16 DB** (볼륨 `autocoin_pgdata` 영구 저장) |
+| **`autocoin-backend`** | `autocoin-trade:latest` (로컬 빌드) | `8001` | Node.js 22 백엔드 엔진 · 10대 퀀트 봇 · 5중 실전 가드레일 · WebSocket · SQLite WAL + PG 하이브리드 동기화 |
+| **`autocoin-frontend`** | `autocoin-trade:latest` (동일 이미지) | `9000` | Vite 프로덕션 번들 정적 서빙 + `/api/*` 리버스 프록시 보안 웹 서버 |
+| **`llm-filter-worker`** *(선택)* | `autocoin-trade:latest` (동일 이미지) | - | Python 3(`.venv`) LLM 시황/뉴스 필터 워커 (`--profile workers`로 활성화) |
 
 ---
 
-## 2. 사전 준비 사항 (비개발자 필수 가이드)
+## 2. 사전 준비
 
-### 🔑 업비트(Upbit) Open API 키 발급 및 IP 등록 방법
+- **Windows / macOS**: [Docker Desktop](https://www.docker.com/products/docker-desktop/) 설치 및 실행
+- **Linux**: Docker Engine + Docker Compose 플러그인 (`docker compose`) 설치
 
-실거래를 연동하거나 본인의 실제 자산 현황을 조회하기 위해 업비트 API 키가 필요합니다. *(안전 가상거래 모의투자만 먼저 체험하실 분은 키 입력 없이 바로 시작할 수 있습니다!)*
-
-1. **업비트 웹사이트 접속 및 로그인**: PC 브라우저로 [업비트(upbit.com)](https://upbit.com)에 로그인합니다.
-2. **Open API 관리 메뉴 진입**: 우측 상단 **[마이]** ➔ **[Open API 관리]** 메뉴를 클릭합니다.
-3. **허용할 권한 선택 (매우 중요)**:
-   - ✅ **자산조회** (체크)
-   - ✅ **주문조회** (체크)
-   - ✅ **주문하기** (체크)
-   - ❌ **출금조회 / 출금하기 / 입금조회 / 입금하기** ➔ **절대 체크하지 마십시오!** (본 프로그램은 입출금 권한을 일체 요구하지 않으며, 보안을 위해 절대 비활성화 상태를 유지해야 합니다.)
-4. **특정 IP 주소 등록 (필수 보안)**:
-   - 네이버나 다음 검색창에 **`내 IP`**를 검색하여 표시되는 본인의 공인 IP(예: `123.456.78.90`)를 복사하여 업비트의 **[특정 IP 주소 등록]** 입력란에 등록합니다.
-5. **API Key 발급 및 복사**:
-   - 카카오페이/2채널 인증을 완료하면 **Access Key**와 **Secret Key**가 발급됩니다.
-   - **주의**: Secret Key는 발급 시점 단 한 번만 화면에 표시되므로 메모장 등에 즉시 안전하게 복사해 두십시오.
+*(별도의 Node.js, Python, PostgreSQL 설치가 전혀 필요 없습니다.)*
 
 ---
 
-### 🤖 Google Gemini AI API 키 무료 발급 방법
+## 3. 원클릭 빌드 및 실행
 
-30분/1시간 단위의 실시간 AI 시황 브리핑과 암호화폐 뉴스 감성 분석을 무료로 이용하기 위해 구글 Gemini API 키를 발급받습니다.
+### Linux / macOS
+```bash
+cd install
+chmod +x *.sh
+./AutoCoinTrade_Linux_Start.sh
+```
+- 종료 (DB 데이터 보존):
+  ```bash
+  ./AutoCoinTrade_Linux_Stop.sh
+  ```
+- 완전 초기화 (DB 볼륨까지 삭제):
+  ```bash
+  ./AutoCoinTrade_Linux_Stop.sh --clean
+  ```
 
-1. **Google AI Studio 접속**: [https://aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey) 에 접속하여 본인의 구글 계정으로 로그인합니다.
-2. **API 키 생성**: 파란색 **`[Create API key]`** 버튼을 클릭하고 프로젝트를 선택합니다.
-3. **키 복사**: 발급된 영문/숫자 혼합 문자열(예: `AIzaSy...`)을 복사해 둡니다.
-   - *Google AI Studio는 매일 넉넉한 분량의 무료 API 호출 한도를 제공하므로 신용카드 등록 없이 무료로 사용 가능합니다.*
+### Windows
+- **시작**: `AutoCoinTrade_Windows_Start.bat` 더블 클릭
+- **종료**: `AutoCoinTrade_Windows_Stop.bat` 더블 클릭
 
----
+### 수동 Docker Compose 명령
+```bash
+# 기본 실행 (App 이미지 빌드 + PostgreSQL 16 + Backend + Frontend)
+docker compose up -d --build
 
-### 🗄️ 데이터베이스(DB) 선택 기준
+# Python LLM 필터 워커까지 함께 실행
+docker compose --profile workers up -d --build
 
-초기 설정 마법사에서 2가지 DB 방식 중 하나를 선택할 수 있습니다:
-
-| 구분 | 📂 DB 없음 (내장 SQLite 사용) | 🗄️ DB 서버 있음 (PostgreSQL 연동) |
-| :--- | :--- | :--- |
-| **추천 대상** | **일반 사용자, 비개발자, 단일 PC 운용자 (강력 권장)** | 개발자, 별도 DB 서버 보유자, 엔터프라이즈 환경 |
-| **별도 DB 설치** | **전혀 불필요 (무설치)** | 필요 (PostgreSQL 14+ 서버 구동 필요) |
-| **동작 원리** | 프로그램 내부 파일(`data/auto_coin_trade.db`) 자동 생성 (WAL 고속 모드) | 입력받은 DB 서버 IP/계정으로 접속 후 테이블 자동 생성 및 실시간 동기화 |
-| **설정 난이도** | 클릭 한 번으로 끝 (**초간편**) | Host, Port, 계정, 비밀번호 입력 필요 |
-
----
-
-## 3. OS별 원클릭 실행 및 종료 방법
-
-### Windows 사용자 실행 가이드
-
-1. **필수 사전 프로그램**:
-   - 시스템에 **Node.js (v22.5.0 이상, `node:sqlite` 내장 지원)** 가 설치되어 있어야 합니다.
-   - 미설치 상태라면 [Node.js 공식 홈페이지(nodejs.org)](https://nodejs.org/)에서 **v22 LTS 이상 버전**을 다운로드받아 기본 옵션으로 설치하십시오. (Python 3 연동 오케스트레이터 사용 시 `Python 3.10+` 권장)
-2. **원클릭 실행**:
-   - `AutoCoinTrade_Windows_Start.bat` 파일을 마우스로 **더블 클릭**합니다.
-   - 프로그램이 환경을 점검하고, 필수 패키지를 자동 설치한 뒤 백엔드와 웹 UI를 백그라운드에서 구동합니다.
-   - 약 3초 후 기본 웹 브라우저가 자동으로 실행되면서 대시보드 화면이 열립니다.
-3. **원클릭 종료**:
-   - 프로그램을 종료하려면 `AutoCoinTrade_Windows_Stop.bat` 파일을 더블 클릭하십시오.
-
----
-
-### Linux 사용자 실행 가이드
-
-1. **터미널 실행 및 권한 부여**:
-   ```bash
-   cd install
-   chmod +x *.sh
-   ```
-2. **원클릭 실행**:
-   ```bash
-   ./AutoCoinTrade_Linux_Start.sh
-   ```
-   - Node.js 및 의존 패키지를 자동으로 점검하고 서버를 백그라운드로 안전하게 구동합니다.
-   - 브라우저가 자동 실행되며 접속 주소가 터미널에 표시됩니다.
-3. **원클릭 종료**:
-   ```bash
-   ./AutoCoinTrade_Linux_Stop.sh
-   ```
-
----
-
-## 4. Step-by-Step 초기 설정 마법사 안내
-
-프로그램을 최초로 실행하면 웹 화면에 **다크 테마 기반의 4단계 초기 설정 마법사**가 자동으로 나타납니다:
-
-```text
-[Step 1. 기본 & 보안] ➔ [Step 2. 데이터베이스] ➔ [Step 3. 거래소 & AI 키] ➔ [Step 4. 자동 설치 & 시작]
+# 상태 및 로그 확인
+docker compose ps
+docker compose logs -f
 ```
 
-- **Step 1 (기본 보안 및 시작 모드)**:
-  - 웹 대시보드 입장 코드 (기본값: `stock`, 한글 자판 오타 `ㄴ새차` 자동 변환 지원, `⚙️ 설정` 화면 또는 `.env`에서 사용자 지정 코드로 변경 가능)
-  - 시작 거래 모드: `🟢 안전 가상거래(모의투자)` 선택 권장
-  - 운용 시드 금액 설정 (기본: `10,000,000`원)
-- **Step 2 (데이터베이스 환경)**:
-  - **`📂 DB 없음 (SQLite 자동 사용 — 일반 사용자 권장)`** 카드를 클릭합니다. (별도 입력 없이 다음 단계로 진행)
-- **Step 3 (거래소 및 AI API 키)**:
-  - 업비트 Access/Secret Key 입력 (가상거래만 먼저 할 경우 `[가상거래만 먼저 사용할 경우 나중에 입력하기]` 체크 시 건너뛰기 가능)
-  - Google Gemini API Key 입력 (Google AI Studio에서 발급받은 키 입력)
-  - `[🔑 API 키 연동 테스트]` 버튼을 눌러 정상 여부를 사전 확인합니다.
-- **Step 4 (요약 확인 및 원클릭 설치)**:
-  - 선택한 내역을 최종 확인하고 **`[🚀 설정 저장 및 프로그램 자동 설치·구동 시작]`** 버튼을 클릭합니다.
-  - 5단계 체크리스트(`✔ 설정 파일 생성` ➔ `✔ DB 테이블 자동 생성` ➔ `✔ 10대 봇 엔진 초기화` ➔ `✔ 워커 가동` ➔ `✔ 완료`)가 애니메이션으로 진행된 후 메인 대시보드로 자동 전환됩니다!
+---
 
-> 💡 **참고**: 언제든 상단 메뉴의 `⚙️ 설정` ➔ `[🛠️ 초기 설정 마법사 다시 열기]` 버튼을 누르면 마법사 창을 다시 열어 설정을 수정할 수 있습니다.
+## 4. Docker 이미지 단독 빌드 및 오프라인 내보내기 (`.tar`)
+
+폐쇄망/별도 서버로 Docker 이미지(앱 + PostgreSQL 16 DB)를 그대로 옮기고 싶을 때:
+
+```bash
+# 앱 이미지만 빌드 (autocoin-trade:latest)
+./AutoCoinTrade_Linux_Build_Image.sh
+
+# 앱 이미지 + postgres:16-alpine 이미지를 하나의 tar 파일로 저장
+./AutoCoinTrade_Linux_Build_Image.sh --save
+```
+대상 서버에서 로드:
+```bash
+docker load -i autocoin-docker-images.tar
+docker compose up -d --no-build
+```
 
 ---
 
-## 5. 네트워크 포트 및 방화벽 / 원격 접속 안내
+## 5. 접속 및 초기 설정
 
-- **로컬 접속 주소**:
-  - 기본 대시보드: `http://localhost:9000`
-  - 통합 백엔드 API: `http://localhost:8001` (백엔드 자체에서도 웹 화면 접근 지원)
-- **외부 스마트폰/원격 PC 접속 안내**:
-  - 동일 공유기(와이파이) 내 스마트폰: 본인 PC의 사설 IP(예: `http://192.168.0.15:9000`)로 접속 가능.
-  - 외부 인터넷 접속: 공유기 설정에서 9000번 포트를 포트포워딩하거나, 프로젝트 루트에 포함된 Cloudflare 터널링(`./start_tunnel.sh`) 또는 WireGuard VPN(`scripts/setup_wireguard.sh`)을 활용하세요.
+- **웹 대시보드**: `http://localhost:9000`
+- **백엔드 API**: `http://localhost:8001`
+- **기본 입장 코드**: `stock` (`.env`의 `GATE_CODE` 또는 웹 대시보드 `⚙️ 설정`에서 변경 가능)
+- **PostgreSQL 16 접속**: `localhost:5432` / DB: `coin_trader` / User: `coin_trader` (비밀번호는 `.env`의 `PGPASSWORD`)
 
----
-
-## 6. 자주 묻는 질문 및 문제 해결 (FAQ)
-
-### Q1. "Node.js가 설치되어 있지 않습니다" 창이 뜹니다.
-- **해결**: [nodejs.org](https://nodejs.org/)에 접속하여 **LTS(안정화) 버전**을 다운로드 받아 기본 설정 그대로 설치한 후 실행기를 다시 켜주세요.
-
-### Q2. 업비트 API 연동 테스트 시 "인증 실패" 또는 "401 에러"가 납니다.
-- **원인 1**: 업비트에 등록한 IP와 현재 PC의 공인 IP가 일치하지 않는 경우입니다. 네이버에 "내 IP"를 검색하여 확인된 IP를 업비트 Open API 관리의 [특정 IP 등록]에 추가해주세요.
-- **원인 2**: Access Key나 Secret Key의 앞뒤에 공백(띄어쓰기)이 들어갔거나 오타가 있는 경우입니다. 다시 복사하여 붙여넣으세요.
-- **원인 3**: 자산조회, 주문조회, 주문하기 권한이 체크되어 있는지 확인하세요.
-
-### Q3. 포트 충돌(Port already in use) 메시지가 발생합니다.
-- Windows의 경우 `AutoCoinTrade_Windows_Stop.bat`, Linux의 경우 `./AutoCoinTrade_Linux_Stop.sh`를 실행하여 기존 잔류 프로세스를 정리한 뒤 다시 시작하십시오.
-
-### Q4. 가상거래(모의투자) 모드에서는 실제 내 돈이 나가나요?
-- **절대로 나가지 않습니다.** 가상거래 모드는 업비트의 실시간 호가/체결 데이터와 지표만을 조회하여 내부 가상 계좌에서 시뮬레이션 매수/매도를 수행하므로 원화가 단 1원도 소모되지 않습니다.
+> 💡 최초 실행 시 `.env.example`이 `.env`로 자동 복사됩니다. 실전 거래 API 키, Gemini API 키, DB 비밀번호 변경이 필요하면 `.env`를 수정한 뒤 `docker compose up -d`로 재적용하거나 웹 대시보드의 초기 설정 마법사를 이용하세요.
 
 ---
 
-## ⚖️ 법적 면책 조항 (Legal Disclaimer)
+## 6. 데이터 영구 보존 경로
 
-> **[필독]** 본 프로그램은 오픈소스 소프트웨어 및 알고리즘 연구 목적의 도구일 뿐, 수익을 보장하거나 특정 종목의 매수를 권유하지 않습니다. 모든 실전 투자의 책임은 사용자 본인에게 있습니다.
+- `./data`: SQLite WAL DB(`auto_coin_trade.db`), 세션/암호화 볼트 키
+- `./config`: `upbit_config.json` (API 키 AES-256-GCM 암호화 저장)
+- `./logs`: 일자별 로테이션 로그 (`backend.log`, `frontend.log`)
+- Docker Volume `autocoin_pgdata`: PostgreSQL 16 데이터베이스 영구 스토리지

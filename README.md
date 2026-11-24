@@ -1,6 +1,6 @@
 # Upbit AutoCoinTrade (업비트 다중 전략 자동매매 & 실시간 AI 퀀트 시스템)
 
-[![Version](https://img.shields.io/badge/version-v0.0.32-green.svg)](history.md)
+[![Version](https://img.shields.io/badge/version-v0.0.33-green.svg)](history.md)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 > 업비트(Upbit) Open API를 기반으로 선택형(1~3개) 퀀트 실전 봇을 동시에 운용하고, 10대 알고리즘 상시 가상 경쟁(Always-On Arena)과 실시간 뉴스 인텔리전스, 그리고 듀얼 AI 스트리밍 시황 분석(30분 로컬 Ollama `qwen3-news` 1순위 ➔ Gemini Flash 백업 ➔ BTC 20MA 기계적 안전 모드 / 1시간 Gemini Pro 심층 교차 검증)을 결합한 통합 가상자산 퀀트 트레이딩 플랫폼입니다.
