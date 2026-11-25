@@ -1,3 +1,9 @@
+# [Antigravity-Doc] ============================================================
+# [Antigravity-Doc] 파일 역할: Python 10대 트레이딩 봇 및 듀얼 AI 필터 워커의 생명주기를 총괄하는 멀티프로세싱 슈퍼바이저
+# [Antigravity-Doc] 아키텍처 위치: Python 독립 실행 모드의 최상위 진입점 (DB 초기화 -> 시세 허브 웜업 -> 워커 스폰 -> 3초 헬스체크/자동 재기동 -> Graceful Shutdown)
+# [Antigravity-Doc] 주요 의존성: bots.py(봇 러너 및 가드레일), llm_filter_worker.py(AI 필터 워커), init_db.py(DB 초기화/조회), market_hub.py(티커 웜업)
+# [Antigravity-Doc] 수정 시 주의사항: Node.js 백엔드(LIVE_EXECUTOR_OWNER=node)와 동시 실행 시 중복 주문 방지를 위한 가드레일 검사 및 PID 파일/리스 락 정리 순서를 깨뜨리지 말 것
+# [Antigravity-Doc] ============================================================
 """
 main_orchestrator.py - 멀티프로세싱 기반 슈퍼바이저 오케스트레이터
 - BOT_CONFIGS 레지스트리에 10대 퀀트 봇(bot_01 ~ bot_10, bot_10 잭 켈로그 포함) 및 듀얼 AI 필터 워커(bot_llm_filter) 등록
@@ -44,6 +50,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("supervisor")
 
+# [Antigravity-Doc] BOT_CONFIGS: 봇 ID(표준 bot_01~bot_10, AI 필터 bot_llm_filter, 레거시 별칭)와 실행 함수 매핑 레지스트리
 # 10대 알고리즘 및 AI 필터 워커 프로세스 레지스트리
 BOT_CONFIGS = {
     "bot_01": run_bot_vb,
@@ -66,6 +73,8 @@ BOT_CONFIGS = {
 }
 
 
+# [Antigravity-Doc] 클래스 역할: multiprocessing.Event와 동일한 인터페이스(is_set, set, wait)를 Pipe 기반으로 구현한 프로세스 간 종료 신호 객체
+# [Antigravity-Doc] 설계 의도: Windows 비관리자 권한 등에서 SemLock 생성 실패(WinError 5)를 회피하면서도 자식 워커에 안전하게 종료 신호 전파
 class UniversalStopEvent:
     """
     Windows SemLock(WinError 5) 권한 제약 및 표준 환경 모두를 지원하는 범용 프로세스 종료 제어 이벤트
@@ -73,11 +82,13 @@ class UniversalStopEvent:
     - SemLock 접근 거부 환경(예: LibreOffice Python / 비관리자 권한)에서는 Pipe 기반으로 자동 폴백
     """
 
+    # [Antigravity-Doc] 부모 송신 파이프(parent_pipe) 또는 자식 수신 파이프(child_pipe) 중 하나를 바인딩하여 초기화
     def __init__(self, parent_pipe=None, child_pipe=None):
         self._parent = parent_pipe
         self._child = child_pipe
         self._flag = False
 
+    # [Antigravity-Doc] 종료 신호 수신 여부를 논블로킹으로 확인 (내부 플래그 또는 child_pipe.poll() 검사)
     def is_set(self) -> bool:
         if self._flag:
             return True
@@ -90,6 +101,7 @@ class UniversalStopEvent:
                 pass
         return False
 
+    # [Antigravity-Doc] 종료 플래그를 True로 설정하고 부모 파이프로 1바이트 신호 전송
     def set(self) -> None:
         self._flag = True
         if self._parent is not None:
@@ -98,6 +110,7 @@ class UniversalStopEvent:
             except Exception:
                 pass
 
+    # [Antigravity-Doc] 지정 timeout(초) 동안 최대 0.2초 간격으로 종료 신호를 폴링 대기 (신호 수신 시 즉시 True 반환)
     def wait(self, timeout=None) -> bool:
         if self.is_set():
             return True
@@ -111,6 +124,7 @@ class UniversalStopEvent:
         return self.is_set()
 
 
+# [Antigravity-Doc] 클래스 역할: 슈퍼바이저가 모든 자식 워커 프로세스의 UniversalStopEvent를 일괄 생성·보관하고 한 번에 종료 신호를 브로드캐스트하는 컨트롤러
 class SupervisorStopController:
     """슈퍼바이저가 각 워커들에게 동시에 종료 시그널을 전달하는 통합 컨트롤러"""
 
@@ -118,6 +132,7 @@ class SupervisorStopController:
         self._parent_events = []
         self._is_stopped = False
 
+    # [Antigravity-Doc] 워커 1개당 Pipe 쌍을 생성해 송신측은 컨트롤러에 보관하고, 수신측 UniversalStopEvent를 워커용으로 반환
     def create_child_event(self) -> UniversalStopEvent:
         parent_conn, child_conn = multiprocessing.Pipe()
         parent_evt = UniversalStopEvent(parent_pipe=parent_conn)
@@ -125,14 +140,17 @@ class SupervisorStopController:
         self._parent_events.append(parent_evt)
         return child_evt
 
+    # [Antigravity-Doc] 슈퍼바이저 전체 종료 플래그 반환
     def is_set(self) -> bool:
         return self._is_stopped
 
+    # [Antigravity-Doc] 전체 종료 플래그 설정 후 등록된 모든 자식 워커 파이프에 종료 신호 일괄 발송
     def set(self) -> None:
         self._is_stopped = True
         for evt in self._parent_events:
             evt.set()
 
+    # [Antigravity-Doc] 슈퍼바이저 메인 루프가 헬스체크 주기(예: 3초) 동안 종료 신호를 감시하며 대기
     def wait(self, timeout=None) -> bool:
         if self._is_stopped:
             return True
@@ -146,6 +164,8 @@ class SupervisorStopController:
         return self._is_stopped
 
 
+# [Antigravity-Doc] 역할: 개별 봇/필터 워커를 비데몬(daemon=False) 독립 OS 프로세스로 생성·기동
+# [Antigravity-Doc] 입력: bot_id(str), target_func(Callable), controller(SupervisorStopController) | 반환: 시작된 multiprocessing.Process
 def spawn_worker_process(
     bot_id: str,
     target_func,
@@ -166,6 +186,7 @@ def spawn_worker_process(
     return proc
 
 
+# [Antigravity-Doc] 역할: 멀티프로세싱 시작 방식을 'spawn'으로 통일하고, Windows 특수 환경에서 파이썬 실행 파일 경로를 보정
 def configure_multiprocessing_environment():
     """Windows 환경 멀티프로세싱 호환성 및 실행 파일 경로 자동 보정"""
     multiprocessing.freeze_support()
@@ -191,6 +212,7 @@ def configure_multiprocessing_environment():
                     pass
 
 
+# [Antigravity-Doc] 역할: 오케스트레이터 중복 기동 방지용 PID 파일(logs/.orchestrator.pid) 경로 반환 및 디렉터리 자동 생성
 def _get_orchestrator_pid_path() -> str:
     base_dir = os.path.dirname(os.path.abspath(__file__))
     logs_dir = os.path.join(base_dir, "logs")
@@ -198,6 +220,7 @@ def _get_orchestrator_pid_path() -> str:
     return os.path.join(logs_dir, ".orchestrator.pid")
 
 
+# [Antigravity-Doc] 역할: os.kill(pid, 0) 시그널 체크로 지정 PID 프로세스가 현재 살아있는지 판별 (자기 자신 제외)
 def _is_pid_alive(pid: int) -> bool:
     if pid <= 0 or pid == os.getpid():
         return False
@@ -210,11 +233,13 @@ def _is_pid_alive(pid: int) -> bool:
         return False
 
 
+# [Antigravity-Doc] 역할: 슈퍼바이저 메인 진입점 — 중복 기동 검사 -> DB/시세 초기화 -> 실전 권한/리스 확인 -> 워커 스폰 -> 3초 주기 헬스체크/자동 재기동 -> Graceful Shutdown
 def main():
     logger.info("=========================================================")
     logger.info("  Upbit Multi-Processing Auto Trading & LLM Filter System")
     logger.info("=========================================================")
 
+    # [Antigravity-Doc] 1단계: 멀티프로세싱 spawn 설정 및 PID 파일 검사로 동일 호스트 내 오케스트레이터 이중 실행 차단
     # 1. 멀티프로세싱 환경 설정 및 중복 오케스트레이터 방지
     configure_multiprocessing_environment()
 
@@ -237,10 +262,12 @@ def main():
     except Exception as pid_err:
         logger.warning("Could not write orchestrator PID file: %s", pid_err)
 
+    # [Antigravity-Doc] 2단계: DB 스키마·마이그레이션·기본 시드 초기화 (SQLite WAL 또는 PostgreSQL)
     # 2. SQLite 데이터베이스 및 스키마, 기본 시드 초기화
     logger.info("[Step 1/4] Initializing SQLite database schema & ledger...")
     init_database()
 
+    # [Antigravity-Doc] 3단계: 워커 기동 전 KRW 마켓 티커 목록을 사전 캐싱하여 초기 API 버스트 완화
     # 3. 중앙 시세 허브 캐시 웜업
     logger.info("[Step 2/4] Initializing Market Data Hub cache...")
     try:
@@ -249,6 +276,7 @@ def main():
     except Exception as hub_err:
         logger.warning("Market Data Hub initial ticker fetch error: %s", hub_err)
 
+    # [Antigravity-Doc] 4단계: 단일 실전 실행 주체(LIVE_EXECUTOR_OWNER) 검증, Python 실전 리스 락 선점, Node.js 백엔드 공존(Coordinated Mode) 감지
     # Node.js 백엔드 구동 감지 및 단일 실전 실행 주체(LIVE_EXECUTOR_OWNER) 검증
     live_owner = get_live_executor_owner()
     logger.info("[Guardrail] LIVE_EXECUTOR_OWNER=%s (DRY_RUN=%s)", live_owner, is_dry_run())
@@ -271,6 +299,7 @@ def main():
             backend_port,
         )
 
+    # [Antigravity-Doc] 5단계: SIGINT/SIGTERM 수신 시 모든 자식 워커에 종료 신호를 전파하도록 시그널 핸들러 등록
     # 4. 프로세스 간 종료 시그널 제어를 위한 컨트롤러
     stop_controller = SupervisorStopController()
 
@@ -282,6 +311,7 @@ def main():
     signal.signal(signal.SIGINT, handle_shutdown_signal)
     signal.signal(signal.SIGTERM, handle_shutdown_signal)
 
+    # [Antigravity-Doc] 6단계: 실전 선택 봇(is_selected_for_live=1)과 Graceful Drain 중인 OPEN 포지션 보유 봇의 합집합 조회 + AI 필터 워커 항상 포함
     # 5. 실행할 워커 목록 결정 (활성 실전 봇, Graceful Drain 보유 포지션 봇 및 듀얼 AI 필터 워커)
     logger.info("[Step 3/4] Determining active trading and filter workers...")
     active_bot_ids = []
@@ -321,6 +351,7 @@ def main():
     logger.info("Active Workers: %s", list(workers.keys()))
     logger.info("Press Ctrl+C to terminate all processes gracefully.\n")
 
+    # [Antigravity-Doc] 7단계: 3초 주기 헬스체크 루프 — 비정상 종료된 워커 감지 시 동일 bot_id로 자동 재기동(Auto-Restart)
     # 5. 슈퍼바이저 헬스체크 및 자동 재기동 루프
     try:
         while not stop_controller.is_set():
@@ -350,6 +381,7 @@ def main():
         logger.info("Main supervisor loop interrupted.")
         stop_controller.set()
     finally:
+        # [Antigravity-Doc] 8단계: Graceful Shutdown — 모든 워커에 종료 신호 전달 후 최대 4초 join 대기, 미종료 시 강제 terminate, 리스 락 및 PID 파일 안전 정리
         # 6. Graceful Shutdown 처리 및 PID 파일 정리
         logger.info("Graceful shutdown in progress. Stopping all worker processes...")
         stop_controller.set()

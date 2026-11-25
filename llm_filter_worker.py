@@ -1,3 +1,12 @@
+# [Antigravity-Doc] ============================================================
+# [Antigravity-Doc] 파일 역할: 듀얼 AI(30분 단기 방패 Flash/로컬 Ollama qwen3-news + 1시간 거시 전략가 Gemini Pro) 시장 체제·감성 분석 및 10대 봇 게이트웨이 갱신 워커
+# [Antigravity-Doc] 아키텍처 위치: main_orchestrator.py가 스폰하는 'bot_llm_filter' 상주 워커 프로세스 (market_regime_filter id=1 및 ai_*_briefings 테이블 갱신)
+# [Antigravity-Doc] 주요 의존성: init_db.py(DB 조회/갱신), market_hub.py(BTC 캔들 캐시), requests/urllib(Ollama·Gemini·OpenAI·RSS·공포탐욕지수), cryptography 또는 Node crypto_vault.mjs(API 키 복호화)
+# [Antigravity-Doc] 수정 시 주의사항:
+# [Antigravity-Doc]   1) Node.js 백엔드 기동 중에는 중복 LLM 호출 방지를 위해 PYTHON_LLM_COEXIST=true가 아니면 자동 대기함
+# [Antigravity-Doc]   2) 'BLOCK' 판정은 신규 매수 진입만 보류하며 기존 보유 포지션을 강제 청산하지 않는 것이 시스템 불변 원칙임
+# [Antigravity-Doc]   3) FLASH_30M은 [1순위 로컬 Ollama -> 2순위 Gemini Flash/OpenAI -> 3순위 90분 캐시 또는 BTC 20MA/4h 60MA 룰베이스] 3중 폴백 체인을 유지해야 함
+# [Antigravity-Doc] ============================================================
 """
 llm_filter_worker.py - Dual AI Engine (30m Gemini Flash & 1h Gemini Pro) Market Regime & Sentiment Worker
 - 30분 단위 Gemini Flash 빠른 분석: 단기 뉴스(최근 1시간), 호가/차트 변동성, 단기 지표 기반 돌발 악재 신속 감지
@@ -36,6 +45,7 @@ from init_db import (
 )
 from market_hub import get_cached_ohlcv
 
+# [Antigravity-Doc] 런타임 경로, KST 타임존 및 로컬 맥북 Ollama(qwen3-news) 기본 접속 상수
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = Path(os.getenv("AUTOCOIN_ENV_PATH") or str(BASE_DIR / ".env"))
 load_dotenv(dotenv_path=ENV_PATH)
@@ -48,10 +58,12 @@ DEFAULT_OLLAMA_NEWS_MODEL = "qwen3-news"
 DEFAULT_OLLAMA_TIMEOUT_MS = 120000
 
 
+# [Antigravity-Doc] 역할: 현재 KST 시각 문자열('YYYY-MM-DD HH:MM:SS') 반환
 def _now_kst_str() -> str:
     return datetime.now(KST_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
+# [Antigravity-Doc] 역할: 환경변수/DB/JSON의 다양한 불리언 표현('true','1','yes','on' 등)을 안전하게 bool로 파싱
 def _parse_bool_flag(val: Any, default: bool = True) -> bool:
     if val is None or val == "":
         return default
@@ -65,6 +77,7 @@ def _parse_bool_flag(val: Any, default: bool = True) -> bool:
     return default
 
 
+# [Antigravity-Doc] 역할: config/upbit_config.json(없으면 example 설정)을 읽어 런타임 설정 딕셔너리 반환
 def _load_runtime_config() -> Dict[str, Any]:
     target = CONFIG_PATH if CONFIG_PATH.exists() else EXAMPLE_CONFIG_PATH
     try:
@@ -77,6 +90,7 @@ def _load_runtime_config() -> Dict[str, Any]:
     return {}
 
 
+# [Antigravity-Doc] 역할: DB system_settings 테이블에서 지정 key의 설정값을 조회 (오류 시 default 반환)
 def _get_system_setting(key: str, default: str = "", db_path: Optional[str] = None) -> str:
     conn = None
     try:
@@ -92,6 +106,7 @@ def _get_system_setting(key: str, default: str = "", db_path: Optional[str] = No
     return default
 
 
+# [Antigravity-Doc] 역할: AES-256-GCM 암호화 볼트 문자열(enc:v1:<iv>:<tag>:<cipher>) 복호화 (PBKDF2-SHA256 10만 회 파생키; cryptography 미설치 시 Node crypto_vault.mjs로 폴백)
 def _decrypt_vault_secret(raw_val: Any) -> str:
     """
     AES-256-GCM 암호화 볼트 문자열(enc:v1:<iv>:<tag>:<cipher>)을 복호화합니다.
@@ -139,6 +154,7 @@ def _decrypt_vault_secret(raw_val: Any) -> str:
         return ""
 
 
+# [Antigravity-Doc] 역할: Gemini API 키를 [설정 JSON -> DB system_settings -> 환경변수] 우선순위로 조회·복호화하여 반환
 def get_gemini_api_key(db_path: Optional[str] = None) -> str:
     cfg = _load_runtime_config()
     cfg_key = _decrypt_vault_secret(cfg.get("gemini_api_key"))
@@ -150,6 +166,7 @@ def get_gemini_api_key(db_path: Optional[str] = None) -> str:
     return _decrypt_vault_secret(os.getenv("GEMINI_API_KEY", ""))
 
 
+# [Antigravity-Doc] 역할: 로컬 Ollama 런타임 설정(enabled, base_url, model, timeout_ms)을 우선순위(라이브러리 모드 env > UI 설정 DB > JSON > env > 기본값)로 해석
 def get_ollama_runtime_config(db_path: Optional[str] = None) -> Dict[str, Any]:
     cfg = _load_runtime_config() if CONFIG_PATH.exists() else {}
     ui_configured = _get_system_setting("ollama_ui_configured", "", db_path=db_path)
@@ -219,9 +236,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("llm_filter_worker")
 
+# [Antigravity-Doc] 10대 봇 전략군 분류 상수: 추세·돌파형(TREND_BREAKOUT_BOT_IDS) vs 역추세·그리드·눌림목형(MEAN_REVERSION_GRID_BOT_IDS)
 TREND_BREAKOUT_BOT_IDS = ("bot_01", "bot_02", "bot_03", "bot_04", "bot_07", "bot_09")
 MEAN_REVERSION_GRID_BOT_IDS = ("bot_05", "bot_06", "bot_08", "bot_10")
 
+# [Antigravity-Doc] BOT_STRATEGY_PROFILES: LLM 프롬프트에 주입할 10대 봇별 이름·전략군·허용/차단 성격 설명 메타데이터
 BOT_STRATEGY_PROFILES: Dict[str, Dict[str, str]] = {
     "bot_01": {"name": "변동성 돌파봇", "group": "추세·돌파", "desc": "래리 윌리엄스 변동성 돌파 (추세장 ALLOW, 횡보/휩소 BLOCK)"},
     "bot_02": {"name": "슈퍼트렌드+ATR봇", "group": "추세·돌파", "desc": "슈퍼트렌드+ATR 추세 추종 (추세장 ALLOW, 횡보/휩소 BLOCK)"},
@@ -331,6 +350,7 @@ BTC 현재가 대비 일봉 20MA / 4시간봉 60MA 이격도, 공포·탐욕 지
 8. reason: 거시 장세 체제와 실전 선택 봇별 적합성 판단 근거를 한국어로 논리적으로 작성
 """
 
+# [Antigravity-Doc] FLASH_MODELS / PRO_MODELS: Gemini 모델 폴백 체인 (404/429/503 발생 시 순차 대체 모델 호출)
 # 모델 후보군 정의 (무료 티어 정상 작동 Flash 계열 우선 + Pro 프리뷰 후순위 폴백, 폐기된 gemini-2.5-* 제외)
 FLASH_MODELS = [
     "gemini-3.8-flash",
@@ -358,6 +378,7 @@ PRO_MODELS = (
 # 2. 데이터 수집 헬퍼 함수
 # ==============================================================================
 
+# [Antigravity-Doc] 역할: BTC 4시간봉 60MA 및 이격도(%) 계산 (market_hub 캐시 우선, 실패 시 업비트 공용 REST 폴백)
 def _fetch_btc_4h_60ma() -> Dict[str, Any]:
     """
     BTC 4시간봉 60 이동평균선(60MA)과 이격도를 조회합니다 (market_hub 캐시 우선 + REST API 폴백).
@@ -400,6 +421,7 @@ def _fetch_btc_4h_60ma() -> Dict[str, Any]:
     return {"ma60_4h": 0.0, "disparity_4h_pct": 0.0, "is_above_ma60_4h": False}
 
 
+# [Antigravity-Doc] 역할: BTC 최근 1시간 변동률(%) 조회 (단기 급락/쇼크 감지용)
 def _fetch_btc_1h_change_pct() -> float:
     """최근 1시간 BTC 가격 변동률(%)을 계산합니다."""
     try:
@@ -419,6 +441,7 @@ def _fetch_btc_1h_change_pct() -> float:
     return 0.0
 
 
+# [Antigravity-Doc] 역할: BTC 현재가, 24h/1h 변동률, 일봉 20MA 및 4시간봉 60MA 이격도를 종합 수집 (AI 프롬프트 및 룰베이스 폴백 입력)
 def fetch_btc_technical_summary() -> Dict[str, Any]:
     """
     pyupbit를 이용해 KRW-BTC 현재가, 24시간/1시간 변동률, 일봉 20MA 및 4시간 60MA 대비 이격도를 계산합니다.
@@ -487,6 +510,7 @@ def fetch_btc_technical_summary() -> Dict[str, Any]:
     }
 
 
+# [Antigravity-Doc] 역할: Alternative.me 공포·탐욕 지수(0~100 및 등급 문자열) 조회
 def fetch_fear_and_greed_index() -> Dict[str, Any]:
     """
     Alternative.me 공포·탐욕 지수를 조회합니다.
@@ -507,6 +531,7 @@ def fetch_fear_and_greed_index() -> Dict[str, Any]:
     return {"value": "N/A", "classification": "N/A"}
 
 
+# [Antigravity-Doc] 역할: 구글 뉴스(영문/국문 업비트 공시 키워드) 및 토큰포스트 RSS에서 최신 헤드라인 최대 limit건 수집
 def fetch_crypto_news_rss(limit: int = 15) -> List[str]:
     """
     공개 암호화폐 뉴스 RSS로부터 최신 헤드라인을 최대 limit개 추출합니다.
@@ -544,6 +569,7 @@ def fetch_crypto_news_rss(limit: int = 15) -> List[str]:
     return headlines[:limit]
 
 
+# [Antigravity-Doc] 역할: DB crypto_news 테이블의 최근 N시간 기사를 우선 조회하고 부족분을 RSS로 보충해 중복 제거 후 반환
 def fetch_recent_crypto_news(hours: int = 4, limit: int = 15, db_path: Optional[str] = None) -> List[str]:
     """
     DB의 crypto_news(업비트 공시/뉴스 수집분 포함)에서 최근 N시간 헤드라인을 우선 조회한 뒤
@@ -599,6 +625,7 @@ def fetch_recent_crypto_news(hours: int = 4, limit: int = 15, db_path: Optional[
     return collected[:limit]
 
 
+# [Antigravity-Doc] 역할: 로컬 Ollama 뉴스 분석 및 ai_news_briefings 저장용 구조화 뉴스 항목(title/source/sentiment/summary/published_at) 조회
 def fetch_recent_crypto_news_items(hours: int = 1, limit: int = 12, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     로컬 Ollama(qwen3-news) 및 뉴스 브리핑 저장을 위해 DB crypto_news에서
@@ -642,6 +669,7 @@ def fetch_recent_crypto_news_items(hours: int = 1, limit: int = 12, db_path: Opt
     return items[:limit]
 
 
+# [Antigravity-Doc] 역할: bot_positions(OPEN) 및 trades(HOLDING)에서 현재 보유 중인 전체 티커 목록 조회
 def fetch_open_positions_tickers(db_path: Optional[str] = None) -> List[str]:
     """
     bot_positions(OPEN) 및 trades(HOLDING) 테이블에서 현재 보유 중인 포지션 티커 목록을 조회합니다.
@@ -674,6 +702,7 @@ def fetch_open_positions_tickers(db_path: Optional[str] = None) -> List[str]:
         conn.close()
 
 
+# [Antigravity-Doc] 역할: 실전 선택 봇(is_selected_for_live=1) 및 Graceful Drain 보유 봇/오픈 포지션 상세 컨텍스트를 DB에서 조회해 LLM 판단 문맥 제공
 def fetch_live_context(db_path: Optional[str] = None) -> Dict[str, Any]:
     """
     현재 DB에서 사용자가 선택한 실전 담당 봇(is_selected_for_live = 1) 목록과
@@ -771,6 +800,7 @@ def fetch_live_context(db_path: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
+# [Antigravity-Doc] 역할: 모든 LLM 호출 실패/API 키 부재 시 발동하는 BTC 일봉 20MA & 4시간 60MA 기반 기계적 Fail-Safe 폴백 체제 생성
 def make_fallback_regime(btc_summary: Dict[str, Any], label: str = "Fallback") -> Dict[str, Any]:
     """
     API 키가 없거나 장애 발생 시 발동하는 BTC 일봉 20MA / 4시간봉 60MA 기반 기계적 룰베이스 폴백 로직
@@ -836,6 +866,7 @@ def make_fallback_regime(btc_summary: Dict[str, Any], label: str = "Fallback") -
 # 3. LLM API 호출 및 지수 백오프(Exponential Backoff: 1초, 2초, 4초) 로직
 # ==============================================================================
 
+# [Antigravity-Doc] 역할: 후보 Gemini 모델 목록을 순회하며 지수 백오프(1s->2s->4s)로 JSON 생성 요청 (401/403 즉시 중단, 404 모델 제외, thinkingConfig 미지원 시 자동 재시도)
 def _call_gemini_api_with_model(
     system_prompt: str,
     user_prompt: str,
@@ -919,6 +950,7 @@ def call_gemini_api_with_retry(
     return raw_text
 
 
+# [Antigravity-Doc] 역할: OpenAI Chat Completions API(json_object) 백업 폴백 호출기
 def call_openai_api_with_retry(
     system_prompt: str,
     user_prompt: str,
@@ -1003,6 +1035,7 @@ BLACKLIST_PLACEHOLDER_TICKERS = {
 }
 
 
+# [Antigravity-Doc] 역할: LLM 응답의 blacklist_tickers에서 프롬프트 예시 플레이스홀더(KRW-TICKER 등)를 걸러내고 유효한 KRW-[A-Z0-9]{2,10} 티커만 정렬 반환
 def normalize_blacklist_tickers(raw_blacklist: Any) -> List[str]:
     """업비트 표준 영문 KRW 티커 형식(KRW-[A-Z0-9]{2,10})만 통과시켜 프롬프트 예시 문자열 오염을 차단합니다."""
     items = raw_blacklist
@@ -1031,6 +1064,8 @@ def normalize_blacklist_tickers(raw_blacklist: Any) -> List[str]:
     return sorted(blacklist_set)
 
 
+# [Antigravity-Doc] 역할: LLM 원문 응답에서 마크다운 코드펜스를 제거하고 JSON을 파싱·정규화·안전 보정(하드 중단 vs 비중 축소 일관성 강제)
+# [Antigravity-Doc] 입력: raw_text(str|None), default_reason(str) | 반환: 검증된 표준 판단 dict 또는 파싱 실패 시 None
 def parse_and_validate_llm_json(raw_text: Optional[str], default_reason: str = "Analysis completed") -> Optional[Dict[str, Any]]:
     """
     LLM 응답 텍스트에서 JSON 블록을 추출하고 표준 10대 봇(bot_01~bot_10) 스키마로 정규화/검증합니다.
@@ -1039,6 +1074,7 @@ def parse_and_validate_llm_json(raw_text: Optional[str], default_reason: str = "
         return None
 
     try:
+        # [Antigravity-Doc] 1단계: ```json 펜스 및 앞뒤 부가 텍스트를 제거하고 최외곽 { ... } JSON 객체 추출
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip(), flags=re.MULTILINE)
         first_brace = cleaned.find("{")
         last_brace = cleaned.rfind("}")
@@ -1051,6 +1087,7 @@ def parse_and_validate_llm_json(raw_text: Optional[str], default_reason: str = "
             logger.error("LLM JSON missing required decision keys: %s", (raw_text or "")[:200])
             return None
 
+        # [Antigravity-Doc] 2단계: 감성 점수(-1.0~1.0 클램핑), 시장 체제, 리스크 경보, 권고 액션, 투입 배율 유효성 검증
         try:
             raw_sent = parsed.get("sentiment_score", 0.0)
             sentiment_score = float(0.0 if raw_sent is None else raw_sent)
@@ -1078,6 +1115,9 @@ def parse_and_validate_llm_json(raw_text: Optional[str], default_reason: str = "
         except (TypeError, ValueError):
             multiplier = 0.5 if action == "REDUCE_SIZE" else 1.0
 
+        # [Antigravity-Doc] 3단계: 하드 중단(is_hard_halt) vs 평시 축소(REDUCE_SIZE) 간 필드 모순 자동 보정
+        # [Antigravity-Doc]   - 하드 중단 시 risk_alert=True, multiplier=0.0, 10대 봇 전체 BLOCK 강제
+        # [Antigravity-Doc]   - 단순 REDUCE_SIZE에서 실수로 전봇 BLOCK+0.0배율이 내려온 경우 역추세/그리드 봇(05,06,08,10) 0.5x 복원
         raw_overrides_input = parsed.get("bot_overrides")
         has_explicit_overrides = isinstance(raw_overrides_input, dict) and len(raw_overrides_input) > 0
         bot_overrides = normalize_bot_overrides(raw_overrides_input)
@@ -1138,6 +1178,8 @@ def parse_and_validate_llm_json(raw_text: Optional[str], default_reason: str = "
 # 4. Flash 30분 빠른 분석(1순위: 맥북 로컬 Ollama qwen3-news) & Pro 1시간 심층 퀀트 분석 개별 실행기
 # ==============================================================================
 
+# [Antigravity-Doc] 역할: 로컬 Ollama(/api/chat, stream=False, think=False, format='json')로 30분 단기 코인 뉴스·시황 분석 수행
+# [Antigravity-Doc] 입력: BTC 지표, 뉴스 최대 6건 압축, 보유 포지션, 공포탐욕지수, Ollama 접속 설정 | 반환: 검증된 분석 dict (실패 시 예외 발생 -> Gemini 폴백 유도)
 def call_local_ollama_coin_news_analyzer(
     btc_summary: Dict[str, Any],
     news_items: List[Any],
@@ -1219,6 +1261,7 @@ def call_local_ollama_coin_news_analyzer(
     return parsed
 
 
+# [Antigravity-Doc] 역할: 30분 단기 시황 분석(FLASH_30M) 오케스트레이터 — [1순위 Ollama -> 2순위 Gemini Flash/OpenAI -> 3순위 90분 캐시/BTC 20MA 룰베이스] 3중 무중단 폴백
 def call_flash_fast_analysis(
     btc_summary: Dict[str, Any],
     news_headlines: List[Any],
@@ -1334,6 +1377,7 @@ def call_flash_fast_analysis(
     return make_fallback_regime(btc_summary, "Flash Fallback Rule")
 
 
+# [Antigravity-Doc] 역할: 1시간 거시 심층 퀀트 분석(PRO_1H) — Gemini Pro(->OpenAI gpt-4o -> 90분 캐시 -> BTC 20MA 룰베이스 폴백)으로 장세 및 10대 봇 스위치 결정
 def call_pro_indepth_analysis(
     btc_summary: Dict[str, Any],
     fng: Dict[str, Any],
@@ -1409,6 +1453,8 @@ def call_pro_indepth_analysis(
 # 5. 다중 모델 교차 검증 기반 거래 여부 최종 판단 합성 (Decision Synthesis)
 # ==============================================================================
 
+# [Antigravity-Doc] 역할: Flash(30분 단기 방패)와 Pro(1시간 거시 전략가) 결과를 보수적 우선순위(Pro/Flash 리스크 경보 > 비중 축소 > 정상 허용)로 교차 합성
+# [Antigravity-Doc] 입력: flash_res(dict), pro_res(dict) | 반환: market_regime_filter 갱신용 최종 합성 판단 dict (감성점수는 Pro 60% + Flash 40% 가중합)
 def synthesize_dual_decisions(
     flash_res: Dict[str, Any],
     pro_res: Dict[str, Any],
@@ -1571,6 +1617,7 @@ def synthesize_dual_decisions(
     }
 
 
+# [Antigravity-Doc] 역할: 합성된 듀얼 AI 판단 결과를 market_regime_filter(id=1) 단일 행에 BEGIN IMMEDIATE 트랜잭션으로 원자적 저장
 def update_market_regime_filter_table(
     synthesized: Dict[str, Any],
     db_path: Optional[str] = None,
@@ -1656,6 +1703,7 @@ def update_market_regime_filter_table(
         conn.close()
 
 
+# [Antigravity-Doc] 역할: 신선한 AI 분석 결과를 마크다운 리포트로 가공해 ai_market_briefings / ai_news_briefings 및 system_settings(사용 모델 메타)에 영속 저장
 def save_ai_briefings_to_db(
     flash_res: Optional[Dict[str, Any]],
     pro_res: Optional[Dict[str, Any]],
@@ -1786,6 +1834,7 @@ def save_ai_briefings_to_db(
 # 6. 메인 워커 프로세스 루프 (30분 Flash & 1시간 Pro 독립 타이머 제어)
 # ==============================================================================
 
+# [Antigravity-Doc] 역할: 듀얼 AI 워커 상주 프로세스 메인 루프 — DB 직전 상태 복원 -> 백엔드 공존 체크 -> 30분(Flash)/1시간(Pro) 독립 주기 실행 -> 교차 합성 및 DB 반영
 def run_llm_sentiment_worker(stop_event, bot_id: str = "bot_llm_filter", db_path: Optional[str] = None) -> None:
     """
     듀얼 AI 워커 메인 프로세스:

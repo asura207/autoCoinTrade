@@ -1,20 +1,37 @@
 /**
- * algo_lab_service.mjs
- * 10대 순수 알고리즘 상시 가상 경쟁(Arena) 서비스
+ * [Antigravity-Doc] backend/common/algo_lab_service.mjs
  *
- * - bot_01 ~ bot_10 : 수익률 검증형 10개 코인 거래 알고리즘 마스터 데이터 및 DB 스키마 보강/마이그레이션
- * - evaluateStrategy(botId, marketData, indicators, position) : 10개 봇이 공유하는 순수 수식·기술적 지표 전략 함수
- *     (LLM / Gemini 시황 브리핑 / BTC Regime 필터를 일절 참조하지 않는 순수 알고리즘)
- * - runArenaCycle : 가상거래(paper_trades / paper_bot_positions) 원장에 상시 가상 체결 및 리더보드 산출
- *     (실제거래 원장 trades / bot_positions 와는 완전히 분리)
+ * [파일 역할 및 아키텍처]
+ * - 업비트 10대 순수 알고리즘 봇(`bot_01` ~ `bot_10`)의 핵심 엔진이자 상시 가상 경쟁(Arena) 및 주간 로테이션 계산기.
+ * - 주요 구성 섹션:
+ *   1) 기술적 지표 유틸리티: SMA, Wilder RSI, EMA, MACD, Bollinger Band/Bandwidth, Wilder ATR, SuperTrend, OLS 20봉 선형회귀 채널(LRC ±2σ), Jack Kellogg 4대 지표(VWAP/LRC/RVOL/기준선).
+ *   2) 통합 지표 빌더(`buildIndicators`), 윗꼬리/과열 추격매수 차단 필터(`checkUpperWickAndOverextension`), 3단계 스마트 청산(`evaluateSmartExit`).
+ *   3) 10대 봇 마스터 메타(`ARENA_BOT_DEFS`), 3대 전략군(추세·스윙 / 변동성·돌파 / 역추세·그리드),
+ *      총 평가자산 기준 단일 90% 상한(Single 90% Cap) · 1~3개 차등 균등 배분 · Draining 자금 차감/복원 불변식 엔진.
+ *   4) 10대 순수 알고리즘 전략 함수(`STRATEGIES`, `evaluateStrategy`) — LLM/시황 필터를 참조하지 않는 순수 수식·지표 기반.
+ *   5) 캔들 TTL 공유 캐시(`buildMarketData`), 가상 체결(`paperBuy`/`paperSell`/`runPaperBot`), 리더보드/주간 챔피언 선출(`evaluateWeeklyStrategyChampions`), 상시 경쟁 사이클(`runArenaCycle`).
+ *
+ * [주요 의존성]
+ * - `./execution_quality_service.mjs`: `analyzeOrderbookQuality` (가상 매수 진입 전 호가 스프레드·깊이 품질 가드).
+ * - SQLite/PG 호환 DB 어댑터: `bots`, `paper_trades`, `paper_bot_positions`, `market_regime_filter`, `system_settings`.
+ *
+ * [수정 시 주의사항]
+ * - `evaluateStrategy()`는 실전(`server.mjs`), 가상(`runArenaCycle`), 백테스트(`backtest_service.mjs`) 3곳이 공유하므로
+ *   시그니처 변경이나 부작용(전역 상태 변경) 추가를 절대 금지할 것.
+ * - 단일 90% 상한(`assertGlobal90CapInvariant`)은 `totalEquityKrw * maxDeployRatio`를 단 1회만 적용해야 하며,
+ *   이중 적용(0.9 × 0.9 = 81%)이나 Draining 봇의 `virtual_krw > 0` 유출이 발생하지 않도록 유지할 것.
  */
 
 import { analyzeOrderbookQuality } from "./execution_quality_service.mjs";
 
+// [Antigravity-Doc] 가상거래(Arena) 및 백테스트 공통 기준 상수 (업비트 원화마켓 수수료 0.05%, 최소주문 5,000원, 봇당 초기 시드 100만 원)
 export const PAPER_FEE_RATE = 0.0005;
 export const PAPER_MIN_ORDER_KRW = 5000;
 export const DEFAULT_PAPER_CAPITAL = 1000000;
 
+/**
+ * [Antigravity-Doc] Date 또는 타임스탬프를 Asia/Seoul(KST) `YYYY-MM-DD HH:MM:SS` 문자열로 포맷팅
+ */
 export function formatKstDateTime(dateInput = new Date()) {
   const d = dateInput instanceof Date ? dateInput : new Date(dateInput);
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -34,11 +51,17 @@ export function formatKstDateTime(dateInput = new Date()) {
   return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}:${map.second}`;
 }
 
+/**
+ * [Antigravity-Doc] 현재 시각의 KST 문자열(`YYYY-MM-DD HH:MM:SS`) 반환
+ */
 export function nowKSTString() {
   return formatKstDateTime(new Date());
 }
 
-/** 업비트 일봉 기준(09:00 KST) 거래일 문자열(YYYY-MM-DD). 서버 타임존과 무관하게 계산 */
+/**
+ * [Antigravity-Doc] 업비트 일봉 리셋 기준(09:00 KST) 거래일 문자열(`YYYY-MM-DD`) 산출
+ * - 00:00~08:59 KST는 전일 거래일로 귀속되어 `bot_01` 익일 시가 청산 및 당일 VWAP 집계 기준일로 사용된다.
+ */
 export function tradingDateKST(dateStr) {
   const base = String(dateStr || nowKSTString()).replace("T", " ").slice(0, 19);
   const ms = Date.parse(`${base.replace(" ", "T")}Z`);
@@ -49,6 +72,7 @@ export function tradingDateKST(dateStr) {
 // ============================================================================
 // 1. 기술적 지표 유틸리티
 // ============================================================================
+/** [Antigravity-Doc] 단순 이동평균(SMA): 최근 period개 값의 산술 평균 (부족 시 null) */
 export function computeSma(values, period) {
   if (!values || values.length < period) return null;
   let sum = 0;
@@ -56,7 +80,7 @@ export function computeSma(values, period) {
   return sum / period;
 }
 
-/** Wilder RSI 시계열 (값이 산출되지 않는 초반 구간은 null) */
+/** [Antigravity-Doc] Wilder 평활법 기반 RSI 시계열 계산 (초반 period 구간은 null, 하락폭 0이면 100) */
 export function computeRsiSeries(closes, period = 14) {
   const out = new Array(closes ? closes.length : 0).fill(null);
   if (!closes || closes.length < period + 1) return out;
@@ -82,12 +106,14 @@ export function computeRsiSeries(closes, period = 14) {
   return out;
 }
 
+/** [Antigravity-Doc] 최신 시점 Wilder RSI 단일값 반환 (데이터 부족 시 중립값 50.0) */
 export function computeRsi(closes, period = 14) {
   const series = computeRsiSeries(closes, period);
   const last = series[series.length - 1];
   return last === null || last === undefined ? 50.0 : last;
 }
 
+/** [Antigravity-Doc] 지수 이동평균(EMA) 전체 시계열 계산 (평활 계수 k = 2 / (period + 1)) */
 export function computeEma(values, period) {
   if (!values || values.length === 0) return [];
   const k = 2 / (period + 1);
@@ -98,7 +124,7 @@ export function computeEma(values, period) {
   return emaArr;
 }
 
-/** MACD 시계열 (macd / signal 모두 closes 와 동일 인덱스로 정렬) */
+/** [Antigravity-Doc] MACD(fast EMA - slow EMA) 및 Signal(MACD의 signal EMA) 시계열 계산 (`bot_07` 용) */
 export function computeMacdSeries(closes, fast = 12, slow = 26, signal = 9) {
   if (!closes || closes.length < slow + signal) return null;
   const fastEma = computeEma(closes, fast);
@@ -125,7 +151,7 @@ export function computeMacd(closes, fast = 12, slow = 26, signal = 9) {
   };
 }
 
-/** 볼린저 밴드 (모집단 표준편차) */
+/** [Antigravity-Doc] 볼린저 밴드(모집단 표준편차 σ, 상/중/하단선 및 밴드폭 Bandwidth) 계산 (`bot_04`/`bot_05`/`bot_06` 용) */
 export function computeBollinger(closes, period = 20, numStd = 2.0) {
   if (!closes || closes.length < period) return null;
   const win = closes.slice(-period);
@@ -137,7 +163,7 @@ export function computeBollinger(closes, period = 20, numStd = 2.0) {
   return { mid, upper, lower, std, bandwidth: mid > 0 ? (upper - lower) / mid : 0 };
 }
 
-/** 각 시점별 볼린저 밴드폭 시계열 (Bandwidth = (Upper - Lower) / Middle) */
+/** [Antigravity-Doc] 볼린저 밴드폭(Bandwidth = (Upper - Lower) / Mid) 시계열 계산 (`bot_04` 스퀴즈 응축 판별용) */
 export function computeBandwidthSeries(closes, period = 20, numStd = 2.0) {
   const out = [];
   for (let i = period; i <= closes.length; i++) {
@@ -147,7 +173,7 @@ export function computeBandwidthSeries(closes, period = 20, numStd = 2.0) {
   return out;
 }
 
-/** Wilder ATR 시계열 */
+/** [Antigravity-Doc] Wilder ATR(Average True Range) 시계열 계산 — True Range = max(H-L, |H-prevC|, |L-prevC|) */
 export function computeAtrSeries(candles, period = 14) {
   const n = candles.length;
   const out = new Array(n).fill(null);
@@ -170,7 +196,11 @@ export function computeAtrSeries(candles, period = 14) {
   return out;
 }
 
-/** SuperTrend (ATR 기반). dir: 1 상승 / -1 하락 */
+/**
+ * [Antigravity-Doc] ATR 기반 SuperTrend 추세 지표 계산 (`bot_02` 및 MTF 필터 공용)
+ * - `dir`: +1(상승 추세, 지지선=finalLower) / -1(하락 추세, 저항선=finalUpper)
+ * - `flipUpBarsAgo`: 최근 6봉 이내 하락(-1)→상승(+1) 전환이 몇 봉 전에 발생했는지 반환
+ */
 export function computeSuperTrend(candles, period = 10, multiplier = 3.0) {
   const n = candles.length;
   const atr = computeAtrSeries(candles, period);
@@ -225,8 +255,9 @@ function candleKstKey(c) {
 }
 
 /**
- * 20봉 선형 회귀 채널 (Linear Regression Channel, N = 20)
- * 최소자승법(OLS)으로 기울기 m, 절편 b, 현재 시점 중심값 ŷ_19, 잔차 표준편차 σ(±2σ) 계산
+ * [Antigravity-Doc] 20봉 선형 회귀 채널 (Linear Regression Channel, OLS 최소자승법)
+ * - 최근 `period`(기본 20)개 종가에 대해 기울기 `slope`, 절편 `intercept`, 현재 중심 추정가 `mid(ŷ_{n-1})`,
+ *   잔차 표준편차 `sigma` 기반 상단(+2σ)·하단(-2σ) 채널을 산출한다 (`bot_10` 및 차트 오버레이 공용).
  */
 export function computeLinearRegressionChannel(closes, period = 20) {
   if (!closes || closes.length < period) return null;
@@ -269,11 +300,11 @@ export function computeLinearRegressionChannel(closes, period = 20) {
 }
 
 /**
- * 잭 켈로그(Jack Kellogg) 4대 핵심 지표 패키지 계산
- * ① 당일/롤링 VWAP (TP = (H+L+C)/3) 및 이격도
- * ② 20봉 선형 회귀 채널 (LRC ±2σ)
- * ③ 상대 거래량 폭발 배수 (RVOL)
- * ④ 3대 핵심 기준 가격선 (당일 09시 시가, 전일 종가, 전일 고가, 전일 저가)
+ * [Antigravity-Doc] 잭 켈로그(Jack Kellogg) 4대 핵심 프라이스액션 지표 패키지 (`bot_10` 전용)
+ * ① 당일(09:00 KST 이후) 및 롤링 24시간(96봉) VWAP(TP=(H+L+C)/3)과 현재가 이격도(%)
+ * ② 20봉 선형 회귀 채널(LRC ±2σ)
+ * ③ 상대 거래량 배수(RVOL): 진행 봉과 직전 마감 봉의 20봉 평균 분모를 각각 분리해 자기희석을 방지
+ * ④ 4대 기준 가격선(당일 시가, 전일 종가/고가/저가) 및 최근 20봉 고저가
  */
 export function calculateKelloggIndicators(m15Candles, dayCandles, currentPrice) {
   if (!m15Candles || m15Candles.length < 20) return null;
@@ -373,6 +404,11 @@ export function calculateKelloggIndicators(m15Candles, dayCandles, currentPrice)
 // ============================================================================
 // 2. 지표 패키지 빌더 (한 번 계산해 10개 봇이 공유)
 // ============================================================================
+/**
+ * [Antigravity-Doc] 종목별 통합 지표 패키지 빌더 — 4개 타임프레임(day/m240/m60/m15)을 1회 계산해 10개 봇이 공유
+ * - 일봉(MA5/20/60, 7일 모멘텀, 20일 고가), 4시간봉(MA, SuperTrend, 거래량 배수), 1시간봉(EMA20/60, ATR14, SuperTrend),
+ *   15분봉(RSI14, BB, 밴드폭, EMA, ATR14, MACD, 당일 VWAP, Kellogg 4대 지표) 및 MTF 상위 추세 합의(`ind.mtf`)를 산출한다.
+ */
 export function buildIndicators(marketData) {
   const price = Number(marketData?.price || 0);
   const day = marketData?.candles?.day || [];
@@ -508,7 +544,7 @@ export function buildIndicators(marketData) {
   return ind;
 }
 
-/** 거래대금 상위 종목 간 7일 상대 모멘텀 순위 (bot_03 용) */
+/** [Antigravity-Doc] 유니버스 종목 간 7일 상대 모멘텀(`momentum7dPct`) 내림차순 순위표 생성 (`bot_03` 듀얼 모멘텀용) */
 export function computeMomentumRanking(marketDataMap, markets) {
   const rows = [];
   for (const m of markets) {
@@ -527,10 +563,9 @@ export function computeMomentumRanking(marketDataMap, markets) {
 }
 
 /**
- * 돌파형 봇(bot_01, bot_03, bot_04, bot_09) 윗꼬리(Whipsaw) & 고점 물림 방어 필터
- * 1) 캔들 전체 길이(High - Low) 중 윗꼬리 길이(High - Close)가 45% 초과하거나,
- *    캔들 종가가 고가 대비 상위 35% 이내에 안착하지 못한 경우((High - Close) / (High - Low) > 0.35) 가짜 돌파(Bull Trap) 차단
- * 2) 15분봉 현재가가 20MA 또는 VWAP 대비 +6.0% 이상 급등한 상태일 경우 이격도 과열 추격 매수 금지
+ * [Antigravity-Doc] 돌파형 봇(`bot_01`, `bot_03`, `bot_04`, `bot_09`) 공통 윗꼬리(Bull Trap) & 이격도 과열 방어 필터
+ * 1) 윗꼬리 비율 > 45% 또는 종가가 고가 대비 상위 35% 안착 실패 시 가짜 돌파 차단
+ * 2) 현재가가 20MA 또는 VWAP 대비 +6.0% 이상 과열 급등 시 추격 매수 차단
  */
 export function checkUpperWickAndOverextension(candle, currentPrice, ma20 = null, vwap = null) {
   if (!candle) return { ok: true };
@@ -589,10 +624,11 @@ function parseKstTimestampMs(timeStr) {
 }
 
 /**
- * 횡보장 자금 잠김(Position Lock) 해소를 위한 3단계 스마트 청산(Exit) 엔진
- * 1) 본절 스탑 (Breakeven Stop): 최고 수익률 +1.2% 이상 도달 후 +0.25% 이하로 하락 시 수익 반납 방지 익절
- * 2) 시간 제한 청산 (Time-Stop): 단타 봇(bot_01, bot_04, bot_05, bot_09, bot_10)이 4시간(실전)/2시간(가상) 경과 후 -0.6%~+0.8% 박스권 & RVOL < 1.0 시 자금 회수
- * 3) ATR 기반 동적 트레일링 스탑: 진입가 대비 -2.2*ATR 하드 손절(분할 그리드 bot_06 제외), 최고가 수익 +1.0% 이상 도달 후 수익 구간 내 -1.8*ATR 트레일링 스탑
+ * [Antigravity-Doc] 횡보장 자금 잠김(Position Lock) 해소 및 수익 보호용 3단계 스마트 청산(Smart Exit) 엔진
+ * 1) 본절 스탑(Breakeven Stop): 최고가 +1.2% 이상 도달 후 +0.25% 이하 반락 시 수익 반납 방지 청산
+ * 2) 시간 제한 청산(Time-Stop): 단타 봇(`bot_01`/`04`/`05`/`09`/`10`)이 실전 4h/가상 2h 경과 후 -0.6%~+0.8% 박스권 & RVOL < 1.0이면 자금 회수
+ * 3) ATR 동적 스탑: 진입가 -2.2×ATR 하드 손절(`bot_06`·`bot_10 Setup B` 제외), 최고 +1.0% 이상 후 `peak - 1.8×ATR`(>평단가) 트레일링 익절
+ *    (ATR 산출 불가 시 고정 `stopLossPct`로 폴백)
  */
 export function evaluateSmartExit({
   botId,
@@ -703,6 +739,7 @@ export function evaluateSmartExit({
 // ============================================================================
 // 3. 10대 알고리즘 봇 마스터 데이터 & 3대 전략군 표준 메타
 // ============================================================================
+// [Antigravity-Doc] 3대 전략군 표준 순서 및 로테이션 배분 모드별 가중치 테이블
 export const STRATEGY_GROUP_ORDER = ["TREND_SWING", "VOLATILITY_BREAKOUT", "REVERSAL_GRID"];
 
 export const ALLOCATION_MODE_WEIGHTS = {
@@ -718,18 +755,20 @@ export const ALLOCATION_MODE_WEIGHTS = {
 // 3-1. 실시간 업비트 총 평가자산 기준 주간 봇 차등 선정(1~3개 균등 배분),
 //      단일 90% 상한 통합, 자동 원금 동기화 충돌 방지 및 교체 봇 자금 차감·복원 엔진
 // ============================================================================
+// [Antigravity-Doc] 최소 안전 실전 주문액(5,050원), 총자산 구간 경계(40만/70만 원), 단일 최대 투입비율(90%) 상수
 export const MIN_LIVE_ORDER_SAFE_KRW = 5050;
 export const DEFAULT_CAPITAL_TIER_1_MAX = 400000;
 export const DEFAULT_CAPITAL_TIER_2_MAX = 700000;
 export const DEFAULT_MAX_DEPLOY_RATIO = 0.9;
 
+/** [Antigravity-Doc] 총자산 구간별 균등 배분 모드 여부 판별 */
 export function isEquityTierAllocationMode(mode) {
   return mode === "EQUAL_BY_EQUITY_TIER" || mode === "EQUAL_BY_CAPITAL_TIER";
 }
 
 /**
- * 0. 실시간 총 평가자산(E_total) 및 단일 90% 상한(C_max) 해석기
- * - 절대 90%를 이중 적용(0.9 * 0.9 = 81%)하지 않음
+ * [Antigravity-Doc] 0. 실시간 총 평가자산(E_total) 및 단일 90% 상한(globalCapKrw) 해석기
+ * - 우선순위: 업비트 실시간 총자산 > DB 캐시 총자산 > 레거시 90% 원금 역산(이중 0.9 적용 원천 방지)
  */
 export function resolveTotalEquityAndSingle90Cap({
   liveTotalEquityKrw = null,
@@ -771,11 +810,7 @@ export function resolveTotalEquityAndSingle90Cap({
 }
 
 /**
- * 1. 실시간 총 평가자산(E_total) 구간별 주간 선출 봇 개수 결정
- * - < 10,000원: 0개 (최소 주문 불가 원금)
- * - <= 400,000원: 1개
- * - 400,000원 초과 ~ 700,000원 미만: 2개
- * - >= 700,000원: 3개
+ * [Antigravity-Doc] 1. 총 평가자산 구간별 주간 실전 선출 봇 개수 결정 (<1만: 0개, ≤40만: 1개, <70만: 2개, ≥70만: 3개)
  */
 export function getTargetBotCountByTotalEquity(
   totalEquityKrw,
@@ -823,7 +858,8 @@ export function getCapitalTierSummary(
 }
 
 /**
- * 총 투입/배정 자금이 총 평가자산의 단일 90% 상한을 단 1원도 초과하지 않음을 검증하는 불변식 함수
+ * [Antigravity-Doc] 총 투입/배정 자금(`totalUsedCapital`)이 단일 90% 상한(`globalCapKrw`)을 1원도 초과하지 않음을 강제 검증하는 불변식
+ * - 위반 시 즉시 `[INVARIANT_VIOLATION]` 예외를 발생시켜 과투입 배포를 원천 차단한다.
  */
 export function assertGlobal90CapInvariant({
   totalEquityKrw = null,
@@ -849,7 +885,7 @@ export function assertGlobal90CapInvariant({
 }
 
 /**
- * 2. 전략군 1위 후보들 중 목표 개수(1~3개)만큼 전략 분산 선출 + 동일 비율 설정
+ * [Antigravity-Doc] 2. 3대 전략군 1위 후보 중 목표 개수(1~3개)만큼 전략군 중복 없이 선출하고 단일 90% 상한을 균등 분배
  */
 export function selectTieredEqualChampions(groupChampions, totalEquityKrw, options = {}) {
   const tier1Max = Number(options?.tier1Max || DEFAULT_CAPITAL_TIER_1_MAX);
@@ -904,7 +940,9 @@ export function selectTieredEqualChampions(groupChampions, totalEquityKrw, optio
 }
 
 /**
- * 내부 공용 불변식 적용기: 단일 90% 상한 + 실계좌 가용 원화 이중 캡
+ * [Antigravity-Doc] 내부 공용 배분 불변식 엔진: 단일 90% 상한 + 실계좌 가용 원화 이중 캡 적용
+ * - 각 선출 봇의 희망 가용 원화(`perBotTargetKrw - ownLocked - linkedDrainLocked`)를 합산해 가용 한도를 초과하면
+ *   비례 축소 및 잔여 1원 단위 보정 후 `assertGlobal90CapInvariant`로 총합 상한 준수를 검증한다.
  */
 function _applySingle90CapToElected({
   totalEquityKrw,
@@ -1001,7 +1039,8 @@ function _applySingle90CapToElected({
 }
 
 /**
- * 3. 주간 로테이션 시 기존 Draining 봇 포지션 차감 및 단일 90% 상한 엄수 배분 계산기
+ * [Antigravity-Doc] 3. 주간 로테이션 시 탈락(Draining) 봇의 보유 포지션 잠금액을 후임 봇(1:1 우선 매핑) 한도에서 차감하고
+ * 단일 90% 상한 내에서 선출 봇 가용 원화를 산출하는 배분 계산기 (탈락 봇 `virtual_krw = 0` 강제)
  */
 export function computeRotationAllocationsWith90Cap({
   totalEquityKrw = null,
@@ -1088,10 +1127,9 @@ export function computeRotationAllocationsWith90Cap({
 }
 
 /**
- * 4. [방식 A 핵심] 기존 '총 평가자산 90% 자동 원금 동기화' 함수용 통합 정산기
- * - 주중 자동 동기화가 호출되어도 선출 봇 구성(1~3개)을 임의로 바꾸지 않음
- * - Draining 봇의 virtual_krw = 0 및 replaced_by_bot_id 차감액을 절대 덮어쓰지 않음
- * - 변경된 E_total의 단일 90% 상한(globalCapKrw) 내에서만 안전하게 목표 한도와 가용 원화를 재조정
+ * [Antigravity-Doc] 4. 주중 '총 평가자산 90% 자동 원금 동기화' 전용 통합 정산기
+ * - 기존 선출 봇 구성(1~3개)과 Draining 봇의 `virtual_krw = 0` 및 후임 차감 연결을 보존한 채,
+ *   변동된 총 평가자산의 단일 90% 상한 내에서만 각 봇의 목표 한도와 가용 원화를 안전하게 재조정한다.
  */
 export function reconcileAutoSyncedBudgetsWith90Cap({
   totalEquityKrw,
@@ -1156,9 +1194,10 @@ export function reconcileAutoSyncedBudgetsWith90Cap({
 }
 
 /**
- * 5. Draining(탈락) 봇 포지션 매도 정산 시 교체 봇 자금 자동 복원 계산기
- * - 단일 90% 상한(globalCapKrw = floor(totalEquityKrw * 0.90)) 엄수
- * - 익절 초과분은 계좌 예비비(Reserve) 유보, 손절 시 실회수액 한도만 복원
+ * [Antigravity-Doc] 5. Draining(탈락) 봇 포지션 청산 정산 시 회수 자금을 후임/선출 봇으로 자동 복원하는 계산기
+ * - 1순위: 직접 교체 연결된 후임 봇(`replaced_by_bot_id`)의 한도 부족분 우선 복원
+ * - 2순위: 잔여 복원 풀을 목표 한도 미달 선출 봇들에 부족분 비례 분배
+ * - 단일 90% 상한 초과분(익절 초과액)은 계좌 예비비(`surplusToReserveKrw`)로 유보한다.
  */
 export function computeDrainSellCapitalRestoration({
   totalEquityKrw = null,
@@ -1314,6 +1353,7 @@ export const STRATEGY_GROUP_META = {
   },
 };
 
+// [Antigravity-Doc] 10대 알고리즘 봇(bot_01 ~ bot_10) 마스터 정의 테이블 (DB 시드, 백테스트 기본 파라미터, UI 메타의 단일 원천)
 export const ARENA_BOT_DEFS = [
   {
     bot_id: "bot_01",
@@ -1493,12 +1533,12 @@ for (const d of ARENA_BOT_DEFS) {
   for (const lid of d.legacy_ids) LEGACY_BOT_ID_MAP[lid] = d.bot_id;
 }
 
-/** 구버전 봇 ID(bot_volatility 등)를 신규 ID(bot_01 등)로 변환 */
+/** [Antigravity-Doc] 구버전 봇 ID(`bot_volatility` 등)를 현행 표준 ID(`bot_01` 등)로 정규화 */
 export function normalizeBotId(botId) {
   return LEGACY_BOT_ID_MAP[botId] || botId;
 }
 
-/** 봇 ID별 전략군 메타 조회 */
+/** [Antigravity-Doc] 봇 ID에 해당하는 전략군 코드/배지/룰 메타 정보 조회 */
 export function getBotStrategyMeta(botId) {
   const normId = normalizeBotId(botId);
   const def = BOT_DEF_BY_ID.get(normId);
@@ -1525,7 +1565,9 @@ const pctChange = (a, b) => (b > 0 ? ((a - b) / b) * 100 : 0);
 const fmt = (n, d = 2) => Number(n).toFixed(d);
 const ko = (n) => Math.floor(Number(n || 0)).toLocaleString("ko-KR");
 
+// [Antigravity-Doc] 10대 순수 알고리즘 전략 맵 — LLM/시황 필터 없이 오직 캔들·지표 수식으로만 BUY/SELL/HOLD 판정
 const STRATEGIES = {
+  // [Antigravity-Doc] bot_01 (변동성 돌파): 목표가 = 당일시가 + 전일레인지 × K, 20일선 상회 & 15분 거래량 급증 & 윗꼬리/이격 필터 통과 시 진입, 익일(09시 KST) 시가 청산
   // bot_01: 변동성 돌파
   bot_01({ price, ind, held, params }) {
     const d = ind.day;
@@ -1551,6 +1593,7 @@ const STRATEGIES = {
     return hold(`돌파목표 ${ko(target)} 대기 (현재 ${ko(price)})`);
   },
 
+  // [Antigravity-Doc] bot_02 (SuperTrend + ATR 트레일링): 1h/4h SuperTrend 최근 상승 전환 + 거래량 1.4배 이상 돌파 진입, 고점 - 2.5×ATR(14) 이탈 시 청산
   // bot_02: SuperTrend + ATR 트레일링
   bot_02({ price, ind, held, params, options = {} }) {
     const mult = Number(params.atr_multiplier ?? 2.5);
@@ -1576,6 +1619,7 @@ const STRATEGIES = {
     return hold("SuperTrend 상승 전환 + 거래량 돌파 대기");
   },
 
+  // [Antigravity-Doc] bot_03 (듀얼 모멘텀): 7일 상대 모멘텀 상위 top_n & 절대 모멘텀 ≥ +1.2% & 윗꼬리 필터 통과 시 진입, 7일 모멘텀 음전(<0%) 시 청산
   // bot_03: 듀얼 모멘텀
   bot_03({ price, ind, held, params, options = {} }) {
     const info = options.momentumRank?.[options.market];
@@ -1598,6 +1642,7 @@ const STRATEGIES = {
     return hold(`7일 모멘텀 ${info.rank}위 (${fmt(info.momPct)}%)`);
   },
 
+  // [Antigravity-Doc] bot_04 (BB 스퀴즈 VCP 돌파): 15m 밴드폭 20봉 최저 응축(≤1.1배) 후 거래량 급증 + 상단 돌파 진입, 중심선 하향 이탈 청산
   // bot_04: 볼린저 스퀴즈 돌파
   bot_04({ price, ind, held, params }) {
     const m = ind.m15;
@@ -1621,6 +1666,7 @@ const STRATEGIES = {
     return hold(`스퀴즈 ${squeezed ? "형성" : "미형성"} / 상단 ${ko(m.bb.upper)}`);
   },
 
+  // [Antigravity-Doc] bot_05 (볼린저 역추세 반등): 15m 직전 2봉 저가가 BB 하단 터치 + 현재가 양봉 복귀 + 최근 3봉 RSI ≤ 38 과매도 시 진입
   // bot_05: 볼린저 역추세 반등
   bot_05({ price, ind, held, params }) {
     const m = ind.m15;
@@ -1634,6 +1680,7 @@ const STRATEGIES = {
     return hold(`BB 하단 ${ko(m.bb.lower)} / RSI ${fmt(m.rsi, 1)} (기준 ≤ ${rsiTh})`);
   },
 
+  // [Antigravity-Doc] bot_06 (다단계 분할 그리드): RSI ≤ 38 & BB 하단 부근 1차 진입 후 -2.5%/-5.0% 하락 시 최대 3차 분할 매수, 개별 포지션 +1.8% 개별 익절
   // bot_06: 다단계 분할 매수 그리드
   bot_06({ price, ind, held, params }) {
     const m = ind.m15;
@@ -1672,6 +1719,7 @@ const STRATEGIES = {
     return hold(`과매도 대기 (RSI ${fmt(m.rsi, 1)} / 기준 ≤ ${rsiEntry})`);
   },
 
+  // [Antigravity-Doc] bot_07 (MACD + RSI 골든크로스): 15m·60m EMA(20>60) 정배열 + MACD 골든크로스 + RSI 45~65 진입, 데드크로스 또는 EMA 붕괴 청산
   // bot_07: MACD + RSI 골든크로스
   bot_07({ ind, held, params }) {
     const m = ind.m15;
@@ -1699,6 +1747,7 @@ const STRATEGIES = {
     return hold(`정배열 ${aligned ? "O" : "X"} / 골든크로스 ${crossUp ? "O" : "X"} / RSI ${fmt(m.rsi, 1)}`);
   },
 
+  // [Antigravity-Doc] bot_08 (20일선 눌림목 스윙): 일봉/4h 정배열(5>20>60) + 20일선 ±band% 지지 + 거래량 감소 + 직전고점 상승여력 확인 시 진입, 직전고점 부근 익절
   // bot_08: 정배열 20일선 눌림목
   bot_08({ price, ind, held, params }) {
     const d = ind.day;
@@ -1729,6 +1778,7 @@ const STRATEGIES = {
     return hold(`정배열 ${dayAligned && h4Aligned ? "O" : "X"} / 20선 이격 ${fmt(gap)}%`);
   },
 
+  // [Antigravity-Doc] bot_09 (거래량 폭발 스캘퍼): 15m 마감봉 거래량 ≥ 1.4배 양봉 + 추격 상한(+1.5%) & 윗꼬리 필터 통과 시 진입, 최고가 대비 -1.5% 트레일링 청산
   // bot_09: 거래량 폭발 모멘텀 스캘퍼
   bot_09({ price, ind, held, params, options = {} }) {
     const trailPct = Number(params.trailing_stop_pct ?? 1.5);
@@ -1755,6 +1805,7 @@ const STRATEGIES = {
     return hold(`거래량 ${fmt(m.closedVolRatio, 1)}배 (기준 ${spike}배)`);
   },
 
+  // [Antigravity-Doc] bot_10 (Jack Kellogg 프라이스액션): VWAP/LRC(±2σ)/RVOL/기준선 기반 Setup A(추세 돌파 1분할) & Setup B(과매도 반등 2분할) 멀티 레짐 전략
   // bot_10: 잭 켈로그(Jack Kellogg) 프라이스 액션 & VWAP/선형회귀 모멘텀
   bot_10({ price, ind, held, params, options = {} }) {
     const k = ind.kellogg || ind.m15?.kellogg;
@@ -1912,12 +1963,14 @@ const STRATEGIES = {
 };
 
 /**
- * 10개 봇 공통 전략 평가 함수 (순수 수식·기술적 지표 기반)
- * @param {string} botId       bot_01 ~ bot_10
+ * [Antigravity-Doc] 10개 봇 공통 전략 평가 엔트리포인트 (순수 수식·기술적 지표 기반, 실전/가상/백테스트 공용)
+ * - `mtfTrendBots`(`bot_01`/`02`/`03`/`04`/`07`/`09`)는 `enforceMtf !== false`일 때 상위 타임프레임(1h/4h)이
+ *   강한 하락 추세(`htfStronglyBearish`)면 신규 BUY를 자동 차단하여 역추세 물림을 방지한다.
+ * @param {string} botId       bot_01 ~ bot_10 (구버전 ID 자동 정규화)
  * @param {object} marketData  { market, price, ticker, candles: { day, m240, m60, m15 } }
  * @param {object} indicators  buildIndicators(marketData) 결과
  * @param {Array|object|null} position 해당 마켓의 보유 OPEN 포지션(들)
- * @param {object} options     { params, peakPrice, momentumRank, market }
+ * @param {object} options     { params, peakPrice, momentumRank, market, isLive, enforceMtf }
  * @returns {{signal: "BUY"|"SELL"|"HOLD", reason: string, splitIndex?: number, sellPositionIds?: number[]}}
  */
 export function evaluateStrategy(botId, marketData, indicators, position, options = {}) {
@@ -1957,6 +2010,7 @@ export function evaluateStrategy(botId, marketData, indicators, position, option
 // ============================================================================
 // 5. 캔들 캐시 (업비트 Rate Limit 방어: 마켓·주기별 TTL 공유 캐시)
 // ============================================================================
+// [Antigravity-Doc] 업비트 Rate Limit 방어용 4개 타임프레임별 캔들 조회 스펙 및 TTL 공유 캐시 맵
 const CANDLE_UNITS = [
   { key: "day", unit: "days", count: 65, ttlMs: 5 * 60 * 1000 },
   { key: "m240", unit: "minutes/240", count: 65, ttlMs: 2 * 60 * 1000 },
@@ -1965,6 +2019,7 @@ const CANDLE_UNITS = [
 ];
 const candleCache = new Map();
 
+/** [Antigravity-Doc] 마켓·단위별 TTL 캐시 적중 시 즉시 반환하고 만료 시 `fetchCandlesFn` 호출 (실패 시 직전 캐시 폴백) */
 async function getCandlesCached(market, spec, fetchCandlesFn) {
   const cacheKey = `${market}|${spec.unit}`;
   const hit = candleCache.get(cacheKey);
@@ -1983,7 +2038,7 @@ async function getCandlesCached(market, spec, fetchCandlesFn) {
   return hit ? hit.rows : [];
 }
 
-/** 마켓별 시세 + 4종 캔들 + 지표 패키지 구성 (공유 캐시 사용) */
+/** [Antigravity-Doc] 마켓별 최신 티커 + 4종 캔들(day/m240/m60/m15) + 통합 지표 패키지(`buildIndicators`) 조립 */
 export async function buildMarketData(market, ticker, fetchCandlesFn) {
   const candles = {};
   for (const spec of CANDLE_UNITS) {
@@ -1998,12 +2053,14 @@ export async function buildMarketData(market, ticker, fetchCandlesFn) {
 // ============================================================================
 // 6. 쿨다운 / 트레일링 고점 추적 (인메모리)
 // ============================================================================
+// [Antigravity-Doc] 가상거래 인메모리 상태: 재진입 쿨다운(cooldownMap), 포지션별 최고가(peakMap), 직전 시세 캐시(lastPriceMap)
 const cooldownMap = new Map();
 const peakMap = new Map();
 let lastPriceMap = new Map();
 let lastCycleAt = "";
 let lastCycleSummary = "";
 
+/** [Antigravity-Doc] 포지션별 트레일링 스탑 기준 최고가(`peakMap`) 단조 증가 갱신 */
 export function updatePeakPrice(key, price, initial = 0) {
   const prev = Number(peakMap.get(key) || initial || 0);
   const next = Math.max(prev, Number(price || 0));
@@ -2035,7 +2092,7 @@ async function addColumnSafe(db, table, name, ddl) {
   }
 }
 
-/** bots 테이블 선택/전략군/가상거래 컬럼 및 paper_trades 사유 컬럼 보강 (중복 컬럼 예외 방어) */
+/** [Antigravity-Doc] `bots`·`paper_trades`·`paper_bot_positions`·`bot_positions` 테이블의 Arena 확장 컬럼 안전 마이그레이션 */
 export async function ensureArenaSchema(db) {
   const cols = await columnNames(db, "bots");
   const hadSelectionColumn = cols.includes("is_selected_for_live");
@@ -2055,11 +2112,8 @@ export async function ensureArenaSchema(db) {
 }
 
 /**
- * 10대 봇 마스터 데이터 보장
- * - 구버전 3개 실전 봇(bot_volatility / bot_dual_momentum / bot_bollinger_reversal)을
- *   bot_01 / bot_03 / bot_05 로 이관 (원장 trades · bot_positions · paper_* 의 bot_id 포함)
- * - 신규 설치: 상위 3개 봇(bot_01~03)을 실전 담당으로 기본 선택
- * - 기존 설치: 기존 실전 봇이었던 봇들을 실전 담당으로 승계
+ * [Antigravity-Doc] 10대 알고리즘 봇 마스터 시드 및 구버전 봇 ID(`bot_volatility` 등) 원장 일괄 마이그레이션
+ * - 기존 사용자 커스텀 파라미터는 보존하고 누락된 신규 키만 기본값으로 보충하며, 모든 봇의 `paper_is_running = 1`을 보장한다.
  */
 export async function seedArenaBots(db, { hadSelectionColumn = true } = {}) {
   const now = nowKSTString();
@@ -2176,6 +2230,7 @@ export async function seedArenaBots(db, { hadSelectionColumn = true } = {}) {
 // ============================================================================
 // 8. 가상 체결 (paper_trades / paper_bot_positions 원장 전용)
 // ============================================================================
+/** [Antigravity-Doc] 가상거래 가용 현금 계산: `초기시드 + 누적 실현손익 - 현재 OPEN 포지션 매수원금(수수료 포함)` */
 async function computePaperCash(db, botId, initial) {
   const pnl = await db
     .prepare("SELECT COALESCE(SUM(profit_krw), 0) AS p FROM paper_trades WHERE bot_id = ? AND status = 'COMPLETED'")
@@ -2186,7 +2241,7 @@ async function computePaperCash(db, botId, initial) {
   return Math.max(0, Math.floor(Number(initial) + Number(pnl?.p || 0) - Number(open?.inv || 0)));
 }
 
-/** 가상 매수 체결: 예산을 Math.floor(예산 / 1.0005) 로 환산하고 수수료 0.05% 별도 반영 */
+/** [Antigravity-Doc] 가상 매수 체결: `Math.floor(budget / 1.0005)`로 원금·0.05% 수수료 분리 후 `paper_trades`/`paper_bot_positions` 기록 */
 async function paperBuy(db, bot, market, price, budgetKrw, reason) {
   const safePrice = Number(price);
   const safeBudget = Number(budgetKrw);
@@ -2217,7 +2272,7 @@ async function paperBuy(db, bot, market, price, budgetKrw, reason) {
   return { positionId: Number(pr.lastInsertRowid), tradeId, buyAmount, fee, volume, uuid };
 }
 
-/** 가상 매도 체결 (포지션별 개별 정산, 수수료 0.05% 반영) */
+/** [Antigravity-Doc] 가상 매도 체결: 포지션별 0.05% 매도 수수료 반영 정산 + `cooldownMap` 15분 재진입 쿨다운 등록 */
 async function paperSell(db, bot, positions, price, reason) {
   const safePrice = Number(price);
   if (!Number.isFinite(safePrice) || safePrice <= 0 || !Array.isArray(positions) || positions.length === 0) {
@@ -2272,6 +2327,11 @@ function normalizedOrderRatio(cfg, fallback = 0.3) {
 
 const COOLDOWN_MS = 15 * 60 * 1000;
 
+/**
+ * [Antigravity-Doc] 단일 가상 봇의 1사이클 평가 및 가상 체결 실행기 (`paper_trades`/`paper_bot_positions` 전용)
+ * - (1) 보유 포지션 청산: 포지션별 독립 고점(`perPosPeak`)으로 3단계 스마트 청산 → 고정 SL/TP → 전략 SELL 시그널 순으로 평가.
+ * - (2) 신규/분할 진입: 동일 사이클 매도 마켓 및 15분 쿨다운 마켓 제외, 호가 품질 가드(`analyzeOrderbookQuality`) 통과 시 가상 매수.
+ */
 export async function runPaperBot(db, bot, ctx) {
   const { mdMap, universe, rankMap, tickerMap, getOrderbook } = ctx;
   const cfg = parseCfg(bot);
@@ -2431,6 +2491,7 @@ export async function runPaperBot(db, bot, ctx) {
 // ============================================================================
 // 9. 리더보드 / 통계 산출
 // ============================================================================
+/** [Antigravity-Doc] 단일 봇의 가상거래 누적 평가자산·실현/미실현 손익·수익률·승률·보유 포지션 목록 집계 */
 async function computeBotArenaStats(db, bot) {
   const rawInitial = Number(bot.paper_initial_capital || DEFAULT_PAPER_CAPITAL);
   const initial = Number.isFinite(rawInitial) && rawInitial > 0 ? rawInitial : DEFAULT_PAPER_CAPITAL;
@@ -2529,6 +2590,7 @@ function parseBotOverridesSafe(raw) {
   return {};
 }
 
+/** [Antigravity-Doc] `market_regime_filter(id=1)`에서 현재 시황 레짐(BULL/SIDEWAYS/BEAR) 및 봇별 허용/차단 오버라이드 로드 */
 export async function readMarketRegimeContext(db, explicitRegime = null) {
   let row = null;
   if (!explicitRegime || (!explicitRegime.market_regime && !explicitRegime.recommended_action)) {
@@ -2573,6 +2635,10 @@ export async function readMarketRegimeContext(db, explicitRegime = null) {
   };
 }
 
+/**
+ * [Antigravity-Doc] `SINGLE_MARKET_FIT_100` 모드 전용: 현재 시황 레짐(BULL/SIDEWAYS/BEAR)과 봇별 오버라이드에 맞춰
+ * 9단계 우선순위 티어로 최적 단일 봇 1개를 선출한다.
+ */
 export function selectSingleMarketFitChampion(enrichedBots = [], { regimeContext, minWeeklyTrades = 2 } = {}) {
   const ctx = regimeContext || {
     market_regime: "SIDEWAYS",
@@ -2645,9 +2711,10 @@ export function selectSingleMarketFitChampion(enrichedBots = [], { regimeContext
 }
 
 /**
- * 주간 전략군별(그룹 A/B/C) 1위 챔피언 선출 및 비중 산정
- * - 최근 7일 롤링(ROLLING_7D) Arena 성과를 우선 평가하되,
- *   해당 전략군 주간 거래가 0건인 초기 DB 환경에서는 누적 Arena 성적(ARENA_CUMULATIVE_FALLBACK)으로 자동 폴백
+ * [Antigravity-Doc] 주간 3대 전략군(추세·스윙 / 변동성·돌파 / 역추세·그리드) 1위 챔피언 선출 및 실전 비중 산정기
+ * - 최근 7일 롤링(ROLLING_7D) 가상 성과를 기본 평가하되, 그룹 내 7일 거래가 0건이면 누적 Arena 성적으로 자동 폴백.
+ * - `rotation_score = eval_return_pct - |mdd_pct| * 0.5 + eval_win_rate * 0.05 + (최소거래 충족 시 +1.0)`
+ * - 배분 모드(`EQUAL_BY_EQUITY_TIER`, `SINGLE_MARKET_FIT_100`, `RANK_WEIGHTED_*`)에 따라 최종 실전 선출 봇과 목표 자본을 계산한다.
  */
 export async function evaluateWeeklyStrategyChampions(db, options = {}) {
   const rawMinTrades = Number(options.minWeeklyTrades ?? 2);
@@ -2922,7 +2989,7 @@ export async function evaluateWeeklyStrategyChampions(db, options = {}) {
   };
 }
 
-/** 10개 봇 실시간 가상거래 경쟁 순위 (1위~10위) */
+/** [Antigravity-Doc] 10대 알고리즘 봇 가상거래 수익률 순위표(1~10위) 조회 */
 export async function getArenaLeaderboard(db, options = {}) {
   let evalConfig = options;
   if (!options.allocationMode) {
@@ -2952,6 +3019,7 @@ export async function getArenaLeaderboard(db, options = {}) {
   return rows;
 }
 
+/** [Antigravity-Doc] 가상거래 체결 이력(`paper_trades`) 최근 최대 500건 조회 (특정 봇 필터 지원) */
 export async function getArenaTrades(db, botId = null, limit = 100) {
   const lim = Math.max(1, Math.min(500, Number(limit) || 100));
   const base = `
@@ -2965,6 +3033,7 @@ export async function getArenaTrades(db, botId = null, limit = 100) {
   return await db.prepare(`${base} ORDER BY t.id DESC LIMIT ?`).all(lim);
 }
 
+/** [Antigravity-Doc] 10대 봇 가상거래 잔액·최고평가자산·누적 MDD·상태 메시지를 `bots` 테이블에 영속화 */
 async function persistArenaStats(db, statusMap) {
   const bots = await db.prepare("SELECT * FROM bots").all();
   const upd = db.prepare(
@@ -2983,8 +3052,11 @@ async function persistArenaStats(db, statusMap) {
 // 10. 상시 가상 경쟁 사이클 (LLM / Regime 필터 완전 우회)
 // ============================================================================
 /**
- * @param db   PostgreSQL Database Adapter
- * @param deps { getUniverse(): Promise<string[]>, fetchTickersMap(markets): Promise<Map>, fetchCandles(market, unit, count): Promise<Array> }
+ * [Antigravity-Doc] 10대 순수 알고리즘 상시 가상 경쟁(Arena) 메인 사이클 (LLM / 시황 필터 완전 우회)
+ * - 거래대금 상위 유니버스 + 현재 OPEN 포지션 마켓의 시세·4종 캔들·지표·7일 모멘텀 순위를 1회 일괄 계산해
+ *   10개 봇이 공유하며, 각 봇 실행 후 `persistArenaStats`로 DB 통계를 갱신한다.
+ * @param {object} db   SQLite/PG DB 어댑터
+ * @param {object} deps `{ getUniverse, fetchTickersMap, fetchCandles, getOrderbook }`
  */
 export async function runArenaCycle(db, deps) {
   const universe = (await deps.getUniverse()).slice();
@@ -3029,11 +3101,12 @@ export async function runArenaCycle(db, deps) {
   return { ok: true, message: lastCycleSummary };
 }
 
+/** [Antigravity-Doc] 가상거래(Arena) 최근 실행 시각 및 요약 문자열 반환 */
 export function getArenaStatus() {
   return { last_cycle_at: lastCycleAt, last_cycle_summary: lastCycleSummary };
 }
 
-/** 가상거래 전용 원장 및 가상 잔액 초기화 (실제 거래 원장은 건드리지 않음) */
+/** [Antigravity-Doc] 가상거래 원장(`paper_trades`, `paper_bot_positions`) 및 봇별 가상 시드(100만 원) 초기화 — 실전 원장은 미접촉 */
 export async function resetArena(db) {
   await db.exec("DELETE FROM paper_trades; DELETE FROM paper_bot_positions;");
   await db.prepare(`

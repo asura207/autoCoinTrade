@@ -1,3 +1,34 @@
+/**
+ * [Antigravity-Doc] backend/node_server.mjs — autoCoinTrade 메인 백엔드 서버
+ *
+ * ■ 전체 아키텍처 개요
+ *   Node.js 내장 `node:http` 기반 단일 진입점 백엔드 서버로, 업비트(Upbit) 현물 실전 자동매매,
+ *   10대 전략 상시 가상 아레나(Paper Arena), 듀얼 AI(Flash/Pro + 로컬 Ollama) 장세·뉴스 분석,
+ *   주간 자동 봇 로테이션 및 자본 90% 상한(Global 90% Cap) 관리, 백테스트, Web Push/알림,
+ *   그리고 React SPA 정적 서빙과 REST/SSE API 라우팅을 모두 총괄한다.
+ *
+ * ■ 주요 섹션 목차
+ *   1. 환경·경로·버전 초기화 및 KST 시간/DB 어댑터(SQLite/PostgreSQL) 유틸리티
+ *   2. 10대 봇 메타데이터, 정밀도(8자리 절삭/호가 단위) 및 듀얼 AI 장세 판단 정규화·교차검증 엔진
+ *   3. DB 스키마 초기화·마이그레이션(`initializeDatabase`) 및 Web Push(VAPID) 브로드캐스트
+ *   4. 봇 자본 배분(`recalculateAndApplyBotAllocations`), 업비트 계좌·주문 API, 동적 자본/월별 스냅샷 동기화
+ *   5. 세션 인증(HMAC 쿠키 + IP Rate Limit), CORS/JSON 헬퍼, 런타임 설정 및 Ollama/Gemini 설정 관리
+ *   6. 듀얼 AI 게이트웨이(할당량 관리, 3-Tier 폴백, 시황/뉴스 분석 및 SSE 스트리밍)
+ *   7. DB 쓰기 뮤텍스(`withDbWriteLock`), 실전 봇 선택(`applyLiveBotsSelection`), 주간 LLM 봇 선정 및 자동 로테이션·드레인(Drain) 정산
+ *   8. HTTP 서버 및 전체 REST/SSE API 라우터(`/api/*`, `/sw.js`, SPA 정적 파일)
+ *   9. 업비트 시세/캔들/호가 조회, 장세 필터(`checkMarketRegimeFilter`), 실전 매수(`executeBotBuyOrder`)·정산(`settleLiveSellOrderInDb`)·매도(`executeBotSellOrder`) 엔진
+ *  10. 실전 매매 루프(`runLiveTradingBotsCycle`), 실시간 틱 반응형 스마트 청산(`triggerTickReactiveSmartExit`),
+ *      상시 아레나/포지션 대사/정기 AI 스케줄러 및 워커 기동·그레이스풀 셧다운
+ *
+ * ■ 동시성 · 보안 · 주문 안전 핵심 규칙
+ *   - DB 쓰기 직렬화: 자본 배분·로테이션·봇 교체 등 복합 쓰기는 `withDbWriteLock` 직렬 큐 + 트랜잭션(`BEGIN IMMEDIATE` / `BEGIN`)으로 보호한다.
+ *   - 실전 주문 가드레일: 프로세스 리스(`acquireLiveExecutorLease`), 멱등 주문 의도(Intent) 선점·확정·환불,
+ *     미확정 타임아웃 대사(`reconcileLiveOrderIntents`), 일/시간당 주문 속도 제한으로 중복·폭주 매수를 차단한다.
+ *   - 90% 자본 상한 불변식: 실전 총자산 대비 최대 투입 비율(기본 90%)을 초과하지 않도록 배분·로테이션·드레인 환원 전 구간에서 검증한다.
+ *   - 인증/보안: 입장 코드(Entry Code) 기반 HMAC-SHA256 서명 HttpOnly 쿠키, 타이밍 세이프 비교, IP별 실패 잠금(Rate Limit),
+ *     API 키 암호화 볼트(`crypto_vault.mjs`)를 적용한다.
+ *   - 라이브러리 모드: `AUTOCOIN_LIBRARY_MODE=1` 설정 시 테스트/스크립트에서 HTTP 서버·워커 자동 기동 없이 핵심 함수만 import 가능하다.
+ */
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
@@ -106,6 +137,10 @@ import {
   buildSellIntentBucket,
 } from "./common/live_order_guardrail.mjs";
 
+// [Antigravity-Doc] 경로 및 환경 변수(.env) 설정 상수
+// - BASE_DIR: 프로젝트 루트 디렉터리
+// - DATA_DIR / DB_PATH: SQLite DB, 세션 시크릿 등 런타임 데이터 저장 경로
+// - CONFIG_PATH / ENV_PATH: 업비트 API 키·모드 설정 JSON 및 .env 파일 경로 (환경변수로 오버라이드 가능)
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const BASE_DIR = path.resolve(__dirname, "..");
@@ -114,6 +149,7 @@ const DB_PATH = path.join(DATA_DIR, "auto_coin_trade.db");
 const CONFIG_PATH = process.env.AUTOCOIN_CONFIG_PATH || path.join(BASE_DIR, "config", "upbit_config.json");
 const EXAMPLE_CONFIG_PATH = path.join(BASE_DIR, "config", "upbit_config.example.json");
 const ENV_PATH = process.env.AUTOCOIN_ENV_PATH || path.join(BASE_DIR, ".env");
+// [Antigravity-Doc] 외부 dotenv 패키지 없이 .env 파일을 직접 파싱해 미설정 process.env 항목만 채움
 if (fs.existsSync(ENV_PATH)) {
   const raw = fs.readFileSync(ENV_PATH, "utf-8");
   for (const line of raw.split(/\r?\n/)) {
@@ -129,6 +165,7 @@ if (fs.existsSync(ENV_PATH)) {
     }
   }
 }
+// [Antigravity-Doc] HTTP 바인딩 호스트/포트 (기본 127.0.0.1:8001) 및 package.json 기반 앱 버전 로드
 const HOST = process.env.BACKEND_HOST || "127.0.0.1";
 const PORT = Number(process.env.BACKEND_PORT || process.env.PORT || 8001);
 
@@ -145,10 +182,19 @@ if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
+/**
+ * [Antigravity-Doc] 현재 시각을 KST(UTC+9) 'YYYY-MM-DD HH:mm:ss' 문자열로 반환한다.
+ * @returns {string} KST 포맷 타임스탬프
+ */
 function nowKSTString() {
   return formatKstDateTime(new Date());
 }
 
+/**
+ * [Antigravity-Doc] 주어진 시각을 KST(UTC+9) 기준 연/월/일/요일/시/분/초 및 날짜·타임스탬프 문자열로 분해한다.
+ * @param {Date|string|number} [dateInput=new Date()] 기준 시각
+ * @returns {{year:number, month:number, day:number, dayOfWeek:number, hour:number, minute:number, second:number, dateStr:string, timestampStr:string}}
+ */
 function getKstCalendarParts(dateInput = new Date()) {
   const ref = dateInput instanceof Date ? dateInput : new Date(dateInput);
   const kstEpoch = new Date(ref.getTime() + 9 * 3600 * 1000);
@@ -165,6 +211,14 @@ function getKstCalendarParts(dateInput = new Date()) {
   return { year, month, day, dayOfWeek, hour, minute, second, dateStr, timestampStr };
 }
 
+/**
+ * [Antigravity-Doc] 주간 자동 로테이션의 다음 예정 실행 시각(KST 정시)을 계산한다.
+ * 현재 시각이 이번 주 목표 시각을 이미 지났거나 같으면 다음 주(+7일)로 이월한다.
+ * @param {number} [dayOfWeek=1] 목표 요일 (0=일 ~ 6=토, 기본 1=월요일)
+ * @param {number} [hourKst=9] 목표 시각(KST 0~23시, 기본 9시)
+ * @param {Date} [refDate=new Date()] 기준 시각
+ * @returns {string} 'YYYY-MM-DD HH:00:00' KST 문자열
+ */
 function computeNextRotationKstString(dayOfWeek = 1, hourKst = 9, refDate = new Date()) {
   const targetDow = Math.max(0, Math.min(6, Math.floor(Number(dayOfWeek ?? 1))));
   const targetHour = Math.max(0, Math.min(23, Math.floor(Number(hourKst ?? 9))));
@@ -186,6 +240,11 @@ function computeNextRotationKstString(dayOfWeek = 1, hourKst = 9, refDate = new 
   return `${c.getUTCFullYear()}-${pad(c.getUTCMonth() + 1)}-${pad(c.getUTCDate())} ${pad(c.getUTCHours())}:00:00`;
 }
 
+/**
+ * [Antigravity-Doc] `bots` 테이블의 자본·배분·선정 상태를 레거시/호환용 `bot_accounts` 테이블로 단방향 동기화한다.
+ * @param {object} db 활성 DB 인스턴스
+ * @returns {Promise<void>} 부수효과: `bot_accounts` UPSERT/UPDATE (테이블 미존재 시 무시)
+ */
 async function syncBotAccountsFromBots(db) {
   try {
     const bots = await db
@@ -231,10 +290,19 @@ async function syncBotAccountsFromBots(db) {
   }
 }
 
+/**
+ * [Antigravity-Doc] 현재 KST 날짜를 'YYYY-MM-DD' 형식으로 반환한다.
+ * @returns {string}
+ */
 function todayDateString() {
   return nowKSTString().slice(0, 10);
 }
 
+/**
+ * [Antigravity-Doc] 초기 셋업 마법사 완료 여부를 환경변수 및 `upbit_config.json` 기준으로 판별한다.
+ * 미완료 시 프론트엔드가 셋업 마법사로 유도되며 일부 API만 허용된다.
+ * @returns {boolean}
+ */
 function checkSetupCompleted() {
   if (process.env.SETUP_COMPLETED === "true") return true;
   if (fs.existsSync(CONFIG_PATH)) {
@@ -251,8 +319,14 @@ function checkSetupCompleted() {
   return false;
 }
 
+// [Antigravity-Doc] 현재 프로세스의 초기 설정 완료 상태 캐시 (셋업 완료 API 호출 시 true로 전환)
 let isConfigured = checkSetupCompleted();
 
+/**
+ * [Antigravity-Doc] 환경변수(`DB_MODE`, `PG_SYNC_ENABLED`)에 따라 활성 DB 어댑터(`sqliteDb` 또는 `pgDb`)를 반환한다.
+ * 기본값은 `sqliteDb`이며, `DB_MODE`가 sqlite가 아니고 `PG_SYNC_ENABLED !== 'false'`일 때 `pgDb`를 사용한다.
+ * @returns {object} prepared statement 호환 DB 래퍼
+ */
 // 데이터베이스 인스턴스 (SQLite / PostgreSQL 동적 분기)
 export function getDb() {
   const mode = (process.env.DB_MODE || "sqlite").trim().toLowerCase();
@@ -263,6 +337,11 @@ export function getDb() {
   return pgDb;
 }
 
+// [Antigravity-Doc] 10대 표준 봇 식별자 및 전략군 분류 상수
+// - ALL_BOT_IDS: bot_01 ~ bot_10 전체 목록
+// - TREND_BREAKOUT_BOT_IDS: 추세/돌파 전략군 (횡보·약세 방어 시 우선 BLOCK 대상)
+// - MEAN_REVERSION_GRID_BOT_IDS: 역추세/그리드/눌림목 전략군 (약세·횡보 시 0.5x 방어 허용 대상)
+// - LEGACY_BOT_OVERRIDE_ALIAS: 구 3봇 키(bot_vb 등)를 10봇 표준 키로 자동 마이그레이션하기 위한 매핑
 const ALL_BOT_IDS = Array.from({ length: 10 }, (_, idx) => `bot_${String(idx + 1).padStart(2, "0")}`);
 const TREND_BREAKOUT_BOT_IDS = new Set(["bot_01", "bot_02", "bot_03", "bot_04", "bot_07", "bot_09"]);
 const MEAN_REVERSION_GRID_BOT_IDS = new Set(["bot_05", "bot_06", "bot_08", "bot_10"]);
@@ -279,6 +358,7 @@ const LEGACY_BOT_OVERRIDE_ALIAS = {
 const DEFAULT_BOT_OVERRIDES = Object.fromEntries(ALL_BOT_IDS.map((id) => [id, "ALLOW"]));
 const DEFAULT_BOT_OVERRIDES_JSON = JSON.stringify(DEFAULT_BOT_OVERRIDES);
 
+// [Antigravity-Doc] AI 프롬프트에 주입하는 10대 봇별 전략 특성 및 장세별 ALLOW/BLOCK 가이드
 const BOT_STRATEGY_GUIDE = {
   bot_01: { name: "변동성 돌파봇", group: "추세·돌파", rule: "BULL ALLOW, SIDEWAYS/휩소 BLOCK" },
   bot_02: { name: "슈퍼트렌드+ATR봇", group: "추세·돌파", rule: "BULL ALLOW, SIDEWAYS/휩소 BLOCK" },
@@ -292,6 +372,12 @@ const BOT_STRATEGY_GUIDE = {
   bot_10: { name: "잭 켈로그 올라운더봇", group: "역추세·그리드·눌림목", rule: "VWAP/회귀 채널 멀티 레짐 ALLOW, 패닉 쇼크 BLOCK" },
 };
 
+/**
+ * [Antigravity-Doc] 코인 수량(volume)을 소수점 8자리 이하로 안전 절삭(ROUND_DOWN)한 10진 문자열로 변환한다.
+ * 업비트 매도 API에서 잔고 초과 오류(`insufficient_funds_ask`)를 막기 위해 반올림이 아닌 문자열 절삭을 사용한다.
+ * @param {number|string} val 원본 수량
+ * @returns {string} 소수점 최대 8자리 양수 문자열 (유효하지 않으면 "0")
+ */
 function floorTo8DecimalsStr(val) {
   if (val === null || val === undefined || val === "") return "0";
   const num = Number(val);
@@ -308,6 +394,12 @@ function floorTo8DecimalsStr(val) {
   return fracPart ? `${intPart}.${fracPart}` : intPart;
 }
 
+/**
+ * [Antigravity-Doc] 체결가(실행 가격)를 정규화한다. 1,000원 이상은 정수 절삭, 1,000원 미만 저가 코인은 소수점 8자리 유지.
+ * @param {number|string} rawPrice 원본 체결가
+ * @param {number} [fallbackPrice=0] rawPrice가 0 이하/비정상일 때 대체가
+ * @returns {number}
+ */
 function normalizeExecPrice(rawPrice, fallbackPrice = 0) {
   const num = Number(rawPrice);
   if (!Number.isFinite(num) || num <= 0) {
@@ -318,6 +410,12 @@ function normalizeExecPrice(rawPrice, fallbackPrice = 0) {
   return num >= 1000 ? Math.floor(num) : Number(num.toFixed(8));
 }
 
+/**
+ * [Antigravity-Doc] AI 또는 DB에서 읽은 `bot_overrides`(JSON 문자열 또는 객체)를 10대 표준 봇(`bot_01`~`bot_10`) 기준
+ * `{ bot_id: "ALLOW" | "BLOCK" }` 맵으로 정규화한다. 레거시 키(`bot_vb` 등)도 자동 승계한다.
+ * @param {string|object} rawOverrides 원본 오버라이드
+ * @returns {Record<string, "ALLOW"|"BLOCK">}
+ */
 function normalizeBotOverrides(rawOverrides) {
   let parsed = {};
   if (typeof rawOverrides === "string" && rawOverrides.trim()) {
@@ -349,6 +447,11 @@ function normalizeBotOverrides(rawOverrides) {
   return out;
 }
 
+/**
+ * [Antigravity-Doc] DB에 저장된 `bot_overrides`가 레거시 키를 포함하거나 10대 봇 키가 누락되어 마이그레이션이 필요한지 검사한다.
+ * @param {string|object} rawOverrides
+ * @returns {boolean}
+ */
 function needsBotOverridesMigration(rawOverrides) {
   let parsed = null;
   if (typeof rawOverrides === "string") {
@@ -365,6 +468,7 @@ function needsBotOverridesMigration(rawOverrides) {
   return ALL_BOT_IDS.some((id) => parsed[id] !== "ALLOW" && parsed[id] !== "BLOCK");
 }
 
+// [Antigravity-Doc] LLM이 예시/플레이스홀더로 출력할 수 있는 가짜 티커 차단 목록
 const BLACKLIST_PLACEHOLDER_TICKERS = new Set([
   "KRW-TICKER",
   "KRW-COIN",
@@ -377,6 +481,12 @@ const BLACKLIST_PLACEHOLDER_TICKERS = new Set([
   "KRW-TEST",
 ]);
 
+/**
+ * [Antigravity-Doc] LLM이 반환한 블랙리스트 티커 배열을 정규화(`KRW-XXX`)하고 플레이스홀더 및 미상장 종목을 걸러낸다.
+ * @param {string|string[]} rawList 원본 블랙리스트 (JSON 문자열 또는 배열)
+ * @param {Set<string>|null} [validMarketsSet=null] 유효 KRW 마켓 화이트리스트 (미지정 시 캐시 사용)
+ * @returns {string[]} 정렬된 고유 KRW 마켓 코드 배열
+ */
 function normalizeBlacklistTickers(rawList, validMarketsSet = null) {
   let arr = [];
   if (typeof rawList === "string") {
@@ -411,6 +521,12 @@ function normalizeBlacklistTickers(rawList, validMarketsSet = null) {
   return Array.from(dedup).sort();
 }
 
+/**
+ * [Antigravity-Doc] 불리언/숫자/문자열("true","1","yes","on" 등) 플래그를 안전하게 boolean으로 변환한다.
+ * @param {*} val 입력값
+ * @param {boolean} [defaultVal=false] 판별 불가 시 기본값
+ * @returns {boolean}
+ */
 function parseBoolFlag(val, defaultVal = false) {
   if (typeof val === "boolean") return val;
   if (typeof val === "number") return val !== 0 && !Number.isNaN(val);
@@ -422,6 +538,16 @@ function parseBoolFlag(val, defaultVal = false) {
   return defaultVal;
 }
 
+/**
+ * [Antigravity-Doc] 단일 LLM(Flash/Pro/Ollama)이 출력한 장세 제어 JSON을 검증·정규화한다.
+ * 주요 방어 로직:
+ *  - 유효하지 않은 `market_regime`, `recommended_action`, `sentiment_score`(-1~+1) 클램핑
+ *  - `risk_alert=true`와 `REDUCE_SIZE`/부분 ALLOW 간 모순 해소 (진성 HALT 조건에서만 0% 전면 차단)
+ *  - 약세/패닉 방어 액션인데 감성 점수가 양수(+)인 경량 모델 오류를 음수(-)로 부호 보정
+ * @param {object} parsedDecision LLM 파싱 결과 객체
+ * @param {string} [defaultReason] reason 누락 시 기본 설명
+ * @returns {object} 정규화된 장세 판단 객체
+ */
 function normalizeLlmRegimeDecision(parsedDecision, defaultReason = "듀얼 AI 장세 및 봇 스위치 판단") {
   const regime = String(parsedDecision?.market_regime || "SIDEWAYS").trim().toUpperCase();
   const validRegime = ["BULL", "BEAR", "SIDEWAYS", "HIGH_VOLATILITY_SHOCK"].includes(regime) ? regime : "SIDEWAYS";
@@ -525,6 +651,13 @@ function normalizeLlmRegimeDecision(parsedDecision, defaultReason = "듀얼 AI �
   };
 }
 
+/**
+ * [Antigravity-Doc] Tier-3 기계적 폴백 장세 판단기.
+ * Gemini/Ollama 등 모든 AI 호출이 실패했을 때 BTC 현재가 vs 일봉 20MA / 4시간봉 60MA 위치로 보수적 장세를 산출한다.
+ * 시세 조회조차 실패한 경우 Fail-Open(BULL/1.0x)을 금지하고 SIDEWAYS/0.5x 안전 모드로 동작한다.
+ * @param {{btcPrice?:number, btcDaily20Ma?:number, btc4h60Ma?:number, label?:string}} [params]
+ * @returns {object} 정규화된 장세 판단 객체
+ */
 function buildMechanicalFallbackRegime({ btcPrice = 0, btcDaily20Ma = 0, btc4h60Ma = 0, label = "Fallback" } = {}) {
   const hasDailyMa = btcPrice > 0 && btcDaily20Ma > 0;
   const has4hMa = btcPrice > 0 && btc4h60Ma > 0;
@@ -568,6 +701,18 @@ function buildMechanicalFallbackRegime({ btcPrice = 0, btcDaily20Ma = 0, btc4h60
   };
 }
 
+/**
+ * [Antigravity-Doc] 듀얼 AI(단기 Flash 30분 트랙 + 거시 Pro 1시간 트랙) 판단을 교차 검증하여 최종 장세 제어값을 합성한다.
+ * 핵심 합성 규칙:
+ *  1. Pro가 진성 HALT/EMERGENCY_CLOSE_ALL을 요청하면 최우선으로 전봇 BLOCK 및 비중 0% 적용.
+ *  2. 로컬 소형 Ollama(Flash) 단독 HALT 요청은 블랙스완 키워드(해킹/디페깅/상폐 등)가 없고 Pro가 정상일 때 `REDUCE_SIZE(0.5x)`로 완화.
+ *  3. 평시 비중 축소(`REDUCE_SIZE`) 시 전략군 스위치는 거시 전략가(Pro)를 우선하되, 경량 폴백 과잉 차단 시 역추세·그리드 봇을 보호.
+ *  4. 감성 점수는 둘 중 하나가 -0.5 이하면 최솟값 채택, 그 외에는 Flash 40% + Pro 60% 가중 평균.
+ *  5. 블랙리스트 티커는 두 모델의 합집합으로 병합.
+ * @param {object} flashDecision 단기 트랙 판단
+ * @param {object} proDecision 거시 트랙 판단
+ * @returns {object} `market_regime_filter` 갱신용 최종 합성 결과
+ */
 function synthesizeDualAiDecision(flashDecision, proDecision) {
   const flashAction = String(flashDecision?.recommended_action || "NORMAL").trim().toUpperCase();
   const proAction = String(proDecision?.recommended_action || "NORMAL").trim().toUpperCase();
@@ -782,6 +927,11 @@ function synthesizeDualAiDecision(flashDecision, proDecision) {
   };
 }
 
+/**
+ * [Antigravity-Doc] 문자열이 AI 장세 제어 JSON 조각인지 휴리스틱으로 판별한다.
+ * @param {string} text 검사할 텍스트
+ * @returns {boolean}
+ */
 function isRegimeControlJsonFragment(text) {
   if (!text || typeof text !== "string") return false;
   const hasBotOverrides = text.includes('"bot_overrides"') || text.includes("bot_overrides");
@@ -794,6 +944,11 @@ function isRegimeControlJsonFragment(text) {
   return hasBotOverrides || hitCount >= 2;
 }
 
+/**
+ * [Antigravity-Doc] 토큰 절단 등으로 닫히지 않은(불완전한) LLM 제어 JSON 문자열에서 정규식으로 핵심 필드를 복구한다.
+ * @param {string} rawJsonText 잘린 JSON 후보 문자열
+ * @returns {object|null} 핵심 필드(regime/action/bot_overrides) 중 하나 이상 복구되면 객체 반환, 아니면 null
+ */
 function parsePartialRegimeJson(rawJsonText) {
   if (!rawJsonText || typeof rawJsonText !== "string") return null;
   if (!isRegimeControlJsonFragment(rawJsonText)) return null;
@@ -854,6 +1009,11 @@ function parsePartialRegimeJson(rawJsonText) {
   return hasEnoughFields ? out : null;
 }
 
+/**
+ * [Antigravity-Doc] 사용자에게 노출되는 AI 브리핑 마크다운 본문에서 기계 제어용 JSON 블록(닫힌/열린 펜스, 말미 원시 JSON)을 제거한다.
+ * @param {string} rawText LLM 원문 응답
+ * @returns {string} 제어 JSON이 제거된 마크다운 텍스트
+ */
 function stripControlJsonFromBriefingText(rawText) {
   if (!rawText || typeof rawText !== "string") return "";
   let cleaned = rawText;
@@ -887,6 +1047,12 @@ function stripControlJsonFromBriefingText(rawText) {
   return cleaned;
 }
 
+/**
+ * [Antigravity-Doc] LLM 마크다운 응답에서 브리핑 본문(`cleanText`)과 구조화된 장세 제어 객체(`structured`)를 분리 추출한다.
+ * 코드 펜스 JSON -> 말미 원시 JSON -> 잘린 부분 JSON 순으로 3단계 복구를 시도한 뒤 `normalizeLlmRegimeDecision`으로 정규화한다.
+ * @param {string} rawText LLM 원문 응답
+ * @returns {{cleanText:string, structured:object|null}}
+ */
 function extractStructuredRegimeFromLlmText(rawText) {
   if (!rawText || typeof rawText !== "string") {
     return { cleanText: "", structured: null };
@@ -965,6 +1131,13 @@ function extractStructuredRegimeFromLlmText(rawText) {
   return { cleanText, structured };
 }
 
+/**
+ * [Antigravity-Doc] `market_regime_filter` DB 행에 파싱된 `bot_overrides`, `final_bot_overrides`, `blacklist_tickers`와
+ * 활성 Flash/Pro 모델 메타정보를 덧붙여 API 응답 형식으로 확장한다.
+ * @param {object|null} row DB 행
+ * @param {object} [modelMeta={}] `loadDualAiModelMeta` 결과
+ * @returns {object|null}
+ */
 function enrichRegimeFilterRow(row, modelMeta = {}) {
   if (!row) return null;
   const botOverrides = normalizeBotOverrides(row.final_bot_overrides_json || row.bot_overrides_json);
@@ -981,6 +1154,11 @@ function enrichRegimeFilterRow(row, modelMeta = {}) {
   };
 }
 
+/**
+ * [Antigravity-Doc] 현재 사용 중인 듀얼 AI(Flash/Pro) 제공자·모델명을 `system_settings` 및 최신 브리핑 이력에서 조회한다.
+ * @param {object} db 활성 DB 인스턴스
+ * @returns {Promise<{flash_provider:string, flash_model:string, pro_provider:string, pro_model:string}>}
+ */
 async function loadDualAiModelMeta(db) {
   const out = { flash_provider: "", flash_model: "", pro_provider: "", pro_model: "" };
   try {
@@ -1033,6 +1211,16 @@ async function loadDualAiModelMeta(db) {
   return out;
 }
 
+/**
+ * [Antigravity-Doc] 데이터베이스 전체 스키마 생성, 무중단 컬럼 마이그레이션, 기본 시드(10대 봇/로테이션/시스템 설정) 및
+ * 레거시·테스트 이력 정리를 수행한다.
+ * 부수효과:
+ *  - SQLite/PostgreSQL 호환 테이블(`system_settings`, `bots`, `trades`, `bot_positions`, `paper_*`, `market_regime_filter`,
+ *    `auto_rotation_*`, `drain_handoff_logs`, `capital_restoration_logs`, `ai_*`, `crypto_news`, `push_subscriptions` 등) 생성 및 `ALTER TABLE`
+ *  - 백테스트·실전 주문 가드레일 테이블 보장 (`ensureBacktestTables`, `ensureLiveGuardrailTables`)
+ *  - 10대 아레나 봇 시드 및 `virtual_krw = allocated_capital - OPEN 포지션 합계` 정합성 동기화
+ * @returns {Promise<void>}
+ */
 export async function initializeDatabase() {
   const db = getDb();
   await db.exec(`
@@ -1465,6 +1653,7 @@ export async function initializeDatabase() {
   await setDefault.run("ollama_timeout_ms", String(process.env.OLLAMA_TIMEOUT_MS || "180000"), now);
 }
 
+// [Antigravity-Doc] 라이브러리 모드가 아닐 때 프로세스 기동 직후 DB 스키마 초기화 자동 실행
 if (process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
   try {
     await initializeDatabase();
@@ -1477,9 +1666,14 @@ if (process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
   }
 }
 
+// [Antigravity-Doc] Web Push(VAPID) 공개키/비밀키 메모리 캐시
 let vapidPublicKey = "";
 let vapidPrivateKey = "";
 
+/**
+ * [Antigravity-Doc] `system_settings`에서 VAPID 키 쌍을 로드하거나 없으면 신규 생성·저장한 뒤 `webpush`에 등록한다.
+ * @returns {Promise<void>} 부수효과: DB `system_settings` 쓰기 및 `webpush.setVapidDetails` 호출
+ */
 async function initVapidKeys() {
   try {
     const db = getDb();
@@ -1510,6 +1704,7 @@ async function initVapidKeys() {
   }
 }
 
+// [Antigravity-Doc] 라이브러리 모드가 아닐 때 프로세스 기동 직후 Web Push VAPID 키 자동 초기화
 if (process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
   try {
     await initVapidKeys();
@@ -1518,6 +1713,12 @@ if (process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
   }
 }
 
+/**
+ * [Antigravity-Doc] `push_subscriptions` 테이블에 등록된 모든 브라우저 구독자에게 Web Push 알림을 병렬 발송한다.
+ * 404/410(만료된 구독) 응답을 받은 구독은 DB에서 자동 정리한다.
+ * @param {{title?:string, body?:string, data?:object}} params 알림 제목/본문/부가 데이터
+ * @returns {Promise<{success:boolean, count:number, total?:number, error?:string}>}
+ */
 async function broadcastWebPushNotification({ title, body, data = {} }) {
   try {
     const db = getDb();
@@ -1579,12 +1780,23 @@ async function broadcastWebPushNotification({ title, body, data = {} }) {
   }
 }
 
+/**
+ * [Antigravity-Doc] `system_settings` 테이블에서 단일 설정 키 값을 조회한다.
+ * @param {string} key 설정 키
+ * @param {string} [defaultVal=""] 미존재 시 기본값
+ * @returns {Promise<string>}
+ */
 async function getSetting(key, defaultVal = "") {
   const db = getDb();
   const row = await db.prepare("SELECT value FROM system_settings WHERE key = ?").get(key);
   return row ? row.value : defaultVal;
 }
 
+/**
+ * [Antigravity-Doc] 현재 런타임 설정이 실전 매매(live) 모드이고 유효한 업비트 API 키가 설정되었는지 판별한다.
+ * 테스트/라이브러리 모드에서는 `AUTOCOIN_FORCE_LIVE_MODE=1`로 강제 활성화할 수 있다.
+ * @returns {boolean}
+ */
 function isLiveMode() {
   if (process.env.AUTOCOIN_FORCE_LIVE_MODE === "1" && process.env.AUTOCOIN_LIBRARY_MODE === "1") {
     return true;
@@ -1599,36 +1811,69 @@ function isLiveMode() {
   );
 }
 
+/**
+ * [Antigravity-Doc] 매매 모드("live"|"paper")에 대응하는 포지션 테이블명을 반환한다.
+ * @param {"live"|"paper"|null} [mode=null] 미지정 시 "live"
+ * @returns {"bot_positions"|"paper_bot_positions"}
+ */
 function getPositionsTableName(mode = null) {
   const m = mode || "live";
   return m === "live" ? "bot_positions" : "paper_bot_positions";
 }
 
+/**
+ * [Antigravity-Doc] 매매 모드("live"|"paper")에 대응하는 체결 이력 테이블명을 반환한다.
+ * @param {"live"|"paper"|null} [mode=null] 미지정 시 "live"
+ * @returns {"trades"|"paper_trades"}
+ */
 function getTradesTableName(mode = null) {
   const m = mode || "live";
   return m === "live" ? "trades" : "paper_trades";
 }
 
+/**
+ * [Antigravity-Doc] 현재 활성 DB 엔진이 SQLite인지 판별한다 (트랜잭션 구문 `BEGIN IMMEDIATE` vs `BEGIN` 분기용).
+ * @returns {boolean}
+ */
 function isSqliteEngineActive() {
   const mode = (process.env.DB_MODE || "sqlite").trim().toLowerCase();
   const syncEnabled = process.env.PG_SYNC_ENABLED !== "false";
   return mode === "sqlite" || !syncEnabled;
 }
 
+/**
+ * [Antigravity-Doc] 쓰기 트랜잭션을 시작한다. SQLite에서는 쓰기 경합/데드락 방지를 위해 `BEGIN IMMEDIATE`를 사용한다.
+ * @param {object} db 활성 DB 인스턴스
+ */
 async function beginWriteTx(db) {
   await db.exec(isSqliteEngineActive() ? "BEGIN IMMEDIATE" : "BEGIN");
 }
 
+/**
+ * [Antigravity-Doc] 진행 중인 쓰기 트랜잭션을 커밋한다.
+ * @param {object} db 활성 DB 인스턴스
+ */
 async function commitWriteTx(db) {
   await db.exec("COMMIT");
 }
 
+/**
+ * [Antigravity-Doc] 예외 발생 시 진행 중인 쓰기 트랜잭션을 안전하게 롤백한다(이미 종료된 경우 무시).
+ * @param {object} db 활성 DB 인스턴스
+ */
 async function rollbackWriteTx(db) {
   try {
     await db.exec("ROLLBACK");
   } catch {}
 }
 
+/**
+ * [Antigravity-Doc] 전체 10대 봇 목록과 실시간 평가손익, 가용 원화(`virtual_krw`), 일일 손익 및 서킷브레이커(-4%) 상태를 조합해 반환한다.
+ * 실전("live") 조회 시 인플라이트 매수 의도(`live_order_intents` PENDING/SUBMITTED/UNKNOWN_TIMEOUT) 금액을 선차감해 중복 매수를 방지하며,
+ * 가상("paper") 조회 시 실전 원장과 완전히 분리된 `paper_*` 컬럼/테이블만 사용한다.
+ * @param {"live"|"paper"|null} [mode=null] 조회 모드 (미지정 시 `isLiveMode()` 기준 자동 결정)
+ * @returns {Promise<Array<object>>}
+ */
 export async function getBots(mode = null) {
   const db = getDb();
   if (!db) return [];
@@ -1749,6 +1994,18 @@ export async function getBots(mode = null) {
   return result;
 }
 
+/**
+ * [Antigravity-Doc] 총 운용 원금(`flooredTotal`)과 봇별 배분 비율(`ratiosMap`)을 바탕으로 각 봇의 `allocated_capital` 및
+ * 가용 잔고(`virtual_krw`)를 1원 오차 없이(Zero-Sum Invariant) 재계산하고 DB에 반영한다.
+ * 핵심 알고리즘:
+ *  - 이미 보유 중인 OPEN 포지션 + 인플라이트 매수 예약금(`used`)이 자신의 비율 배당분보다 큰 봇은 `locked`로 고정(virtual_krw=0).
+ *  - 나머지 잔여 풀(`remainingPool`)을 미잠금 활성 봇들에게 비율대로 재분배하며, 소수점 절삭 자투리는 최우선 순위 봇에 귀속.
+ * @param {number} flooredTotal 정수 절삭된 총 배분 원금(KRW)
+ * @param {Record<string, number>|null} [ratiosMap=null] 봇별 배분 비율(%) 맵 (미지정 시 DB 기존 비율 사용)
+ * @param {"live"|"paper"|null} [mode=null] 대상 모드
+ * @param {{rankPriorityMap?:Record<string,number>, skipAccountSync?:boolean}} [options={}]
+ * @returns {Promise<{totalUsed:number, totalAllocated:number, totalVirtual:number, remainderDustAwarded:number}>}
+ */
 export async function recalculateAndApplyBotAllocations(flooredTotal, ratiosMap = null, mode = null, options = {}) {
   const db = getDb();
   const now = nowKSTString();
@@ -1903,6 +2160,12 @@ export async function recalculateAndApplyBotAllocations(flooredTotal, ratiosMap 
   };
 }
 
+/**
+ * [Antigravity-Doc] 실전 운용 원금 또는 활성 봇 가용 잔고(보유 포지션 0건 기준)가 0원 이하로 떨어졌는지 검사하고,
+ * 해당 시 전체 봇을 즉시 중지(`is_running=0`)하며 `zero_balance_halted=1` 플래그와 다채널 긴급 알림을 발송한다.
+ * @param {"live"|"paper"|null} [mode=null] paper 모드에서는 항상 중단하지 않고 통과
+ * @returns {Promise<{halted:boolean, reason:string}>}
+ */
 async function checkAndHaltIfZeroBalance(mode = null) {
   const db = getDb();
   if (mode === "paper") {
@@ -1956,6 +2219,14 @@ async function checkAndHaltIfZeroBalance(mode = null) {
   };
 }
 
+/**
+ * [Antigravity-Doc] 업비트 Open API Private 요청용 HS256 JWT 인증 토큰을 생성한다.
+ * 쿼리/바디 파라미터가 있으면 SHA-512 `query_hash`를 페이로드에 포함한다.
+ * @param {string} accessKey 업비트 Access Key
+ * @param {string} secretKey 업비트 Secret Key
+ * @param {Record<string, string>|null} [queryParams=null] 서명할 쿼리/요청 파라미터
+ * @returns {string} `header.payload.signature` JWT 문자열
+ */
 function createUpbitJwt(accessKey, secretKey, queryParams = null) {
   const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
   const payloadObj = {
@@ -1975,8 +2246,14 @@ function createUpbitJwt(accessKey, secretKey, queryParams = null) {
   return `${header}.${payload}.${signature}`;
 }
 
+// [Antigravity-Doc] 업비트 상장 KRW 마켓 코드 캐시 (프로세스 수명 동안 유지)
 let cachedValidKrwMarkets = new Set();
 
+/**
+ * [Antigravity-Doc] 업비트 전체 상장 KRW 마켓 목록(`KRW-*`)을 조회해 메모리에 캐싱한다.
+ * @param {number} [timeoutMs=5000] 요청 타임아웃(ms)
+ * @returns {Promise<Set<string>>}
+ */
 async function getValidKrwMarkets(timeoutMs = 5000) {
   if (cachedValidKrwMarkets.size > 0) {
     return cachedValidKrwMarkets;
@@ -2001,6 +2278,12 @@ async function getValidKrwMarkets(timeoutMs = 5000) {
   return cachedValidKrwMarkets;
 }
 
+/**
+ * [Antigravity-Doc] 업비트 실계좌(`/v1/accounts`)와 보유 코인 현재가(`/v1/ticker`)를 조회하여
+ * 주문 가능 원화(`orderable_krw`), 총 매수금액, 총 평가금액, 총 평가자산(`total_asset_krw`), 평가손익을 계산한다.
+ * 부수효과: 업비트 Private/Public REST API 호출 (0.12s 레이트 리밋 슬립 포함)
+ * @returns {Promise<object>} 계좌 잔고 및 평가자산 요약 객체
+ */
 async function fetchUpbitAccountBalance() {
   const cfg = getRuntimeConfig();
 
@@ -2166,7 +2449,16 @@ async function fetchUpbitAccountBalance() {
 // - 주중 자동 동기화는 선출 봇 개수(1~3개)를 임의 변경하지 않으며,
 //   reconcileAutoSyncedBudgetsWith90Cap()을 통해 Draining 차감액을 절대 덮어쓰지 않음
 // ============================================================================
+// [Antigravity-Doc] 동적 자본 동기화 스로틀링 타임스탬프 (3초 이내 중복 호출 시 캐시 반환)
 let lastDynamicSyncMs = 0;
+/**
+ * [Antigravity-Doc] 업비트 실시간 총 평가자산(`E_total`)을 조회해 단일 90% 상한(`C_max`)을 산출하고,
+ * `withDbWriteLock` + 쓰기 트랜잭션 안에서 `system_settings` 및 활성/드레인 봇 예산을 원자적으로 동기화한다.
+ * 커밋 직전 `assertGlobal90CapInvariant`로 전체 사용 자본이 90% 상한을 넘지 않음을 검증한다.
+ * @param {boolean} [force=false] true 시 3초 스로틀 무시
+ * @param {object|null} [preloadedAccount=null] 이미 조회된 업비트 계좌 객체 재사용
+ * @returns {Promise<object>} 동기화 결과 (`total_equity_krw`, `global_cap_krw`, `allocResult` 등)
+ */
 export async function syncDynamicLiveCapitalFromUpbit(force = false, preloadedAccount = null) {
   const nowMs = Date.now();
   if (!force && !preloadedAccount && nowMs - lastDynamicSyncMs < 3000) {
@@ -2338,6 +2630,13 @@ export async function syncDynamicLiveCapitalFromUpbit(force = false, preloadedAc
 // - 이번달 1일 시점 평가자산과 현재 시점 평가자산, 증감액/증감률 기록
 // - 매달 영구 보존 및 월별 자산 증감 그래프 데이터 제공
 // ============================================================================
+/**
+ * [Antigravity-Doc] 월별 보유 자산 스냅샷(`monthly_asset_snapshots`)을 현재 평가자산 기준으로 갱신/생성하고,
+ * 누적 월별 이력(`history`)과 당월 증감액/증감률(`current_month`)을 반환한다.
+ * @param {"live"|"paper"} [targetMode="live"] 대상 모드
+ * @param {object|null} [forcedAccountInfo=null] 실전 모드에서 사전 조회된 업비트 계좌 정보
+ * @returns {Promise<{success:boolean, mode:string, current_month:object|null, history:Array<object>, updated_at:string}>}
+ */
 async function syncMonthlyAssetSnapshot(targetMode = "live", forcedAccountInfo = null) {
   const db = getDb();
   const kstNow = nowKSTString();
@@ -2485,6 +2784,11 @@ async function syncMonthlyAssetSnapshot(targetMode = "live", forcedAccountInfo =
   };
 }
 
+/**
+ * [Antigravity-Doc] 업비트 최근 체결 완료 주문 목록(`/v1/orders?state=done`)을 조회한다.
+ * @param {number} [limit=20] 조회 건수 상한
+ * @returns {Promise<{success:boolean, orders:Array<object>, count?:number, message?:string, checked_at:string}>}
+ */
 async function fetchUpbitRecentOrders(limit = 20) {
   const cfg = getRuntimeConfig();
 
@@ -2551,6 +2855,11 @@ async function fetchUpbitRecentOrders(limit = 20) {
   }
 }
 
+/**
+ * [Antigravity-Doc] 업비트 Open API 통신 지연(ms) 및 WebSocket 허브 연결 상태를 점검하여
+ * 신호등 상태(`green` 정상 / `yellow` 지연 / `red` 불가)를 반환한다.
+ * @returns {Promise<object>}
+ */
 async function checkUpbitStatus() {
   const cfg = getRuntimeConfig();
   const delayThreshold = Number(cfg.delay_threshold_ms || 800);
@@ -2621,6 +2930,11 @@ async function checkUpbitStatus() {
   }
 }
 
+// [Antigravity-Doc] 대시보드 세션 인증 및 브루트포스 방어(IP Rate Limit) 설정 상수
+// - SESSION_COOKIE_NAME: HttpOnly 세션 쿠키 이름
+// - SESSION_SECRET_PATH: HMAC 서명 키 영속화 경로 (권한 0600, 환경변수 SESSION_SECRET 우선)
+// - SESSION_TTL_MS: 세션 유효기간 (24시간; 단 KST 날짜 변경 시에도 재인증 요구)
+// - AUTH_RATE_LIMIT_*: 10분 윈도우 내 5회 연속 실패 시 해당 IP를 15분간 잠금
 const SESSION_COOKIE_NAME = "autoCoinTrade_session";
 const SESSION_SECRET_PATH = path.join(DATA_DIR, ".session_secret");
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
@@ -2630,6 +2944,10 @@ const AUTH_RATE_LIMIT_LOCK_MS = 15 * 60 * 1000;
 const authFailedAttemptsByIp = new Map();
 let cachedSessionSecret = null;
 
+/**
+ * [Antigravity-Doc] 세션 쿠키 HMAC-SHA256 서명용 비밀키를 로드하거나 최초 실행 시 32바이트 랜덤 키를 생성·저장한다.
+ * @returns {string}
+ */
 function getSessionSecret() {
   if (cachedSessionSecret) return cachedSessionSecret;
   const envSecret = String(process.env.SESSION_SECRET || "").trim();
@@ -2663,16 +2981,31 @@ function getSessionSecret() {
   }
 }
 
+/**
+ * [Antigravity-Doc] 두 문자열을 SHA-256 해시 후 상수 시간(`crypto.timingSafeEqual`)으로 비교해 타이밍 공격을 방지한다.
+ * @param {string} a
+ * @param {string} b
+ * @returns {boolean}
+ */
 function timingSafeEqualText(a, b) {
   const da = crypto.createHash("sha256").update(String(a ?? ""), "utf8").digest();
   const db = crypto.createHash("sha256").update(String(b ?? ""), "utf8").digest();
   return crypto.timingSafeEqual(da, db);
 }
 
+/**
+ * [Antigravity-Doc] 입장 코드 변경 시 기존 발급된 세션 쿠키를 즉시 무효화하기 위한 16자리 해시 버전 태그를 생성한다.
+ * @param {string} entryCode
+ * @returns {string}
+ */
 function entryCodeVersionTag(entryCode) {
   return crypto.createHash("sha256").update(String(entryCode ?? ""), "utf8").digest("hex").slice(0, 16);
 }
 
+/**
+ * [Antigravity-Doc] 현재 유효한 대시보드 입장 코드를 조회한다 (DB `entry_code`/`gate_code` -> 환경변수 -> 기본값 "stock").
+ * @returns {Promise<string>}
+ */
 async function getEffectiveEntryCode() {
   const defaultEntry = String(process.env.GATE_CODE || process.env.ENTRY_CODE || "stock").trim() || "stock";
   try {
@@ -2684,6 +3017,11 @@ async function getEffectiveEntryCode() {
   return defaultEntry;
 }
 
+/**
+ * [Antigravity-Doc] HTTP 요청 헤더의 `Cookie` 문자열을 key-value 맵으로 파싱한다.
+ * @param {http.IncomingMessage} req
+ * @returns {Record<string, string>}
+ */
 function parseRequestCookies(req) {
   const raw = String(req.headers?.cookie || "");
   const out = {};
@@ -2698,6 +3036,11 @@ function parseRequestCookies(req) {
   return out;
 }
 
+/**
+ * [Antigravity-Doc] 입장 코드 버전 태그와 KST 날짜, 만료시각이 포함된 HMAC-SHA256 서명 세션 토큰을 발급한다.
+ * @param {string} entryCode
+ * @returns {string}
+ */
 function createSignedSessionToken(entryCode) {
   const nowMs = Date.now();
   const payload = {
@@ -2712,6 +3055,12 @@ function createSignedSessionToken(entryCode) {
   return `${encoded}.${sig}`;
 }
 
+/**
+ * [Antigravity-Doc] 세션 토큰의 HMAC 서명, 만료시각(`exp`), 당일 KST 날짜(`kst_date`), 입장 코드 버전을 모두 검증한다.
+ * @param {string} token
+ * @param {string} entryCode
+ * @returns {boolean}
+ */
 function verifySignedSessionToken(token, entryCode) {
   if (!token || typeof token !== "string") return false;
   const parts = token.split(".");
@@ -2736,12 +3085,24 @@ function verifySignedSessionToken(token, entryCode) {
   }
 }
 
+/**
+ * [Antigravity-Doc] `Set-Cookie` 헤더 문자열을 생성한다 (HTTPS/리버스프록시 감지 시 `Secure` 속성 자동 부여).
+ * @param {http.IncomingMessage} req
+ * @param {string} token
+ * @param {number} [maxAgeSec=86400]
+ * @returns {string}
+ */
 function buildSessionCookieHeader(req, token, maxAgeSec = 86400) {
   const xfProto = String(req.headers?.["x-forwarded-proto"] || "").toLowerCase();
   const isHttps = xfProto.split(",")[0]?.trim() === "https" || Boolean(req.socket?.encrypted);
   return `${SESSION_COOKIE_NAME}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSec}${isHttps ? "; Secure" : ""}`;
 }
 
+/**
+ * [Antigravity-Doc] 요청 쿠키의 세션 토큰이 현재 유효한 입장 코드로 서명되었는지 비동기 검증한다.
+ * @param {http.IncomingMessage} req
+ * @returns {Promise<boolean>}
+ */
 async function isRequestAuthenticated(req) {
   const cookies = parseRequestCookies(req);
   const token = cookies[SESSION_COOKIE_NAME];
@@ -2750,6 +3111,12 @@ async function isRequestAuthenticated(req) {
   return verifySignedSessionToken(token, effectiveCode);
 }
 
+/**
+ * [Antigravity-Doc] 인증 Rate Limit 키로 사용할 클라이언트 IP를 추출한다.
+ * 루프백 리버스 프록시(Cloudflare/Nginx) 경유 시에만 `cf-connecting-ip` / `x-forwarded-for` 헤더를 신뢰한다.
+ * @param {http.IncomingMessage} req
+ * @returns {string}
+ */
 function getClientIpForAuth(req) {
   const rawRemote = String(req.socket?.remoteAddress || "127.0.0.1");
   const isLoopback = rawRemote === "127.0.0.1" || rawRemote === "::1" || rawRemote === "::ffff:127.0.0.1";
@@ -2762,6 +3129,11 @@ function getClientIpForAuth(req) {
   return rawRemote.replace(/^::ffff:/, "");
 }
 
+/**
+ * [Antigravity-Doc] 지정 IP의 인증 실패 잠금 여부를 확인하고, 메모리 Map이 1,000건을 초과하면 만료 항목을 정리한다.
+ * @param {string} ip
+ * @returns {{blocked:boolean, retryAfterSec:number}}
+ */
 function checkAuthRateLimit(ip) {
   const now = Date.now();
   if (authFailedAttemptsByIp.size > 1000) {
@@ -2783,6 +3155,11 @@ function checkAuthRateLimit(ip) {
   return { blocked: false, retryAfterSec: 0 };
 }
 
+/**
+ * [Antigravity-Doc] 인증 실패 횟수를 누적하고 최대 허용 횟수(`AUTH_RATE_LIMIT_MAX_ATTEMPTS`) 도달 시 잠금 시각을 설정한다.
+ * @param {string} ip
+ * @returns {{count:number, firstFailAt:number, lockedUntil:number}}
+ */
 function recordAuthFailure(ip) {
   const now = Date.now();
   let rec = authFailedAttemptsByIp.get(ip);
@@ -2798,6 +3175,12 @@ function recordAuthFailure(ip) {
   return rec;
 }
 
+/**
+ * [Antigravity-Doc] 동일 출처(Host / X-Forwarded-Host) 또는 `CORS_ALLOWED_ORIGINS` 화이트리스트에 일치하는 Origin에만
+ * Credential 허용 CORS 헤더를 생성한다.
+ * @param {http.IncomingMessage} req
+ * @returns {Record<string, string>}
+ */
 function getCorsHeaders(req) {
   const origin = String(req?.headers?.origin || "").trim();
   if (!origin) return {};
@@ -2822,6 +3205,13 @@ function getCorsHeaders(req) {
   return { Vary: "Origin" };
 }
 
+/**
+ * [Antigravity-Doc] JSON 응답을 공통 보안 헤더(`X-Content-Type-Options: nosniff`) 및 CORS 헤더와 함께 전송한다.
+ * @param {http.ServerResponse} res
+ * @param {number} statusCode
+ * @param {*} payload
+ * @param {Record<string, string>} [extraHeaders={}]
+ */
 function sendJson(res, statusCode, payload, extraHeaders = {}) {
   res.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
@@ -2832,6 +3222,11 @@ function sendJson(res, statusCode, payload, extraHeaders = {}) {
   res.end(JSON.stringify(payload));
 }
 
+/**
+ * [Antigravity-Doc] HTTP 요청 스트림을 UTF-8 문자열로 모아 JSON 객체로 파싱한다(빈 본문은 `{}`).
+ * @param {http.IncomingMessage} req
+ * @returns {Promise<object>}
+ */
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
@@ -2850,10 +3245,17 @@ function readJsonBody(req) {
   });
 }
 
+// [Antigravity-Doc] 로컬 Ollama 서버 기본 접속 정보 상수 (타임아웃 180초)
 const DEFAULT_OLLAMA_BASE_URL = "http://192.168.0.100:11434";
 const DEFAULT_OLLAMA_NEWS_MODEL = "qwen3-news";
 const DEFAULT_OLLAMA_TIMEOUT_MS = 180000;
 
+/**
+ * [Antigravity-Doc] Ollama 설정 등 기본값이 `true`인 불리언 플래그를 파싱한다.
+ * @param {*} val
+ * @param {boolean} [defaultVal=true]
+ * @returns {boolean}
+ */
 function parseBooleanFlag(val, defaultVal = true) {
   if (val === undefined || val === null || val === "") return defaultVal;
   if (typeof val === "boolean") return val;
@@ -2863,6 +3265,12 @@ function parseBooleanFlag(val, defaultVal = true) {
   return defaultVal;
 }
 
+/**
+ * [Antigravity-Doc] `config/upbit_config.json`을 읽고 암호화 볼트(`VAULT_SECRET_FIELDS`) 항목을 복호화해 반환한다.
+ * 평문 키가 감지되면 `migrateConfigSecrets`로 자동 암호화 마이그레이션을 수행한다.
+ * @param {{autoMigrate?:boolean}} [options={}]
+ * @returns {object}
+ */
 function getRuntimeConfig(options = {}) {
   const cfgPath = fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : EXAMPLE_CONFIG_PATH;
   try {
@@ -2882,6 +3290,12 @@ function getRuntimeConfig(options = {}) {
   }
 }
 
+/**
+ * [Antigravity-Doc] 런타임 설정 일부(`partial`)를 기존 `upbit_config.json`과 병합한 뒤,
+ * 비밀 필드(API 키 등)를 암호화 볼트로 감싸 0600 권한으로 안전 저장한다.
+ * @param {object} [partial={}]
+ * @returns {object|null} 저장 후 복호화된 런타임 설정 (실패 시 null)
+ */
 function saveRuntimeConfig(partial = {}) {
   try {
     let cfg = {};
@@ -2914,16 +3328,26 @@ function saveRuntimeConfig(partial = {}) {
   }
 }
 
+// [Antigravity-Doc] Ollama 연결 상태 헬스체크 결과 캐시 (불필요한 /api/tags 반복 호출 방지)
 let cachedOllamaStatus = {
   key: "",
   checkedAtMs: 0,
   value: null,
 };
 
+/**
+ * [Antigravity-Doc] Ollama 상태 캐시를 무효화한다(설정 저장 시 호출).
+ */
 function invalidateOllamaStatusCache() {
   cachedOllamaStatus = { key: "", checkedAtMs: 0, value: null };
 }
 
+/**
+ * [Antigravity-Doc] 로컬 Ollama 런타임 설정(활성 여부, Base URL, 모델명, 타임아웃)을 우선순위에 따라 해석한다.
+ * 우선순위: 함수 인자 -> (라이브러리 모드 시 env) -> UI 설정 DB -> upbit_config.json -> env -> DB 기본값 -> 상수.
+ * @param {object} [options={}]
+ * @returns {Promise<{enabled:boolean, baseUrl:string, model:string, timeoutMs:number}>}
+ */
 async function getOllamaRuntimeConfig(options = {}) {
   const cfg = fs.existsSync(CONFIG_PATH) ? getRuntimeConfig() : {};
   let uiConfigured = "";
@@ -3002,6 +3426,12 @@ async function getOllamaRuntimeConfig(options = {}) {
   };
 }
 
+/**
+ * [Antigravity-Doc] 로컬 Ollama 설정(사용 여부, URL, 모델명, 타임아웃)을 유효성 검증 후 `upbit_config.json`과 DB `system_settings`에 저장하고,
+ * 즉시 연결 테스트(`checkOllamaStatus`)를 수행해 결과를 반환한다.
+ * @param {object} [payload={}]
+ * @returns {Promise<object>}
+ */
 async function saveOllamaSettings(payload = {}) {
   const current = await getOllamaRuntimeConfig();
   const enabled =
@@ -3056,6 +3486,12 @@ async function saveOllamaSettings(payload = {}) {
   };
 }
 
+/**
+ * [Antigravity-Doc] 로컬 Ollama 서버(`/api/tags`, 1.5초 타임아웃) 도달 가능 여부와 응답 지연(ms)을 점검한다.
+ * 10초 캐시(`cachedOllamaStatus`)를 사용하여 대시보드 폴링 부하를 줄인다.
+ * @param {{forceRefresh?:boolean}} [options={}]
+ * @returns {Promise<{enabled:boolean, url:string, reachable:boolean, model:string, latency_ms:number}>}
+ */
 async function checkOllamaStatus(options = {}) {
   const cfg = await getOllamaRuntimeConfig(options);
   const cacheKey = `${cfg.enabled}|${cfg.baseUrl}|${cfg.model}`;
@@ -3106,6 +3542,10 @@ async function checkOllamaStatus(options = {}) {
   return statusObj;
 }
 
+/**
+ * [Antigravity-Doc] Gemini API 키를 `upbit_config.json` -> DB `system_settings` -> `process.env.GEMINI_API_KEY` 순으로 조회·복호화한다.
+ * @returns {Promise<string>}
+ */
 async function getGeminiApiKey() {
   const cfg = getRuntimeConfig();
   if (cfg.gemini_api_key && cfg.gemini_api_key !== "YOUR_GEMINI_API_KEY_HERE" && cfg.gemini_api_key.trim().length > 0) {
@@ -3118,6 +3558,11 @@ async function getGeminiApiKey() {
   return safeDecryptSecret((process.env.GEMINI_API_KEY || "").trim());
 }
 
+/**
+ * [Antigravity-Doc] Gemini API 키를 암호화하여 `upbit_config.json`과 DB `system_settings` 양쪽에 저장한다.
+ * @param {string} key
+ * @returns {Promise<string>} 공백 제거된 원본 키
+ */
 async function saveGeminiApiKey(key) {
   const cleanKey = (key || "").trim();
   saveRuntimeConfig({ gemini_api_key: cleanKey });
@@ -3134,11 +3579,19 @@ async function saveGeminiApiKey(key) {
 // - 30분 단위 Gemini Flash 빠른 분석 및 1시간 단위 Gemini Pro 심층 분석
 // - 사용자 수동 호출 가능 무료 API 한도: 20 - 6 = 14회/일 (일일 수동 안전 가이드)
 // ============================================================================
+// [Antigravity-Doc] Gemini 일일 무료 호출 한도 및 자동/수동 쿼터 배분 상수
+// - GEMINI_DAILY_TOTAL_FREE_LIMIT: 일일 총 무료 호출 상한(50회)
+// - GEMINI_DAILY_AUTO_RESERVED: 정기 자동 분석 예약분(6회)
+// - GEMINI_DAILY_MANUAL_LIMIT: 사용자 수동 분석 일일 허용 상한(30회)
 const GEMINI_DAILY_TOTAL_FREE_LIMIT = 50;
 const AI_SCHEDULE_HOURS = Array.from({ length: 24 }, (_, i) => i);
 const GEMINI_DAILY_AUTO_RESERVED = 6;
 const GEMINI_DAILY_MANUAL_LIMIT = 30;
 
+/**
+ * [Antigravity-Doc] 다음 30분 정시/반시 정기 AI 분석 예정 시각 문자열을 계산한다.
+ * @returns {string} 'YYYY-MM-DD HH:mm:00'
+ */
 function getNextScheduledAiAnalysisAt() {
   const now = new Date();
   const pad = (n) => String(n).padStart(2, "0");
@@ -3152,6 +3605,10 @@ function getNextScheduledAiAnalysisAt() {
   return `${target.getFullYear()}-${pad(target.getMonth() + 1)}-${pad(target.getDate())} ${pad(target.getHours())}:${pad(target.getMinutes())}:00`;
 }
 
+/**
+ * [Antigravity-Doc] 당일(KST) Gemini API 자동/수동 사용량과 잔여 쿼터를 조회한다. 날짜가 바뀌면 자동 0으로 리셋한다.
+ * @returns {Promise<object>}
+ */
 async function getGeminiQuotaStatus() {
   const db = getDb();
   const today = todayDateString();
@@ -3186,6 +3643,11 @@ async function getGeminiQuotaStatus() {
   };
 }
 
+/**
+ * [Antigravity-Doc] Gemini API 호출 성공 시 자동(`AUTO`) 또는 수동(`MANUAL`) 일일 사용량 카운터를 1 증가시킨다.
+ * @param {"AUTO"|"MANUAL"} [triggerType="MANUAL"]
+ * @returns {Promise<object>} 갱신된 쿼터 상태
+ */
 async function consumeGeminiQuota(triggerType = "MANUAL") {
   const db = getDb();
   const status = await getGeminiQuotaStatus();
@@ -3207,6 +3669,10 @@ async function consumeGeminiQuota(triggerType = "MANUAL") {
   return await getGeminiQuotaStatus();
 }
 
+/**
+ * [Antigravity-Doc] Gemini 429 전 모델 소진 시 당일 수동 사용량을 상한까지 채워 불필요한 재호출을 차단한다.
+ * @returns {Promise<object>}
+ */
 async function markGeminiManualQuotaExhausted() {
   const db = getDb();
   await getGeminiQuotaStatus();
@@ -3218,6 +3684,10 @@ async function markGeminiManualQuotaExhausted() {
   return await getGeminiQuotaStatus();
 }
 
+/**
+ * [Antigravity-Doc] 최신 AI 시황 브리핑(`ai_market_briefings`), 장세 필터(`market_regime_filter`), 쿼터, Ollama 상태를 통합 조회한다.
+ * @returns {Promise<object>}
+ */
 async function getLatestAiBriefing() {
   const db = getDb();
   const row = await db.prepare("SELECT * FROM ai_market_briefings ORDER BY id DESC LIMIT 1").get();
@@ -3250,6 +3720,10 @@ async function getLatestAiBriefing() {
   };
 }
 
+/**
+ * [Antigravity-Doc] 최신 AI 뉴스 브리핑(`ai_news_briefings`)과 키 보유 여부·쿼터·Ollama 상태를 조회한다.
+ * @returns {Promise<object>}
+ */
 async function getLatestAiNewsBriefing() {
   const db = getDb();
   const row = await db.prepare("SELECT * FROM ai_news_briefings ORDER BY id DESC LIMIT 1").get();
@@ -3268,6 +3742,14 @@ async function getLatestAiNewsBriefing() {
   };
 }
 
+/**
+ * [Antigravity-Doc] AI 시황/뉴스 분석 결과(Flash 또는 Pro 트랙)를 `system_settings`에 저장한 뒤,
+ * 유효 TTL(Flash 90분 / Pro 180분) 내의 상대 트랙 상태와 `synthesizeDualAiDecision`으로 교차 합성하여
+ * `market_regime_filter(id=1)` 테이블과 메모리 장세 캐시(`cachedRegimeState`)를 갱신한다.
+ * 부수효과: DB `system_settings`, `market_regime_filter` UPDATE 및 장세 캐시 무효화
+ * @param {object} params 분석 트랙(`isPro`), 모델 정보, BTC 지표, LLM 텍스트/결정 객체
+ * @returns {Promise<object|null>} 갱신된 `market_regime_filter` 확장 행
+ */
 async function updateMarketRegimeFilterFromAnalysis({
   isPro = false,
   provider = "",
@@ -3491,6 +3973,12 @@ async function updateMarketRegimeFilterFromAnalysis({
   }
 }
 
+/**
+ * [Antigravity-Doc] 듀얼 AI(Flash/Pro) 시황 분석용 실시간 팩트 컨텍스트와 한국어 프롬프트를 조립한다.
+ * BTC 이동평균선, 주요 5대 코인 시세, 최신 뉴스 12건, 업비트 실계좌 현황, 실전 선택/드레인 봇 포지션을 포함한다.
+ * @param {{isProTarget?:boolean}} [params]
+ * @returns {Promise<{regimeFilter:object, btcPrice:number, btcDaily20Ma:number, btc4h60Ma:number, isHoldCash:boolean, regimeReason:string, nowStr:string, prompt:string}>}
+ */
 async function buildDualAiMarketPromptContext({ isProTarget = false } = {}) {
   const regimeFilter = await checkMarketRegimeFilter();
   const btcPrice = Number(regimeFilter.btcPrice || 0);
@@ -3718,6 +4206,7 @@ ${allBotProfilesText}
   };
 }
 
+// [Antigravity-Doc] Gemini Flash/Pro 후보 모델 우선순위 목록 및 HTTP 429(30분)/503(10분) 쿨다운 관리
 const GEMINI_FLASH_WORKING_MODELS = [
   "gemini-3.5-flash",
   "gemini-3.8-flash",
@@ -3740,12 +4229,22 @@ const GEMINI_429_COOLDOWN_MS = 30 * 60 * 1000;
 const GEMINI_503_COOLDOWN_MS = 10 * 60 * 1000;
 const geminiModelQuotaCooldownMap = new Map();
 
+/**
+ * [Antigravity-Doc] 현재 429/503 쿨다운 중인 Gemini 모델을 후보 목록에서 제외한다.
+ * @param {string[]} [candidateModels=[]]
+ * @returns {string[]}
+ */
 function filterGeminiModelsByCooldown(candidateModels = []) {
   const nowMs = Date.now();
   return candidateModels.filter((m) => (geminiModelQuotaCooldownMap.get(m) || 0) <= nowMs);
 }
 
-/** Pro/Flash 분석 슬롯별 우선순위 + 무료 티어 Fallback 후보 모델 목록을 반환합니다. */
+/**
+ * [Antigravity-Doc] Pro/Flash 분석 슬롯별 우선순위 + 무료 티어 Fallback 후보 모델 목록을 반환한다.
+ * @param {boolean} [isProTarget=false]
+ * @param {string} [preferredModel=""] 최우선 지정 모델명
+ * @returns {string[]}
+ */
 function getDualAiCandidateModels(isProTarget = false, preferredModel = "") {
   const pref = String(preferredModel || "").trim();
   const baseList = isProTarget ? [...GEMINI_PRO_CANDIDATE_MODELS] : [...GEMINI_FLASH_CANDIDATE_MODELS];
@@ -3755,8 +4254,14 @@ function getDualAiCandidateModels(isProTarget = false, preferredModel = "") {
   return baseList;
 }
 
+// [Antigravity-Doc] Alternative.me 공포·탐욕 지수 5분 메모리 캐시
 let cachedFngData = { checkedAtMs: 0, value: "N/A", classification: "N/A" };
 
+/**
+ * [Antigravity-Doc] 암호화폐 공포·탐욕 지수(Fear & Greed Index)를 5분 캐시와 함께 조회한다.
+ * @param {{skipExternalApi?:boolean}} [options={}]
+ * @returns {Promise<{value:string, classification:string}>}
+ */
 async function fetchQuickFearAndGreedIndex(options = {}) {
   if (options?.skipExternalApi) {
     return { value: "N/A", classification: "N/A" };
@@ -3785,6 +4290,12 @@ async function fetchQuickFearAndGreedIndex(options = {}) {
   return { value: cachedFngData.value || "N/A", classification: cachedFngData.classification || "N/A" };
 }
 
+/**
+ * [Antigravity-Doc] 지정 마켓 목록의 업비트 현재가 및 전일대비 등락률을 요약 문자열로 조회한다(Ollama 프롬프트 주입용).
+ * @param {string[]} [markets]
+ * @param {{skipUpbitApi?:boolean}} [options={}]
+ * @returns {Promise<{btcPrice:number|null, btcChangePct:number|null, tickerLines:string}>}
+ */
 async function fetchUpbitTickersSummary(markets = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP"], options = {}) {
   if (options?.skipUpbitApi) {
     return { btcPrice: null, btcChangePct: null, tickerLines: "" };
@@ -3812,6 +4323,13 @@ async function fetchUpbitTickersSummary(markets = ["KRW-BTC", "KRW-ETH", "KRW-SO
   return { btcPrice: null, btcChangePct: null, tickerLines: "" };
 }
 
+/**
+ * [Antigravity-Doc] 로컬 Ollama 분석기에 주입할 실시간 시장 컨텍스트(BTC 이평선, 주요 시세, 공포탐욕지수, 오픈 포지션 종목, 활성 봇)를 병렬 수집한다.
+ * @param {object} db
+ * @param {object|null} [regimeCtx=null]
+ * @param {object} [options={}]
+ * @returns {Promise<{regimeFilter:object, marketContext:object, activeBots:Array<object>}>}
+ */
 async function fetchLiveMarketContextForOllama(db, regimeCtx = null, options = {}) {
   const regimeFilter = regimeCtx || (await checkMarketRegimeFilter(null, options));
   const [tickerSummary, fng, allBots, posRows, tradeRows] = await Promise.all([
@@ -3851,7 +4369,14 @@ async function fetchLiveMarketContextForOllama(db, regimeCtx = null, options = {
 }
 
 /**
- * 맥북 프로 로컬 Ollama(qwen3-news) API를 호출하여 최근 30분 암호화폐 뉴스 감성 및 업비트 10대 봇 제어 상태를 JSON으로 분석
+ * [Antigravity-Doc] 로컬 Ollama(`qwen3-news` 등) `/api/chat`을 호출하여 최근 암호화폐 뉴스·시황 기반 10대 봇 제어 JSON을 생성한다.
+ * CPU 추론 최적화(`think: false`, `format: "json"`, `keep_alive: "35m"`, 뉴스 최대 6건 90자 압축)를 적용하고
+ * 응답을 `normalizeLlmRegimeDecision`으로 검증·정규화한다.
+ * @param {Array} [newsList=[]]
+ * @param {object} [marketContext={}]
+ * @param {Array} [activeBots=[]]
+ * @param {object} [options={}]
+ * @returns {Promise<object>} provider="ollama" 정규화 결정 객체
  */
 async function callLocalOllamaCoinNewsAnalyzer(newsList = [], marketContext = {}, activeBots = [], options = {}) {
   const config = typeof getRuntimeConfig === "function" ? getRuntimeConfig() : {};
@@ -3961,6 +4486,13 @@ ${compactNewsText || "특이 속보 없음"}
   };
 }
 
+/**
+ * [Antigravity-Doc] 로컬 Ollama JSON 분석 결과를 대시보드 시황 브리핑 마크다운 문서로 포맷팅한다.
+ * @param {object} ollamaRes
+ * @param {object} [marketContext={}]
+ * @param {Array} [activeBots=[]]
+ * @returns {string}
+ */
 function buildOllamaMarketBriefingMarkdown(ollamaRes, marketContext = {}, activeBots = []) {
   const score = Number(ollamaRes?.sentiment_score || 0);
   const scoreStr = `${score >= 0 ? "+" : ""}${score.toFixed(2)}`;
@@ -4002,6 +4534,12 @@ function buildOllamaMarketBriefingMarkdown(ollamaRes, marketContext = {}, active
   ].join("\n");
 }
 
+/**
+ * [Antigravity-Doc] 로컬 Ollama JSON 분석 결과와 뉴스 통계를 대시보드 뉴스 브리핑 마크다운 문서로 포맷팅한다.
+ * @param {object} ollamaRes
+ * @param {object} [statsContext={}]
+ * @returns {string}
+ */
 function buildOllamaNewsBriefingMarkdown(ollamaRes, statsContext = {}) {
   const { totalNews = 0, bullCount = 0, bearCount = 0, neutCount = 0, topNews = [], marketContext = {} } = statsContext;
   const score = Number(ollamaRes?.sentiment_score || 0);
@@ -4037,6 +4575,14 @@ function buildOllamaNewsBriefingMarkdown(ollamaRes, statsContext = {}) {
     .join("\n");
 }
 
+/**
+ * [Antigravity-Doc] 완성된 마크다운 텍스트(예: Ollama/폴백 결과)를 SSE `chunk` 이벤트로 분할 전송하여 스트리밍 UX를 제공한다.
+ * @param {http.ServerResponse} res
+ * @param {http.IncomingMessage} req
+ * @param {string} fullText
+ * @param {number} [chunkSize=12]
+ * @param {number} [delayMs=4]
+ */
 async function streamTextAsSseChunks(res, req, fullText, chunkSize = 12, delayMs = 4) {
   const text = String(fullText || "");
   for (let i = 0; i < text.length; i += chunkSize) {
@@ -4049,11 +4595,14 @@ async function streamTextAsSseChunks(res, req, fullText, chunkSize = 12, delayMs
   }
 }
 
+// [Antigravity-Doc] Gemini 429 할당량 초과 멀티채널 알림 30분 중복 방지 쿨다운
 const GEMINI_QUOTA_NOTIFY_COOLDOWN_MS = 30 * 60 * 1000;
 let lastGeminiQuotaNotifyMs = 0;
 
 /**
- * Gemini API 호출 한도 초과(429 / 일일 무료 한도 소진) 발생 시 30분 쿨다운으로 텔레그램 등 멀티채널 알림을 발송합니다.
+ * [Antigravity-Doc] Gemini API 호출 한도 초과(HTTP 429 / 일일 무료 한도 소진) 발생 시 30분 쿨다운으로 텔레그램 등 멀티채널 알림을 발송한다.
+ * @param {{source?:string, triggerType?:string, fallbackTier?:string, reason?:string}} [params]
+ * @returns {boolean} 알림 발송 여부 (쿨다운 중이면 false)
  */
 function notifyGeminiQuotaExceeded({
   source = "Gemini API",
@@ -4082,6 +4631,12 @@ function notifyGeminiQuotaExceeded({
   return true;
 }
 
+/**
+ * [Antigravity-Doc] Gemini `generateContent` API를 후보 모델 순회 + 지수 백오프(1s/2s/4s) + 429/503 쿨다운 캐시와 함께 호출한다.
+ * Flash 모델에서 `thinkingConfig` 400 오류가 나면 자동으로 해당 옵션을 제거해 재시도한다.
+ * @param {object} params apiKey, candidateModels, prompt, temperature, timeoutMs, backoffDelaysMs, logTag
+ * @returns {Promise<{chosenModel:string, analysisText:string, lastErrorMsg:string, quota429Count:number, allQuota429:boolean}>}
+ */
 async function callGeminiGenerateWithBackoff({
   apiKey,
   candidateModels,
@@ -4221,6 +4776,11 @@ async function callGeminiGenerateWithBackoff({
   };
 }
 
+/**
+ * [Antigravity-Doc] Gemini `streamGenerateContent?alt=sse` 스트리밍 API를 후보 모델 순회 + 지수 백오프 + 쿨다운 캐시와 함께 호출한다.
+ * @param {object} params
+ * @returns {Promise<{geminiResp:Response|null, chosenModel:string, quota429Count:number, allQuota429:boolean}>}
+ */
 async function callGeminiStreamWithBackoff({
   apiKey,
   candidateModels,
@@ -4336,6 +4896,11 @@ async function callGeminiStreamWithBackoff({
   };
 }
 
+/**
+ * [Antigravity-Doc] Tier-3 기계적 폴백(BTC 일봉 20MA / 4시간 60MA 기반)을 실행해 `market_regime_filter`에 즉시 반영한다.
+ * @param {{isPro?:boolean, btcPrice?:number, btcDaily20Ma?:number, btc4h60Ma?:number, label?:string}} [params]
+ * @returns {Promise<object|null>}
+ */
 async function applyTier3MechanicalFallback({ isPro = false, btcPrice = 0, btcDaily20Ma = 0, btc4h60Ma = 0, label = "Mechanical Fallback" } = {}) {
   try {
     const fbDecision = buildMechanicalFallbackRegime({ btcPrice, btcDaily20Ma, btc4h60Ma, label });
@@ -4357,6 +4922,12 @@ async function applyTier3MechanicalFallback({ isPro = false, btcPrice = 0, btcDa
   }
 }
 
+/**
+ * [Antigravity-Doc] Gemini SSE 응답 스트림을 청크 단위로 읽어 클라이언트에 실시간 중계(`chunk` 이벤트)하고 전체 텍스트를 누적 반환한다.
+ * @param {Response} geminiResp
+ * @param {http.ServerResponse} res
+ * @returns {Promise<string>}
+ */
 async function consumeGeminiSseBody(geminiResp, res) {
   const reader = geminiResp.body.getReader();
   const decoder = new TextDecoder();
@@ -4403,6 +4974,12 @@ async function consumeGeminiSseBody(geminiResp, res) {
   return fullText;
 }
 
+/**
+ * [Antigravity-Doc] 시황 분석 결과를 `market_regime_filter`에 반영하고 `ai_market_briefings` 테이블에 영속화한다.
+ * 필요 시 자동 슬롯 키(`ai_briefing_last_auto_slot`)와 Gemini 일일 쿼터(`consumeQuota`)를 함께 갱신한다.
+ * @param {object} params
+ * @returns {Promise<{updatedRegime:object|null, regimeStatus:string, briefingId:number, updatedQuota:object}>}
+ */
 async function persistMarketBriefingAndUpdateRegime({
   db,
   provider,
@@ -4498,6 +5075,15 @@ async function persistMarketBriefingAndUpdateRegime({
   };
 }
 
+/**
+ * [Antigravity-Doc] 3-Tier 폴백 구조의 AI 시황 분석 메인 오케스트레이터(비스트리밍).
+ *  - Tier 1 (Flash 트랙 한정): 로컬 Ollama(`qwen3-news`) 호출 (API 비용 0원)
+ *  - Tier 2: Google Gemini API (후보 모델 순회 + 지수 백오프 + 429/503 쿨다운)
+ *  - Tier 3: BTC 일봉 20MA / 4시간 60MA 기반 기계적 폴백(`applyTier3MechanicalFallback`)
+ * 부수효과: DB `ai_market_briefings`, `market_regime_filter`, `system_settings` 갱신 및 429 초과 시 멀티채널 알림
+ * @param {{triggerType?:"AUTO"|"MANUAL", slotKey?:string, modelType?:"flash"|"pro", preferredModel?:string}} [options={}]
+ * @returns {Promise<object>}
+ */
 async function generateAiMarketAnalysis(options = {}) {
   const triggerType = options?.triggerType === "AUTO" ? "AUTO" : "MANUAL";
   const slotKey = options?.slotKey || null;
@@ -4737,6 +5323,12 @@ async function generateAiMarketAnalysis(options = {}) {
   };
 }
 
+/**
+ * [Antigravity-Doc] 대시보드 수동 AI 시황 분석용 SSE(Server-Sent Events) 스트리밍 핸들러.
+ * 1순위로 로컬 Ollama 결과를 타이프라이터 청크로 스트리밍하고, 실패 시 2순위 Gemini SSE 스트림으로 전환한다.
+ * @param {http.IncomingMessage} req
+ * @param {http.ServerResponse} res
+ */
 async function generateAiMarketAnalysisStream(req, res) {
   const db = getDb();
   const nowStr = nowKSTString();
@@ -5022,6 +5614,12 @@ async function generateAiMarketAnalysisStream(req, res) {
   }
 }
 
+/**
+ * [Antigravity-Doc] 최근 수집 뉴스 상위 25건, 감성 통계(호재/악재/중립), 주요 코인 시세를 조합해 AI 뉴스 분석 프롬프트를 생성한다.
+ * @param {object} db
+ * @param {object} [options={}]
+ * @returns {Promise<{topNews:Array, totalNews:number, bullCount:number, bearCount:number, neutCount:number, nowStr:string, prompt:string}>}
+ */
 async function buildNewsAnalysisPromptAndStats(db, options = {}) {
   const [topNews, stats, tickerSummary] = await Promise.all([
     getRecentNewsForAiAnalysis(db, 25),
@@ -5086,6 +5684,11 @@ ${newsSummaryList}
   };
 }
 
+/**
+ * [Antigravity-Doc] AI 뉴스 브리핑 결과를 `ai_news_briefings` 테이블에 저장하고 Web Push 완료 알림을 비동기 브로드캐스트한다.
+ * @param {object} params
+ * @returns {Promise<{briefingId:number, updatedQuota:object}>}
+ */
 async function persistNewsBriefingAndNotify({
   db,
   provider,
@@ -5147,6 +5750,12 @@ async function persistNewsBriefingAndNotify({
   };
 }
 
+/**
+ * [Antigravity-Doc] 3-Tier 폴백 구조의 AI 뉴스 감성 분석 오케스트레이터(비스트리밍).
+ * 동일 30분 슬롯의 시황 분석 Ollama 결과(`precomputedOllamaResult`)가 전달되면 중복 호출 없이 재사용한다.
+ * @param {object} [options={}]
+ * @returns {Promise<object>}
+ */
 async function generateAiNewsAnalysis(options = {}) {
   const triggerType = options?.triggerType === "AUTO" ? "AUTO" : "MANUAL";
   const slotKey = options?.slotKey || null;
@@ -5384,6 +5993,11 @@ async function generateAiNewsAnalysis(options = {}) {
   };
 }
 
+/**
+ * [Antigravity-Doc] 대시보드 수동 AI 뉴스 분석용 SSE 스트리밍 핸들러(1순위 Ollama 청크 -> 2순위 Gemini SSE -> 3순위 기계적 폴백).
+ * @param {http.IncomingMessage} req
+ * @param {http.ServerResponse} res
+ */
 async function generateAiNewsAnalysisStream(req, res) {
   const db = getDb();
   const { topNews, totalNews, bullCount, bearCount, neutCount, nowStr, prompt } =
@@ -5666,6 +6280,12 @@ async function generateAiNewsAnalysisStream(req, res) {
   }
 }
 
+/**
+ * [Antigravity-Doc] 가상거래 아레나 원장(`paper_trades`, `paper_bot_positions`)을 초기화하고(PostgreSQL 연동 시 원격도 동기 삭제),
+ * 100ms 후 새 아레나 사이클을 즉시 1회 트리거한다.
+ * @param {object} db
+ * @returns {Promise<{success:boolean, message:string, leaderboard:Array}>}
+ */
 async function resetPaperArenaAndNotify(db) {
   await resetArena(db);
   if (pgSyncManager.isConnected && pgSyncManager.pool) {
@@ -5688,8 +6308,17 @@ async function resetPaperArenaAndNotify(db) {
 // ============================================================================
 // [실전 담당 봇(1~3개) 동적 투자금 배분 및 미매도 포지션 안전 승계 함수]
 // ============================================================================
+// [Antigravity-Doc] 프로세스 내 DB 복합 쓰기 직렬화 뮤텍스(Promise 체인 기반 FIFO 큐)
+// 자본 재계산, 실전 봇 교체, 주간 로테이션, 매도 정산 등 다중 테이블 트랜잭션 간 경쟁 조건을 차단한다.
 let dbWriteMutex = Promise.resolve();
 
+/**
+ * [Antigravity-Doc] 전달된 비동기 콜백 `fn`을 전역 `dbWriteMutex` 락 안에서 배타적으로 실행한다.
+ * 주의: 외부 HTTP(업비트/LLM) 호출은 락 획득 전에 선행 수행해 락 점유 시간을 최소화해야 한다.
+ * @template T
+ * @param {() => Promise<T>} fn
+ * @returns {Promise<T>}
+ */
 async function withDbWriteLock(fn) {
   const prevLock = dbWriteMutex;
   let releaseLock;
@@ -5704,6 +6333,15 @@ async function withDbWriteLock(fn) {
   }
 }
 
+/**
+ * [Antigravity-Doc] 실전 담당 봇(1~3개) 선택 및 비율 배분을 안전하게 적용한다.
+ * 업비트 계좌 조회를 락 외부에서 선행 수행한 뒤 `withDbWriteLock` 내에서 `_applyLiveBotsSelectionUnsafe`를 호출한다.
+ * @param {Array<{bot_id:string, allocation_ratio:number}>} selected 선택된 실전 봇 및 비율(합계 1.0)
+ * @param {Array<{from_bot_id:string, to_bot_id:string}>} [handoverMap=[]] 명시적 포지션 이관 매핑 (미지정 시 Graceful Drain)
+ * @param {number|null} [forcedCapital=null] 강제 지정 운용 자본(KRW)
+ * @param {object} [options={}]
+ * @returns {Promise<object>}
+ */
 export async function applyLiveBotsSelection(selected, handoverMap = [], forcedCapital = null, options = {}) {
   // 외부 네트워크 조회(업비트 실계좌)는 DB 쓰기 락 밖에서 선행 수행하여 TOCTOU 및 락 홀딩 지연 방지
   let preloadedAccountInfo = null;
@@ -5720,6 +6358,15 @@ export async function applyLiveBotsSelection(selected, handoverMap = [], forcedC
   );
 }
 
+/**
+ * [Antigravity-Doc] `withDbWriteLock` 내부 전용 실전 봇 선택·배분·드레인(Drain)/이관(Handover) 트랜잭션 구현체.
+ * 탈락 봇의 미청산 포지션은 기본 강제 청산 없이 `DRAINING` 상태로 보호하며, 가용 원화만 신규 선출 봇에 재배분한다.
+ * @param {Array} selected
+ * @param {Array} [handoverMap=[]]
+ * @param {number|null} [forcedCapital=null]
+ * @param {object} [options={}]
+ * @returns {Promise<object>}
+ */
 async function _applyLiveBotsSelectionUnsafe(selected, handoverMap = [], forcedCapital = null, options = {}) {
   const db = getDb();
   const allBots = await getBots("live");
@@ -5931,6 +6578,11 @@ async function _applyLiveBotsSelectionUnsafe(selected, handoverMap = [], forcedC
 // [LLM 1주일 단위 실전 봇 1,2,3위 자동 평가 및 편성 엔진]
 // 기점: 매주 일요일 오전 09:00 (KST)
 // ============================================================================
+/**
+ * [Antigravity-Doc] 매주 일요일 오전 09:00 KST 기점의 현재/차기 주간 슬롯 키와 잔여 일수를 계산한다.
+ * @param {Date} [targetDate=new Date()]
+ * @returns {{lastSundaySlot:string, nextSundaySlot:string, slotKey:string, daysRemaining:number, msRemaining:number}}
+ */
 function getWeeklySundaySlotInfo(targetDate = new Date()) {
   const d = new Date(targetDate);
   const day = d.getDay(); // 0: Sun, 1: Mon, ..., 6: Sat
@@ -5969,6 +6621,10 @@ function getWeeklySundaySlotInfo(targetDate = new Date()) {
   };
 }
 
+/**
+ * [Antigravity-Doc] 최근 주간 LLM 봇 선정 결과와 차기 예정 실행 시각을 `system_settings`에서 조회한다.
+ * @returns {Promise<object>}
+ */
 async function getLlmWeeklyBotSelectionStatus() {
   const slotInfo = getWeeklySundaySlotInfo();
   const lastSlotKey = await getSetting("llm_weekly_bot_selection_last_slot", "");
@@ -5998,7 +6654,14 @@ async function getLlmWeeklyBotSelectionStatus() {
   };
 }
 
+// [Antigravity-Doc] 주간 LLM 봇 선정 동시 실행 방지 플래그
 let isWeeklyBotSelectionRunning = false;
+/**
+ * [Antigravity-Doc] 10대 아레나 모의투자 성적표와 현재 장세 필터를 바탕으로 Gemini(실패 시 퀀트 룰베이스 폴백)를 통해
+ * 차주 실전 담당 봇(단일 100% 또는 상위 3봇)을 선정하고 `applyLiveBotsSelection`으로 자동 편성한다.
+ * @param {boolean} [force=false] true 시 동일 주차 슬롯 캐시 무시하고 강제 재평가
+ * @returns {Promise<object>}
+ */
 async function runLlmWeeklyBotSelection(force = false) {
   if (isWeeklyBotSelectionRunning) {
     return { success: false, message: "AI 주간 봇 평가가 이미 실행 중입니다." };
@@ -6283,6 +6946,11 @@ ${botSummary}
   }
 }
 
+/**
+ * [Antigravity-Doc] 레거시 일요일 09:00 LLM 주간 봇 선정 스케줄러.
+ * `legacy_llm_weekly_rotation_enabled='1'` 명시적 Opt-In 및 신규 자동 로테이션 비활성 상태에서만 동작한다.
+ * @returns {Promise<void>}
+ */
 async function checkAndRunScheduledLlmWeeklyBotSelection() {
   if (isWeeklyBotSelectionRunning) return;
   try {
@@ -6314,10 +6982,16 @@ async function checkAndRunScheduledLlmWeeklyBotSelection() {
 // ============================================================================
 // [주간 전략별 챔피언(3대 전략군 1위 봇) 자동 로테이션 & Graceful Drain 엔진]
 // ============================================================================
+// [Antigravity-Doc] 자동 로테이션·자본 리밸런싱 배타 실행 플래그 및 72시간 장기 미매도 Drain 일일 중복 알림 방지 캐시
 let isAutoRotationExecuting = false;
 let isCapitalRebalancing = false;
 const staleDrainAlertSentMap = new Map();
 
+/**
+ * [Antigravity-Doc] KST 타임스탬프 문자열('YYYY-MM-DD HH:mm:ss')을 UTC 에포크 밀리초로 파싱한다.
+ * @param {string} dateStr
+ * @returns {number} 파싱 실패 시 NaN
+ */
 function parseKstTimestampMs(dateStr) {
   if (!dateStr) return NaN;
   const normalized = String(dateStr).trim().replace("T", " ").slice(0, 19);
@@ -6325,6 +6999,12 @@ function parseKstTimestampMs(dateStr) {
   return Number.isFinite(ms) ? ms : NaN;
 }
 
+/**
+ * [Antigravity-Doc] `auto_rotation_config(id=1)` 테이블에서 주간 자동 로테이션 설정(요일/시각/배분모드/자본 티어/90% 상한)을 조회한다.
+ * 행이 없으면 기본값(월요일 09:00 KST, `EQUAL_BY_EQUITY_TIER`, 90% 상한)을 자동 시드한다.
+ * @param {object} db
+ * @returns {Promise<object>}
+ */
 async function getAutoRotationConfig(db) {
   let row = await db.prepare("SELECT * FROM auto_rotation_config WHERE id = 1").get();
   if (!row) {
@@ -6370,6 +7050,11 @@ async function getAutoRotationConfig(db) {
   };
 }
 
+/**
+ * [Antigravity-Doc] 주간 자동 로테이션 설정(`auto_rotation_config`)을 유효성 클램핑 후 갱신하고 차기 실행 시각을 재계산한다.
+ * @param {object} [payload={}]
+ * @returns {Promise<object>} 갱신된 설정 객체
+ */
 async function updateAutoRotationConfig(payload = {}) {
   const db = getDb();
   const current = await getAutoRotationConfig(db);
@@ -6420,6 +7105,13 @@ async function updateAutoRotationConfig(payload = {}) {
   return await getAutoRotationConfig(db);
 }
 
+/**
+ * [Antigravity-Doc] 로테이션 대시보드 전체 현황 페이로드를 생성한다.
+ * 자본 티어(1~3봇), 90% 상한 사용률, 전략군별 챔피언 평가, Draining 포지션 실시간 평가손익 및 72시간 경과 경고 알림,
+ * 후임 봇 자금 복원 대기 상태(`WAITING_CAPITAL_RESTORE`), 로테이션/이관/복원 이력을 모두 포함한다.
+ * @param {{liveTotalEquityKrw?:number, skipMarketFetch?:boolean}} [options={}]
+ * @returns {Promise<object>}
+ */
 export async function getRotationStatusPayload(options = {}) {
   const db = getDb();
   const config = await getAutoRotationConfig(db);
@@ -6705,6 +7397,17 @@ export async function getRotationStatusPayload(options = {}) {
   };
 }
 
+/**
+ * [Antigravity-Doc] 주간 전략군 챔피언 자동/수동 로테이션을 실행한다.
+ * 핵심 절차:
+ *  1. 중복 실행 가드(`isAutoRotationExecuting`, `isCapitalRebalancing`) 설정 및 업비트 총 평가자산 선조회(락 외부).
+ *  2. `evaluateWeeklyStrategyChampions`로 전략군별 챔피언 선출.
+ *  3. `EQUAL_BY_EQUITY_TIER` 모드 시 `withDbWriteLock` 트랜잭션 안에서 90% 상한 불변식(`assertGlobal90CapInvariant`)을 검증하며
+ *     선출 봇 배정 및 탈락 봇 Graceful Drain(`replaced_by_bot_id` 연결) 적용.
+ *  4. `auto_rotation_history` 기록, 차기 로테이션 시각 갱신, 멀티채널 알림 발송.
+ * @param {{triggerType?:string, forcedCapital?:number|null, skipLiveAccountSync?:boolean, actualAvailableKrwOverride?:number|null}} [params]
+ * @returns {Promise<object>}
+ */
 export async function executeWeeklyBotRotation({
   triggerType = "MANUAL_IMMEDIATE",
   forcedCapital = null,
@@ -7035,6 +7738,12 @@ export async function executeWeeklyBotRotation({
   }
 }
 
+/**
+ * [Antigravity-Doc] 탈락(Draining) 상태 봇의 미매도(OPEN) 포지션을 수동으로 즉시 시장가/지정가 청산하고
+ * 회수된 원화를 후임 선출 봇 예산으로 자동 복원한다. (실전 담당 중인 활성 봇 포지션은 보호를 위해 거부)
+ * @param {{positionId?:number|null, orderUuid?:string|null, botId?:string|null, reason?:string}} [params]
+ * @returns {Promise<object>}
+ */
 export async function forceCloseDrainingPosition({
   positionId = null,
   orderUuid = null,
@@ -7089,6 +7798,11 @@ export async function forceCloseDrainingPosition({
   };
 }
 
+/**
+ * [Antigravity-Doc] 매 분 주기 스케줄러가 호출하며, 설정된 요일/KST 시각 도달 및 당일 미실행 조건 충족 시
+ * `executeWeeklyBotRotation({ triggerType: "SCHEDULED_WEEKLY" })`를 자동 트리거한다.
+ * @returns {Promise<void>}
+ */
 async function checkAndRunScheduledAutoRotation() {
   if (isAutoRotationExecuting) return;
   try {
@@ -7117,10 +7831,12 @@ async function checkAndRunScheduledAutoRotation() {
   }
 }
 
+// [Antigravity-Doc] 백그라운드 워커 기동 함수 참조, 기동 여부 플래그 및 종료 시 정리할 타이머 핸들 목록
 let startBackgroundWorkers = null;
 let workersStarted = false;
 let workerTimers = [];
 
+// [Antigravity-Doc] 정적 파일 서빙용 MIME 타입 매핑 및 프론트엔드 빌드 산출물 디렉터리(`frontend/dist`)
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
   ".js": "application/javascript; charset=utf-8",
@@ -7136,6 +7852,14 @@ const mimeTypes = {
 
 const DIST_DIR = path.join(BASE_DIR, "frontend", "dist");
 
+/**
+ * [Antigravity-Doc] `frontend/dist` 정적 에셋 및 React SPA 폴백(`index.html`)을 서빙한다.
+ * Path Traversal 방어를 위해 `filePath.startsWith(DIST_DIR)`을 검증한다.
+ * @param {http.IncomingMessage} req
+ * @param {http.ServerResponse} res
+ * @param {string} pathname
+ * @returns {boolean} 응답 처리 완료 여부
+ */
 function serveStatic(req, res, pathname) {
   if (!fs.existsSync(DIST_DIR)) return false;
   let target = pathname === "/" ? "index.html" : pathname.replace(/^\//, "");
@@ -7173,6 +7897,15 @@ function serveStatic(req, res, pathname) {
   return false;
 }
 
+/**
+ * [Antigravity-Doc] 메인 HTTP 서버 및 전체 REST/SSE API 라우터.
+ * 라우팅 순서:
+ *  1. CORS 프리플라이트(`OPTIONS`) 처리
+ *  2. 공개 허용 엔드포인트: `/api/version`, `/api/auth/*`, `/api/setup/status`
+ *  3. 전역 인증 미들웨어: `/api/*` 요청은 세션 쿠키 검증 필수 (단, 미설정 초기 온보딩 시 `/api/setup/*` 예외 허용)
+ *  4. 인증 보호 API: 셋업/계좌/가드레일/봇/AI·SSE/로테이션/WebPush/거래내역/통계/아레나/설정/백테스트/알림/AlgoLab
+ *  5. 정적 파일 및 SPA 폴백(`serveStatic`)
+ */
 const server = http.createServer(async (req, res) => {
   res.__corsHeaders = getCorsHeaders(req);
   if (req.method === "OPTIONS") {
@@ -7358,6 +8091,7 @@ const server = http.createServer(async (req, res) => {
     // ============================================================
     // [설치 마법사 실행 API]
     // ============================================================
+    // [Antigravity-Doc] POST /api/setup/test-db — PostgreSQL 연결 테스트 (DB 미존재 3D000 오류 시 자동 CREATE DATABASE 시도)
     if (pathname === "/api/setup/test-db" && req.method === "POST") {
       const body = await readJsonBody(req);
       const host = String(body.host || "127.0.0.1").trim();
@@ -7429,6 +8163,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // [Antigravity-Doc] POST /api/setup/test-keys — 업비트 Open API(/v1/accounts) 및 Google Gemini API 키 유효성 검증
     if (pathname === "/api/setup/test-keys" && req.method === "POST") {
       const body = await readJsonBody(req);
       const upbitAccess = String(body.upbit_access_key || "").trim();
@@ -7498,6 +8233,8 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // [Antigravity-Doc] POST /api/setup/complete — 초기 설치 마법사 최종 완료:
+    // config/upbit_config.json 암호화 저장 -> .env 기록(0600) -> DB 스키마 초기화·시드 -> PG 동기화 연결 -> 워커 핫스타트 -> 세션 쿠키 발급
     if (pathname === "/api/setup/complete" && req.method === "POST") {
       const body = await readJsonBody(req);
       const entryCode = String(body.entry_code || "stock").trim();
@@ -7644,6 +8381,8 @@ const server = http.createServer(async (req, res) => {
       );
     }
 
+    // [Antigravity-Doc] GET /api/upbit/status, /api/health, /api/upbit/account, /api/upbit/orders —
+    // 업비트 API·WebSocket·Ollama 헬스체크, 실계좌 잔고 조회(+동적 자본 동기화) 및 최근 체결 주문 조회
     if (pathname === "/api/upbit/status" && req.method === "GET") {
       const [status, ollama] = await Promise.all([checkUpbitStatus(), checkOllamaStatus()]);
       return sendJson(res, 200, { ...status, ollama });
@@ -7674,6 +8413,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, ordersInfo);
     }
 
+    // [Antigravity-Doc] GET /api/system/overview — 대시보드 메인 통합 현황(자본, 봇, AI 장세 필터, Ollama, WebSocket, 가드레일 상태)
     if (pathname === "/api/system/overview" && req.method === "GET") {
       const mode = parsedUrl.searchParams.get("mode") || (isLiveMode() ? "live" : "paper");
       if (mode === "live") {
@@ -7710,6 +8450,8 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // [Antigravity-Doc] GET /api/guardrail/status & POST /api/guardrail/reset-emergency —
+    // 실전 주문 가드레일(리스/Kill-Switch/주문 속도 제한) 현황 조회 및 비상 정지 상태 수동 해제
     if (pathname === "/api/guardrail/status" && req.method === "GET") {
       const status = await getLiveGuardrailStatusPayload();
       return sendJson(res, 200, status);
@@ -7726,6 +8468,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ...result, guardrail: status });
     }
 
+    // [Antigravity-Doc] GET /api/bots — 지정 모드(live|paper) 10대 봇 상태, 실시간 평가손익, 잔고 0원 중단 여부 및 가드레일 조회
     if (pathname === "/api/bots" && req.method === "GET") {
       const mode = parsedUrl.searchParams.get("mode") || (isLiveMode() ? "live" : "paper");
       if (process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
@@ -7752,6 +8495,7 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // [Antigravity-Doc] /api/ai/* — AI 시황·뉴스 브리핑 조회, Gemini 키/쿼터 관리, 단발 분석 및 SSE 스트리밍 분석 엔드포인트
     if (pathname === "/api/ai/briefing" && req.method === "GET") {
       const data = await getLatestAiBriefing();
       return sendJson(res, 200, data);
@@ -7812,6 +8556,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, result.success ? 200 : 500, result);
     }
 
+    // [Antigravity-Doc] /api/rotation/* — 주간 전략군 챔피언 로테이션 현황 조회, 설정 변경, 즉시 실행 및 Draining 포지션 수동 청산
     // [주간 전략별(3대 그룹) 1위 봇 자동 로테이션 & Graceful Drain API]
     if (pathname === "/api/rotation/status" && req.method === "GET") {
       const data = await getRotationStatusPayload();
@@ -7853,6 +8598,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // [Antigravity-Doc] /api/push/* 및 /sw.js — VAPID 공개키 조회, 브라우저 Web Push 구독 등록/해제, 테스트 푸시 발송 및 Service Worker 서빙
     if (pathname === "/api/push/vapid-public-key" && req.method === "GET") {
       return sendJson(res, 200, {
         success: true,
@@ -7942,6 +8688,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // [Antigravity-Doc] POST /api/bots/:botId/(start|stop), POST /manual-trade(드라이런 점검 전용), PUT /api/bots/:botId(봇 파라미터 수정)
     const startStopMatch = pathname.match(/^\/api\/bots\/([^/]+)\/(start|stop)$/);
     if (startStopMatch && req.method === "POST") {
       const botId = startStopMatch[1];
@@ -8061,6 +8808,7 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // [Antigravity-Doc] GET /api/trades — 실거래(live), 가상거래(paper), 통합(all, UNION ALL) 체결 내역 조회 (SQLite/PostgreSQL 분기 및 페이지네이션 지원)
     if (pathname === "/api/trades" && req.method === "GET") {
       const botId = parsedUrl.searchParams.get("bot_id");
       const mode = parsedUrl.searchParams.get("mode") || (isLiveMode() ? "live" : "paper");
@@ -8374,6 +9122,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, result);
     }
 
+    // [Antigravity-Doc] GET /api/statistics — 2026-10-01 이후 일간/ISO주간/월간 누적 손익, 코인별/봇별 랭킹, 월별 자산 스냅샷 및 슬리피지 실행 품질 집계
     if (pathname === "/api/statistics" && req.method === "GET") {
       const mode = parsedUrl.searchParams.get("mode") || (isLiveMode() ? "live" : "paper");
       const tradesTable = mode === "live" ? "trades" : "paper_trades";
@@ -8551,6 +9300,7 @@ const server = http.createServer(async (req, res) => {
     // ============================================================
     // [10대 알고리즘 상시 가상 경쟁(Arena) REST API]
     // ============================================================
+    // [Antigravity-Doc] /api/arena/* — 10대 알고리즘 상시 가상 경쟁 리더보드, 거래 이력, 수동 1사이클 실행 및 원장 초기화
     if (pathname === "/api/arena/leaderboard" && req.method === "GET") {
       const leaderboard = await getArenaLeaderboard(db);
       return sendJson(res, 200, {
@@ -8590,6 +9340,7 @@ const server = http.createServer(async (req, res) => {
     // ============================================================
     // [실전 담당 봇(1~3개) 선택 및 동적 투자금 배분 API]
     // ============================================================
+    // [Antigravity-Doc] /api/settings/* — 실전 봇 선택(live-bots), 자본 배분(allocation), Ollama, 입장 코드 변경, JSON 내보내기/복원
     if (pathname === "/api/settings/live-bots" && req.method === "GET") {
       await syncDynamicLiveCapitalFromUpbit();
       const allLive = await getBots("live");
@@ -9169,6 +9920,7 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // [Antigravity-Doc] GET /api/news & POST /api/news/refresh — 암호화폐 뉴스 목록 검색/페이지네이션 및 즉시 RSS 수집
     if (pathname === "/api/news" && req.method === "GET") {
       const page = Number(parsedUrl.searchParams.get("page") || 1);
       const limit = Number(parsedUrl.searchParams.get("limit") || 50);
@@ -9192,6 +9944,7 @@ const server = http.createServer(async (req, res) => {
     // ============================================================
     // [가상거래 모드 (Paper Trading) API]
     // ============================================================
+    // [Antigravity-Doc] GET/POST /api/trade-mode — 실거래(live) / 가상거래(paper) 모드 조회 및 전환 (`upbit_config.json` + DB 동기화)
     if (pathname === "/api/trade-mode" && req.method === "GET") {
       const cfg = getRuntimeConfig();
       const mode = String(cfg.trade_mode || "paper").toLowerCase();
@@ -9233,6 +9986,7 @@ const server = http.createServer(async (req, res) => {
     // ============================================================
     // [히스토리컬 캔들 백테스팅 & Walk-Forward 검증소 API]
     // ============================================================
+    // [Antigravity-Doc] /api/backtest/* — 과거 캔들 기반 Bar-by-Bar/Walk-Forward 백테스트 실행, 이력 조회, 검증 파라미터 봇 적용
     if (pathname === "/api/backtest/run" && req.method === "POST") {
       try {
         const body = await readJsonBody(req);
@@ -9303,6 +10057,7 @@ const server = http.createServer(async (req, res) => {
     // ============================================================
     // [캔들스틱 매수/매도 타점 마커 & 지표 오버레이 차트 API]
     // ============================================================
+    // [Antigravity-Doc] GET /api/chart/trade-markers — 캔들스틱 차트 위 매수/매도 타점 마커 및 보조지표 오버레이 데이터 생성
     if (pathname === "/api/chart/trade-markers" && req.method === "GET") {
       try {
         const market = parsedUrl.searchParams.get("market") || "KRW-BTC";
@@ -9320,6 +10075,7 @@ const server = http.createServer(async (req, res) => {
     // ============================================================
     // [멀티채널 실시간 알림 허브 (Telegram · Discord · WebPush) API]
     // ============================================================
+    // [Antigravity-Doc] /api/settings/notifications/* — Telegram/Discord/WebPush 멀티채널 알림 설정 조회·암호화 저장 및 테스트 발송
     if (pathname === "/api/settings/notifications" && req.method === "GET") {
       const settings = await loadNotificationSettings(db, { maskSecrets: true });
       return sendJson(res, 200, { success: true, settings });
@@ -9369,6 +10125,7 @@ const server = http.createServer(async (req, res) => {
     // ============================================================
     // [하위 호환] 기존 알고리즘 검증소 엔드포인트 -> 10대 알고리즘 Arena 로 통합
     // ============================================================
+    // [Antigravity-Doc] /api/algo-lab/* & /api/paper-trades/reset — 구 알고리즘 검증소 엔드포인트(10대 아레나로 하위 호환 통합)
     if (pathname === "/api/algo-lab/models" && req.method === "GET") {
       return sendJson(res, 200, {
         success: true,
@@ -9410,6 +10167,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// [Antigravity-Doc] 라이브러리 모드(`AUTOCOIN_LIBRARY_MODE=1`)가 아닐 때만 로그 로테이터·HTTP 서버 바인딩·SIGINT/SIGTERM 그레이스풀 셧다운 등록
 if (process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
   startLogRotationScheduler({
     logsDir: path.join(BASE_DIR, "logs"),
@@ -9466,10 +10224,16 @@ if (process.env.AUTOCOIN_LIBRARY_MODE !== "1") {
 // ============================================================================
 // 백그라운드 3종 전략 봇 자동매매 스케줄러 워커 (8초 주기)
 // ============================================================================
+// [Antigravity-Doc] 전략 사이클 실행 플래그 및 업비트 Public 시세(3초 TTL)·캔들(8초 TTL) 메모리 캐시
 let isStrategyCycleRunning = false;
 const upbitTickersCache = new Map();
 const upbitCandlesCache = new Map();
 
+/**
+ * [Antigravity-Doc] 업비트 Public REST API를 0.12s 레이트 리밋 + 429/503/네트워크 오류 시 지수 백오프(1s/2s/4s)로 호출한다.
+ * @param {string} url 요청 URL
+ * @returns {Promise<any|null>}
+ */
 async function fetchUpbitPublicWithBackoff(url) {
   const delays = [1000, 2000, 4000];
   for (let attempt = 0; attempt <= delays.length; attempt++) {
@@ -9494,6 +10258,12 @@ async function fetchUpbitPublicWithBackoff(url) {
   return null;
 }
 
+/**
+ * [Antigravity-Doc] 여러 마켓의 실시간 현재가 맵을 조회한다.
+ * 우선순위: 1) WebSocket 허브 최신 틱(stale 아닐 때) -> 2) 3초 메모리 캐시 -> 3) 업비트 `/v1/ticker` 일괄 REST 호출.
+ * @param {string[]} markets
+ * @returns {Promise<Map<string, object>>}
+ */
 async function fetchUpbitTickersMap(markets) {
   const map = new Map();
   if (!markets || markets.length === 0) return map;
@@ -9537,6 +10307,13 @@ async function fetchUpbitTickersMap(markets) {
   return map;
 }
 
+/**
+ * [Antigravity-Doc] 업비트 캔들 데이터를 조회해 과거->최신 오름차순으로 정렬하고 8초간 캐싱한다.
+ * @param {string} market 예: "KRW-BTC"
+ * @param {string} [unit="days"] 업비트 캔들 단위("days", "minutes/15", "minutes/240" 등)
+ * @param {number} [count=8] 조회 봉 수 (최소 8)
+ * @returns {Promise<Array<object>>}
+ */
 async function fetchUpbitCandlesSorted(market, unit = "days", count = 8) {
   const safeCount = Math.max(count, 8);
   const cacheKey = `${market}:${unit}:${safeCount}`;
@@ -9556,6 +10333,12 @@ async function fetchUpbitCandlesSorted(market, unit = "days", count = 8) {
   return cached?.rows || [];
 }
 
+/**
+ * [Antigravity-Doc] 종가 배열(`closes`)로 단순 상대강도지수(RSI)를 계산한다.
+ * @param {number[]} closes 과거->최신 종가 배열
+ * @param {number} [period=7] 기간
+ * @returns {number} 0~100
+ */
 function computeRsi(closes, period = 7) {
   if (!Array.isArray(closes) || closes.length < 2) return 50.0;
   let gainSum = 0;
@@ -9573,6 +10356,16 @@ function computeRsi(closes, period = 7) {
   return 100.0 - 100.0 / (1.0 + rs);
 }
 
+/**
+ * [Antigravity-Doc] 봇의 가용 원화(`virtual_krw`), 배정 비율, AI 장세 비중 배수(`aiMultiplier`), ATR 변동성 배수를 종합해
+ * 안전한 1회 실전 매수 주문 금액(KRW)을 산출한다.
+ * - 업비트 최소주문(5,000원) 대비 -4.5% 손절 시에도 매도 가능하도록 최소 5,250원(+수수료 0.05%) 버퍼를 보장한다.
+ * @param {object} bot
+ * @param {number|null} [ratio=null]
+ * @param {number} [aiMultiplier=1.0]
+ * @param {{atr14?:number, currentPrice?:number, targetAtrPct?:number}} [options={}]
+ * @returns {number} 주문 가능 금액(KRW, 불가 시 0)
+ */
 function getSafeOrderKrw(bot, ratio = null, aiMultiplier = 1.0, options = {}) {
   const rawVirtual = Number(bot.virtual_krw || 0);
   const virtualKrw = Number.isFinite(rawVirtual) ? Math.floor(rawVirtual) : 0;
@@ -9615,6 +10408,7 @@ function getSafeOrderKrw(bot, ratio = null, aiMultiplier = 1.0, options = {}) {
 // ------------------------------------------------------------------
 // [듀얼 AI 동적 매수 게이트웨이 & 시장 체제 상태 조회]
 // ------------------------------------------------------------------
+// [Antigravity-Doc] 장세 필터(`checkMarketRegimeFilter`) 20초 메모리 캐시 상태 객체
 let cachedRegimeState = {
   checkedAtMs: 0,
   allowBuy: true,
@@ -9632,6 +10426,13 @@ let cachedRegimeState = {
   blacklistTickers: [],
 };
 
+/**
+ * [Antigravity-Doc] BTC 일봉 20MA / 4시간 60MA 지표와 DB `market_regime_filter(id=1)` 듀얼 AI 판단을 통합 조회한다.
+ * 20초 캐시(`cachedRegimeState`)를 사용하며, AI 분석 갱신 시 `checkedAtMs=0`으로 즉시 무효화된다.
+ * @param {Map<string, object>|null} [tickerMap=null]
+ * @param {{skipUpbitApi?:boolean}} [options={}]
+ * @returns {Promise<object>} `allowBuy`, `multiplier`, `botOverrides`, `blacklistTickers` 등 포함
+ */
 async function checkMarketRegimeFilter(tickerMap = null, options = {}) {
   const nowMs = Date.now();
   if (!options?.skipUpbitApi && nowMs - cachedRegimeState.checkedAtMs < 20000 && cachedRegimeState.btcPrice > 0) {
@@ -9727,6 +10528,11 @@ async function checkMarketRegimeFilter(tickerMap = null, options = {}) {
 // ------------------------------------------------------------------
 // [손실 방어 패치 2] 시장가 주문 -> 최유리 지정가 주문(매수 1호가) 전환 및 미체결 취소(cancel_order)
 // ------------------------------------------------------------------
+/**
+ * [Antigravity-Doc] 업비트 KRW 마켓 가격대별 호가 단위(Tick Size)를 반환한다.
+ * @param {number} price
+ * @returns {number}
+ */
 function getUpbitKrwTickSize(price) {
   const p = Number(price || 0);
   if (p >= 2000000) return 1000;
@@ -9740,6 +10546,11 @@ function getUpbitKrwTickSize(price) {
   return 0.0001;
 }
 
+/**
+ * [Antigravity-Doc] 주어진 가격을 업비트 KRW 호가 단위에 맞게 내림(floor) 정규화한다.
+ * @param {number} price
+ * @returns {number}
+ */
 function normalizeUpbitKrwTick(price) {
   const p = Number(price || 0);
   if (!Number.isFinite(p) || p <= 0) return 0;
@@ -9752,6 +10563,13 @@ function normalizeUpbitKrwTick(price) {
   return Number((Math.floor((p * factor) + 1e-9) / factor).toFixed(decimals));
 }
 
+/**
+ * [Antigravity-Doc] WebSocket 오더북(우선) 또는 REST `/v1/orderbook`에서 최유리 호가(매수 1호가 `bid` / 매도 1호가 `ask`)를 조회한다.
+ * @param {string} market
+ * @param {"bid"|"ask"} [side="bid"]
+ * @param {number} [fallbackPrice=0]
+ * @returns {Promise<number>}
+ */
 async function fetchUpbitBestPrice(market, side = "bid", fallbackPrice = 0) {
   const priceKey = side === "ask" ? "ask_price" : "bid_price";
   if (!upbitWsHub.isStale()) {
@@ -9781,14 +10599,26 @@ async function fetchUpbitBestPrice(market, side = "bid", fallbackPrice = 0) {
   return normalizeUpbitKrwTick(fallbackPrice);
 }
 
+/**
+ * [Antigravity-Doc] 지정 마켓의 최유리 매수 1호가(Best Bid)를 조회한다.
+ */
 async function fetchUpbitBestBidPrice(market, fallbackPrice = 0) {
   return fetchUpbitBestPrice(market, "bid", fallbackPrice);
 }
 
+/**
+ * [Antigravity-Doc] 지정 마켓의 최유리 매도 1호가(Best Ask)를 조회한다.
+ */
 async function fetchUpbitBestAskPrice(market, fallbackPrice = 0) {
   return fetchUpbitBestPrice(market, "ask", fallbackPrice);
 }
 
+/**
+ * [Antigravity-Doc] 업비트 미체결 지정가 주문을 `DELETE /v1/order`로 취소한다.
+ * @param {string} orderUuid 취소할 업비트 주문 UUID
+ * @param {object} cfg 복호화된 런타임 설정(`access_key`, `secret_key`)
+ * @returns {Promise<boolean>} 취소 API 수용 여부
+ */
 async function cancelUpbitOrder(orderUuid, cfg) {
   if (!orderUuid) return false;
   try {
@@ -9810,6 +10640,24 @@ async function cancelUpbitOrder(orderUuid, cfg) {
   }
 }
 
+/**
+ * [Antigravity-Doc] 봇 매수 주문 실행 메인 엔진(가상거래/실거래 통합).
+ * 실전(live) 모드 안전 실행 파이프라인(2PC + 5중 가드레일):
+ *  1. AI 장세 게이트웨이(`allowBuy`, `botOverrides`, `blacklistTickers`) 및 호가 품질(OBI/스프레드) 사전 검사.
+ *  2. Step A (`claimLiveBuyIntentAtomic`): 단일 `BEGIN IMMEDIATE` 트랜잭션에서 5중 가드레일 검증 + `live_order_intents(PENDING)` 선점 + `virtual_krw` 선차감.
+ *  3. Step B: 업비트 `POST /v1/orders`에 `identifier: intentId` 포함 최유리 매수 1호가 지정가 주문 전송.
+ *     - 4xx 확정 거절 -> 즉시 환불(`refundFailedOrCanceledBuyIntentAtomic`).
+ *     - 5xx/네트워크 타임아웃 -> 재시도 금지 및 `UNKNOWN_TIMEOUT` 잠금(추후 `identifier` 대사).
+ *  4. 체결 폴링(최대 40초): 약 12초 미체결 시 매도 1호가(+0.35% 상한) 1회 정정 재주문, 최종 미체결 시 취소 후 0체결 확인 시에만 환불.
+ *  5. Step C (`confirmBuyIntentAndRecordPositionAtomic`): 실제 체결가/수수료/슬리피지 기록 및 차액 환불, 멀티채널 알림 발송.
+ * @param {object} bot 대상 봇 객체
+ * @param {string} market 예: "KRW-BTC"
+ * @param {number} orderKrw 주문 금액(KRW)
+ * @param {number} currentPrice 현재가
+ * @param {string|null} [buyReason=null] 매수 사유
+ * @param {object} [options={}]
+ * @returns {Promise<boolean>} 체결 완료 여부
+ */
 export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, buyReason = null, options = {}) {
   const db = getDb();
   const isLive = isLiveMode();
@@ -10534,6 +11382,17 @@ export async function executeBotBuyOrder(bot, market, orderKrw, currentPrice, bu
   return true;
 }
 
+/**
+ * [Antigravity-Doc] 실전 매도 체결 완료 후 DB 원장 정산을 단일 `withDbWriteLock` 트랜잭션으로 원자적 처리한다.
+ * 주요 처리 단계:
+ *  1. 대상 포지션(`bot_positions`) CLOSED 처리 및 대응 `trades` 레코드 실현손익(`profit_krw`/`profit_pct`) 기록.
+ *  2. 탈락(Draining) 봇인 경우: `computeDrainSellCapitalRestoration`으로 90% 상한 불변식을 지키며 순회수금을 후임/활성 봇에 복원
+ *     (초과 수익은 예비비 유보)하고 `capital_restoration_logs` 및 `drain_handoff_logs` 기록.
+ *  3. 활성 봇인 경우: 이중 계상 없이 `prevVirtual + netProceeds`로 `virtual_krw`/`allocated_capital` 갱신.
+ *  4. 커밋 후 멀티채널 알림(`LIVE_SELL` / `DRAIN_HANDOFF` / `DRAIN_CAPITAL_RESTORED`) 발송.
+ * @param {object} params
+ * @returns {Promise<{isDrainingBot:boolean, netProceeds:number, totalProfitKrw:number, remainingOpenCnt:number, remainingOpenUsed:number, handoffAllocations:Array}>}
+ */
 export async function settleLiveSellOrderInDb({
   db,
   bot,
@@ -10920,6 +11779,22 @@ export async function settleLiveSellOrderInDb({
   };
 }
 
+/**
+ * [Antigravity-Doc] 봇 매도 주문 실행 메인 엔진(가상거래/실거래 통합).
+ * 실전(live) 모드 핵심 방어 로직:
+ *  - 주의: 매수 쿨다운/비상정지/Graceful Drain 상태에서도 보유 포지션 청산 매도는 절대 차단하지 않음.
+ *  - Step A (`claimLiveSellIntentAtomic`): `closing_lock=1` 및 `live_order_intents(SELL)` 선점으로 동일 포지션 중복 매도 차단.
+ *  - 방어로직 0: `/v1/accounts` 조회 실패 시 DB 포지션을 파괴하지 않고 락 해제 후 다음 사이클 재시도.
+ *  - 방어로직 1: 실계좌 잔고에서 타 봇 보유분(`otherBotsVol`)을 제외한 본인 지분만 매도하며, 고아 포지션은 타 봇 물량을 건드리지 않고 CLOSED 동기화.
+ *  - 방어로직 2 (Buy-to-Cleanse): 평가액이 업비트 최소주문(5,000원) 미만일 때 포지션당 15분 쿨다운으로 5,500원 보충 매수 후 일괄 청산 시도.
+ *  - Step B/C: `identifier: sellIntentId` 포함 시장가 매도 -> 체결 상세 조회 -> `settleLiveSellOrderInDb` -> `confirmSellIntentAtomic`.
+ * @param {object} bot
+ * @param {object} pos 청산 대상 OPEN 포지션
+ * @param {number} sellPrice 현재가/기준 매도가
+ * @param {string} reasonLabel 청산 사유
+ * @param {object} [options={}]
+ * @returns {Promise<boolean>}
+ */
 export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, options = {}) {
   const db = getDb();
   const isLive = isLiveMode();
@@ -11489,6 +12364,14 @@ export async function executeBotSellOrder(bot, pos, sellPrice, reasonLabel, opti
 // 1. 실거래 매매 스케줄러 (선택된 1~3개 실전 봇 전용 - 기존 LLM/Regime 필터 100% 보존)
 //    + 5중 하드 가드레일(Re-entrancy Mutex · Lease Lock · Timeout Reconciliation)
 // ============================================================================
+// [Antigravity-Doc] 실거래 스케줄러 및 틱 반응형 청산 런타임 상태·뮤텍스·캐시 맵
+// - isBackendShuttingDown: SIGINT/SIGTERM 수신 시 신규 사이클 진입 차단
+// - isLiveCycleRunning / liveCycleStartedAtMs: 비동기 재진입 뮤텍스 및 180초 고착 감지용
+// - liveBotPeakMap: 포지션별 트레일링 스탑 최고가 추적 (`live-${pos.id}`)
+// - liveBotCooldownMap: 매도 후 동일 종목 15분 재진입 쿨다운 (`${botId}|${market}`)
+// - cleanseAttemptMap: 소액 Buy-to-Cleanse 15분 중복 시도 방지 캐시
+// - lastTickExitCheckMap / inFlightTickExitSet: WebSocket 틱 청산 1.5초 디바운스 및 마켓별 동시 실행 락
+// - circuitBreakerNotifiedDateMap: 일일 -4% 서킷브레이커 당일 중복 알림 방지
 let isBackendShuttingDown = false;
 let isLiveCycleRunning = false;
 let liveCycleStartedAtMs = 0;
@@ -11501,6 +12384,9 @@ const circuitBreakerNotifiedDateMap = new Map();
 const LIVE_REENTRY_COOLDOWN_MS = 15 * 60 * 1000;
 const TICK_EXIT_DEBOUNCE_MS = 1500;
 
+/**
+ * [Antigravity-Doc] 현재 실거래 사이클 뮤텍스 점유 여부 및 경과 시간(ms)을 반환한다(가드레일 상태 조회용).
+ */
 function getLiveCycleMutexState() {
   return {
     isRunning: isLiveCycleRunning,
@@ -11509,10 +12395,18 @@ function getLiveCycleMutexState() {
   };
 }
 
+/**
+ * [Antigravity-Doc] 인메모리 재진입 쿨다운 캐시를 초기화한다(테스트/수동 리셋용).
+ */
 function clearLiveCooldownCache() {
   liveBotCooldownMap.clear();
 }
 
+/**
+ * [Antigravity-Doc] SQLite 기반 단일 실전 실행 주체 프로세스 리스(TTL 30초)를 획득하거나 갱신한다.
+ * @param {object} [options={}]
+ * @returns {Promise<object>}
+ */
 async function acquireLiveExecutorLease(options = {}) {
   const db = getDb();
   if (!db) return { ok: false, code: "NO_DB", reason: "DB not initialized" };
@@ -11529,6 +12423,9 @@ async function acquireLiveExecutorLease(options = {}) {
   );
 }
 
+/**
+ * [Antigravity-Doc] 그레이스풀 셧다운 시 보유 중인 실전 실행 리스를 즉시 반납한다.
+ */
 async function releaseLiveExecutorLeaseNow(options = {}) {
   const db = getDb();
   if (!db) return false;
@@ -11544,6 +12441,10 @@ async function releaseLiveExecutorLeaseNow(options = {}) {
   );
 }
 
+/**
+ * [Antigravity-Doc] 네트워크 타임아웃 등으로 미확정(`UNKNOWN_TIMEOUT`) 상태에 머문 주문 의도(Intent)를
+ * 업비트 `identifier` 조회로 대사하여 체결 확정 또는 안전 환불을 완료한다.
+ */
 async function reconcileLiveOrderIntents(options = {}) {
   const db = getDb();
   if (!db) return { checked: 0, confirmed: 0, refunded: 0, pending: 0 };
@@ -11565,6 +12466,9 @@ async function reconcileLiveOrderIntents(options = {}) {
   );
 }
 
+/**
+ * [Antigravity-Doc] 대시보드 및 `/api/guardrail/status`용 실전 주문 가드레일 종합 상태 페이로드를 반환한다.
+ */
 async function getLiveGuardrailStatusPayload() {
   const db = getDb();
   if (!db) {
@@ -11577,9 +12481,17 @@ async function getLiveGuardrailStatusPayload() {
   return await getGuardrailStatus(db, getRuntimeConfig(), getLiveCycleMutexState());
 }
 
+// [Antigravity-Doc] 최근 5분간 계산된 마켓별 기술지표 캐시 (WebSocket 틱 청산 시 ATR 등 보조지표 즉시 참조용)
 const latestMarketIndicatorsCache = new Map();
 const TICK_INDICATOR_CACHE_TTL_MS = 5 * 60 * 1000;
 
+/**
+ * [Antigravity-Doc] 업비트 WebSocket 실시간 체결 틱 수신 시 호출되는 초저지연 반응형 스마트 청산 핸들러.
+ * 10초 정기 루프를 기다리지 않고 1.5초 디바운스로 해당 마켓의 모든 OPEN 포지션(Draining 포함)에 대해
+ * 3단계 스마트 청산(본절/시간제한/ATR 트레일링) 및 손절·익절 임계치 도달 시 즉시 `executeBotSellOrder`를 실행한다.
+ * @param {{market?:string, price?:number, ticker?:object, indicators?:object, bypassDebounce?:boolean, allowPaperMode?:boolean, skipUpbitApi?:boolean}} [tickEvent={}]
+ * @returns {Promise<object>}
+ */
 export async function triggerTickReactiveSmartExit(tickEvent = {}) {
   const market = String(tickEvent?.market || "").trim().toUpperCase();
   const price = Number(tickEvent?.price || 0);
@@ -11711,9 +12623,15 @@ const livePaceSkipLogMap = new Map();
 // 진단 스킵 메시지(속도제어 대기/호가 품질 가드/미체결 등) 실제 기록 시각 추적
 // (syncDynamicLiveCapitalFromUpbit가 bots.updated_at을 6~10초마다 갱신해도 3분 TTL이 영구 연장되지 않도록 분리)
 const liveDiagnosticStatusTsMap = new Map();
+/**
+ * [Antigravity-Doc] 봇의 진단 스킵 메시지(속도제어/호가 가드/미체결 등)가 3분간 UI에 유지되도록 기록 시각을 저장한다.
+ */
 function markBotDiagnosticStatus(botId) {
   if (botId) liveDiagnosticStatusTsMap.set(botId, Date.now());
 }
+/**
+ * [Antigravity-Doc] KST 또는 ISO-8601 타임스탬프 문자열을 UTC 에포크 밀리초로 변환한다.
+ */
 function parseKstDateTimeMsLocal(str) {
   if (!str) return NaN;
   const s = String(str).trim();
@@ -11724,6 +12642,16 @@ function parseKstDateTimeMsLocal(str) {
   return Date.parse(s.replace(" ", "T") + "+09:00");
 }
 
+/**
+ * [Antigravity-Doc] 10초 주기 실거래 자동매매 메인 사이클.
+ * 실행 흐름:
+ *  1. 가드레일 선행: 종료/모드 검사 -> 재진입 뮤텍스(180초 고착 복구) -> 프로세스 리스 획득 -> `UNKNOWN_TIMEOUT` 인텐트 대사 -> 동적 자본 동기화.
+ *  2. 감시 대상 수집: 활성 봇 + Draining/일시정지 보유 포지션 봇의 유니버스 마켓 시세·지표·모멘텀 랭킹 일괄 빌드.
+ *  3. 보유 포지션 청산 우선 평가: 스마트 청산 -> 손절/익절 -> 전략별 SELL 시그널 (비활성/차단/Draining 상태와 무관하게 무조건 실행).
+ *  4. 신규 매수 탐색: 가동·잔고(>=5,050원)·서킷브레이커(-4%)·듀얼 AI 게이트웨이(`allowBuy`/`botOverrides`/`blacklist`)·속도제어 선검사(`precheckLiveBuyPaceLimits`) 통과 시 `executeBotBuyOrder` 실행.
+ * @param {object} [options={}] 테스트용 오버라이드(`tickerMapOverride`, `mdMapOverride`, `skipUpbitApi` 등)
+ * @returns {Promise<object|undefined>}
+ */
 export async function runLiveTradingBotsCycle(options = {}) {
   if (isBackendShuttingDown) return { skipped: true, reason: "BACKEND_SHUTTING_DOWN" };
   // 가상거래 모드에서는 Always-On Arena(runAlwaysOnPaperArenaCycle)가 10대 봇을 독립 운용하므로 실전 루프의 paper_* 교차 오염을 원천 차단
@@ -12212,8 +13140,12 @@ export async function runLiveTradingBotsCycle(options = {}) {
 // ============================================================================
 // 2. 가상거래 상시 경쟁 스케줄러 (10대 순수 알고리즘 Always-On Arena - LLM/Regime 필터 완전 우회)
 // ============================================================================
+// [Antigravity-Doc] 10대 알고리즘 상시 가상 아레나 동시 실행 방지 플래그
 let isPaperArenaCycleRunning = false;
 
+/**
+ * [Antigravity-Doc] 9초 주기 상시 가상거래 아레나 사이클(10대 순수 알고리즘 비교 검증용, AI 장세 필터 완전 우회).
+ */
 async function runAlwaysOnPaperArenaCycle() {
   if (isPaperArenaCycleRunning) return;
   isPaperArenaCycleRunning = true;
@@ -12238,6 +13170,10 @@ async function runAlwaysOnPaperArenaCycle() {
   }
 }
 
+/**
+ * [Antigravity-Doc] 서버 기동 시 DB의 OPEN 실전 포지션(`bot_positions`)을 업비트 `/v1/order?uuid=...`로 재조회하여
+ * 실제 체결 수량·평균 체결가·수수료를 정확히 동기화하고 봇별 배분을 재정렬한다.
+ */
 async function reconcileOpenPositionsWithUpbit() {
   if (!isLiveMode()) {
     return;
@@ -12304,6 +13240,7 @@ async function reconcileOpenPositionsWithUpbit() {
 //    - 30분 단위(1800초) Gemini Flash 빠른 시장 & 뉴스 분석
 //    - 1시간 단위(3600초) Gemini Pro 심층 퀀트 분석
 // ============================================================================
+// [Antigravity-Doc] 정기 듀얼 AI 분석 스케줄러 뮤텍스 및 트랙별(market/news/pro) 실패 백오프 상태
 let isScheduledAiAnalysisRunning = false;
 const AI_SLOT_RETRY_BACKOFF_MS = 15 * 60 * 1000; // 일시 오류(503/타임아웃) 시 15분 쿨다운 후 최대 1회 재시도
 const AI_SLOT_QUOTA_COOLDOWN_MS = 30 * 60 * 1000; // 429/할당량 소진 시 최소 30분 쿨다운 및 해당 슬롯 재시도 중단
@@ -12314,6 +13251,9 @@ const aiSlotFailureState = {
   pro: { slotKey: "", failCount: 0, nextRetryAtMs: 0, skipSlot: false },
 };
 
+/**
+ * [Antigravity-Doc] 지정 AI 트랙이 현재 슬롯에서 실행(또는 백오프 후 재시도) 가능한지 판별한다.
+ */
 function canAttemptAiSlot(track, slotKey, nowMs = Date.now()) {
   const st = aiSlotFailureState[track];
   if (!st || st.slotKey !== slotKey) return true;
@@ -12322,10 +13262,16 @@ function canAttemptAiSlot(track, slotKey, nowMs = Date.now()) {
   return nowMs >= st.nextRetryAtMs;
 }
 
+/**
+ * [Antigravity-Doc] AI 트랙 성공 시 해당 트랙의 슬롯 실패/쿨다운 상태를 초기화한다.
+ */
 function clearAiSlotFailure(track) {
   aiSlotFailureState[track] = { slotKey: "", failCount: 0, nextRetryAtMs: 0, skipSlot: false };
 }
 
+/**
+ * [Antigravity-Doc] AI 트랙 실패 시 오류 유형(429 할당량 vs 503/타임아웃)에 따라 재시도 쿨다운 또는 해당 슬롯 중단을 기록한다.
+ */
 function recordAiSlotFailure(track, slotKey, resultOrErr) {
   const nowMs = Date.now();
   const prev = aiSlotFailureState[track];
@@ -12346,6 +13292,11 @@ function recordAiSlotFailure(track, slotKey, resultOrErr) {
   return { failCount, skipSlot, cooldownMin: Math.round(cooldownMs / 60000), isQuotaOr429 };
 }
 
+/**
+ * [Antigravity-Doc] 10초마다 폴링하며 KST 매시 15분/45분 슬롯 기준으로 정기 듀얼 AI 분석을 자동 실행한다.
+ *  - 30분 주기(15/45분): 뉴스 선행 수집 -> Flash 시황 분석(Ollama 우선) -> Flash 뉴스 분석(동일 슬롯 Ollama 결과 공유)
+ *  - 1시간 주기(매시 15분): Gemini Pro 심층 거시 장세 분석
+ */
 async function checkAndRunScheduledAiMarketAnalysis() {
   if (isScheduledAiAnalysisRunning) return;
   try {
@@ -12479,6 +13430,11 @@ async function checkAndRunScheduledAiMarketAnalysis() {
   }
 }
 
+/**
+ * [Antigravity-Doc] 모든 백그라운드 워커 및 인터벌 스케줄러를 1회 기동한다(중복 호출 방어).
+ *  - Upbit WebSocket 허브 시작 -> 1초 후 PG 동기화/뉴스/미확정 주문 대사/포지션 대사/아레나/실전/AI/로테이션 초기 실행
+ *  - 주기 타이머: 아레나(9s), 실전매매(10s), AI 분석(10s), 주간 로테이션(60s), 레거시 LLM 선정(60s), 뉴스 수집(30m)
+ */
 startBackgroundWorkers = async function() {
   if (workersStarted) return;
   workersStarted = true;
@@ -12532,6 +13488,7 @@ startBackgroundWorkers = async function() {
   console.log("[Workers] Background schedulers and 10-bot Arena cycles started successfully.");
 };
 
+// [Antigravity-Doc] 초기 설정 완료 상태면 백그라운드 워커 자동 기동, 미완료면 Setup Mode 안내 로그 출력
 if (process.env.AUTOCOIN_LIBRARY_MODE !== "1" && isConfigured) {
   startBackgroundWorkers().catch((err) => console.warn("[Startup] Background worker start error:", err.message));
 } else if (process.env.AUTOCOIN_LIBRARY_MODE !== "1") {

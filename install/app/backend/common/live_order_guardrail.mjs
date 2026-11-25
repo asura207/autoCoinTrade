@@ -1,19 +1,32 @@
 /**
- * backend/common/live_order_guardrail.mjs
+ * [Antigravity-Doc] backend/common/live_order_guardrail.mjs
  *
- * 실전 업비트 계좌 연속 결제(중복 매수·중복 매도) 원천 차단을 위한 5중 하드 가드레일(Hard Guardrail) 코어 모듈
+ * [파일 역할 및 아키텍처]
+ * - 실전 업비트 계좌의 연속 결제(중복 매수·중복 매도·이중 환불·프로세스 동시 실행)를 원천 차단하는
+ *   5중 하드 가드레일(Hard Guardrail) 핵심 트랜잭션 엔진.
+ * - [5중 방어 계층]
+ *   1. Layer 1: 단일 실전 실행 주체(`LIVE_EXECUTOR_OWNER`) + SQLite 원자적 프로세스 리스 락(`live_executor_lease`, TTL 30s)
+ *   2. Layer 2: 2단계 커밋(`live_order_intents` PENDING 버킷 선점 + `virtual_krw` 원자적 선차감 + Upbit `identifier` 멱등성 + `UNKNOWN_TIMEOUT` 사후 정산)
+ *   3. Layer 3: 동일 포지션(`order_uuid`) 중복 매도 차단(`closing_lock=1` + `sell:<uuid>` 버킷) & Graceful Drain 매도 비차단 보장
+ *   4. Layer 4: 최후 하드 상한(청산 후 15분 재진입 쿨다운 · 최소 매수 간격 30s · 봇별 시간당 3회/일 12회 · 전체 일 30회)
+ *   5. Layer 5: 이상 징후 감지 시 자동 비상 정지(Auto Kill-Switch: 5분 내 비정상 차단 5회 / `virtual_krw < 0` / 미해결 `UNKNOWN_TIMEOUT` 2건 이상)
  *
- * [5중 방어 계층]
- * 1. 단일 실전 실행 주체(LIVE_EXECUTOR_OWNER) + SQLite 원자적 프로세스 리스 락(live_executor_lease, TTL 30s)
- * 2. 주문 실행 최하단 2단계 커밋 (live_order_intents PENDING 선점 + virtual_krw 원자적 선차감 + Upbit identifier 멱등성 + UNKNOWN_TIMEOUT 정산)
- * 3. 동일 포지션(order_uuid) 중복 매도 차단 (closing_lock + sell:<uuid> 버킷) & Graceful Drain 매도 비차단 보장
- * 4. 최후 하드 상한 (청산 후 15분 재진입 쿨다운 · 최소 매수 간격 30s/분할 30s · 봇별 시간당 3회/일 12회 · 전체 일 30회)
- * 5. 이상 연속 주문 시도 감지 시 자동 비상 정지(Auto Kill-Switch: 5분 내 5회 차단 / virtual_krw < 0 / 미해결 UNKNOWN_TIMEOUT 2건 이상)
+ * [주요 의존성]
+ * - `node:crypto`, `node:os`: 멱등 주문 UUID(`intent_id`) 생성 및 호스트 식별.
+ * - SQLite/PG 호환 DB 어댑터 + 외부 주입 트랜잭션 헬퍼(`withDbWriteLock`, `beginWriteTx`, `commitWriteTx`, `rollbackWriteTx`).
+ *
+ * [수정 시 주의사항]
+ * - 실전 매수(`claimLiveBuyIntentAtomic`)·환불(`refundFailedOrCanceledBuyIntentAtomic`)·확정(`confirmBuyIntentAndRecordPositionAtomic`)은
+ *   반드시 단일 `BEGIN IMMEDIATE` 쓰기 트랜잭션 안에서 실행되며, `WHERE refunded = 0` 조건을 절대 제거하지 말 것(이중 환불 방지).
+ * - 매도(`claimLiveSellIntentAtomic`)는 Graceful Drain 또는 `is_running=0` 중에도 보유 포지션 청산이 가능해야 하므로
+ *   매수 쿨다운/횟수 상한/실전 선택 여부를 절대 검사하지 않는다.
+ * - Auto Kill-Switch(`tripGuardrailKillSwitchInTx`)는 실전 봇(`is_running=0`)만 정지하며, 10대 가상거래 Arena(`paper_is_running`)는 절대 건드리지 않는다.
  */
 
 import crypto from "node:crypto";
 import os from "node:os";
 
+// [Antigravity-Doc] 5중 가드레일 기본 임계치 상수 (DB system_settings / 환경변수 미설정 시 폴백; 완화 시 과매매·중복 주문 위험 증가)
 export const DEFAULT_LIVE_EXECUTOR_OWNER = "node";
 export const DEFAULT_LIVE_LEASE_TTL_SEC = 30;
 export const DEFAULT_LIVE_REENTRY_COOLDOWN_SEC = 900;
@@ -27,10 +40,15 @@ export const DEFAULT_LIVE_ANOMALY_WINDOW_SEC = 300;
 export const DEFAULT_LIVE_ANOMALY_TIMEOUT_THRESHOLD = 2;
 export const LIVE_CYCLE_STALE_WARN_MS = 180 * 1000;
 
+// [Antigravity-Doc] 동일 마켓 다단계 분할 매수가 공식 허용된 봇 집합 (그 외 8개 봇은 1마켓 1포지션 엄격 적용)
 export const SPLIT_ALLOWED_BOTS = new Set(["bot_06", "bot_10"]);
+// [Antigravity-Doc] 정상 속도 제어(최소 매수 간격 · 청산 후 재진입 쿨다운) 코드는 이상 반복 Kill-Switch 누적 카운트에서 제외
 // 정상 속도 제어(최소 매수 간격 · 청산 후 재진입 쿨다운)는 반복 이상 비상 정지(Auto Kill-Switch) 누적 대상에서 분리
 export const NON_ANOMALY_PACE_BLOCK_CODES = new Set(["MIN_BUY_INTERVAL", "REENTRY_COOLDOWN"]);
 
+/**
+ * [Antigravity-Doc] Date 객체를 KST(UTC+9) 기준 `YYYY-MM-DD HH:MM:SS` 문자열로 포맷팅 (서버 타임존 독립)
+ */
 function formatKstDateTimeLocal(dateObj = new Date()) {
   const kst = new Date(dateObj.getTime() + 9 * 3600 * 1000);
   const yyyy = kst.getUTCFullYear();
@@ -42,6 +60,9 @@ function formatKstDateTimeLocal(dateObj = new Date()) {
   return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
 }
 
+/**
+ * [Antigravity-Doc] 현재 시각 기준 당일 00:00:00 KST를 UTC ISO-8601 문자열로 반환 (일일 매수 상한 집계 기준점)
+ */
 export function getTodayStartKstUtcIso(nowMs = Date.now()) {
   const kst = new Date(nowMs + 9 * 3600 * 1000);
   const midnightKstInUtcMs =
@@ -49,6 +70,10 @@ export function getTodayStartKstUtcIso(nowMs = Date.now()) {
   return new Date(midnightKstInUtcMs).toISOString();
 }
 
+/**
+ * [Antigravity-Doc] 현재 시각을 지정 분(기본 15분) 캔들 경계로 내림하여 KST 버킷 키(`YYYYMMDDTHHMM`) 생성
+ * - 동일 캔들·동일 차수 내 중복 매수를 DB UNIQUE 제약으로 원천 차단하는 데 사용된다.
+ */
 export function buildCandleBucketKey(nowMs = Date.now(), candleMinutes = 15) {
   const unitMs = Math.max(1, Number(candleMinutes || 15)) * 60 * 1000;
   const flooredUtcMs = Math.floor(nowMs / unitMs) * unitMs;
@@ -61,6 +86,9 @@ export function buildCandleBucketKey(nowMs = Date.now(), candleMinutes = 15) {
   return `${yyyy}${mm}${dd}T${hh}${mi}`;
 }
 
+/**
+ * [Antigravity-Doc] 매수 주문 의도(Intent)의 UNIQUE 버킷 키 생성 (`{botId}:{market}:{candleTs}:s{step}`)
+ */
 export function buildBuyIntentBucket(botId, market, stepIndex = 1, options = {}) {
   if (options?.intentBucket && String(options.intentBucket).trim()) {
     return String(options.intentBucket).trim();
@@ -74,15 +102,24 @@ export function buildBuyIntentBucket(botId, market, stepIndex = 1, options = {})
   return `${normBot}:${normMkt}:${candleTs}:s${step}`;
 }
 
+/**
+ * [Antigravity-Doc] 매도 주문 의도(Intent)의 UNIQUE 버킷 키 생성 (`sell:{targetPositionUuid}`)
+ */
 export function buildSellIntentBucket(targetPositionUuid) {
   return `sell:${String(targetPositionUuid || "").trim()}`;
 }
 
+/**
+ * [Antigravity-Doc] 양의 정수 설정값 안전 파싱 (유효하지 않으면 fallback 반환)
+ */
 function parsePositiveInt(raw, fallback) {
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
+/**
+ * [Antigravity-Doc] 실전 주문 단독 실행 주체(`node` | `python`) 해석 (환경변수 > runtimeConfig > 기본값 "node")
+ */
 export function getLiveExecutorOwner(runtimeConfig = {}) {
   const envVal = String(process.env.LIVE_EXECUTOR_OWNER || "").trim().toLowerCase();
   if (envVal === "node" || envVal === "python") return envVal;
@@ -91,6 +128,14 @@ export function getLiveExecutorOwner(runtimeConfig = {}) {
   return DEFAULT_LIVE_EXECUTOR_OWNER;
 }
 
+/**
+ * [Antigravity-Doc] 5중 가드레일 런타임 설정 통합 로더
+ * - 우선순위: `system_settings` DB 값 > `process.env` > `runtimeConfig` > 모듈 상수 기본값
+ * - 단, `live_executor_owner`는 보안상 `process.env.LIVE_EXECUTOR_OWNER`가 DB 설정보다 우선한다.
+ * @param {object} db - DB 인스턴스
+ * @param {object} [runtimeConfig={}] - 런타임 설정 객체
+ * @returns {Promise<object>} 정규화된 가드레일 설정 객체
+ */
 export async function getGuardrailConfig(db, runtimeConfig = {}) {
   const readDbSetting = async (key) => {
     if (!db) return "";
@@ -183,7 +228,8 @@ export async function getGuardrailConfig(db, runtimeConfig = {}) {
 }
 
 /**
- * SQLite / PostgreSQL 공통 가드레일 테이블 및 컬럼 자동 마이그레이션
+ * [Antigravity-Doc] SQLite / PostgreSQL 공통 가드레일 테이블(`live_executor_lease`, `live_order_intents`, `live_guardrail_events`)
+ * 및 `bot_positions.closing_lock`, `trades.buy_reason/sell_reason` 컬럼 자동 마이그레이션(Idempotent)
  */
 export async function ensureLiveGuardrailTables(db) {
   if (!db) return;
@@ -241,7 +287,9 @@ export async function ensureLiveGuardrailTables(db) {
 }
 
 /**
- * [Layer 1] 트랜잭션 내부용 프로세스 리스 획득/검증 (이미 BEGIN IMMEDIATE 안에 있을 때 호출)
+ * [Antigravity-Doc] [Layer 1] 트랜잭션 내부용 프로세스 리스 획득/검증/TTL 갱신
+ * - `LIVE_EXECUTOR_OWNER` 불일치(`OWNER_MISMATCH`) 또는 타 프로세스가 유효한 리스를 보유 중(`LEASE_HELD_BY_OTHER`)이면 즉시 차단.
+ * - 동일 홀더(owner_id, pid, host 일치)이거나 기존 리스가 만료된 경우에만 `id=1` 행을 갱신/삽입한다.
  */
 async function acquireOrVerifyLeaseInTx(db, cfg, options = {}) {
   const expectedEngine = String(options.engine || "node").toLowerCase();
@@ -307,7 +355,7 @@ async function acquireOrVerifyLeaseInTx(db, cfg, options = {}) {
 }
 
 /**
- * [Layer 1] 독립 호출용 원자적 프로세스 리스 획득/갱신 (BEGIN IMMEDIATE)
+ * [Antigravity-Doc] [Layer 1] 독립 호출용 원자적 프로세스 리스 획득/갱신 (`BEGIN IMMEDIATE` + DB 쓰기 락)
  */
 export async function acquireOrRenewLiveExecutorLease(db, deps = {}, options = {}) {
   const { runtimeConfig = {}, withDbWriteLock, beginWriteTx, commitWriteTx, rollbackWriteTx } = deps;
@@ -333,7 +381,7 @@ export async function acquireOrRenewLiveExecutorLease(db, deps = {}, options = {
 }
 
 /**
- * [Layer 1] 종료 시 본 프로세스가 보유한 리스만 안전 해제
+ * [Antigravity-Doc] [Layer 1] 프로세스 정상 종료 시 본인(owner_id, pid, host)이 보유한 리스만 안전하게 해제
  */
 export async function releaseLiveExecutorLease(db, deps = {}, options = {}) {
   const { withDbWriteLock, beginWriteTx, commitWriteTx, rollbackWriteTx } = deps;
@@ -360,8 +408,9 @@ export async function releaseLiveExecutorLease(db, deps = {}, options = {}) {
 }
 
 /**
- * [Layer 5] 이상 징후 감지 시 비상 정지(Auto Kill-Switch) 발동 (트랜잭션 내부 호출)
- * - 실전 봇(is_running = 0)만 정지하며, 10대 가상거래 Arena(paper_is_running / algo_lab_models)는 절대 건드리지 않음!
+ * [Antigravity-Doc] [Layer 5] 이상 징후 감지 시 자동 비상 정지(Auto Kill-Switch) 발동 (트랜잭션 내부 전용)
+ * - 대상 실전 봇의 `is_running = 0`으로 정지하고 `system_settings`에 비상 정지 상태/사유/대상 봇 목록을 영속 기록한다.
+ * - 10대 가상거래 Arena(`paper_is_running`, `algo_lab_models`)는 절대 건드리지 않는다.
  */
 async function tripGuardrailKillSwitchInTx(db, { botIds = [], haltAllLiveBots = false, code = "ANOMALY_KILL_SWITCH", reason = "" }) {
   const nowKst = formatKstDateTimeLocal();
@@ -421,7 +470,9 @@ async function tripGuardrailKillSwitchInTx(db, { botIds = [], haltAllLiveBots = 
 }
 
 /**
- * 차단 이벤트 기록 + 5분 내 동일 봇 5회 이상 차단 시 자동 Kill-Switch 발동 (트랜잭션 내부 호출)
+ * [Antigravity-Doc] [Layer 5] 가드레일 차단 이벤트 감사 기록(`live_guardrail_events`) + 비정상 차단 누적 시 자동 Kill-Switch 발동
+ * - 정상 속도 제어(`MIN_BUY_INTERVAL`, `REENTRY_COOLDOWN`)는 카운트에서 제외하고, 비정상 차단(중복 포지션, 미확정 인텐트, 버킷 충돌 등)이
+ *   최근 `anomaly_window_sec`(기본 5분) 내 `anomaly_block_threshold`(기본 5회) 이상 누적되면 해당 봇을 자동 비상 정지한다.
  */
 async function recordBlockAndMaybeKillSwitchInTx(db, cfg, { botId, market, side = "BUY", code, reason, nowMs = Date.now() }) {
   const nowIso = new Date(nowMs).toISOString();
@@ -463,9 +514,10 @@ async function recordBlockAndMaybeKillSwitchInTx(db, cfg, { botId, market, side 
 }
 
 /**
- * [Layer 4 선검사 (Read-Only)]
- * 10초 주기 실전 루프(runLiveTradingBotsCycle) 진입 전 정상적 속도 제어(재진입 쿨다운 / 최소 매수 간격 / 시간당·일일·전체 상한)를
- * 비파괴적으로 선확인하여 live_guardrail_events 불필요 누적 및 Auto Kill-Switch 오발동을 원천 방지합니다.
+ * [Antigravity-Doc] [Layer 4 선검사 (Read-Only)]
+ * - 10초 주기 실전 루프 진입 전 정상 속도 제어(청산 후 재진입 쿨다운 / 최소 매수 간격 / 시간당·일일·전체 상한)를
+ *   DB 쓰기나 `live_guardrail_events` 누적 없이 선확인하여 Auto Kill-Switch 오발동을 원천 방지한다.
+ * @returns {Promise<{ ok: boolean, code?: string, reason?: string }>}
  */
 export async function precheckLiveBuyPaceLimits(
   db,
@@ -620,15 +672,16 @@ export async function precheckLiveBuyPaceLimits(
 }
 
 /**
- * [Layer 1 + Layer 2 + Layer 4 + Layer 5]
- * 실전 매수(BUY) Step A: 단일 원자적 BEGIN IMMEDIATE 트랜잭션으로
- * 1) 소유자/리스 락 검증
- * 2) 봇 상태/이상 징후(virtual_krw < 0, UNKNOWN_TIMEOUT >= 2) 검증
- * 3) 미확정 인텐트(PENDING/SUBMITTED/UNKNOWN_TIMEOUT) 존재 여부 차단
- * 4) 단일 포지션 / 분할 전략 차수 상한 검증
- * 5) 재진입 쿨다운(900s), 최소 매수 간격(60s/30s), 시간당(3)/일일(12)/전체 일일(30) Hard Cap 검증
- * 6) 최소 주문 금액(5,000원/수수료 완충 1.0005) 검증
- * 7) live_order_intents(PENDING) INSERT (UNIQUE 버킷 잠금) + virtual_krw 원자적 선차감
+ * [Antigravity-Doc] [Layer 1 + Layer 2 + Layer 4 + Layer 5] 실전 매수(BUY) 2단계 커밋 Step A 원자적 선점 트랜잭션
+ * - 단일 `BEGIN IMMEDIATE` 트랜잭션 안에서 아래 7단계를 원자적으로 검증 및 선점한다:
+ *   1) 소유자(`LIVE_EXECUTOR_OWNER`) 및 프로세스 리스 락 검증
+ *   2) 봇 존재·가동 상태 및 이상 징후(`virtual_krw < 0`, 미해결 `UNKNOWN_TIMEOUT >= 2`) 감지 시 즉시 Kill-Switch
+ *   3) 동일 `(bot_id, market)` 미확정 매수 인텐트(`PENDING`/`SUBMITTED`/`UNKNOWN_TIMEOUT`) 존재 시 차단
+ *   4) 단일 진입 vs 분할 허용 봇(`bot_06`, `bot_10`) 최대 차수 상한 검증
+ *   5) Layer 4 하드 상한(재진입 쿨다운 900s, 최소 매수 간격 30s, 시간당 3회, 일일 12회, 전체 일일 30회) 검증
+ *   6) 최소 주문금액(5,000원, 수수료 1.0005 완충) 및 배정 원금(`allocated_capital`) 초과 여부 검증
+ *   7) `live_order_intents(PENDING)` UNIQUE 버킷 선점 INSERT + `bots.virtual_krw` 원자적 선차감
+ * - Kill-Switch가 발동되면 트랜잭션 커밋 직후 `deps.onKillSwitch` 콜백을 비동기 통지한다.
  */
 export async function claimLiveBuyIntentAtomic(db, params, deps = {}) {
   const {
@@ -1028,6 +1081,7 @@ export async function claimLiveBuyIntentAtomic(db, params, deps = {}) {
         };
       }
 
+      // [Antigravity-Doc] 7단계: UNIQUE(bot_id, market, side, intent_bucket) 선점 INSERT 후 조건부 UPDATE(virtual_krw >= reservedKrw)로 원자적 선차감
       // 7. Layer 2: intent_bucket 유니크 선점 INSERT (PENDING) + virtual_krw 원자적 선차감
       const intentId = options?.intentId ? String(options.intentId) : crypto.randomUUID();
       const intentBucket = buildBuyIntentBucket(normBotId, normMkt, requestedStep, options);
@@ -1117,7 +1171,7 @@ export async function claimLiveBuyIntentAtomic(db, params, deps = {}) {
 }
 
 /**
- * Step B 응답 수신 시 SUBMITTED 상태 및 upbit_order_uuid 기록
+ * [Antigravity-Doc] [Layer 2] Step B — 업비트 주문 접수 응답 수신 시 `SUBMITTED` 상태 및 `upbit_order_uuid` 기록
  */
 export async function markLiveIntentSubmitted(db, { intentId, upbitOrderUuid }, deps = {}) {
   const { withDbWriteLock, beginWriteTx, commitWriteTx, rollbackWriteTx } = deps;
@@ -1146,8 +1200,9 @@ export async function markLiveIntentSubmitted(db, { intentId, upbitOrderUuid }, 
 }
 
 /**
- * Step C 네트워크 타임아웃 / 5xx 발생 시 UNKNOWN_TIMEOUT 잠금 전환 (절대 즉시 환불/재시도 금지)
- * - 미해결 UNKNOWN_TIMEOUT >= threshold(기본 2건) 도달 시 자동 비상 정지(Auto Kill-Switch) 발동
+ * [Antigravity-Doc] [Layer 2 + Layer 5] Step C — 네트워크 타임아웃 / 5xx 불확실 응답 시 `UNKNOWN_TIMEOUT` 잠금 전환
+ * - 거래소에 실제 주문이 들어갔는지 불확실하므로 절대 즉시 환불/재시도하지 않고 사후 `reconcileUnknownTimeoutIntents` 정산을 대기한다.
+ * - 미해결 `UNKNOWN_TIMEOUT` 누적 건수가 임계치(기본 2건) 이상이면 전체 실전 봇에 Auto Kill-Switch를 발동한다.
  */
 export async function markLiveIntentUnknownTimeout(db, { intentId, botId, market, errorMessage }, deps = {}) {
   const { runtimeConfig = {}, withDbWriteLock, beginWriteTx, commitWriteTx, rollbackWriteTx, onKillSwitch = null } = deps;
@@ -1207,8 +1262,8 @@ export async function markLiveIntentUnknownTimeout(db, { intentId, botId, market
 }
 
 /**
- * Step C 명확한 4xx 거절 또는 확인된 미체결 취소(CANCELED) 시 단 1회 원자적 환불
- * - WHERE intent_id = ? AND refunded = 0 조건으로 이중 환불 원천 차단
+ * [Antigravity-Doc] [Layer 2] Step C — 명확한 4xx 거절 또는 0체결 취소(`CANCELED`) 확정 시 선차감 원화 단 1회 원자적 환불
+ * - `WHERE intent_id = ? AND refunded = 0` 조건으로 이중 환불을 원천 차단하고, 실패 버킷은 아카이빙하여 추후 재진입과 구분한다.
  */
 export async function refundFailedOrCanceledBuyIntentAtomic(
   db,
@@ -1280,7 +1335,9 @@ export async function refundFailedOrCanceledBuyIntentAtomic(
 }
 
 /**
- * Step C 실전 매수 체결 확정 + 미사용 선차감 차액 단 1회 정산 + trades/bot_positions 멱등 기록
+ * [Antigravity-Doc] [Layer 2] Step C — 실전 매수 체결 확정(`CONFIRMED`) + 선차감 차액 단 1회 정산 + `trades`/`bot_positions` 멱등 기록
+ * - 이미 `CONFIRMED` 되었거나 동일 `order_uuid` 포지션이 존재하면 중복 INSERT·이중 정산 없이 `alreadyConfirmed: true` 반환.
+ * - `diff = reservedKrw - (actualBuyAmount + fee)`를 계산해 미사용 선차감 잔여분만 정확히 1회 `virtual_krw`에 환입한다.
  */
 export async function confirmBuyIntentAndRecordPositionAtomic(
   db,
@@ -1443,8 +1500,10 @@ export async function confirmBuyIntentAndRecordPositionAtomic(
 }
 
 /**
- * [Layer 1 + Layer 3] 실전 매도(SELL) Step A: 동일 포지션(order_uuid) 중복 매도 원천 차단 선점
- * - 매수 쿨다운 / 매수 횟수 상한 / Graceful Drain(is_selected_for_live = 0) / is_running = 0 에 절대 차단되지 않음!
+ * [Antigravity-Doc] [Layer 1 + Layer 3] 실전 매도(SELL) Step A — 동일 포지션(`order_uuid`) 중복 매도 원천 차단 원자적 선점
+ * - `bot_positions.closing_lock = 1` 선점과 `live_order_intents(side='SELL', intent_bucket='sell:<uuid>')` UNIQUE 삽입을 단일 트랜잭션으로 묶는다.
+ * - 단일 포지션 평가액이 5,500원 미만이고 동일 마켓 OPEN 포지션이 여럿이면 업비트 최소 주문금액 충족을 위해 일괄 합산 매도 대상으로 묶는다.
+ * - 매수 쿨다운 / 매수 상한 / Graceful Drain(`is_selected_for_live = 0`) / `is_running = 0` 상태에는 절대 차단되지 않는다.
  */
 export async function claimLiveSellIntentAtomic(db, params, deps = {}) {
   const { botId, positionId, sellPrice, floorTo8DecimalsStr, options = {} } = params;
@@ -1583,8 +1642,8 @@ export async function claimLiveSellIntentAtomic(db, params, deps = {}) {
 }
 
 /**
- * 매도 주문이 업비트에 생성되지 않음이 확정된 실패(/v1/accounts 실패, locked, 4xx 거절 등) 시
- * 포지션이 영구 데드락되지 않도록 closing_lock 해제 및 버킷 아카이빙(이력 보존)
+ * [Antigravity-Doc] [Layer 3] 매도 주문이 업비트에 미생성 확정(4xx 거절, 잔고 부족 등) 시 `closing_lock = 0` 해제 및 버킷 아카이빙
+ * - 포지션 영구 데드락을 방지하여 다음 감시 사이클에서 정상 청산 재시도가 가능하도록 복구한다.
  */
 export async function releaseFailedSellIntentAtomic(
   db,
@@ -1624,7 +1683,7 @@ export async function releaseFailedSellIntentAtomic(
 }
 
 /**
- * 매도 체결 확정 시 SELL 인텐트 CONFIRMED 처리 및 closing_lock 정리
+ * [Antigravity-Doc] [Layer 3] 실전 매도 체결 확정 시 SELL 인텐트 `CONFIRMED` 전환 및 대상 포지션 `closing_lock = 0` 정리
  */
 export async function confirmSellIntentAtomic(db, { intentId, upbitOrderUuid = null, targetPositionIds = [] }, deps = {}) {
   const { withDbWriteLock, beginWriteTx, commitWriteTx, rollbackWriteTx } = deps;
@@ -1656,10 +1715,11 @@ export async function confirmSellIntentAtomic(db, { intentId, upbitOrderUuid = n
 }
 
 /**
- * [Layer 2] UNKNOWN_TIMEOUT (및 장기 고착 PENDING/SUBMITTED) 인텐트 업비트 identifier 정산 함수
- * - GET /v1/order?identifier={intent_id} 로 거래소 실제 주문 존재 여부 확정
- * - 존재(200): 체결 완료/부분체결은 중복 없이 1회만 원장 확정, 미체결(wait)은 취소 후 재조회, 취소(0체결)는 1회 환불
- * - 미생성 확정(404 order_not_found): FAILED_NOT_CREATED 전환 및 선차감 원화 정확히 1회 환불 (이중 환불 불가)
+ * [Antigravity-Doc] [Layer 2] `UNKNOWN_TIMEOUT` 및 장기 고착(기본 90초 초과) `PENDING`/`SUBMITTED` 인텐트 업비트 사후 정산기
+ * - `GET /v1/order?identifier={lookupIdentifier}`로 거래소 실제 주문 상태를 확정한다:
+ *   1) HTTP 404(`order_not_found`): BUY는 `FAILED_NOT_CREATED` + 선차감 원화 1회 환불, SELL은 `closing_lock = 0` 해제
+ *   2) HTTP 200: `wait` 상태면 취소 후 재조회 → 체결량(`executed_volume > 0`) 있으면 멱등 확정, 0체결 취소면 환불/락 해제
+ *   3) HTTP 5xx/429/네트워크 오류: 상태를 보존해 다음 주기에 안전하게 재시도
  */
 export async function reconcileUnknownTimeoutIntents(db, deps = {}, options = {}) {
   const {
@@ -1922,7 +1982,7 @@ export async function reconcileUnknownTimeoutIntents(db, deps = {}, options = {}
 }
 
 /**
- * 비상 정지 플래그 수동 해제 (UI/관리자 확인 후 복구용)
+ * [Antigravity-Doc] [Layer 5] 관리자/대시보드 확인 후 비상 정지(`guardrail_emergency_*`) 플래그 일괄 수동 초기화
  */
 export async function resetGuardrailEmergencyState(db, deps = {}) {
   const { withDbWriteLock, beginWriteTx, commitWriteTx, rollbackWriteTx } = deps;
@@ -1955,7 +2015,8 @@ export async function resetGuardrailEmergencyState(db, deps = {}) {
 }
 
 /**
- * GET /api/guardrail/status 및 GET /api/system/overview 용 5중 가드레일 실시간 상태 조회
+ * [Antigravity-Doc] 대시보드(`GET /api/guardrail/status`, `GET /api/system/overview`)용 5중 가드레일 실시간 진단 스냅샷 조회
+ * - 리스 소유 상태, 실전 루프 뮤텍스 경과 시간, 설정 한도, 당일/시간당/5분간 차단 카운터, 비상 정지 상태, 최근 인텐트·차단 20건을 반환한다.
  */
 export async function getGuardrailStatus(db, runtimeConfig = {}, mutexState = {}) {
   const cfg = await getGuardrailConfig(db, runtimeConfig);

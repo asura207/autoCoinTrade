@@ -1,3 +1,12 @@
+# [Antigravity-Doc] ============================================================
+# [Antigravity-Doc] 파일 역할: Python 트레이딩 봇 공통 리스크 게이트웨이, 5중 중복 주문 하드 가드레일, 매수/분할매도·Graceful Drain 정산 엔진 및 핵심 전략 워커(bot_vb/bot_momentum/bot_bb)
+# [Antigravity-Doc] 아키텍처 위치: main_orchestrator.py와 agentBot/bot_10_jack_kellogg.py가 공통 참조하는 Python 주문·리스크·전략 코어 모듈
+# [Antigravity-Doc] 주요 의존성: init_db.py(SQLite/PG 원장), market_hub.py(시세/OHLCV 캐시), pyupbit/requests/jwt(업비트 주문 API), pandas/numpy(ATR·BB·RSI)
+# [Antigravity-Doc] 수정 시 주의사항:
+# [Antigravity-Doc]   1) 실전 주문 생성(POST /v1/orders)에는 절대 맹목 재시도(retry_with_backoff)를 적용하지 말 것 (타임아웃 시 UNKNOWN_TIMEOUT 잠금 후 GET /v1/order?identifier=... 정산 필수)
+# [Antigravity-Doc]   2) 매도 시 업비트 전체 잔고(get_balance)가 아닌 bot_positions.volume만 정확히 매도해 타 봇 포지션 침범 방지
+# [Antigravity-Doc]   3) Graceful Drain 탈락 봇 청산 시 90% 상한 불변식(total_used_after <= global_cap_krw)을 절대 위반하지 말 것
+# [Antigravity-Doc] ============================================================
 """
 bots.py - 3개 트레이딩 봇 매매 전략 및 공통 리스크 게이트웨이 / 주문 유틸리티
 - Step 3: 공통 can_enter_position() 게이트웨이 및 슬리피지 방어형 주문 래퍼
@@ -42,16 +51,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bots")
 
+# [Antigravity-Doc] 업비트 원화 마켓 거래 핵심 상수 (수수료율 0.05%, 최소 주문 5,000원, -20% 손절 데드락 방지 안전 최소 주문 6,500원, KST 타임존)
 UPBIT_FEE_RATE = 0.0005  # 업비트 원화 마켓 수수료 0.05%
 MIN_ORDER_KRW = 5000.0   # 업비트 최소 주문 금액 5,000원
 SAFE_MIN_ORDER_KRW = 6500.0  # -20% 손절 시에도 5,200원 유지 (업비트 5,000원 최소 매도 제한 데드락 방지)
 KST_TZ = datetime.timezone(datetime.timedelta(hours=9))
 
 
+# [Antigravity-Doc] 역할: 현재 KST 시각을 'YYYY-MM-DD HH:MM:SS' 문자열로 반환
 def _now_kst_str() -> str:
     return datetime.datetime.now(KST_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
+# [Antigravity-Doc] 역할: 부동소수점 반올림 오차로 인한 잔고 초과 매도 실패를 방지하기 위해 Decimal 소수점 8자리 내림(ROUND_DOWN) 변환
 def _to_decimal_volume_8(vol: Any) -> Decimal:
     """Decimal 기반 소수점 8자리 내림(ROUND_DOWN) 수량을 반환합니다."""
     try:
@@ -82,6 +94,7 @@ def format_volume_8(vol: Any) -> str:
     return f"{d:.8f}"
 
 
+# [Antigravity-Doc] 역할: TCP 포트 연결(기본 8001) 및 logs/.backend.pid 생존 여부로 Node.js 백엔드 기동 상태 감지 (이중 주문 방지)
 def is_backend_running(port: Optional[int] = None) -> bool:
     """
     Node.js 백엔드(BACKEND_PORT/PORT, 기본 8001)가 기동 중인지 검사합니다.
@@ -119,6 +132,7 @@ def is_backend_running(port: Optional[int] = None) -> bool:
     return False
 
 
+# [Antigravity-Doc] 역할: 구버전 별칭(bot_vb, bot_momentum, bot_bb, bot_kellogg 등)을 표준 ID(bot_01~bot_10)로 일관 정규화
 def normalize_bot_id(raw_id: str) -> str:
     """구버전 봇 ID(bot_vb 등)를 최신 표준 ID(bot_01 ~ bot_10)로 정규화합니다."""
     if not raw_id:
@@ -146,6 +160,7 @@ def normalize_bot_id(raw_id: str) -> str:
 # =====================================================================
 # 0. 실전 중복 주문 원천 차단 5중 하드 가드레일 (Python 측)
 # =====================================================================
+# [Antigravity-Doc] 5중 실전 가드레일 전역 상태: 사이클 고착 경보 기준(180초), 분할 매수 허용 봇 집합(bot_06/bot_10), 스레드 안전 사이클 뮤텍스
 LIVE_CYCLE_STALE_WARN_SEC = 180.0
 SPLIT_ALLOWED_BOTS = {"bot_06", "bot_10"}
 _LIVE_CYCLE_MUTEX_LOCK = threading.Lock()
@@ -162,6 +177,7 @@ def _today_start_kst_utc_iso() -> str:
     return midnight_kst.astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+# [Antigravity-Doc] 역할: 15분 캔들 버킷 기반 매수 멱등성 키 생성 (형식: "{bot_id}:{ticker}:{YYYYMMDDTHHMM}:s{step_level}")
 def _build_py_buy_bucket(bot_id: str, ticker: str, step_level: int = 1) -> str:
     now_kst = datetime.datetime.now(KST_TZ)
     floored_min = (now_kst.minute // 15) * 15
@@ -182,6 +198,7 @@ def _load_upbit_config_json() -> Dict[str, Any]:
     return {}
 
 
+# [Antigravity-Doc] 역할: [Layer 1] 단일 실전 실행 주체(LIVE_EXECUTOR_OWNER)를 env -> config JSON -> 기본값('node') 순으로 조회
 def get_live_executor_owner() -> str:
     """
     단일 실전 주문 실행 주체(LIVE_EXECUTOR_OWNER) 반환 (기본값: 'node').
@@ -283,6 +300,7 @@ def _parse_iso_ts(val: str) -> float:
         return 0.0
 
 
+# [Antigravity-Doc] 역할: [Layer 1] DB live_executor_lease(id=1) 단일 리스 락을 BEGIN IMMEDIATE 트랜잭션으로 원자적 획득/연장 (타 프로세스 점유 중이면 거부)
 def acquire_live_executor_lease(db_path: Optional[str] = None, ttl_sec: int = 30) -> Tuple[bool, str]:
     """
     [Layer 1] SQLite BEGIN IMMEDIATE 트랜잭션으로 live_executor_lease(id=1)를 원자적 획득/갱신합니다.
@@ -396,6 +414,7 @@ def _create_upbit_jwt_py(access_key: str, secret_key: str, query_params: Optiona
     return token.decode("utf-8") if isinstance(token, bytes) else str(token)
 
 
+# [Antigravity-Doc] 역할: [Layer 2] 업비트 POST /v1/orders 직접 호출 (SHA512 query_hash JWT 서명 + identifier 멱등성 키 포함, 맹목 재시도 금지)
 def _py_post_upbit_order_with_identifier(params: Dict[str, Any]) -> Tuple[int, Optional[Dict[str, Any]], Optional[str]]:
     """
     업비트 POST /v1/orders 직접 호출 (identifier 포함, 맹목 재시도 절대 금지).
@@ -446,6 +465,7 @@ def _py_get_upbit_order_by_identifier(identifier: str) -> Tuple[int, Optional[Di
         return 0, None, str(exc)
 
 
+# [Antigravity-Doc] 역할: [Layer 5] 이상 행위(음수 잔고, 미해결 타임아웃 누적, 반복 차단) 감지 시 봇 가동 중지(is_running=0) 및 비상 정지 플래그 기록
 def _py_trip_kill_switch_in_tx(conn, bot_id: str, code: str, reason: str, halt_all: bool = False) -> None:
     now_kst = _now_kst_str()
     msg = f"[🚨 가드레일 비상 정지:{code}] {reason}"
@@ -497,6 +517,7 @@ def _py_record_block_in_tx(conn, bot_id: str, ticker: str, code: str, reason: st
         )
 
 
+# [Antigravity-Doc] 역할: [Layer 2] 네트워크 타임아웃으로 체결 여부가 불확실한 UNKNOWN_TIMEOUT 인텐트를 GET /v1/order?identifier=...로 대조 정산 (404면 안전 환불/락 해제, 200 체결이면 포지션 반영 및 차액 환불)
 def reconcile_python_unknown_timeout_intents(db_path: Optional[str] = None) -> Dict[str, int]:
     """[Layer 2] Python 측 미해결 UNKNOWN_TIMEOUT 인텐트를 GET /v1/order?identifier=... 로 정산합니다."""
     summary = {"checked": 0, "confirmed": 0, "refunded": 0, "pending": 0}
@@ -589,6 +610,7 @@ def reconcile_python_unknown_timeout_intents(db_path: Optional[str] = None) -> D
     return summary
 
 
+# [Antigravity-Doc] 역할: 돌파형 봇의 가짜 돌파(윗꼬리 > 45% 또는 종가 고점 대비 하위 65% 이하) 및 20MA/VWAP +6% 이상 과열 추격 매수 차단 필터
 def check_upper_wick_and_overextension(
     df_candle: Optional[pd.DataFrame],
     current_price: float,
@@ -639,6 +661,7 @@ def check_upper_wick_and_overextension(
     return True, "OK"
 
 
+# [Antigravity-Doc] 역할: 전 봇 공용 3단계 스마트 청산 평가기 — (1) 본절 스탑(+1.2% -> +0.25%) (2) KST 기준 시간 제한 청산 (3) ATR(-2.2x 하드손절, -1.8x 트레일링; bot_06/bot_10 Setup B는 하드손절 예외)
 def evaluate_smart_exit(
     bot_id: str,
     open_pos: Dict[str, Any],
@@ -797,6 +820,8 @@ def get_safe_current_price(ticker: str) -> float:
 # 2. Step 3: 공통 매수 게이트웨이 (can_enter_position)
 # =====================================================================
 
+# [Antigravity-Doc] 역할: 전 봇 공용 매수 진입 게이트웨이 — 백엔드 공존/실전 주체 검증 -> 가상모드 바이패스 -> 실전 일일 -4% 서킷브레이커 -> Graceful Drain 차단 -> 듀얼 AI 필터(risk_alert/action/bot_overrides/blacklist/multiplier) -> BTC 20MA 감축 -> 수수료 반영 최종 투입금 산출
+# [Antigravity-Doc] 입력: bot_id, ticker, available_krw, db_path, is_paper | 반환: Tuple[bool(진입허용), float(투입원화), str(사유코드)]
 def can_enter_position(
     bot_id: str,
     ticker: str,
@@ -1013,6 +1038,8 @@ def can_enter_position(
 # 3. Step 3: 슬리피지 방어형 주문 래퍼 함수 (매수 / 분할 매도)
 # =====================================================================
 
+# [Antigravity-Doc] 역할: 시장가 슬리피지 방어용 최유리 지정가 주문 + 최대 timeout_sec(기본 40초) 3초 간격 폴링 + 미체결 잔여분 취소 래퍼
+# [Antigravity-Doc] 주의: 네트워크/5xx 오류 시 맹목 재시도하지 않고 {"uncertain_timeout": True}를 반환하여 상위에서 UNKNOWN_TIMEOUT 정산 유도
 def execute_limit_order_with_polling(
     upbit: pyupbit.Upbit,
     side: str,  # "bid" or "ask"
@@ -1123,6 +1150,8 @@ def execute_limit_order_with_polling(
     return None
 
 
+# [Antigravity-Doc] 역할: 매수 주문 실행 및 원장(trades, bot_positions, bot_accounts, bots) 원자적 기록 (실전 모드 2단계 커밋: Step A 5중 가드레일 선점·선차감 -> Step B 지정가 주문 전송 -> 확정 정산 또는 미체결 1회 안전 환불)
+# [Antigravity-Doc] 입력: bot_id, ticker, invest_krw, step_level(분할 차수), db_path, buy_reason | 반환: 체결 요약 dict 또는 차단/실패 시 None
 def execute_buy_order(
     bot_id: str,
     ticker: str,
@@ -1455,6 +1484,8 @@ def execute_buy_order(
         conn.close()
 
 
+# [Antigravity-Doc] 역할: 개별 포지션(position_id) 분할 매도 실행 및 원장 정산 — Layer 3 closing_lock 중복 매도 차단 -> 지정가 우선(부분 체결 보존)/단일 시장가 폴백 -> Graceful Drain 탈락 봇 회수금의 90% 상한 내 후임 봇 우선 자동 복원
+# [Antigravity-Doc] 입력: position_id(int), reason(매도 사유), db_path | 반환: 정산 결과 dict(realized_pnl, pnl_pct, net_sell_amount, partial) 또는 None
 def execute_sell_order(
     position_id: int,
     reason: str = "SELL",
@@ -1791,6 +1822,10 @@ def execute_sell_order(
                 ).fetchone()
             is_selected_live = int(dict(bot_live_row).get("is_selected_for_live") or 0) == 1 if bot_live_row is not None else True
 
+            # [Antigravity-Doc] Graceful Drain 자금 회수/복원 정산 블록:
+            # [Antigravity-Doc]   - 탈락 봇(is_selected_for_live=0) 청산 시 회수 원화를 실시간 총 평가자산(E_total)의 max_deploy_ratio(90%) 상한 내에서
+            # [Antigravity-Doc]     1순위 후임 봇(replaced_by_bot_id) -> 2순위 목표 한도 미달 선출 봇 비례 분배 -> 잔여분은 예비비 유보(RESERVE)
+            # [Antigravity-Doc]   - 상한 초과 감지 시 RuntimeError(INVARIANT_VIOLATION)로 트랜잭션 전체 롤백 보장
             if not is_selected_live:
                 # 탈락(Draining) 봇: 실현 손익 누적만 기록하고, 회수 원화는 원금 90% 상한 불변식 하에 후임 봇 우선 복원
                 prev_cash_row = conn.execute(
@@ -2162,6 +2197,7 @@ def execute_sell_order(
 # 4. 기술적 보조지표 계산 함수들
 # =====================================================================
 
+# [Antigravity-Doc] 역할: 기술적 보조지표 ATR(14), 볼린저 밴드(20, 2.0 + 밴드폭), RSI(14) 계산 유틸리티 함수군
 def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """ATR (Average True Range) 지표를 계산합니다."""
     high = df["high"]
@@ -2200,6 +2236,7 @@ def compute_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
 # 5. Step 4: 봇 1 (`bot_vb`) - 슈퍼트렌드 변동성 돌파 + ATR 트레일링 스탑
 # =====================================================================
 
+# [Antigravity-Doc] 역할: [Bot 1] 변동성 돌파(4h 노이즈 동적 K=0.3~0.6, 5MA 상단, 거래량 1.5배) + 윗꼬리 필터 + ATR 트레일링 스탑 워커 루프 (10초 주기)
 def run_bot_vb(stop_event, bot_id: str = "bot_01", db_path: Optional[str] = None) -> None:
     """
     [Bot 1] 슈퍼트렌드 / 동적 변동성 돌파 + ATR 트레일링 스탑 (자금 비중 40%)
@@ -2372,6 +2409,7 @@ def run_bot_vb(stop_event, bot_id: str = "bot_01", db_path: Optional[str] = None
 # 6. Step 4: 봇 2 (`bot_momentum`) - 볼린저 밴드 스퀴즈 돌파 (VCP)
 # =====================================================================
 
+# [Antigravity-Doc] 역할: [Bot 2] 볼린저 밴드 스퀴즈(VCP) 돌파 스윙 워커 루프 — 24h 거래대금 100억+ 종목 스캔, 최대 2슬롯 분할 진입, 20MA 하향 이탈/스마트 청산 (15초 주기)
 def run_bot_momentum(stop_event, bot_id: str = "bot_03", db_path: Optional[str] = None) -> None:
     """
     [Bot 2] 볼린저 밴드 스퀴즈 돌파 (VCP) 스윙 (자금 비중 40%)
@@ -2559,6 +2597,7 @@ def run_bot_momentum(stop_event, bot_id: str = "bot_03", db_path: Optional[str] 
 # 7. Step 4: 봇 3 (`bot_bb`) - 다단계 분할 매수 볼린저 역추세 (DCA / Grid)
 # =====================================================================
 
+# [Antigravity-Doc] 역할: [Bot 3] 볼린저 하단 + RSI<=40 과매도 1차 진입 및 -3%/-6% 3단계 분할 매수(DCA) 워커 루프 — 개별 +1.8% / 20MA 회귀 익절 / -5%~-7% 안전 손절 (10초 주기)
 def run_bot_bb(stop_event, bot_id: str = "bot_05", db_path: Optional[str] = None) -> None:
     """
     [Bot 3] SQLite 원장 기반 다단계 분할 매수 (DCA/역추세) (자금 비중 20%)
@@ -2793,6 +2832,7 @@ from agentBot.bot_10_jack_kellogg import (
     run_bot_jack_kellogg,
 )
 
+# [Antigravity-Doc] BOT_RUNNERS: 표준 10대 봇(bot_01~bot_10) 및 레거시 별칭과 워커 실행 함수를 매핑하는 통합 레지스트리 (main_orchestrator.py에서 참조)
 # 10대 알고리즘 및 레거시 봇 통합 러너 레지스트리
 BOT_RUNNERS: Dict[str, Any] = {
     "bot_01": run_bot_vb,

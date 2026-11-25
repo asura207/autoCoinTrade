@@ -1,3 +1,27 @@
+/* [Antigravity-Doc]
+ * 파일 역할: AutoCoinTrade 대시보드 프론트엔드의 전역 스타일시트입니다.
+ * 구성 요소:
+ *   1. :root 다크 테마 디자인 토큰 및 한국식 손익 색상 변수(#ef4444 수익 / #3b82f6 손실)
+ *   2. 입장 코드(Gate) 인증 화면 및 메인 2:8 사이드바·본문 레이아웃
+ *   3. 좌측 사이드바(업비트 API 통신 상태 표시기, 실전/모의 거래 모드 토글 칩, 메뉴 네비게이션)
+ *   4. 공통 UI(페이지 헤더, 탭 바, 카드, 봇 컨트롤 패널, 버튼, 로딩 스피너, 게시판 테이블, 설정 폼, 모달)
+ *   5. 뉴스 피드(48px 고정 행 높이 테이블, AI 분석 스트리밍 타이핑 박스, 필터 그리드)
+ *   6. 모바일 반응형 미디어쿼리(@media max-width: 900px)
+ *   7. 10대 알고리즘 상시 가상 경쟁(Arena) 포디움·실전 봇 선택 UI, 초기 온보딩 설정 마법사(Wizard)
+ *   8. 버전 배지·변경 이력(History) 마크다운 모달, WebSocket/슬리피지 배지 및 퀀트 백테스트·타점 차트 모달
+ * 수정 시 주의사항:
+ *   - CSS 표준 블록 주석만 사용해야 하며, 블록 내부에 별도 종료 기호를 중첩하지 마세요.
+ *   - 한국 금융 표준 손익 색상(--profit-red: #ef4444, --loss-blue: #3b82f6)은 수익/손실 가독성 규격이므로 임의 변경을 피하세요.
+ *   - .news-board-table의 48px 행 높이는 .news-title-link의 line-height: 48px와 동기화되어 있습니다.
+ */
+
+/* [Antigravity-Doc] 전역 디자인 토큰(:root CSS 커스텀 프로퍼티)
+ * - --bg-primary / --bg-secondary / --bg-card / --bg-card-hover: 딥 네이비 계열 다크 테마 배경 계층
+ * - --border-color / --text-primary / --text-secondary: 테두리 및 본문/보조 텍스트 대비 색상
+ * - --accent-indigo / --accent-indigo-hover: 주요 액션·활성 탭 강조 색상
+ * - --status-green / --status-yellow / --status-red: 업비트 API 통신 신호등 상태 색상
+ * - --profit-red(#ef4444) / --loss-blue(#3b82f6) / --neutral-black(#000000): 한국 주식·코인 시장 표준 손익 색상(이익=빨강, 손실=파랑, 보합=검정)
+ */
 :root {
   --bg-primary: #0b0f19;
   --bg-secondary: #111827;
@@ -16,12 +40,14 @@
   --neutral-black: #000000;
 }
 
+/* [Antigravity-Doc] 전역 박스 모델 초기화(border-box) 및 브라우저 기본 여백 제거 */
 * {
   box-sizing: border-box;
   margin: 0;
   padding: 0;
 }
 
+/* [Antigravity-Doc] 기본 다크 배경, Pretendard 우선 한글 타이포그래피, 가로 스크롤 방지 설정 */
 body {
   background-color: var(--bg-primary);
   color: var(--text-primary);
@@ -30,6 +56,7 @@ body {
   overflow-x: hidden;
 }
 
+/* [Antigravity-Doc] 입장 코드(Gate) 인증 화면: 세션 인증 전 전체 뷰포트 중앙에 카드형 비밀번호 입력 UI 배치 */
 /* 입장 코드 (Gate) 화면 */
 .gate-wrapper {
   min-height: 100vh;
@@ -96,6 +123,10 @@ body {
   margin-bottom: 12px;
 }
 
+/* [Antigravity-Doc] 데스크톱 메인 2:8 분할 레이아웃
+ * - .left-sidebar: 고정 20%(최소 230px) 좌측 네비게이션 및 상태 패널
+ * - .right-content: 가변 80% 우측 탭 본문 영역(세로 스크롤 지원)
+ */
 /* 메인 2:8 레이아웃 (요구사항 7) */
 .app-layout {
   display: flex;
@@ -127,6 +158,10 @@ body {
   overflow-y: auto;
 }
 
+/* [Antigravity-Doc] 좌측 상단 업비트 API 통신 상태 표시기
+ * - .status-dot / .status-label-text: green(정상)·yellow(주의/지연)·red(오류) 3단계 상태 시각화
+ * - .status-Tooltip: 호버 시 상세 응답 지연·오류 정보를 보여주는 플로팅 툴팁
+ */
 /* 좌측 상단 업비트 통신 상태 표시기 (요구사항 19) */
 .upbit-status-box {
   position: relative;
@@ -222,6 +257,9 @@ body {
   display: block;
 }
 
+/* [Antigravity-Doc] 좌측 사이드바 브랜드 타이틀 및 모의(Paper)/실전(Live) 거래 모드 전환 토글 칩
+ * - .chip-paper: 인디고 톤(모의투자 안전 상태) / .chip-live: 레드 톤(실전 자금 운용 경고 강조)
+ */
 /* 좌측 메뉴 네비게이션 (요구사항 8) */
 .brand-header {
   font-size: 17px;
@@ -305,6 +343,7 @@ body {
   border-radius: 4px;
 }
 
+/* [Antigravity-Doc] 전략 검증소 상위 TOP 3 랭킹 포디움 카드 그리드 (1위 gold / 2위 silver / 3위 bronze 메달 테마) */
 /* 검증소 TOP 3 랭킹 포디움 카드 */
 .podium-grid {
   display: grid;
@@ -373,6 +412,7 @@ body {
   border: 1px solid rgba(217, 119, 6, 0.4);
 }
 
+/* [Antigravity-Doc] 좌측 사이드바 메인 메뉴 버튼 목록 및 하단 푸터 영역 (.menu-btn.active로 현재 선택 탭 강조) */
 .menu-list {
   display: flex;
   flex-direction: column;
@@ -415,6 +455,11 @@ body {
   color: var(--text-secondary);
 }
 
+/* [Antigravity-Doc] 우측 본문 공통 UI 컴포넌트
+ * - .page-header / .tab-bar / .card: 페이지 제목, 하위 탭 바, 다크 카드 컨테이너
+ * - .bot-control-panel / .bot-meta-grid: 봇 실행 상태 메타정보 및 제어 버튼 그룹
+ * - .btn 계열(.btn-primary, .btn-start, .btn-stop, .btn-outline, .btn-secondary) 및 .spinner 로딩 애니메이션
+ */
 /* 공통 헤더 / 탭 / 카드 / 버튼 */
 .page-header {
   display: flex;
@@ -569,6 +614,7 @@ body {
   }
 }
 
+/* [Antigravity-Doc] 공통 데이터/거래내역 게시판 테이블(.table-container 가로 스크롤 래퍼 + .board-table) */
 /* 게시판 테이블 (요구사항 9, 12) */
 .table-container {
   width: 100%;
@@ -600,6 +646,11 @@ body {
   background: rgba(30, 41, 59, 0.45);
 }
 
+/* [Antigravity-Doc] 한국식 손익(PnL) 색상 유틸리티 클래스
+ * - .pnl-profit: 수익(양수) -> 빨간색(--profit-red: #ef4444)
+ * - .pnl-loss: 손실(음수) -> 파란색(--loss-blue: #3b82f6)
+ * - .pnl-Zero / .pnl-zero: 0원/보합 -> 회색 배지 위 검은색(--neutral-black: #000000)으로 다크 배경 가독성 확보
+ */
 /* 손익 색상 구분 (요구사항 12: 이익=빨간색, 손해=파란색, 그외=검은색) */
 .pnl-profit {
   color: var(--profit-red);
@@ -621,6 +672,7 @@ body {
   display: inline-block;
 }
 
+/* [Antigravity-Doc] 환경설정(Settings) 탭 폼 그리드: auto-fit(최소 320px) 반응형 다열 배치 및 입력 필드 스타일 */
 /* 설정 폼 그리드 */
 .settings-grid {
   display: grid;
@@ -657,6 +709,7 @@ body {
   font-size: 14px;
 }
 
+/* [Antigravity-Doc] 공통 확인/알림 모달 팝업(.modal-backdrop 오버레이 + .modal-box 중앙 다이얼로그) 및 타이핑 커서 점멸 키프레임 */
 /* Modal Popup (요구사항 20, 21) */
 .modal-backdrop {
   position: fixed;
@@ -706,6 +759,7 @@ body {
   }
 }
 
+/* [Antigravity-Doc] 뉴스 키워드 태그 칩 버튼 스타일 */
 /* 뉴스 피드 & 페이지네이션 보조 스타일 */
 .news-tag-btn {
   background: rgba(38, 50, 77, 0.6);
@@ -723,6 +777,11 @@ body {
   border-color: var(--accent-indigo);
 }
 
+/* [Antigravity-Doc] 뉴스 게시판 48px 고정 행 높이 테이블
+ * - table-layout: fixed + height/max-height: 48px + ellipsis(white-space: nowrap)로 모든 뉴스 행 높이를 48px로 균일하게 고정
+ * - td[colspan](빈 상태/안내 행)만 height: auto로 예외 허용
+ * - .news-title-link의 line-height: 48px는 행 높이와 수직 중앙 정렬을 맞추기 위해 동기화되어 있음
+ */
 /* 뉴스 테이블 고정 높이 및 말줄임 (요구사항: row 높이 동일화) */
 .news-board-table {
   table-layout: fixed;
@@ -769,6 +828,7 @@ body {
   color: #818cf8;
 }
 
+/* [Antigravity-Doc] 뉴스 AI 시황 분석 패널: 접기/펼치기 본문 마크다운 타이포그래피 및 SSE 스트리밍 타이핑 커서(.news-ai-cursor) */
 /* 뉴스 AI 판단 접기/펼치기 및 스트리밍 타이핑 스타일 */
 .news-ai-box {
   background: radial-gradient(circle at top left, #161e38 0%, #0d1322 100%);
@@ -832,6 +892,7 @@ body {
   animation: cursorBlink 1s infinite;
 }
 
+/* [Antigravity-Doc] 뉴스 검색·날짜 필터 바 데스크톱 Flex 레이아웃 및 AI 브리핑 액션 버튼 그룹 */
 /* 뉴스 필터 데스크탑 기본 스타일 */
 .news-filter-grid {
   display: flex;
@@ -869,6 +930,11 @@ body {
   gap: 8px;
 }
 
+/* [Antigravity-Doc] 반응형 모바일/태블릿 미디어쿼리 (뷰포트 900px 이하)
+ * - 2:8 가로 분할 레이아웃을 세로 스택으로 전환하고 좌측 사이드바를 상단 sticky 네비게이션 바로 변환
+ * - 5개 메뉴 탭을 균등 5열 그리드로 배치, 테이블은 min-width 보존 + 터치 가로 스크롤 적용
+ * - 뉴스 필터·봇 메타·포디움 카드를 모바일 폭에 맞게 1~2열 그리드로 재배치
+ */
 /* ============================================================
    모바일 반응형 레이아웃 (@media max-width: 900px)
    - 모바일 환경에서 좌측 사이드바와 우측 본문 영역의 압축 현상 해결
@@ -962,6 +1028,7 @@ body {
     font-size: 11px;
   }
 
+  /* [Antigravity-Doc] 모바일 환경에서 5개 메인 메뉴 탭을 1행 5열 균등 그리드로 재배치 */
   /* 모바일 5단 메뉴 버튼 그리드 */
   .menu-list {
     display: grid;
@@ -1178,6 +1245,11 @@ body {
 
 
 
+/* [Antigravity-Doc] 10대 알고리즘 상시 가상 경쟁(Arena) 및 실전 봇(1~3개) 동적 선택 섹션
+ * - .arena-status-banner / .arena-pulse-dot: 실시간 가상 경쟁 가동 중 펄스 애니메이션 배너
+ * - .podium-container / .podium-card(.gold/.silver/.bronze): TOP 3 알고리즘 랭킹 카드 및 실전 채택 배지(.badge-live-selected)
+ * - .step-box / .bot-select-grid / .bot-select-card(.selected) / .dynamic-alloc-card: 실전 봇 선택 및 자본 배분 카드 UI
+ */
 /* ==========================================================================
    10대 순수 알고리즘 상시 가상 경쟁(Arena) & 선택형 실전 봇 전용 스타일
    ========================================================================== */
@@ -1388,6 +1460,12 @@ body {
   gap: 10px;
 }
 
+/* [Antigravity-Doc] 초기 온보딩 설정 마법사(Setup Wizard) 전용 스타일
+ * - .wizard-wrapper / .wizard-card: 전체 화면 중앙 카드 레이아웃
+ * - .wizard-stepper / .wizard-step-node(.active/.completed): 단계별 진행 표시기(연결선 포함)
+ * - .wizard-choice-grid / .wizard-form-group / .wizard-footer / .wizard-test-box: DB·API 선택 카드, 입력 폼, 연결 테스트 및 하단 네비게이션
+ * - .wizard-progress-track / .wizard-checklist: 최종 설치 진행률 바 및 단계별 완료 체크리스트
+ */
 /* ============================================================
    Step-by-Step Onboarding Setup Wizard Styles
    ============================================================ */
@@ -1752,6 +1830,9 @@ body {
   color: #e0e7ff;
 }
 
+/* [Antigravity-Doc] 버전 배지(.version-badge, .version-pill-badge) 및 변경 이력(HISTORY.md) 마크다운 뷰어 모달(.history-modal-box)
+ * - 마크다운 헤딩(h1~h3), 테이블, 인라인 코드(code), 코드 블록(pre), 인용문(blockquote) 전용 다크 타이포그래피 정의
+ */
 /* ============================================================
    프로젝트 버전 배지 및 히스토리(History) 모달 스타일
    ============================================================ */
@@ -1899,6 +1980,12 @@ body {
   font-size: 13px;
 }
 
+/* [Antigravity-Doc] 퀀트 모니터링 및 백테스트/타점 차트 모달 스타일
+ * - .ws-mode-badge(.ws-live / .ws-rest): 실시간 WebSocket 시세 연결 vs REST 폴링 폴백 상태 배지
+ * - .slippage-pill(.slip-good / .slip-neutral / .slip-warn): 주문 체결 슬리피지 품질 등급 배지
+ * - .quant-modal-box / .backtest-form-grid / .backtest-metrics-grid / .bt-metric-card / .quant-chart-shell:
+ *   전략 백테스트 조건 입력 폼, 핵심 성과 지표(수익률·승률·MDD 등) 카드 및 캔들/타점 차트 컨테이너
+ */
 /* ============================================================
    WebSocket 실시간 배지 / 체결 슬리피지 배지 / 백테스트 & 타점 차트 모달
    ============================================================ */

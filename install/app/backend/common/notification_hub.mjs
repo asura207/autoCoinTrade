@@ -1,4 +1,16 @@
 /**
+ * [Antigravity-Doc]
+ * 파일 역할: Telegram Bot API, Discord Webhook, WebPush 3개 채널을 통합 관리·발송하는 멀티채널 실시간 알림 허브
+ * 아키텍처:
+ * - 알림 설정은 `system_settings` 테이블(DB)에서 우선 로드하며, 미설정 항목은 환경 변수(`TELEGRAM_BOT_TOKEN`, `DISCORD_WEBHOOK_URL` 등)로 폴백합니다.
+ * - 민감 시크릿(텔레그램 봇 토큰, 디스코드 웹훅 URL)은 `crypto_vault.mjs`를 통해 AES-256-GCM 암호화 저장 및 UI 노출용 마스킹(`••••`)을 수행합니다.
+ * - `dispatchMultiChannelNotification`은 이벤트 카테고리별 수신 토글(`notify_on_trade`, `notify_on_risk`, `notify_daily_report`)을 검사한 뒤, 활성화된 모든 채널에 `Promise.allSettled`로 병렬 비동기 발송합니다.
+ * 주요 의존성: `./crypto_vault.mjs` (`encryptSecret`, `safeDecryptSecret`), 전역 `fetch` 및 `AbortSignal.timeout`
+ * 수정 시 주의사항:
+ * - 새 이벤트 유형을 추가할 때는 `NOTIFICATION_EVENT_TYPES`, 카테고리 Set(`TRADE_EVENTS`/`RISK_EVENTS`/`REPORT_EVENTS`), `formatNotificationMessage`의 `switch` 분기를 모두 함께 갱신해야 합니다.
+ * - `saveNotificationSettings`는 마스킹 문자열(`••••`)이 그대로 재전송될 경우 기존 저장된 실제 토큰을 유지하도록 설계되어 있습니다.
+ */
+/**
  * backend/common/notification_hub.mjs
  *
  * 멀티채널 실시간 알림 허브 (Telegram Bot API · Discord Webhook · WebPush 연동)
@@ -9,6 +21,7 @@
 
 import { encryptSecret, safeDecryptSecret } from "./crypto_vault.mjs";
 
+// [Antigravity-Doc] 시스템 전역에서 사용하는 표준 알림 이벤트 유형 열거 상수
 export const NOTIFICATION_EVENT_TYPES = {
   LIVE_BUY: "LIVE_BUY",
   LIVE_SELL: "LIVE_SELL",
@@ -21,10 +34,12 @@ export const NOTIFICATION_EVENT_TYPES = {
   TEST: "TEST",
 };
 
+// [Antigravity-Doc] 사용자 알림 필터 토글(매매 / 리스크 / 일일리포트)에 매핑되는 이벤트 집합
 const TRADE_EVENTS = new Set(["LIVE_BUY", "LIVE_SELL", "DRAIN_HANDOFF"]);
 const RISK_EVENTS = new Set(["CIRCUIT_BREAKER", "ZERO_BALANCE_HALT", "WEEKLY_ROTATION", "GEMINI_QUOTA_EXCEEDED"]);
 const REPORT_EVENTS = new Set(["DAILY_SUMMARY"]);
 
+// [Antigravity-Doc] .env 예시 등에 남아 있을 수 있는 미설정 플레이스홀더 값 목록
 const PLACEHOLDER_NOTIFICATION_VALUES = new Set([
   "your_telegram_bot_token_here",
   "your_telegram_chat_id_here",
@@ -34,6 +49,13 @@ const PLACEHOLDER_NOTIFICATION_VALUES = new Set([
   "YOUR_DISCORD_WEBHOOK_URL",
 ]);
 
+/**
+ * [Antigravity-Doc]
+ * 역할: 알림 설정 문자열에서 공백과 미설정 플레이스홀더(`your_*_here` 등)를 걸러내 빈 문자열로 정규화합니다.
+ * 매개변수:
+ * - val {any}: 원시 설정값
+ * 반환값: {string} 유효한 설정 문자열 또는 `""`
+ */
 function sanitizeNotificationValue(val) {
   const s = String(val || "").trim();
   if (!s) return "";
@@ -41,6 +63,13 @@ function sanitizeNotificationValue(val) {
   return s;
 }
 
+/**
+ * [Antigravity-Doc]
+ * 역할: 암호화되었거나 평문인 민감 토큰을 UI 표시용 마스킹 문자열(앞 4자 + `••••••••` + 뒤 4자)로 변환합니다.
+ * 매개변수:
+ * - val {string}: 암호문 또는 평문 토큰
+ * 반환값: {string} 마스킹된 문자열 (값이 비어 있으면 `""`, 8자 이하면 `"••••••••"`)
+ */
 export function maskSecretValue(val) {
   const plain = sanitizeNotificationValue(safeDecryptSecret(val || ""));
   if (!plain) return "";
@@ -48,6 +77,14 @@ export function maskSecretValue(val) {
   return `${plain.slice(0, 4)}••••••••${plain.slice(-4)}`;
 }
 
+/**
+ * [Antigravity-Doc]
+ * 역할: DB 문자열(`"true"`, `"1"`, `"yes"`, `"on"` 등) 또는 불리언 설정값을 boolean으로 파싱합니다.
+ * 매개변수:
+ * - val {any}: 파싱할 원본 값
+ * - defaultVal {boolean} [true]: 값이 없거나 판별 불가할 때 사용할 기본값
+ * 반환값: {boolean}
+ */
 function parseBoolSetting(val, defaultVal = true) {
   if (val === undefined || val === null || val === "") return defaultVal;
   if (typeof val === "boolean") return val;
@@ -57,6 +94,15 @@ function parseBoolSetting(val, defaultVal = true) {
   return defaultVal;
 }
 
+/**
+ * [Antigravity-Doc]
+ * 역할: `system_settings` 테이블과 환경 변수에서 멀티채널 알림 설정을 로드하고 시크릿을 복호화/마스킹해 반환합니다.
+ * 매개변수:
+ * - db {object|null}: DB 래퍼 인스턴스 (`null`이면 환경 변수만 참조)
+ * - options {object} [{}]: `{ maskSecrets: boolean }` (`true`일 경우 API 응답용으로 원문 토큰을 빈 문자열로 숨김)
+ * 반환값: {Promise<object>} 채널별 활성화 플래그, 설정 완료 여부, 원문/마스킹 토큰, 이벤트 필터 토글을 포함한 설정 객체
+ * 부수효과/예외 처리: DB 조회 실패 시 예외를 삼키고 환경 변수 및 기본값으로 안전 폴백합니다.
+ */
 export async function loadNotificationSettings(db, options = {}) {
   const keys = [
     "telegram_enabled",
@@ -70,6 +116,7 @@ export async function loadNotificationSettings(db, options = {}) {
     "notify_daily_report",
   ];
   const map = {};
+  // [Antigravity-Doc] system_settings에서 알림 관련 키 일괄 조회
   if (db) {
     try {
       const rows = await db
@@ -83,6 +130,7 @@ export async function loadNotificationSettings(db, options = {}) {
     } catch {}
   }
 
+  // [Antigravity-Doc] DB 값 우선 적용, 미존재 시 프로세스 환경 변수 폴백 후 안전 복호화 및 플레이스홀더 제거
   const rawTgToken = map.telegram_bot_token ?? process.env.TELEGRAM_BOT_TOKEN ?? "";
   const rawTgChatId = map.telegram_chat_id ?? process.env.TELEGRAM_CHAT_ID ?? "";
   const rawDiscordUrl = map.discord_webhook_url ?? process.env.DISCORD_WEBHOOK_URL ?? "";
@@ -93,6 +141,7 @@ export async function loadNotificationSettings(db, options = {}) {
   const telegramConfigured = Boolean(telegramBotToken && telegramChatId);
   const discordConfigured = Boolean(discordWebhookUrl);
 
+  // [Antigravity-Doc] 채널별/카테고리별 활성화 불리언 플래그 정규화
   const telegramEnabled = parseBoolSetting(map.telegram_enabled, telegramConfigured);
   const discordEnabled = parseBoolSetting(map.discord_enabled, discordConfigured);
   const webpushEnabled = parseBoolSetting(map.webpush_enabled, true);
@@ -119,10 +168,21 @@ export async function loadNotificationSettings(db, options = {}) {
   };
 }
 
+/**
+ * [Antigravity-Doc]
+ * 역할: 사용자가 수정한 알림 설정을 검증·병합하여 `system_settings` 테이블에 암호화 저장하고, 마스킹된 최신 설정을 반환합니다.
+ * 매개변수:
+ * - db {object}: DB 래퍼 인스턴스
+ * - payload {object} [{}]: 클라이언트에서 전달된 부분/전체 알림 설정 객체
+ * - nowStr {string} [""]: `updated_at`에 기록할 타임스탬프 (미지정 시 KST 현재 시각 자동 생성)
+ * 반환값: {Promise<object>} `maskSecrets: true`로 다시 로드한 최신 알림 설정 객체
+ * 부수효과/예외 처리: `telegram_bot_token`과 `discord_webhook_url`은 `••••`가 포함된 마스킹 값이면 기존 값을 유지하고, 새 값이면 AES-256-GCM 암호화 후 저장합니다.
+ */
 export async function saveNotificationSettings(db, payload = {}, nowStr = "") {
   const now = nowStr || new Date(Date.now() + 9 * 3600000).toISOString().replace("T", " ").slice(0, 19);
   const current = await loadNotificationSettings(db, { maskSecrets: false });
 
+  // [Antigravity-Doc] 텔레그램 토큰 갱신: 빈 문자열이면 삭제, 마스킹 문자 미포함 시에만 신규 토큰으로 교체
   let nextTgToken = current.telegram_bot_token;
   if (payload.telegram_bot_token !== undefined) {
     const input = String(payload.telegram_bot_token || "").trim();
@@ -138,6 +198,7 @@ export async function saveNotificationSettings(db, payload = {}, nowStr = "") {
       ? String(payload.telegram_chat_id || "").trim()
       : current.telegram_chat_id;
 
+  // [Antigravity-Doc] 디스코드 웹훅 URL 갱신: 텔레그램 토큰과 동일한 마스킹 보호 규칙 적용
   let nextDiscordUrl = current.discord_webhook_url;
   if (payload.discord_webhook_url !== undefined) {
     const input = String(payload.discord_webhook_url || "").trim();
@@ -148,6 +209,7 @@ export async function saveNotificationSettings(db, payload = {}, nowStr = "") {
     }
   }
 
+  // [Antigravity-Doc] 채널 및 이벤트 카테고리 토글 값 병합 (일일 리포트는 구/신 필드명 모두 호환)
   const telegramEnabled =
     payload.telegram_enabled !== undefined
       ? parseBoolSetting(payload.telegram_enabled, Boolean(nextTgToken && nextTgChatId))
@@ -177,6 +239,7 @@ export async function saveNotificationSettings(db, payload = {}, nowStr = "") {
       ? parseBoolSetting(rawDailyFlag, true)
       : current.notify_daily_report;
 
+  // [Antigravity-Doc] 민감 필드(bot_token, webhook_url)는 저장 직전 AES-256-GCM 암호화
   const entries = [
     ["telegram_enabled", telegramEnabled ? "true" : "false"],
     ["telegram_bot_token", nextTgToken ? encryptSecret(nextTgToken) : ""],
@@ -189,6 +252,7 @@ export async function saveNotificationSettings(db, payload = {}, nowStr = "") {
     ["notify_daily_report", notifyDailyReport ? "true" : "false"],
   ];
 
+  // [Antigravity-Doc] system_settings 테이블에 UPSERT 일괄 반영
   const stmt = await db.prepare("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES (?, ?, ?)");
   for (const [k, v] of entries) {
     await stmt.run(k, v, now);
@@ -197,6 +261,16 @@ export async function saveNotificationSettings(db, payload = {}, nowStr = "") {
   return await loadNotificationSettings(db, { maskSecrets: true });
 }
 
+/**
+ * [Antigravity-Doc]
+ * 역할: JSON POST 요청을 타임아웃 및 지수 백오프 재시도(429/5xx/네트워크 오류 대상)와 함께 전송합니다.
+ * 매개변수:
+ * - url {string}: 대상 웹훅/API 엔드포인트
+ * - bodyObj {object}: JSON 직렬화할 요청 본문
+ * - options {object} [{}]: `{ timeoutMs = 4000, maxRetries = 2 }`
+ * 반환값: {Promise<{ok: boolean, status?: number, error?: string}>} 전송 성공 여부 및 오류 메시지
+ * 부수효과/예외 처리: 4xx(429 제외) 클라이언트 오류는 재시도해도 성공 가능성이 없으므로 즉시 중단합니다.
+ */
 async function postWithRetry(url, bodyObj, { timeoutMs = 4000, maxRetries = 2 } = {}) {
   let lastErr = null;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -212,12 +286,14 @@ async function postWithRetry(url, bodyObj, { timeoutMs = 4000, maxRetries = 2 } 
       }
       const errText = await resp.text().catch(() => "");
       lastErr = new Error(`HTTP ${resp.status}: ${errText.slice(0, 140)}`);
+      // [Antigravity-Doc] 레이트 리밋(429)이나 서버 오류(5xx)가 아닌 4xx 오류는 재시도 없이 즉시 탈출
       if (resp.status !== 429 && resp.status < 500) {
         break;
       }
     } catch (err) {
       lastErr = err;
     }
+    // [Antigravity-Doc] 지수 백오프 대기 (150ms -> 300ms)
     if (attempt < maxRetries) {
       await new Promise((r) => setTimeout(r, 150 * Math.pow(2, attempt)));
     }
@@ -225,9 +301,18 @@ async function postWithRetry(url, bodyObj, { timeoutMs = 4000, maxRetries = 2 } 
   return { ok: false, error: lastErr?.message || "Unknown notification error" };
 }
 
+/**
+ * [Antigravity-Doc]
+ * 역할: 이벤트 유형과 페이로드 데이터를 사람이 읽기 쉬운 한국어 제목(`title`)과 본문(`text`) 메시지로 포맷팅합니다.
+ * 매개변수:
+ * - eventType {string}: 알림 이벤트 유형 (`LIVE_BUY`, `LIVE_SELL`, `CIRCUIT_BREAKER` 등)
+ * - data {object} [{}]: 이벤트 상세 수치 및 메타데이터
+ * 반환값: {{title: string, text: string}} 포맷된 알림 제목과 본문
+ */
 export function formatNotificationMessage(eventType, data = {}) {
   const type = String(eventType || "TEST").toUpperCase();
   const title = data.title || `[autoCoinTrade] ${type}`;
+  // [Antigravity-Doc] 호출부가 커스텀 message 문자열을 직접 지정한 경우 기본 템플릿 대신 우선 사용
   if (data.message && typeof data.message === "string") {
     return { title, text: `${title}\n${data.message}` };
   }
@@ -323,17 +408,30 @@ export function formatNotificationMessage(eventType, data = {}) {
   }
 }
 
+/**
+ * [Antigravity-Doc]
+ * 역할: 설정된 알림 정책을 평가하고 활성화된 모든 채널(Telegram, Discord, WebPush)에 이벤트를 병렬 발송합니다.
+ * 매개변수:
+ * - db {object|null}: 알림 설정 조회용 DB 래퍼
+ * - eventTypeOrPayload {string|object}: 이벤트 유형 문자열 또는 `{ eventType, ...data }` 통합 페이로드 객체
+ * - dataOrOptions {object} [{}]: 이벤트 데이터(2번째 인자가 문자열일 때) 또는 옵션(2번째 인자가 객체일 때)
+ * - maybeOptions {object} [{}]: `{ settingsOverride, forceSend, telegramApiBaseUrl, webPushBroadcastFn, timeoutMs, maxRetries }`
+ * 반환값: {Promise<object>} 채널별 발송 결과(`{ event_type, telegram, discord, webpush, channels }`) 또는 정책 스킵 결과(`{ skipped: true, reason, channels }`)
+ * 부수효과/예외 처리: `Promise.allSettled`로 채널 간 장애를 격리하므로 한 채널이 실패해도 다른 채널 발송과 매매 루프에 영향을 주지 않습니다.
+ */
 export async function dispatchMultiChannelNotification(db, eventTypeOrPayload, dataOrOptions = {}, maybeOptions = {}) {
   let rawEventType = eventTypeOrPayload;
   let rawData = dataOrOptions;
   let options = maybeOptions;
 
+  // [Antigravity-Doc] 오버로드 인자 정규화: (db, payloadObj, options) 호출 방식과 (db, eventType, data, options) 모두 지원
   if (eventTypeOrPayload && typeof eventTypeOrPayload === "object") {
     rawEventType = eventTypeOrPayload.eventType || eventTypeOrPayload.event_type || "TEST";
     rawData = eventTypeOrPayload;
     options = dataOrOptions && typeof dataOrOptions === "object" ? dataOrOptions : {};
   }
 
+  // [Antigravity-Doc] camelCase / snake_case 혼재 호출을 모두 수용하도록 표준 필드 정규화
   const type = String(rawEventType || "TEST").toUpperCase();
   const extra = rawData?.extra && typeof rawData.extra === "object" ? rawData.extra : {};
   const data = {
@@ -354,6 +452,7 @@ export async function dispatchMultiChannelNotification(db, eventTypeOrPayload, d
 
   const cfg = options.settingsOverride || (await loadNotificationSettings(db, { maskSecrets: false }));
 
+  // [Antigravity-Doc] TEST 이벤트나 forceSend가 아닌 경우, 사용자 카테고리별 알림 수신 거부 설정 확인
   if (type !== "TEST" && !options.forceSend) {
     if (TRADE_EVENTS.has(type) && !cfg.notify_on_trade) {
       return { skipped: true, reason: "notify_on_trade disabled", channels: {} };
@@ -376,6 +475,7 @@ export async function dispatchMultiChannelNotification(db, eventTypeOrPayload, d
 
   const tasks = [];
 
+  // [Antigravity-Doc] 1) Telegram Bot API sendMessage 비동기 발송 태스크 등록
   if (cfg.telegram_enabled !== false && cfg.telegram_bot_token && cfg.telegram_chat_id) {
     const tgBase = String(
       options.telegramApiBaseUrl || process.env.TELEGRAM_API_BASE_URL || "https://api.telegram.org"
@@ -396,6 +496,7 @@ export async function dispatchMultiChannelNotification(db, eventTypeOrPayload, d
     );
   }
 
+  // [Antigravity-Doc] 2) Discord Webhook 비동기 발송 태스크 등록
   if (cfg.discord_enabled !== false && cfg.discord_webhook_url) {
     tasks.push(
       postWithRetry(
@@ -411,6 +512,7 @@ export async function dispatchMultiChannelNotification(db, eventTypeOrPayload, d
     );
   }
 
+  // [Antigravity-Doc] 3) WebPush 브로드캐스트 콜백(주입된 경우) 비동기 실행 태스크 등록
   if (cfg.webpush_enabled !== false && typeof options.webPushBroadcastFn === "function") {
     tasks.push(
       Promise.resolve()
@@ -435,6 +537,7 @@ export async function dispatchMultiChannelNotification(db, eventTypeOrPayload, d
     );
   }
 
+  // [Antigravity-Doc] 모든 활성 채널 발송을 병렬 대기한 뒤 하위 호환용 channels 필드를 포함해 결과 반환
   await Promise.allSettled(tasks);
   results.channels = {
     telegram: results.telegram,

@@ -1,12 +1,24 @@
 /**
- * backend/common/backtest_service.mjs
+ * [Antigravity-Doc] backend/common/backtest_service.mjs
  *
- * 10대 알고리즘(bot_01 ~ bot_10) 과거 캔들 기반 정량 백테스팅(Backtesting) & 워크포워드(Walk-Forward) 검증 엔진
- * - historical_candles 로컬 SQLite 캐싱 및 업비트 120ms Rate Limit 준수
- * - 시점 t 평가 시 0..t 캔들 슬라이스만 참조하여 미래 참조(Look-Ahead Bias) 100% 원천 차단
- * - 양방향 수수료(0.05%) + 가변 슬리피지(bps) 반영, 다단계 분할(bot_06/bot_10) 독립 최고가 및 동일 봉 재진입 금지
- * - 정량 성과 지표: 총수익률, CAGR, MDD, 승률, 손익비(Profit Factor), Sharpe Ratio, Sortino Ratio, 평균 보유시간
- * - 워크포워드(In-Sample 70% 최적화 -> Out-of-Sample 30% 전진 검증) 및 캔들 차트 매매 타점(BUY/SELL 마커) 생성
+ * [파일 역할 및 아키텍처]
+ * - 업비트 10대 알고리즘(bot_01 ~ bot_10)의 과거 캔들 기반 정량 백테스팅(Backtesting) 및
+ *   워크포워드(Walk-Forward: In-Sample 70% 최적화 → Out-of-Sample 30% 전진 검증) 엔진.
+ * - `algo_lab_service.mjs`의 실제 전략 평가 함수(`evaluateStrategy`, `evaluateSmartExit`, `buildIndicators`)를
+ *   그대로 재사용하여 실전/가상거래와 동일한 로직으로 과거 성과를 시뮬레이션한다.
+ * - `historical_candles` 테이블에 로컬 SQLite 캐싱을 수행하고 업비트 REST API 120ms(실제 125ms) Rate Limit을 준수한다.
+ * - 시점 t 평가 시 `ordered.slice(0, t + 1)`만 전달하여 미래 참조(Look-Ahead Bias)를 원천 차단한다.
+ * - 양방향 수수료(0.05%) + 가변 슬리피지(bps) 반영, 다단계 분할 봇(bot_06/bot_10) 독립 최고가 추적 및 동일 봉 재진입 금지.
+ * - 대시보드 차트 렌더링용 캔들 + 보조지표(VWAP, LRC ±2σ, 20MA) + 매매 타점(BUY/SELL 마커) 생성 기능도 포함한다.
+ *
+ * [주요 의존성]
+ * - `./algo_lab_service.mjs`: 10대 봇 정의(`ARENA_BOT_DEFS`), 지표 빌더, 스마트 청산, 전략 평가, KST 시간 포맷.
+ * - SQLite DB 어댑터(`db.exec`, `db.prepare().all/run`): `historical_candles`, `backtest_runs`, `trades`/`paper_trades`.
+ *
+ * [수정 시 주의사항]
+ * - `simulateBarByBarBacktest` 루프에서 미래 봉 데이터(`t + 1` 이후)가 절대 지표/전략으로 새어 나가지 않도록 유지할 것.
+ * - 업비트 캔들 API 호출 간격(125ms)을 줄이면 429 Too Many Requests 차단이 발생할 수 있음.
+ * - `backtest_runs` 스키마 변경 시 기존 SQLite/PG 마이그레이션 및 `getBacktestHistory` JSON 파싱과 정합성을 맞출 것.
  */
 
 import {
@@ -22,12 +34,25 @@ import {
   normalizeBotId,
 } from "./algo_lab_service.mjs";
 
+/**
+ * [Antigravity-Doc] 단순 이동평균(SMA) 계산 유틸리티 (차트 보조지표용)
+ * @param {number[]} values - 가격 시계열 배열
+ * @param {number} period - 이동평균 기간 (예: 20)
+ * @returns {number|null} 최근 period개 평균값 (데이터 부족 또는 비정상 period 시 null)
+ */
 function computeSma(values, period) {
   if (!Array.isArray(values) || values.length < period || period <= 0) return null;
   const slice = values.slice(-period);
   return slice.reduce((a, b) => a + Number(b || 0), 0) / period;
 }
 
+/**
+ * [Antigravity-Doc] 최근 최대 96개 봉(15분봉 기준 24시간) 롤링 VWAP(거래량 가중 평균가) 계산
+ * - 대표가 TP = (High + Low + Close) / 3 을 사용하여 Σ(TP × Volume) / Σ(Volume) 산출
+ * @param {Array<object>} candles - 과거 캔들 배열
+ * @param {number} [fallbackPrice=0] - 거래량 합계가 0이거나 캔들이 비어 있을 때 반환할 대체가
+ * @returns {{ vwap: number }} 계산된 VWAP 객체
+ */
 function computeVwap(candles, fallbackPrice = 0) {
   if (!Array.isArray(candles) || candles.length === 0) return { vwap: fallbackPrice };
   const windowCandles = candles.slice(-96);
@@ -47,12 +72,24 @@ function computeVwap(candles, fallbackPrice = 0) {
   };
 }
 
+// [Antigravity-Doc] 업비트 캔들 REST API 호출 간 최소 125ms Rate Limit 유지를 위한 마지막 요청 시각(ms)
 let lastCandleFetchMs = 0;
 
+/**
+ * [Antigravity-Doc] 지정 밀리초(ms)만큼 비동기 대기 (업비트 API Rate Limit 조절용)
+ * @param {number} ms - 대기 시간(밀리초)
+ * @returns {Promise<void>}
+ */
 async function sleepMs(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * [Antigravity-Doc] 백테스트 전용 SQLite 테이블(`historical_candles`, `backtest_runs`) 자동 생성(Idempotent)
+ * - `historical_candles`: (market, unit, candle_time_kst) 복합 PK로 캔들 중복 저장 방지
+ * - `backtest_runs`: 백테스트 실행 결과 및 워크포워드/자산곡선/체결내역 JSON 이력 영속화
+ * @param {object} db - SQLite DB 인스턴스
+ */
 export async function ensureBacktestTables(db) {
   if (!db) return;
   await db.exec(`
@@ -95,6 +132,12 @@ export async function ensureBacktestTables(db) {
   `);
 }
 
+/**
+ * [Antigravity-Doc] 업비트 원본 캔들 또는 SQLite 캐시 행을 내부 표준 캔들 스키마로 정규화
+ * - `candle_date_time_kst`를 `YYYY-MM-DD HH:MM:SS` 19자리 형식으로 통일하고, 누락 필드를 안전하게 폴백 처리한다.
+ * @param {object} c - 원본 캔들 객체 (Upbit API 응답 또는 DB 행)
+ * @returns {object} 표준화된 캔들 객체
+ */
 function normalizeCandleRow(c) {
   const timeStr = String(c.candle_date_time_kst || c.candle_time_kst || "")
     .replace("T", " ")
@@ -115,6 +158,13 @@ function normalizeCandleRow(c) {
   };
 }
 
+/**
+ * [Antigravity-Doc] 정규화된 과거 캔들 배열을 `historical_candles` 테이블에 UPSERT(`INSERT OR REPLACE`) 캐싱
+ * @param {object} db - SQLite DB 인스턴스
+ * @param {string} market - 마켓 코드 (예: "KRW-BTC")
+ * @param {string|number} unit - 캔들 단위 ("15", "60", "day" 등)
+ * @param {Array<object>} [candles=[]] - 저장할 캔들 배열
+ */
 export async function cacheHistoricalCandles(db, market, unit, candles = []) {
   if (!db || !Array.isArray(candles) || candles.length === 0) return;
   await ensureBacktestTables(db);
@@ -138,6 +188,16 @@ export async function cacheHistoricalCandles(db, market, unit, candles = []) {
   }
 }
 
+/**
+ * [Antigravity-Doc] 과거 캔들 조회 및 로컬 SQLite 캐싱 파이프라인
+ * - 우선순위: (1) 테스트/주입용 `customCandles` → (2) 로컬 `historical_candles` 캐시 충족 시 즉시 반환
+ *   → (3) 업비트 REST API 조회(125ms Rate Limit, `AUTOCOIN_LIBRARY_MODE !== "1"`) 후 캐싱
+ *   → (4) 부분 캐시 폴백 → (5) 오프라인/테스트용 결정론적 합성 캔들(sin/cos 파동) 생성
+ * - 모든 반환 배열은 시간 오름차순(과거 → 현재)으로 정렬된다.
+ * @param {object} db - SQLite DB 인스턴스
+ * @param {object} [opts] - market, unit, count, customCandles, skipNetwork 옵션
+ * @returns {Promise<Array<object>>} 시간 오름차순 정규화 캔들 배열
+ */
 export async function fetchAndCacheHistoricalCandles(
   db,
   { market = "KRW-BTC", unit = "15", count = 180, customCandles = null, skipNetwork = false } = {}
@@ -220,6 +280,7 @@ export async function fetchAndCacheHistoricalCandles(
       );
   }
 
+  // [Antigravity-Doc] 오프라인/네트워크 차단/단위테스트 환경에서도 백테스트가 재현 가능하도록 결정론적 합성 캔들 시퀀스 생성
   // 오프라인/테스트 폴백: 결정론적 합성 캔들 시퀀스 생성
   const synth = [];
   const total = Math.max(80, Number(count || 120));
@@ -247,6 +308,14 @@ export async function fetchAndCacheHistoricalCandles(
   return synth;
 }
 
+/**
+ * [Antigravity-Doc] 하위 타임프레임 캔들(예: 15분봉)을 `groupSize`개씩 묶어 상위 타임프레임(예: 60분봉=4, 240분봉=16)으로 집계
+ * - 시가는 첫 봉 open, 종가와 시각은 마지막 봉 close/time, 고가/저가는 구간 max/min, 거래량/거래대금은 합산한다.
+ * - 시점 t까지의 슬라이스만 입력받으므로 상위 타임프레임 합성 시에도 미래 참조가 발생하지 않는다.
+ * @param {Array<object>} [baseCandles=[]] - 하위 타임프레임 캔들 배열
+ * @param {number} [groupSize=4] - 묶을 봉 개수
+ * @returns {Array<object>} 집계된 상위 타임프레임 캔들 배열
+ */
 function aggregateHigherTimeframeCandles(baseCandles = [], groupSize = 4) {
   if (!Array.isArray(baseCandles) || baseCandles.length === 0) return [];
   const out = [];
@@ -279,6 +348,12 @@ function aggregateHigherTimeframeCandles(baseCandles = [], groupSize = 4) {
   return out;
 }
 
+/**
+ * [Antigravity-Doc] KST 또는 ISO 날짜 문자열을 UTC Epoch 밀리초(ms)로 안전하게 파싱
+ * - 타임존 표기(`Z` 또는 `+`)가 없으면 명시적으로 `+09:00`(KST)을 부여해 서버 로컬 타임존과 무관하게 일관된 결과를 보장한다.
+ * @param {string} str - 날짜/시각 문자열
+ * @returns {number} 파싱된 밀리초 타임스탬프 (실패 시 0)
+ */
 function parseTsMs(str) {
   if (!str) return 0;
   const s = String(str).trim().replace(" ", "T");
@@ -286,6 +361,19 @@ function parseTsMs(str) {
   return Number.isFinite(ms) ? ms : 0;
 }
 
+/**
+ * [Antigravity-Doc] 봉 단위(Bar-by-Bar) 정량 백테스트 핵심 시뮬레이션 엔진
+ * - [미래 참조 원천 차단] 각 시점 `t`에서 `ordered.slice(0, t + 1)`만 잘라 지표(`buildIndicators`)와 전략(`evaluateStrategy`)에 전달한다.
+ * - [다단계 분할 전략 지원] `bot_06`(최대 3분할), `bot_10`(최대 2분할)은 포지션별 독립 최고가(`perPosPeak`)를 추적하며,
+ *   동일 봉에서 매도 청산(`soldThisBar = true`)이 발생하면 같은 봉에서의 즉시 재진입을 금지한다.
+ * - [체결 비용 반영] 매수가는 `price * (1 + slipRate)`, 매도가는 `price * (1 - slipRate)`로 슬리피지를 적용하고
+ *   양방향 수수료(`feeRate`, 기본 0.05%)를 원금 및 정산액에 반영한다.
+ * - [정량 지표 산출] 총수익률, CAGR, MDD, 승률, 손익비(Profit Factor), Sharpe/Sortino Ratio, 평균 보유시간 및
+ *   UI 차트용 최대 100포인트 다운샘플링 자산곡선(`equity_curve`)을 반환한다.
+ *
+ * @param {object} options - botId, market, candles, dayCandles, initialCapital, slippageBps, feeRate, params, stopLossPct, takeProfitPct, warmupBars
+ * @returns {object} 백테스트 정량 성과 요약 + 자산곡선 + 완료 체결 목록
+ */
 export function simulateBarByBarBacktest({
   botId = "bot_01",
   market = "KRW-BTC",
@@ -323,10 +411,12 @@ export function simulateBarByBarBacktest({
   const barReturns = [];
   let prevEquity = safeInitial;
 
+  // [Antigravity-Doc] 다단계 분할 매수 허용 봇(bot_06: 최대 3차, bot_10: 최대 2차)과 단일 진입 봇(1차) 구분
   const isMultiSplitBot = normId === "bot_06" || normId === "bot_10";
   const maxSplitsPerMarket = normId === "bot_06" ? 3 : normId === "bot_10" ? 2 : 1;
 
   for (let t = startIdx; t < n; t++) {
+    // [Antigravity-Doc] Look-Ahead Bias 차단: 시점 t에서 0..t 슬라이스만 추출하고 상위 타임프레임(m60/m240/day)도 동일 과거 범위로만 합성
     // Look-Ahead Bias 완전 차단: 오직 0 .. t 까지의 과거/현재 슬라이스만 전달
     const m15Slice = ordered.slice(0, t + 1);
     const curBar = m15Slice[m15Slice.length - 1];
@@ -366,6 +456,7 @@ export function simulateBarByBarBacktest({
 
     let soldThisBar = false;
 
+    // [Antigravity-Doc] 1단계: 보유 포지션 청산 평가 우선순위 = (1) 고정 SL/TP → (2) 3단계 스마트 청산(evaluateSmartExit) → (3) 전략 자체 SELL 시그널
     // 1. 보유 포지션 청산 평가
     if (openPositions.length > 0) {
       let groupPeak = 0;
@@ -428,6 +519,7 @@ export function simulateBarByBarBacktest({
         }
       }
 
+      // [Antigravity-Doc] 청산 체결 정산: 매도 슬리피지(1 - slipRate) 및 매도 수수료(feeRate) 차감 후 현금(cash) 환입 및 거래 기록 적재
       if (toSell.length > 0) {
         const sellExecPrice = price * (1 - slipRate);
         const sellIds = new Set(toSell.map((p) => p.id));
@@ -468,6 +560,7 @@ export function simulateBarByBarBacktest({
       }
     }
 
+    // [Antigravity-Doc] 2단계: 신규 진입 또는 분할 추가 매수 평가 (동일 봉 매도 직후 재진입 금지, 수수료 포함 예산 및 최소 주문금액 5,000원 준수)
     // 2. 신규 매수 진입 또는 추가 분할 매수 평가 (동일 봉 매도 직후 재진입 금지)
     if (!soldThisBar && openPositions.length < maxSplitsPerMarket && cash >= PAPER_MIN_ORDER_KRW) {
       if (openPositions.length === 0 || isMultiSplitBot) {
@@ -512,6 +605,7 @@ export function simulateBarByBarBacktest({
       }
     }
 
+    // [Antigravity-Doc] 3단계: 봉 마감 평가자산(현금 + 보유 평가액), 최고점 대비 낙폭(MDD), 봉별 수익률(Sharpe/Sortino 계산용) 갱신
     // 3. 봉 마감 기준 총 평가자산(Equity) 및 MDD 갱신
     let evalValue = 0;
     for (const p of openPositions) {
@@ -558,6 +652,7 @@ export function simulateBarByBarBacktest({
         )
       : 0;
 
+  // [Antigravity-Doc] 위험조정 수익률(Sharpe Ratio, Sortino Ratio) 산출: 변동성 0 나눗셈 방지(1e-9) 및 [-10, 10] 클램핑 적용
   // Sharpe & Sortino Ratio (연율화 계수: 15분봉 기준 sqrt(365 * 96))
   let sharpeRatio = 0;
   let sortinoRatio = 0;
@@ -577,6 +672,7 @@ export function simulateBarByBarBacktest({
     }
   }
 
+  // [Antigravity-Doc] 연평균 복리 수익률(CAGR) 추정: 단기 구간 과대 왜곡 방지를 위해 연율화 지수 상한 12배 및 [-99.9%, 999.9%] 클램핑
   // CAGR 추정
   const firstTs = ordered[startIdx]?.candle_date_time_kst;
   const lastTs = ordered[n - 1]?.candle_date_time_kst;
@@ -614,6 +710,16 @@ export function simulateBarByBarBacktest({
   };
 }
 
+/**
+ * [Antigravity-Doc] 과거 백테스트 실행 + 워크포워드(Walk-Forward) 검증 + `backtest_runs` DB 영속화 엔트리포인트
+ * - 캔들 로드(`fetchAndCacheHistoricalCandles`) → 전체 구간 메인 시뮬레이션(`simulateBarByBarBacktest`)
+ *   → `doWalkForward` 활성화 및 캔들 60개 이상일 때 In-Sample(70%)에서 3종 프로파일(보수형/기본형/적극형) 중
+ *     종합 점수(`total_return_pct - mdd_pct * 0.8 + win_rate_pct * 0.05`) 최고 조합을 선정하고 Out-of-Sample(30%)에서 검증.
+ * - In-Sample 수익률 > +5% 이면서 Out-of-Sample 수익률 < -3% 이면 `overfit_warning = true` 과최적화 경고를 표시한다.
+ * @param {object} db - SQLite DB 인스턴스
+ * @param {object} [options={}] - 백테스트 실행 옵션(bot_id, market, unit, days, slippage_bps, fee_rate, walkForward 등)
+ * @returns {Promise<object>} DB 저장 ID(`run_id`)를 포함한 백테스트 및 워크포워드 전체 결과
+ */
 export async function runHistoricalBacktest(db, options = {}) {
   await ensureBacktestTables(db);
   const normId = normalizeBotId(options.bot_id || options.botId || "bot_01");
@@ -651,6 +757,7 @@ export async function runHistoricalBacktest(db, options = {}) {
     takeProfitPct: options.take_profit_pct ?? null,
   });
 
+  // [Antigravity-Doc] 워크포워드(Walk-Forward) 검증: 앞 70% 구간(IS)에서 파라미터 최적화 후 뒤 30% 미학습 구간(OOS, 워밍업 40봉 포함)에서 일반화 성능 검증
   // 워크포워드(Walk-Forward: In-Sample 70% 최적화 -> Out-of-Sample 30% 검증)
   let walkForward = null;
   if (doWalkForward && candles.length >= 60) {
@@ -791,6 +898,13 @@ export async function runHistoricalBacktest(db, options = {}) {
   };
 }
 
+/**
+ * [Antigravity-Doc] 최근 백테스트 실행 이력 목록 조회 (`backtest_runs` 테이블, 최대 50건)
+ * - JSON 문자열 컬럼(`markets_json`, `params_json`, `walk_forward_json`)을 안전하게 파싱해 프론트엔드 표시용으로 반환한다.
+ * @param {object} db - SQLite DB 인스턴스
+ * @param {number} [limit=15] - 조회 건수 제한 (1 ~ 50)
+ * @returns {Promise<Array<object>>} 최신순 백테스트 이력 배열
+ */
 export async function getBacktestHistory(db, limit = 15) {
   await ensureBacktestTables(db);
   const rows = await db
@@ -837,7 +951,12 @@ export async function getBacktestHistory(db, limit = 15) {
 }
 
 /**
- * 캔들 차트 + 보조지표(VWAP, LRC 상·중·하단, 20MA) + 매수/매도 체결 타점(BUY/SELL 마커) 생성
+ * [Antigravity-Doc] 대시보드 캔들 차트용 OHLCV + 보조지표(20MA, VWAP, LRC 상·중·하단) + 매매 타점(BUY/SELL 마커) 생성기
+ * - `mode === "paper"`이면 `paper_trades`, 그 외에는 실전 `trades` 테이블에서 최근 100건 체결을 조회하여
+ *   각 매수(빨강 `#ef4444`)/매도(파랑 `#3b82f6`) 시각에 가장 가까운 캔들 인덱스(`candle_index`)를 매핑한다.
+ * @param {object} db - SQLite DB 인스턴스
+ * @param {object} [opts] - market, botId("all" 또는 특정 봇), mode("live"|"paper"), unit, count, customCandles
+ * @returns {Promise<object>} `{ market, bot_id, mode, unit, candles, markers }` 차트 데이터 페이로드
  */
 export async function buildChartTradeMarkers(
   db,

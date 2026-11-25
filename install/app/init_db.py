@@ -1,3 +1,11 @@
+# [Antigravity-Doc] ============================================================
+# [Antigravity-Doc] 파일 역할: SQLite(WAL) 및 PostgreSQL 듀얼 DB 추상화 레이어, 전체 테이블 스키마 정의, 무중단 컬럼 마이그레이션 및 초기 시드 데이터 생성
+# [Antigravity-Doc] 아키텍처 위치: 모든 Python 모듈(main_orchestrator.py, bots.py, llm_filter_worker.py, bot_10_jack_kellogg.py)의 최하단 영속성 레이어
+# [Antigravity-Doc] 주요 의존성: sqlite3(기본 내장), psycopg2(PostgreSQL 하이브리드 모드 선택적 의존), pathlib, re
+# [Antigravity-Doc] 수정 시 주의사항:
+# [Antigravity-Doc]   1) Node.js 백엔드(backend/node_server.mjs)와 동일한 DB 파일(data/auto_coin_trade.db) 및 스키마를 공유하므로 컬럼명/기본값 변경 시 양쪽 동기화 필수
+# [Antigravity-Doc]   2) PgConnectionWrapper._convert_sql은 SQLite 문법(?, INSERT OR IGNORE, AUTOINCREMENT 등)을 PostgreSQL 문법으로 동적 변환함
+# [Antigravity-Doc] ============================================================
 """
 init_db.py - 데이터베이스 스키마 정의 및 커넥션 모듈 (SQLite & PostgreSQL 동적 분기 지원)
 - DB_MODE=sqlite 또는 PG_SYNC_ENABLED=false 시: 내장 SQLite (data/auto_coin_trade.db, WAL 모드, busy_timeout=5000)
@@ -29,20 +37,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger("init_db")
 
+# [Antigravity-Doc] 프로젝트 루트, .env 경로, 데이터 디렉터리 및 기본 SQLite DB 파일 경로 상수
 PROJECT_ROOT = Path(__file__).resolve().parent
 ENV_PATH = Path(os.getenv("AUTOCOIN_ENV_PATH") or str(PROJECT_ROOT / ".env"))
 DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_SQLITE_PATH = str(DATA_DIR / "auto_coin_trade.db")
 DEFAULT_DB_PATH = DEFAULT_SQLITE_PATH
 
+# [Antigravity-Doc] ALL_BOT_IDS: 10대 알고리즘 봇 표준 ID 튜플 (bot_01 ~ bot_10)
 ALL_BOT_IDS = tuple(f"bot_{i:02d}" for i in range(1, 11))
+# [Antigravity-Doc] DEFAULT_BOT_OVERRIDES / JSON: AI 필터 초기 상태(10대 봇 전체 ALLOW) 기본값
 DEFAULT_BOT_OVERRIDES: Dict[str, str] = {bot_id: "ALLOW" for bot_id in ALL_BOT_IDS}
 DEFAULT_BOT_OVERRIDES_JSON = json.dumps(DEFAULT_BOT_OVERRIDES, ensure_ascii=False, separators=(",", ":"))
+# [Antigravity-Doc] LEGACY_BOT_OVERRIDE_ALIAS: 구버전 3대 봇 ID(bot_vb/bot_momentum/bot_bb) -> 표준 ID 매핑
 LEGACY_BOT_OVERRIDE_ALIAS = {
     "bot_vb": "bot_01",
     "bot_momentum": "bot_03",
     "bot_bb": "bot_05",
 }
+# [Antigravity-Doc] BOT_STRATEGY_GROUP_MAP: 주간 자동 로테이션 시 전략군별 1위 봇 선출을 위한 3대 전략군 분류 매핑
 BOT_STRATEGY_GROUP_MAP: Dict[str, str] = {
     "bot_02": "TREND_SWING",
     "bot_03": "TREND_SWING",
@@ -55,13 +68,16 @@ BOT_STRATEGY_GROUP_MAP: Dict[str, str] = {
     "bot_06": "REVERSAL_GRID",
     "bot_10": "REVERSAL_GRID",
 }
+# [Antigravity-Doc] KST_TZ: 한국 표준시(UTC+9) 타임존 객체 (업비트 일봉/로테이션/타임스톱 기준 시각 통일)
 KST_TZ = timezone(timedelta(hours=9))
 
 
+# [Antigravity-Doc] 역할: 현재 KST 시각을 'YYYY-MM-DD HH:MM:SS' 문자열로 반환
 def _now_kst_str() -> str:
     return datetime.now(KST_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
+# [Antigravity-Doc] 역할: 지정 요일(0=일~6=토) 및 시각(KST) 기준 다음 주간 로테이션 예정 시각 문자열 계산
 def _compute_next_rotation_kst(day_of_week: int = 1, hour_kst: int = 9) -> str:
     """0=일, 1=월 ... 6=토 기준 다음 주간 로테이션 예정 KST 시각 문자열 반환"""
     now = datetime.now(KST_TZ).replace(minute=0, second=0, microsecond=0)
@@ -73,6 +89,8 @@ def _compute_next_rotation_kst(day_of_week: int = 1, hour_kst: int = 9) -> str:
     return candidate.strftime("%Y-%m-%d %H:%M:%S")
 
 
+# [Antigravity-Doc] 역할: 문자열/딕셔너리 형태의 봇 오버라이드 설정을 레거시 별칭 포함하여 표준 10대 봇('ALLOW'|'BLOCK') 딕셔너리로 정규화
+# [Antigravity-Doc] 입력: raw_overrides(JSON 문자열 또는 dict) | 반환: Dict[str, str] (bot_01~bot_10 전 키 보장)
 def normalize_bot_overrides(raw_overrides: Any) -> Dict[str, str]:
     """
     기존 3대 레거시 키(bot_vb 등)나 일부 누락된 봇 키가 전달되어도
@@ -101,6 +119,7 @@ def normalize_bot_overrides(raw_overrides: Any) -> Dict[str, str]:
             result[bot_id] = val
     return result
 
+# [Antigravity-Doc] 역할: .env 파일에서 미설정 환경변수만 안전하게 로드 (기존 OS 환경변수 우선 보존)
 def _load_env():
     if ENV_PATH.exists():
         with open(ENV_PATH, "r", encoding="utf-8") as f:
@@ -116,6 +135,7 @@ def _load_env():
 
 _load_env()
 
+# [Antigravity-Doc] 역할: 환경변수(DB_MODE, PG_SYNC_ENABLED)를 기준으로 SQLite 모드(True) vs PostgreSQL 모드(False) 판별
 def is_sqlite_mode() -> bool:
     """
     현재 설정이 SQLite 모드인지 확인합니다.
@@ -134,6 +154,7 @@ def is_sqlite_mode() -> bool:
     return True
 
 
+# [Antigravity-Doc] 클래스 역할: sqlite3.Cursor와 psycopg2 RealDictCursor 간 동일한 fetchone/fetchall/rowcount 인터페이스를 제공하는 래퍼
 class CursorWrapper:
     def __init__(self, cur):
         self.cur = cur
@@ -149,6 +170,7 @@ class CursorWrapper:
         return self.cur.rowcount
 
 
+# [Antigravity-Doc] 클래스 역할: SQLite 커넥션에 sqlite3.Row 팩토리와 PostgreSQL 호환 SQL 변환(ILIKE->LIKE, %s->?)을 제공하는 래퍼
 class SqliteConnectionWrapper:
     """
     SQLite3 커넥션 래퍼 (Row 객체 및 호환 인터페이스)
@@ -157,6 +179,7 @@ class SqliteConnectionWrapper:
         self.conn = conn
         self.conn.row_factory = sqlite3.Row
 
+    # [Antigravity-Doc] PostgreSQL 스타일 플레이스홀더(%s) 및 ILIKE를 SQLite 문법(?, LIKE)으로 변환
     def _convert_sql(self, sql: str) -> str:
         s = sql.strip()
         # ILIKE -> LIKE
@@ -184,6 +207,7 @@ class SqliteConnectionWrapper:
         self.conn.close()
 
 
+# [Antigravity-Doc] 클래스 역할: SQLite 문법으로 작성된 쿼리를 PostgreSQL 문법(BIGSERIAL, ON CONFLICT, %s)으로 자동 변환해 실행하는 커넥션 래퍼
 class PgConnectionWrapper:
     """
     SQLite 호환 인터페이스를 제공하는 PostgreSQL 커넥션 래퍼
@@ -191,6 +215,7 @@ class PgConnectionWrapper:
     def __init__(self, pg_conn):
         self.conn = pg_conn
 
+    # [Antigravity-Doc] SQLite 전용 구문(PRAGMA, BEGIN IMMEDIATE, AUTOINCREMENT, INSERT OR IGNORE/REPLACE, ?)을 PostgreSQL 호환 SQL로 치환
     def _convert_sql(self, sql: str) -> str:
         s = sql.strip()
         if re.match(r"^PRAGMA\s+", s, re.I):
@@ -252,11 +277,14 @@ class PgConnectionWrapper:
         self.conn.close()
 
 
+# [Antigravity-Doc] 역할: 현재 DB 모드에 따라 SQLite(WAL, busy_timeout=5000ms) 또는 PostgreSQL(LOCAL/OUTER 분기) 커넥션 래퍼 생성·반환
+# [Antigravity-Doc] 입력: db_path(선택 SQLite 파일 경로) | 반환: SqliteConnectionWrapper 또는 PgConnectionWrapper
 def get_db_connection(db_path: Optional[str] = None):
     """
     설정에 따라 SQLite 또는 PostgreSQL 커넥션을 생성하여 반환합니다.
     """
     _load_env()
+    # [Antigravity-Doc] SQLite 모드: 멀티프로세스 동시 읽기/쓰기 경합 완화를 위해 WAL 저널 모드와 5초 busy_timeout 적용
     if is_sqlite_mode():
         raw_path = db_path or os.getenv("AUTOCOIN_DB_PATH") or os.getenv("DB_PATH") or DEFAULT_SQLITE_PATH
         resolved_path = Path(raw_path)
@@ -269,6 +297,7 @@ def get_db_connection(db_path: Optional[str] = None):
         conn.execute("PRAGMA synchronous = NORMAL;")
         return SqliteConnectionWrapper(conn)
 
+    # [Antigravity-Doc] PostgreSQL 모드: LOCATION(local/outer) 환경변수에 따라 접속 정보를 선택하고 수동 커밋(autocommit=False)으로 연결
     if not HAS_PSYCOPG2:
         raise ImportError("PostgreSQL 모드를 사용하려면 psycopg2-binary가 설치되어 있어야 합니다. (pip install psycopg2-binary)")
 
@@ -299,6 +328,8 @@ def get_db_connection(db_path: Optional[str] = None):
     return PgConnectionWrapper(conn)
 
 
+# [Antigravity-Doc] 역할: 전체 20여 개 운영 테이블 생성(CREATE IF NOT EXISTS), 구버전 DB 무중단 컬럼 추가 마이그레이션(ALTER TABLE), 기본 설정/봇 계좌/AI 필터 시드 초기화
+# [Antigravity-Doc] 입력: db_path(선택 DB 경로) | 반환: None (오류 시 전체 트랜잭션 롤백 후 예외 재발생)
 def init_database(db_path: Optional[str] = None) -> None:
     """
     데이터베이스(SQLite 또는 PostgreSQL) 전체 테이블 스키마를 초기화하고 기본 데이터를 시딩합니다.
@@ -310,6 +341,7 @@ def init_database(db_path: Optional[str] = None) -> None:
         id_primary_key = "INTEGER PRIMARY KEY AUTOINCREMENT" if sqlite_mode else "BIGSERIAL PRIMARY KEY"
         real_type = "REAL" if sqlite_mode else "DOUBLE PRECISION"
 
+        # [Antigravity-Doc] 테이블 1: bot_accounts — 봇별 가상 원장 계좌(배정 비중, 배정 원금, 가용 원화, 누적 실현손익, 실전 선택 여부)
         # 1. 봇 가상 원장 계좌 테이블 (bot_accounts)
         conn.execute(
             f"""
@@ -335,6 +367,7 @@ def init_database(db_path: Optional[str] = None) -> None:
         else:
             conn.execute("ALTER TABLE bot_accounts ADD COLUMN IF NOT EXISTS is_selected_for_live INTEGER NOT NULL DEFAULT 0;")
 
+        # [Antigravity-Doc] 테이블 2: bot_positions — 봇별 개별 오픈/청산 포지션 원장 (order_uuid UNIQUE, closing_lock으로 중복 매도 방어, market/ticker 양방향 동기화)
         # 2. 봇별 독립 포지션 테이블 (bot_positions)
         conn.execute(
             f"""
@@ -405,6 +438,7 @@ def init_database(db_path: Optional[str] = None) -> None:
             "UPDATE bot_positions SET ticker = market WHERE (ticker IS NULL OR ticker = '') AND market IS NOT NULL AND market != '';"
         )
 
+        # [Antigravity-Doc] 테이블 3: market_regime_filter — 듀얼 AI(Flash/Pro) 시장 체제·리스크 경보·비중 배율·10대 봇 오버라이드 단일 행(id=1) 스냅샷
         # 3. LLM 시장 체제 & 뉴스 감성 필터 테이블 (market_regime_filter)
         conn.execute(
             f"""
@@ -457,6 +491,7 @@ def init_database(db_path: Optional[str] = None) -> None:
             for col_name, col_def in regime_alter_cols:
                 conn.execute(f"ALTER TABLE market_regime_filter ADD COLUMN IF NOT EXISTS {col_name} {col_def};")
 
+        # [Antigravity-Doc] 테이블 4~8: system_settings(키-값 런타임 설정), bots(10대 봇 실전/가상/Graceful Drain 메타), trades(실전 체결 원장), paper_*(가상 원장), ai_*/crypto_news(브리핑·뉴스)
         # 4. 시스템 설정 테이블 (system_settings)
         conn.execute(
             """
@@ -831,6 +866,7 @@ def init_database(db_path: Optional[str] = None) -> None:
             """
         )
 
+        # [Antigravity-Doc] 테이블 9-2: auto_rotation_config/history(주간 1위 자동 로테이션), drain_handoff_logs(탈락 봇 자금 인계 이력), capital_restoration_logs(90% 상한 내 원금 복원 감사 로그)
         # 9-2. 주간 전략별 1위 봇 자동 선출 설정 및 이력 테이블
         conn.execute(
             f"""
@@ -926,6 +962,7 @@ def init_database(db_path: Optional[str] = None) -> None:
         else:
             conn.execute(f"ALTER TABLE capital_restoration_logs ADD COLUMN IF NOT EXISTS total_equity_snapshot_krw {real_type} DEFAULT 0;")
 
+        # [Antigravity-Doc] 테이블 9-3: 5중 중복 주문 가드레일 테이블 — live_executor_lease(단일 실행 주체 리스 락), live_order_intents(멱등성 주문 의도 원장), live_guardrail_events(차단/이상행위 감사 로그)
         # 9-3. 실전 중복 주문 원천 차단 5중 가드레일 테이블 (리스 락 · 주문 의도 원장 · 차단 이벤트)
         conn.execute(
             """
@@ -984,6 +1021,7 @@ def init_database(db_path: Optional[str] = None) -> None:
             "CREATE INDEX IF NOT EXISTS idx_live_guardrail_events_bot_created ON live_guardrail_events (bot_id, created_at);"
         )
 
+        # [Antigravity-Doc] 시드 초기화: Ollama·실전 가드레일 기본 시스템 설정, 주간 로테이션 설정, market_regime_filter(id=1) 레거시 3봇->10봇 자동 마이그레이션, 10대 봇 계좌 시드 삽입
         now_kst = _now_kst_str()
         next_rot = _compute_next_rotation_kst(1, 9)
         ollama_defaults = (

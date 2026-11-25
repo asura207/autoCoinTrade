@@ -1,23 +1,59 @@
+/**
+ * [Antigravity-Doc] backend/common/pg_sync.mjs
+ *
+ * [파일 역할 및 아키텍처]
+ * - 로컬 SQLite 원장(Single Source of Truth)의 최신 상태를 PostgreSQL 서버로 단방향 주기 동기화(UPSERT)하는 동기화 매니저.
+ * - `LOCATION` 환경변수(`local` vs `outer`)에 따라 로컬 PG 또는 외부 PG 접속 정보를 자동 분기하며,
+ *   `PG_SYNC_ENABLED=false` 또는 `DB_MODE=sqlite` 설정 시 SQLite 단독 모드로 안전하게 동작한다.
+ * - 동기화 대상 테이블(12개 그룹):
+ *   1) `system_settings`, 1-1) `market_regime_filter`
+ *   2) `bots`, 3) `trades`, 4) `bot_positions`, 5) `crypto_news`
+ *   6) `algo_lab_models` / `algo_lab_positions` / `algo_lab_trades`
+ *   7) `paper_trades` / `paper_bot_positions`, 8) `monthly_asset_snapshots`
+ *   9~10) `ai_market_briefings` / `ai_news_briefings` (시퀀스 `setval` 재정렬 포함)
+ *   11) `auto_rotation_config` / `auto_rotation_history` / `drain_handoff_logs` / `capital_restoration_logs`
+ *   12) `live_executor_lease` / `live_order_intents` (5중 실전 가드레일 리스·주문 의도 원장)
+ *
+ * [주요 의존성]
+ * - `pg` (`Pool`): PostgreSQL 커넥션 풀 관리 (최대 5커넥션, 타임아웃 4초).
+ * - `.env` 파일: `AUTOCOIN_ENV_PATH` 또는 프로젝트 루트 `.env`에서 접속 정보 보완 로드.
+ *
+ * [수정 시 주의사항]
+ * - 신규 테이블/컬럼을 SQLite에 추가할 경우 `syncAll()` 내 `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+ *   및 `INSERT ... ON CONFLICT DO UPDATE` 쿼리를 함께 갱신해야 스키마 불일치로 인한 동기화 누락을 방지할 수 있다.
+ * - 테이블별 `ALTER TABLE`은 독립 `try/catch`로 분리되어 있으므로 한 테이블의 미존재가 전체 동기화 트랜잭션을 롤백하지 않도록 유지할 것.
+ */
+
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 
+// [Antigravity-Doc] ESM 환경에서 프로젝트 루트 및 .env 경로 산출 (AUTOCOIN_ENV_PATH 환경변수 우선)
 const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT_DIR = path.resolve(__dirname, "../..");
 const ENV_PATH = process.env.AUTOCOIN_ENV_PATH ? path.resolve(process.env.AUTOCOIN_ENV_PATH) : path.join(ROOT_DIR, ".env");
 
+// [Antigravity-Doc] 10대 알고리즘 봇 표준 ID 목록 및 구버전(v1) 봇 키 → 현행 봇 ID 매핑 별칭
 const ALL_BOT_IDS = Array.from({ length: 10 }, (_, idx) => `bot_${String(idx + 1).padStart(2, "0")}`);
 const LEGACY_BOT_OVERRIDE_ALIAS = {
   bot_vb: "bot_01",
   bot_momentum: "bot_03",
   bot_bb: "bot_05",
 };
+// [Antigravity-Doc] market_regime_filter 기본 봇 허용 맵 (bot_01~bot_10 전부 "ALLOW")
 const DEFAULT_BOT_OVERRIDES = Object.fromEntries(ALL_BOT_IDS.map((id) => [id, "ALLOW"]));
 const DEFAULT_BOT_OVERRIDES_JSON = JSON.stringify(DEFAULT_BOT_OVERRIDES);
 
+/**
+ * [Antigravity-Doc] 시황 필터(`market_regime_filter`)의 `bot_overrides_json`을 표준 10대 봇 스키마로 정규화
+ * - 구버전 별칭(`bot_vb`, `bot_momentum`, `bot_bb`)이 존재하고 신버전 키가 없을 때 자동 승격한다.
+ * - 허용값은 `"ALLOW"` 또는 `"BLOCK"`만 반영하며 그 외/누락 봇은 기본값 `"ALLOW"`로 채운다.
+ * @param {string|object} rawValue - SQLite에서 읽은 JSON 문자열 또는 객체
+ * @returns {string} 정규화된 10대 봇 허용/차단 JSON 문자열
+ */
 function normalizeBotOverridesJson(rawValue) {
   let parsed = {};
   if (typeof rawValue === "string" && rawValue.trim()) {
@@ -49,6 +85,10 @@ function normalizeBotOverridesJson(rawValue) {
   return JSON.stringify(normalized);
 }
 
+/**
+ * [Antigravity-Doc] `.env` 파일을 직접 파싱하여 아직 `process.env`에 설정되지 않은 환경변수만 보완 로드
+ * - 이미 외부 프로세스/systemd에서 주입된 환경변수는 덮어쓰지 않는다.
+ */
 function loadEnv() {
   if (fs.existsSync(ENV_PATH)) {
     const raw = fs.readFileSync(ENV_PATH, "utf-8");
@@ -67,7 +107,18 @@ function loadEnv() {
   }
 }
 
+/**
+ * [Antigravity-Doc] SQLite → PostgreSQL 단방향 비동기 동기화 매니저 클래스
+ * - `connect()`: 커넥션 풀 초기화 및 연결 상태 검증 (실패 시 SQLite 단독 모드로 우아하게 폴백)
+ * - `syncAll(sqliteDb)`: 12개 테이블 그룹을 순차 UPSERT 동기화
+ * - `startAutoSync(getSqliteDbFn, intervalMs)`: 주기적 백그라운드 동기화 타이머 시작
+ * - `close()`: 타이머 정리 및 PG 커넥션 풀 종료
+ */
 export class PgSyncManager {
+  /**
+   * [Antigravity-Doc] `LOCATION` 환경변수(`local` | `outer`)에 따라 대상 PostgreSQL 접속 파라미터를 결정
+   * @param {object} [config={}] - host, port, database, user, password, location 수동 오버라이드
+   */
   constructor(config = {}) {
     loadEnv();
 
@@ -95,6 +146,12 @@ export class PgSyncManager {
     this.timer = null;
   }
 
+  /**
+   * [Antigravity-Doc] PostgreSQL 커넥션 풀 생성 및 `SELECT NOW()` 헬스체크 수행
+   * - `PG_SYNC_ENABLED=false` 또는 `DB_MODE=sqlite`면 접속을 생략하고 `false` 반환.
+   * - 접속 실패 시 예외를 삼키고 경고를 출력한 뒤 SQLite 단독 모드로 계속 운영한다.
+   * @returns {Promise<boolean>} PG 연결 성공 여부
+   */
   async connect() {
     loadEnv();
     if (process.env.PG_SYNC_ENABLED === "false" || process.env.DB_MODE === "sqlite") {
@@ -126,11 +183,19 @@ export class PgSyncManager {
     }
   }
 
+  /**
+   * [Antigravity-Doc] 로컬 SQLite의 전체 운영/가상/AI/로테이션/가드레일 테이블을 PostgreSQL에 일괄 UPSERT 동기화
+   * - 각 도메인 블록마다 `CREATE TABLE IF NOT EXISTS` 및 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`로
+   *   스키마 자동 마이그레이션을 선행한 뒤, PK/UNIQUE 기준 `ON CONFLICT DO UPDATE`(로그 테이블은 `DO NOTHING`)로 멱등 반영한다.
+   * - 연결 끊김(`ECONNREFUSED`, `Connection terminated`) 감지 시 `this.isConnected = false`로 전환해 반복 오류를 막는다.
+   * @param {object} sqliteDb - better-sqlite3 호환 동기 SQLite DB 인스턴스
+   */
   async syncAll(sqliteDb) {
     if (process.env.PG_SYNC_ENABLED === "false" || process.env.DB_MODE === "sqlite") return;
     if (!this.isConnected || !this.pool) return;
 
     try {
+      // [Antigravity-Doc] 그룹 1: 시스템 전역 설정(system_settings) key 기준 UPSERT
       // 1. system_settings
       const settings = sqliteDb.prepare("SELECT * FROM system_settings").all();
       for (const s of settings) {
@@ -142,6 +207,7 @@ export class PgSyncManager {
         );
       }
 
+      // [Antigravity-Doc] 그룹 1-1: AI 시황 필터(market_regime_filter, id=1) 스키마 보강 및 정규화된 bot_overrides 포함 UPSERT
       // 1-1. market_regime_filter
       try {
         await this.pool.query(`
@@ -224,6 +290,7 @@ export class PgSyncManager {
         console.warn(`[PgSync] market_regime_filter sync skip: ${rErr.message}`);
       }
 
+      // [Antigravity-Doc] 그룹 2: 10대 봇 마스터(bots) — 실전/가상 자본, Drain 상태, 교체 대상 정보 포함 UPSERT
       // 2. bots (paper_trades ALTER와 분리해 신규 PG에서 테이블 미생성으로 인한 전체 트랜잭션 롤백 방지)
       try {
         await this.pool.query(`
@@ -303,6 +370,7 @@ export class PgSyncManager {
         );
       }
 
+      // [Antigravity-Doc] 그룹 3: 실전 매매 원장(trades) — 매도 체결 및 손익 컬럼 중심으로 id 충돌 시 갱신
       // 3. trades
       try {
         await this.pool.query(`
@@ -345,6 +413,7 @@ export class PgSyncManager {
         );
       }
 
+      // [Antigravity-Doc] 그룹 4: 실전 포지션 원장(bot_positions) — order_uuid UNIQUE 기준 UPSERT, buy_reason은 COALESCE로 기존 값 보존
       // 4. bot_positions (스키마 마이그레이션 + sell/메타/buy_reason 컬럼 포함 UPSERT)
       try {
         await this.pool.query(`
@@ -411,6 +480,7 @@ export class PgSyncManager {
         );
       }
 
+      // [Antigravity-Doc] 그룹 5: 암호화폐 뉴스(crypto_news) — 최근 200건 link UNIQUE 기준 UPSERT
       // 5. crypto_news
       await this.pool.query(`
         CREATE TABLE IF NOT EXISTS crypto_news (
@@ -448,6 +518,7 @@ export class PgSyncManager {
         }
       } catch {}
 
+      // [Antigravity-Doc] 그룹 6: 레거시/병행 알고리즘 실험실 테이블(algo_lab_models/positions/trades) 동기화
       // 6. algo_lab_models, algo_lab_positions, algo_lab_trades
       try {
         await this.pool.query(`
@@ -592,6 +663,7 @@ export class PgSyncManager {
         }
       } catch {}
 
+      // [Antigravity-Doc] 그룹 7: 10대 봇 가상거래(Arena) 전용 원장(paper_trades, paper_bot_positions) 동기화
       // 7. paper_trades and paper_bot_positions (가상거래 전용 테이블)
       try {
         await this.pool.query(`
@@ -698,6 +770,7 @@ export class PgSyncManager {
         }
       } catch {}
 
+      // [Antigravity-Doc] 그룹 8: 월별 자산 스냅샷(monthly_asset_snapshots) — (year_month, mode) 복합 PK 기준 UPSERT
       // 8. monthly_asset_snapshots (월별 자산 스냅샷 테이블)
       try {
         await this.pool.query(`
@@ -743,6 +816,7 @@ export class PgSyncManager {
         }
       } catch {}
 
+      // [Antigravity-Doc] 그룹 9~10: AI 시황/뉴스 브리핑(ai_market_briefings, ai_news_briefings) 최근 100건 동기화 + BIGSERIAL 시퀀스 setval 보정
       // 11. auto_rotation_config & auto_rotation_history
       try {
         await this.pool.query(`
@@ -843,6 +917,7 @@ export class PgSyncManager {
         }
       } catch {}
 
+      // [Antigravity-Doc] 그룹 11: 주간 자동 로테이션 설정·이력 및 Graceful Drain 인계·자금 복원 감사 로그 동기화
       // 11. auto_rotation_config & auto_rotation_history
       try {
         await this.pool.query(`
@@ -1022,6 +1097,7 @@ export class PgSyncManager {
         } catch {}
       } catch {}
 
+      // [Antigravity-Doc] 그룹 12: 5중 실전 주문 가드레일 리스(live_executor_lease) 및 최근 300건 주문 의도 원장(live_order_intents) 동기화
       // 12. live_executor_lease & live_order_intents (5중 가드레일 리스 및 주문 의도 원장 동기화)
       try {
         await this.pool.query(`
@@ -1129,6 +1205,12 @@ export class PgSyncManager {
     }
   }
 
+  /**
+   * [Antigravity-Doc] 지정 주기(기본 10초)마다 `syncAll()`을 백그라운드 실행하는 인터벌 타이머 등록
+   * - 연결이 끊기면(`!this.isConnected`) 자동으로 인터벌을 해제하여 불필요한 재시도를 중단한다.
+   * @param {Function} getSqliteDbFn - 최신 SQLite DB 인스턴스를 반환하는 콜백
+   * @param {number} [intervalMs=10000] - 동기화 주기(ms)
+   */
   startAutoSync(getSqliteDbFn, intervalMs = 10000) {
     if (process.env.PG_SYNC_ENABLED === "false" || process.env.DB_MODE === "sqlite" || !this.isConnected || !this.pool) {
       return;
@@ -1153,10 +1235,14 @@ export class PgSyncManager {
     }, intervalMs);
   }
 
+  /**
+   * [Antigravity-Doc] 자동 동기화 타이머 및 PostgreSQL 커넥션 풀을 안전하게 종료
+   */
   async close() {
     if (this.timer) clearInterval(this.timer);
     if (this.pool) await this.pool.end();
   }
 }
 
+// [Antigravity-Doc] 백엔드 전역에서 공유하는 PgSyncManager 싱글턴 인스턴스
 export const pgSyncManager = new PgSyncManager();

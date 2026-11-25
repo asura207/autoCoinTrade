@@ -1,7 +1,33 @@
+/**
+ * [Antigravity-Doc] autoCoinTrade 프론트엔드 메인 React 애플리케이션 (App.jsx)
+ *
+ * ■ 전체 아키텍처
+ *   - 단일 진입점 SPA 구조로 초기 설정 마법사(Setup Wizard), 일일 입장 코드 게이트(Gate Auth),
+ *     5대 핵심 메뉴 탭(거래현황/trades, 가상 Arena/arena·algo-lab, 통계/stats, 뉴스·AI/news, 설정/settings)
+ *     및 각종 모달(알림, 변경이력, 백테스트, 캔들+타점 마커 차트)을 통합 관리한다.
+ *   - 파일 상단부(L1~L1436)에는 전역 fetch 인터셉터, 금액/날짜 포맷터, 자금 배분 프리뷰 계산기,
+ *     10대 봇 전략군 메타 상수, 장세/AI 게이트웨이 판정 헬퍼, SVG 차트 컴포넌트,
+ *     SSE 마크다운 정제기(`sanitizeBriefingMarkdown`) 및 마크다운 렌더러를 배치한다.
+ *   - 파일 하단부(`export default function App()`)에는 상태/Ref 선언, 콜백/핸들러/useEffect 훅,
+ *     조건부 초기 게이트 렌더링, 메인 대시보드 JSX 마크업을 순차 배치한다.
+ *
+ * ■ 필수 불변 규칙
+ *   1. TDZ(Temporal Dead Zone) 방어: `useEffect` 내부에서 참조하는 모든 `useCallback` / 상태 / 헬퍼는
+ *      반드시 해당 `useEffect` 선언보다 상단에 위치해야 하며, Hook 선언 순서를 임의로 변경하면 안 된다.
+ *   2. 상대경로 API 호출 규칙: `API_BASE = ""`를 유지해 모든 백엔드 요청을 `"/api/..."` 상대경로로 호출함으로써
+ *      Nginx/Vite 리버스 프록시 및 동일 출처(same-origin) HttpOnly 인증 쿠키 전송을 보장한다.
+ */
 import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 
+// [Antigravity-Doc] 동일 출처 상대경로 API 호출 기준점 ("" 유지 → "/api/..." 형태로 호출)
 const API_BASE = "";
 
+/**
+ * [Antigravity-Doc] 전역 401 미인증 응답 처리 콜백 및 window.fetch 래핑 인터셉터
+ * - 동일 출처 `/api/*` 요청에 `credentials: "same-origin"`을 자동 주입해 HttpOnly 세션 쿠키를 동반한다.
+ * - 인증 검증/세션/로그아웃 API 외의 요청에서 401 응답이 수신되면 클라이언트 스토리지 인증 플래그를 즉시 파기하고
+ *   `onApiUnauthorizedHandler`를 호출해 로그인 게이트 화면으로 안전하게 되돌린다.
+ */
 let onApiUnauthorizedHandler = null;
 if (typeof window !== "undefined" && !window.__autoCoinFetchWrapped) {
   window.__autoCoinFetchWrapped = true;
@@ -34,6 +60,11 @@ if (typeof window !== "undefined" && !window.__autoCoinFetchWrapped) {
   };
 }
 
+/**
+ * [Antigravity-Doc] 숫자를 원화(KRW) 표기 문자열로 포맷한다 (소수점 이하 버림 + 천 단위 콤마 + "원").
+ * @param {number|string|null|undefined} val - 변환할 원화 금액
+ * @returns {string} 포맷된 원화 문자열 (유효하지 않으면 빈 문자열)
+ */
 function formatKRW(val) {
   if (val === null || val === undefined || val === "") return "";
   const cleaned = String(val).replace(/,/g, "");
@@ -42,6 +73,11 @@ function formatKRW(val) {
   return `${Math.floor(num).toLocaleString("ko-KR")}원`;
 }
 
+/**
+ * [Antigravity-Doc] 입력 필드 표시용 천 단위 콤마 포맷터 (음수 부호 "-" 입력 중간 상태 허용).
+ * @param {number|string|null|undefined} val - 숫자 또는 문자열 입력값
+ * @returns {string} 콤마가 적용된 정수 문자열
+ */
 function formatWithCommas(val) {
   if (val === null || val === undefined || val === "") return "";
   const str = String(val).replace(/,/g, "").trim();
@@ -51,6 +87,11 @@ function formatWithCommas(val) {
   return Math.floor(num).toLocaleString("ko-KR");
 }
 
+/**
+ * [Antigravity-Doc] 사용자 텍스트 입력에서 숫자/음수 부호만 추출해 정수로 파싱한다.
+ * @param {string|number|null|undefined} val - 원본 입력값
+ * @returns {number|string} 파싱된 정수 또는 유효하지 않을 경우 빈 문자열("")
+ */
 function parseNumericInput(val) {
   if (val === null || val === undefined) return "";
   const cleaned = String(val).replace(/[^0-9-]/g, "");
@@ -59,6 +100,12 @@ function parseNumericInput(val) {
   return Number.isNaN(num) ? "" : Math.floor(num);
 }
 
+/**
+ * [Antigravity-Doc] ISO/타임스탬프 문자열을 한국 표준시(Asia/Seoul, YYYY-MM-DD HH:mm:ss)로 변환한다.
+ * - 이미 KST 로컬 포맷("YYYY-MM-DD HH:mm:ss")으로 내려온 값은 재변환 없이 앞 19자리만 반환한다.
+ * @param {string|number|Date} val - 원본 일시 값
+ * @returns {string} KST 포맷 문자열 (빈 값이면 "-")
+ */
 function formatDateTimeKST(val) {
   if (!val) return "-";
   try {
@@ -87,6 +134,16 @@ function formatDateTimeKST(val) {
   return String(val).replace("T", " ").slice(0, 19);
 }
 
+/**
+ * [Antigravity-Doc] 선택된 실전 봇들의 자금 배분 프리뷰 계산기 (보유 매수원금 보호 + Water-filling 분배)
+ * - 이미 포지션을 보유 중인 봇(`used > share`)은 보유 원금만큼 배정액을 우선 고정(lock)하고,
+ *   남은 가용 풀(remainingPool)을 나머지 봇의 비중(`ratio`)대로 반복 재분배한다.
+ * - 절사(Math.floor)로 발생한 잔여 원화(remainder)는 비중이 가장 높은 봇에 귀속시켜 1원 오차를 제거한다.
+ * @param {number} rawTotalCapital - 총 운영 원금 (업비트 실계좌 90% 등)
+ * @param {Array<object>} botsList - 배분 대상 봇 목록
+ * @param {Record<string, number>} ratiosMap - 봇 ID별 배분 비율(%) 맵
+ * @returns {{flooredTotal: number, totalUsed: number, totalAllocated: number, totalVirtual: number, byBot: object}}
+ */
 function computeAllocationPreview(rawTotalCapital, botsList, ratiosMap) {
   const flooredTotal = Math.max(0, Math.floor(Number(rawTotalCapital || 0)));
   const items = (botsList || []).map((b) => {
@@ -196,6 +253,11 @@ function computeAllocationPreview(rawTotalCapital, botsList, ratiosMap) {
   };
 }
 
+/**
+ * [Antigravity-Doc] 손익 금액을 한국 금융 표준 색상(수익 빨강 `.pnl-profit`, 손실 파랑 `.pnl-loss`, 보합 `.pnl-Zero`)으로 렌더링한다.
+ * @param {number|string} val - 실현/평가 손익(KRW)
+ * @returns {JSX.Element} 색상이 적용된 손익 배지 span
+ */
 function renderColoredProfit(val) {
   const num = Number(val || 0);
   const truncated = Math.trunc(Number.isFinite(num) ? num : 0);
@@ -208,6 +270,7 @@ function renderColoredProfit(val) {
   return <span className="pnl-Zero">0원</span>;
 }
 
+// [Antigravity-Doc] 시스템 전체 10대 매매 알고리즘 봇 ID 표준 목록 (순서 고정)
 const ALL_BOT_IDS_UI = [
   "bot_01",
   "bot_02",
@@ -221,6 +284,7 @@ const ALL_BOT_IDS_UI = [
   "bot_10",
 ];
 
+// [Antigravity-Doc] 10대 봇 ID → UI 뱃지/차트/테이블용 단축 한글명 매핑 테이블
 const BOT_SHORT_LABELS_UI = {
   bot_01: "변동성돌파",
   bot_02: "슈퍼트렌드",
@@ -234,6 +298,7 @@ const BOT_SHORT_LABELS_UI = {
   bot_10: "잭켈로그",
 };
 
+// [Antigravity-Doc] 구버전 AI 제어 JSON(bot_overrides)의 레거시 봇 별칭을 표준 bot_01~10 ID로 정규화하는 매핑
 const LEGACY_BOT_OVERRIDE_ALIAS_UI = {
   bot_vb: "bot_01",
   bot_volatility: "bot_01",
@@ -243,8 +308,10 @@ const LEGACY_BOT_OVERRIDE_ALIAS_UI = {
   bot_bollinger_reversal: "bot_05",
 };
 
+// [Antigravity-Doc] 3대 전략군(그룹 A 추세·스윙 / 그룹 B 변동성·돌파 / 그룹 C 역추세·그리드) 노출 순서
 const STRATEGY_GROUP_ORDER_UI = ["TREND_SWING", "VOLATILITY_BREAKOUT", "REVERSAL_GRID"];
 
+// [Antigravity-Doc] 3대 전략군별 UI 표시 메타데이터 (라벨, 아이콘, 장세 적합도, 테마 컬러)
 const STRATEGY_GROUP_META_UI = {
   TREND_SWING: {
     code: "TREND_SWING",
@@ -293,6 +360,7 @@ const STRATEGY_GROUP_META_UI = {
   },
 };
 
+// [Antigravity-Doc] 10대 봇 개별 전략군 소속 코드(groupCode), 세부 전략명(subType), 장세 적합성(marketFit) 매핑
 const BOT_STRATEGY_META_UI = {
   bot_01: { groupCode: "VOLATILITY_BREAKOUT", subType: "변동성 돌파", marketFit: "BULL 장중 돌파 · 횡보/휩소 BLOCK" },
   bot_02: { groupCode: "TREND_SWING", subType: "ATR 추세추종", marketFit: "BULL 중기 추세 · 횡보/휩소 BLOCK" },
@@ -306,6 +374,12 @@ const BOT_STRATEGY_META_UI = {
   bot_10: { groupCode: "REVERSAL_GRID", subType: "VWAP·LRC 올라운더", marketFit: "멀티 레짐(돌파+반등) · 패닉 쇼크 BLOCK" },
 };
 
+/**
+ * [Antigravity-Doc] 봇 ID 또는 봇 객체로부터 통합 전략군 메타정보(색상, 그룹명, 세부유형, 장세적합성)를 해석한다.
+ * - 레거시 별칭 정규화 및 백엔드 응답 필드(`strategy_group_code`, `strategy_group`) 폴백을 지원한다.
+ * @param {string|object} botOrId - 봇 ID 문자열 또는 봇 상태 객체
+ * @returns {object} 통합 전략군 UI 메타 객체
+ */
 function getBotStrategyMeta(botOrId) {
   const rawId = typeof botOrId === "string" ? botOrId : botOrId?.bot_id;
   const botId = LEGACY_BOT_OVERRIDE_ALIAS_UI[rawId] || rawId;
@@ -343,6 +417,12 @@ function getBotStrategyMeta(botOrId) {
   };
 }
 
+/**
+ * [Antigravity-Doc] 봇의 전략군(추세·스윙 / 변동성·돌파 / 역추세·그리드) 및 선택적 세부전략 배지를 렌더링한다.
+ * @param {string|object} botOrId - 봇 ID 또는 봇 객체
+ * @param {{showSubType?: boolean, compact?: boolean}} [options] - 세부 전략명 표시 여부 및 컴팩트 모드
+ * @returns {JSX.Element} 전략군 배지 요소
+ */
 function renderStrategyGroupBadge(botOrId, { showSubType = false, compact = false } = {}) {
   const meta = getBotStrategyMeta(botOrId);
   return (
@@ -389,6 +469,12 @@ function renderStrategyGroupBadge(botOrId, { showSubType = false, compact = fals
   );
 }
 
+/**
+ * [Antigravity-Doc] AI 장세 필터 객체(`regime_filter`)에서 10대 봇별 진입 허용/차단(`ALLOW`/`BLOCK`) 맵을 안전하게 파싱한다.
+ * - 문자열 JSON 또는 객체 형태를 모두 지원하며 누락된 봇은 기본값 `"ALLOW"`로 채운다.
+ * @param {object|null} rf - 백엔드 `regime_filter` 페이로드
+ * @returns {Record<string, "ALLOW"|"BLOCK">} 10대 봇별 스위치 상태 맵
+ */
 function parseRegimeBotOverrides(rf) {
   const result = {};
   for (const id of ALL_BOT_IDS_UI) result[id] = "ALLOW";
@@ -413,6 +499,11 @@ function parseRegimeBotOverrides(rf) {
   return result;
 }
 
+/**
+ * [Antigravity-Doc] AI 장세 필터에서 매수 금지 블랙리스트 티커 배열(예: `["KRW-XXX"]`)을 파싱한다.
+ * @param {object|null} rf - 백엔드 `regime_filter` 페이로드
+ * @returns {string[]} 정제된 블랙리스트 마켓 코드 목록
+ */
 function parseRegimeBlacklist(rf) {
   if (!rf || typeof rf !== "object") return [];
   let raw = rf.blacklist_tickers !== undefined ? rf.blacklist_tickers : rf.blacklist_tickers_json;
@@ -427,6 +518,12 @@ function parseRegimeBlacklist(rf) {
   return raw.map((t) => String(t || "").trim()).filter(Boolean);
 }
 
+/**
+ * [Antigravity-Doc] 시장 장세 코드(`BULL`, `BEAR`, `HIGH_VOLATILITY_SHOCK`, `SIDEWAYS`)에 대응하는
+ * 한글 라벨 및 UI 배지 스타일(색상/배경/테두리)을 반환한다.
+ * @param {string} regime - 시장 체제 코드
+ * @returns {{code: string, label: string, color: string, bg: string, border: string}}
+ */
 function getMarketRegimeMeta(regime) {
   const key = String(regime || "SIDEWAYS").trim().toUpperCase();
   if (key === "BULL") {
@@ -465,6 +562,14 @@ function getMarketRegimeMeta(regime) {
   };
 }
 
+/**
+ * [Antigravity-Doc] 특정 봇에 대한 AI 게이트웨이 최종 진입 판정(허용/보류/차단)과 비중(%), 툴팁 사유를 계산한다.
+ * - 글로벌 리스크 경보(`final_risk_alert`, `HALT_NEW_BUYS`, `EMERGENCY_CLOSE_ALL`, 비중 0%) 또는
+ *   개별 봇 오버라이드(`BLOCK`) 시 신규 매수만 보류하며 기존 보유 포지션 익절/손절 감시는 유지됨을 안내한다.
+ * @param {object|null} rf - `regime_filter` 객체
+ * @param {string} botId - 대상 봇 ID
+ * @returns {object} 배지 표시 문구, 허용 여부, 스타일 정보
+ */
 function getBotGatewayBadgeInfo(rf, botId) {
   const overrides = parseRegimeBotOverrides(rf);
   const overrideState = overrides[botId] || "ALLOW";
@@ -509,8 +614,9 @@ function getBotGatewayBadgeInfo(rf, botId) {
 }
 
 /**
- * 통계 선 그래프 컴포넌트 (요구사항 10, 11)
- * 2026.10.01부터의 일간/주간/월간 차익 이력을 꺾은선 그래프로 표기
+ * [Antigravity-Doc] 통계 선 그래프 컴포넌트 (`ProfitLineChart`, 요구사항 10, 11)
+ * - 2026.10.01 기준일 이후의 일간/주간/월간 누적 차익 시계열을 가로 스크롤 가능한 SVG 꺾은선 그래프로 렌더링한다.
+ * - 데이터 변경 시 우측 최신 시점으로 자동 스크롤되며, 0원 기준선·최대/최소값 축 라벨·체결 유무별 마커 색상을 표시한다.
  */
 function ProfitLineChart({ series, periodLabel }) {
   const scrollContainerRef = useRef(null);
@@ -685,10 +791,9 @@ function ProfitLineChart({ series, periodLabel }) {
 }
 
 /**
- * 월별 보유 자산 및 증감 추이 인터랙티브 차트 컴포넌트
- * - 매달 1일 시점 평가자산 vs 현재/말일 시점 평가자산 막대 그래프 비교
- * - 상단 월간 순증감 뱃지 및 마우스 툴팁 지원
- * - 월별 변동 내역 테이블 표출
+ * [Antigravity-Doc] 월별 보유 자산 및 증감 추이 인터랙티브 차트 컴포넌트 (`MonthlyAssetGrowthChart`)
+ * - 매달 1일 시점 평가자산 vs 현재/말일 시점 평가자산을 그룹 막대 SVG 그래프로 비교한다.
+ * - 상단 월간 순증감률 뱃지, 호버 하이라이트, 수동 동기화 버튼 및 월별 변동 원장 테이블을 함께 표출한다.
  */
 function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) {
   const scrollRef = useRef(null);
@@ -1094,6 +1199,12 @@ function MonthlyAssetGrowthChart({ history, currentMonth, onRefresh, loading }) 
   );
 }
 
+/**
+ * [Antigravity-Doc] AI 브리핑 텍스트 조각이 봇 제어용 JSON 페이로드인지 판별한다.
+ * - `bot_overrides` 키가 포함되거나 핵심 제어 키(`market_regime`, `recommended_action` 등)가 2개 이상이면 true.
+ * @param {string} text - 검사할 텍스트 조각
+ * @returns {boolean} 제어 JSON 여부
+ */
 function isControlJsonSnippet(text) {
   if (!text || typeof text !== "string") return false;
   const hasBotOverrides = text.includes('"bot_overrides"') || text.includes("bot_overrides");
@@ -1106,6 +1217,16 @@ function isControlJsonSnippet(text) {
   return hasBotOverrides || hitCount >= 2;
 }
 
+/**
+ * [Antigravity-Doc] SSE 스트리밍/저장된 AI 브리핑 마크다운에서 시스템 제어용 JSON 블록을 제거해 사람 친화적 텍스트로 정제한다.
+ * - 1단계: 닫힌 ```json ... ``` 제어 블록 제거
+ * - 2단계: 스트리밍 도중 아직 닫히지 않은 미완성 제어 JSON 블록 숨김 처리 (`isReceivingControlJson = true`)
+ * - 3단계: 코드 펜스 없이 본문 말미에 붙은 원시 JSON 객체 제거
+ * - 4단계: 제어 JSON 직전의 안내 헤더 및 잔여 구분선(`---`) 정리
+ * @param {string} content - 원본 AI 마크다운 문자열
+ * @param {boolean} [isStreaming=false] - 현재 SSE 스트리밍 수신 중 여부
+ * @returns {{cleanedText: string, isReceivingControlJson: boolean}} 정제된 마크다운과 제어 JSON 수신 상태
+ */
 function sanitizeBriefingMarkdown(content, isStreaming = false) {
   if (!content || typeof content !== "string") {
     return { cleanedText: "", isReceivingControlJson: false };
@@ -1151,6 +1272,12 @@ function sanitizeBriefingMarkdown(content, isStreaming = false) {
   return { cleanedText: cleaned, isReceivingControlJson };
 }
 
+/**
+ * [Antigravity-Doc] AI 시황/뉴스 브리핑 전용 경량 마크다운 렌더러 컴포넌트
+ * - `sanitizeBriefingMarkdown`으로 제어 JSON을 실시간 필터링한 뒤 제목(#~###), 불릿 리스트, 코드블록, 인라인 강조(**bold**, `code`)를 렌더링한다.
+ * - 스트리밍 중(`isStreaming=true`)에는 깜빡이는 커서와 제어 파라미터 반영 안내를 표시한다.
+ * @param {{content: string, isStreaming?: boolean}} props
+ */
 function MarkdownViewer({ content, isStreaming = false }) {
   if (!content) return null;
   const { cleanedText, isReceivingControlJson } = sanitizeBriefingMarkdown(content, isStreaming);
@@ -1315,6 +1442,11 @@ function MarkdownViewer({ content, isStreaming = false }) {
   );
 }
 
+/**
+ * [Antigravity-Doc] 한국 표준시(KST) 기준 오늘 날짜 문자열(`YYYY-MM-DD`)을 반환한다.
+ * - 일일 입장 코드 인증 만료 기준일 비교에 사용된다.
+ * @returns {string} KST 기준 `YYYY-MM-DD`
+ */
 function getTodayKSTDateString() {
   try {
     return new Intl.DateTimeFormat("en-CA", {
@@ -1329,6 +1461,11 @@ function getTodayKSTDateString() {
   }
 }
 
+/**
+ * [Antigravity-Doc] 클라이언트 스토리지에 저장된 일일 입장 게이트 인증이 오늘(KST) 유효한지 검증한다.
+ * - 날짜가 다르거나 인증 플래그가 없으면 즉시 스토리지를 초기화하고 false를 반환한다.
+ * @returns {boolean} 당일 유효 인증 여부
+ */
 function isDailyGateAuthValid() {
   const today = getTodayKSTDateString();
   const hasAuth =
@@ -1348,6 +1485,12 @@ function isDailyGateAuthValid() {
   return true;
 }
 
+/**
+ * [Antigravity-Doc] 프로젝트 변경 이력(`history.md`) 모달용 경량 마크다운 → HTML 변환기
+ * - HTML 이스케이프 후 테이블(`| ... |`), 제목(`#`~`###`), 인용구(`>`), 다단계 리스트, 인라인 볼드/코드/이탤릭을 변환한다.
+ * @param {string} md - 원본 마크다운 문자열
+ * @returns {string} 렌더링용 HTML 문자열
+ */
 function renderSimpleMarkdown(md) {
   if (!md) return "";
   const lines = md.split(/\r?\n/);
@@ -1434,26 +1577,30 @@ function renderSimpleMarkdown(md) {
   return out.join("\n");
 }
 
+/**
+ * [Antigravity-Doc] autoCoinTrade 메인 루트 컴포넌트 (`App`)
+ * - 인증 게이트, 초기 설치 마법사, 실시간 대시보드(거래현황/가상 Arena/통계/뉴스·AI/설정) 및 모달 상태를 통합 관리한다.
+ */
 export default function App() {
-  // 1) 입장 코드 인증 상태 (백엔드 HttpOnly 서명 쿠키 세션 검증 + KST 날짜 만료)
+  // [Antigravity-Doc] 1) 입장 코드 인증 상태 (백엔드 HttpOnly 서명 쿠키 세션 검증 + KST 날짜 만료)
   const [authenticated, setAuthenticated] = useState(false);
   const [authChecking, setAuthChecking] = useState(true);
   const [entryCodeInput, setEntryCodeInput] = useState("");
   const [gateError, setGateError] = useState("");
 
-  // 프로젝트 버전 및 히스토리 모달 상태
+  // [Antigravity-Doc] 프로젝트 버전 및 변경 이력(history.md) 모달 상태
   const [appVersion, setAppVersion] = useState("0.0.33");
   const [historyModalOpen, setHistoryModalOpen] = useState(false);
   const [historyContent, setHistoryContent] = useState("");
   const [historyLoading, setHistoryLoading] = useState(false);
 
-  // 1-1) 초기 설정 마법사 (Setup Wizard) 상태
+  // [Antigravity-Doc] 1-1) 초기 설정 마법사 (Setup Wizard) 진행 및 단계 상태
   const [setupConfigured, setSetupConfigured] = useState(true);
   const [setupChecking, setSetupChecking] = useState(true);
   const [showSetupWizard, setShowSetupWizard] = useState(false);
   const [wizardStep, setWizardStep] = useState(1);
 
-  // 마법사 폼 데이터
+  // [Antigravity-Doc] 초기 설정 마법사 4단계 폼 입력 데이터 (보안코드, 거래모드, DB, 업비트/Gemini API 키)
   const [wizardForm, setWizardForm] = useState({
     entryCode: "stock",
     tradeMode: "paper",
@@ -1481,6 +1628,10 @@ export default function App() {
     error: null,
   });
 
+  /**
+   * [Antigravity-Doc] 초기 설치(Setup Wizard) 완료 여부 및 현재 환경 설정 요약을 백엔드에서 조회한다.
+   * - 미설정(`is_configured === false`) 시 자동으로 초기 설정 마법사 화면을 연다.
+   */
   const fetchSetupStatus = useCallback(async () => {
     try {
       const resp = await fetch(`${API_BASE}/api/setup/status`);
@@ -1511,6 +1662,9 @@ export default function App() {
     }
   }, []);
 
+  /**
+   * [Antigravity-Doc] 버전 변경 이력(`history.md`) 모달을 열고, 캐시된 내용이 없으면 `/api/version/history`에서 로드한다.
+   */
   const openHistoryModal = useCallback(async () => {
     setHistoryModalOpen(true);
     if (!historyContent) {
@@ -1531,6 +1685,10 @@ export default function App() {
     }
   }, [historyContent]);
 
+  /**
+   * [Antigravity-Doc] 마운트 시 전역 401 미인증 핸들러를 등록해 세션 만료 시 즉시 로그인 게이트로 전환한다.
+   * - 언마운트 시 핸들러 참조를 null로 해제해 메모리 누수를 방지한다.
+   */
   useEffect(() => {
     onApiUnauthorizedHandler = () => {
       setAuthenticated(false);
@@ -1542,6 +1700,10 @@ export default function App() {
     };
   }, []);
 
+  /**
+   * [Antigravity-Doc] 앱 최초 마운트 시 초기 설정 상태(`/api/setup/status`), HttpOnly 인증 세션(`/api/auth/session`),
+   * 현재 앱 버전(`/api/version`)을 병렬 조회해 초기 화면 분기(마법사 / 게이트 / 대시보드)를 결정한다.
+   */
   useEffect(() => {
     fetchSetupStatus();
     fetch(`${API_BASE}/api/auth/session`)
@@ -1575,6 +1737,9 @@ export default function App() {
       .catch(() => {});
   }, [fetchSetupStatus]);
 
+  /**
+   * [Antigravity-Doc] 초기 설정 마법사 Step 2: 입력된 PostgreSQL 서버 접속 정보로 DB 연결 테스트(`/api/setup/test-db`)를 수행한다.
+   */
   const handleTestDbConnection = async () => {
     setDbTestState({ loading: true, result: null, error: null });
     try {
@@ -1594,6 +1759,9 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] 초기 설정 마법사 Step 3: 업비트 API 키 및 Gemini API 키 유효성을 `/api/setup/test-keys`로 일괄 검증한다.
+   */
   const handleTestApiKeys = async () => {
     setKeysTestState({ loading: true, result: null, error: null });
     try {
@@ -1629,6 +1797,10 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] 초기 설정 마법사 Step 4: 입력한 전체 설정을 `/api/setup/complete`에 저장하고 설치 진행률 UI를 갱신한 뒤
+   * 당일 인증 세션을 활성화하고 메인 대시보드 초기 데이터를 즉시 로드한다.
+   */
   const handleCompleteSetup = async () => {
     setInstallState({ installing: true, progress: 15, currentStepIndex: 0, error: null });
 
@@ -1692,7 +1864,7 @@ export default function App() {
     }
   };
 
-  // 2) 좌측 메뉴 상태 (실제거래 현황 | 가상거래 경쟁 | 통계 | 뉴스 | 설정)
+  // [Antigravity-Doc] 2) 좌측 네비게이션 메뉴 상태 (trades: 실제거래 | arena: 가상경쟁 | stats: 통계 | news: 뉴스·AI | settings: 설정)
   const [activeMenu, setActiveMenu] = useState(() => {
     const saved =
       sessionStorage.getItem("autoCoinTrade_menu") ||
@@ -1701,7 +1873,7 @@ export default function App() {
     return saved === "algo-lab" ? "arena" : saved;
   });
 
-  // 3) 업비트 통신 상태 (요구사항 19: 정상 초록 / 지연 노랑 / 불가 빨강 + 이유 툴팁)
+  // [Antigravity-Doc] 3) 업비트 Open API / WebSocket 통신 상태 (초록: 정상 / 노랑: 지연 / 빨강: 불가 + 지연시간·사유 툴팁)
   const [upbitStatus, setUpbitStatus] = useState({
     status: "green",
     label: "정상통신",
@@ -1710,7 +1882,7 @@ export default function App() {
     checked_at: "",
   });
 
-  // 4) 봇 목록, 거래 내역, 통계, 자금 분배 상태
+  // [Antigravity-Doc] 4) 실전 봇 목록, 선택된 봇 ID, 거래내역(20건 페이징), 기간별 통계(일간/주간/월간) 상태 그룹
   const [bots, setBots] = useState([]);
   const [selectedBotId, setSelectedBotId] = useState(() => {
     const saved =
@@ -1746,7 +1918,7 @@ export default function App() {
     );
   });
 
-  // 5) 설정 화면용 상태 (기본값 없음)
+  // [Antigravity-Doc] 5) 설정 화면용 상태 그룹 (총 운용 원금, 봇별 배분 비율, 봇 설정 폼, 업비트 실계좌 조회 결과, 입장 코드 관리)
   const [totalCapitalInput, setTotalCapitalInput] = useState("");
   const [ratioInputs, setRatioInputs] = useState({});
   const [botEditForms, setBotEditForms] = useState({});
@@ -1775,7 +1947,7 @@ export default function App() {
   const [entryCodeLoading, setEntryCodeLoading] = useState(false);
   const [showEntryCode, setShowEntryCode] = useState(false);
 
-  // 6) Modal Popup 상태 (요구사항 20: 거래 시작/중지 모달, 요구사항 21: 잔고 0 이하 중지 알림 모달)
+  // [Antigravity-Doc] 6) 공용 알림 모달, 잔고 0원 경고 플래그 및 5중 실전 중복 주문 가드레일 상태 그룹
   const [modalInfo, setModalInfo] = useState({
     open: false,
     title: "",
@@ -1789,7 +1961,7 @@ export default function App() {
   const [guardrailResetLoading, setGuardrailResetLoading] = useState(false);
   const guardrailAlertedAtRef = useRef("");
 
-  // 7) AI 실시간 마켓 브리핑 & 듀얼 AI 레짐 게이트웨이 상태
+  // [Antigravity-Doc] 7) 듀얼 AI 마켓 브리핑, 장세 레짐 게이트웨이, Gemini 일일 쿼터, SSE 타이핑 스트리밍, 로컬 Ollama 및 주간 봇 선출 상태 그룹
   const [aiBriefing, setAiBriefing] = useState({
     has_key: false,
     masked_key: "",
@@ -1852,7 +2024,7 @@ export default function App() {
   const [weeklyBotLoading, setWeeklyBotLoading] = useState(false);
   const [isWeeklyBotExpanded, setIsWeeklyBotExpanded] = useState(true);
 
-  // 8) 뉴스 피드 상태 (요구사항: 50건 페이지네이션, 날짜/키워드 검색)
+  // [Antigravity-Doc] 8~10) 뉴스 피드(50건 페이징/검색), 뉴스 기반 AI SSE 스트리밍, 웹푸시(ServiceWorker/VAPID) 및 Ref 상태 그룹
   const [newsList, setNewsList] = useState([]);
   const [newsTotal, setNewsTotal] = useState(0);
   const [newsPage, setNewsPage] = useState(1);
@@ -1895,6 +2067,9 @@ export default function App() {
   const newsFilterRef = useRef({ keyword: "", startDate: "", endDate: "" });
   const isLiveConfigDirtyRef = useRef(false);
 
+  /**
+   * [Antigravity-Doc] 뉴스 검색/날짜 필터 변경 시 최신 필터 값을 ref에 동기화해 폴링·비동기 콜백에서 stale closure를 방지한다.
+   */
   useEffect(() => {
     newsFilterRef.current = {
       keyword: newsKeyword,
@@ -1903,7 +2078,10 @@ export default function App() {
     };
   }, [newsKeyword, newsStartDate, newsEndDate]);
 
-  // 뉴스 AI 한 글자씩 부드럽게 화면에 타이핑해주는 이펙트
+  /**
+   * [Antigravity-Doc] 뉴스 AI SSE 스트리밍 버퍼(`newsTypewriterQueueRef`)를 18ms 간격으로 1~4글자씩 꺼내 타자기 효과를 연출한다.
+   * - 큐가 비고 스트림 종료 플래그가 true가 되면 인터벌을 해제하고 `isNewsStreaming`을 false로 전환한다.
+   */
   useEffect(() => {
     if (!isNewsStreaming) {
       if (newsTypingTimerRef.current) clearInterval(newsTypingTimerRef.current);
@@ -1928,7 +2106,9 @@ export default function App() {
     };
   }, [isNewsStreaming]);
 
-  // 한 글자씩 부드럽게 화면에 타이핑해주는 이펙트
+  /**
+   * [Antigravity-Doc] 메인 시황 AI SSE 스트리밍 버퍼(`typewriterQueueRef`)를 18ms 간격으로 소비해 부드러운 타이핑 출력을 제공한다.
+   */
   useEffect(() => {
     if (!isStreaming) {
       if (typingTimerRef.current) clearInterval(typingTimerRef.current);
@@ -1954,7 +2134,9 @@ export default function App() {
     };
   }, [isStreaming]);
 
-  // 컴포넌트 언마운트 시 활성 스트리밍 요청 및 타이머 정리
+  /**
+   * [Antigravity-Doc] 컴포넌트 언마운트 시 진행 중인 모든 SSE `AbortController` 요청과 토스트/알림 타이머를 일괄 정리한다.
+   */
   useEffect(() => {
     return () => {
       if (activeStreamAbortControllerRef.current) {
@@ -1972,6 +2154,7 @@ export default function App() {
     };
   }, []);
 
+  // [Antigravity-Doc] 공용 알림 모달 열기/닫기 헬퍼
   const showModal = (title, message, type = "info") => {
     setModalInfo({ open: true, title, message, type });
   };
@@ -1980,6 +2163,9 @@ export default function App() {
     setModalInfo((prev) => ({ ...prev, open: false }));
   };
 
+  /**
+   * [Antigravity-Doc] 버전별 변경 이력(`history.md`)을 마크다운 HTML로 렌더링하는 모달 뷰 함수
+   */
   const renderHistoryModal = () => {
     if (!historyModalOpen) return null;
     return (
@@ -2051,7 +2237,9 @@ export default function App() {
     );
   };
 
-  // Web Audio 소리 알림 (신호음)
+  /**
+   * [Antigravity-Doc] Web Audio API 오실레이터로 짧은 2음 상승 알림 차임(587Hz → 880Hz)을 재생한다.
+   */
   const playNotificationChime = useCallback(() => {
     try {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -2076,6 +2264,9 @@ export default function App() {
     } catch (e) {}
   }, []);
 
+  /**
+   * [Antigravity-Doc] URL-safe Base64 문자열(VAPID 공개키)을 PushManager 구독용 `Uint8Array`로 디코딩한다.
+   */
   const urlBase64ToUint8Array = (base64String) => {
     const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
     const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
@@ -2087,7 +2278,10 @@ export default function App() {
     return outputArray;
   };
 
-  // 서비스 워커 등록 및 VAPID 푸시 구독
+  /**
+   * [Antigravity-Doc] 브라우저 알림 권한을 확인/요청하고 Service Worker(`/sw.js`) 등록 및 VAPID Web Push 구독을 서버에 등록한다.
+   * @param {boolean} [promptUser=false] - 권한이 default일 때 사용자 권한 팝업을 띄울지 여부
+   */
   const registerAndSubscribePush = useCallback(async (promptUser = false) => {
     if (!("Notification" in window)) {
       if (promptUser) {
@@ -2160,7 +2354,9 @@ export default function App() {
     return true;
   }, []);
 
-  // 웹푸시 알림 표시 (Service Worker + Notification API + 사운드 + 인앱 토스트)
+  /**
+   * [Antigravity-Doc] 통합 웹푸시 알림 발송기 (2초 중복 방지 + 차임 사운드 + 5초 인앱 토스트 + ServiceWorker/OS Notification)
+   */
   const showWebPushNotification = useCallback(
     async (title = "AI 뉴스 분석 완료", body = "ai 분석이 완료되었습니다", options = {}) => {
       // 중복 방지 (최근 2초 이내 동일 알림 방지)
@@ -2241,6 +2437,9 @@ export default function App() {
     message: "",
   });
 
+  /**
+   * [Antigravity-Doc] 현재 거래 실행 모드(`paper` vs `live`) 및 업비트 키 보유 여부를 `/api/trade-mode`에서 조회한다.
+   */
   const fetchTradeMode = useCallback(async () => {
     try {
       const resp = await fetch(`${API_BASE}/api/trade-mode`);
@@ -2256,6 +2455,9 @@ export default function App() {
     } catch {}
   }, []);
 
+  /**
+   * [Antigravity-Doc] 설정 화면 표시용 입장 코드 마스킹 상태를 `/api/settings/entry-code`에서 조회한다.
+   */
   const fetchEntryCode = useCallback(async () => {
     try {
       const resp = await fetch(`${API_BASE}/api/settings/entry-code`);
@@ -2269,6 +2471,10 @@ export default function App() {
     }
   }, []);
 
+  /**
+   * [Antigravity-Doc] 가상거래(`paper`) ↔ 실거래(`live`) 모드 전환 핸들러
+   * - 사용자 확인 후 `/api/trade-mode`를 갱신하고 봇 현황·거래내역·통계·아레나 데이터를 새 모드로 재조회한다.
+   */
   const handleToggleTradeMode = async (targetMode) => {
     const nextMode = targetMode || (tradeMode.mode === "live" ? "paper" : "live");
     const confirmMsg =
@@ -2315,6 +2521,10 @@ export default function App() {
   // 11) 가상거래(Paper Trading) 전용 초기화 상태 및 핸들러
   const [paperResetLoading, setPaperResetLoading] = useState(false);
 
+  /**
+   * [Antigravity-Doc] 가상거래 원장(`paper_trades`) 및 10대 아레나 모델 초기 자금(100만 원)을 일괄 초기화한다.
+   * - 실거래 계좌·원장에는 일절 영향을 주지 않는다.
+   */
   const handleResetPaperTrades = async () => {
     const confirmMsg =
       "⚠️ [가상거래 초기화]\n가상거래 체결 이력(paper_trades)과 가상 포지션을 모두 삭제하고,\n알고리즘 검증소 모델(100만 원)을 초기화하여 처음부터 다시 거래를 시작하시겠습니까?\n\n* 실제 계좌의 거래 내역과 잔고에는 일절 영향을 주지 않습니다.";
@@ -2341,7 +2551,7 @@ export default function App() {
     }
   };
 
-  // 12) 10대 알고리즘 상시 가상 경쟁(Arena) 상태
+  // [Antigravity-Doc] 12~13) 10대 알고리즘 상시 가상 경쟁(Arena), 실전 봇(1~3개) 배분, 주간 자동 로테이션 및 통계 원장 페이징 상태 그룹
   const [algoModels, setAlgoModels] = useState([]);
   const [algoTrades, setAlgoTrades] = useState([]);
   const [selectedAlgoModelId, setSelectedAlgoModelId] = useState("all");
@@ -2383,6 +2593,9 @@ export default function App() {
   const [statsTradeFilterBot, setStatsTradeFilterBot] = useState("all");
   const [statsTradeLoading, setStatsTradeLoading] = useState(false);
 
+  /**
+   * [Antigravity-Doc] 10대 알고리즘 가상 경쟁(Arena) 리더보드 및 상시 사이클 상태를 `/api/arena/leaderboard`에서 조회한다.
+   */
   const fetchAlgoLabModels = useCallback(async () => {
     try {
       const resp = await fetch(`${API_BASE}/api/arena/leaderboard`);
@@ -2397,6 +2610,9 @@ export default function App() {
     } catch {}
   }, []);
 
+  /**
+   * [Antigravity-Doc] 주간 전략별 1위 봇 자동 로테이션 설정·챔피언 프리뷰·Graceful Drain 현황을 `/api/rotation/status`에서 조회한다.
+   */
   const fetchRotationStatus = useCallback(async () => {
     try {
       const resp = await fetch(`${API_BASE}/api/rotation/status`);
@@ -2417,6 +2633,9 @@ export default function App() {
     } catch {}
   }, []);
 
+  /**
+   * [Antigravity-Doc] 주간 자동 로테이션 스케줄/배분모드/최소거래횟수 설정을 `/api/rotation/config`에 저장한다.
+   */
   const handleSaveRotationConfig = async (overrideDraft = null) => {
     const payload = overrideDraft || rotationConfigDraft;
     setRotationSaving(true);
@@ -2450,6 +2669,10 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] 3대 전략군별 주간 1위 봇 3개를 즉시 실전 배치(`/api/rotation/execute-now`)하고
+   * 기존 봇의 미매도 포지션은 Graceful Drain 보호 모드로 전환한 뒤 UI 상태를 동기화한다.
+   */
   const handleExecuteRotationNow = async () => {
     if (
       !window.confirm(
@@ -2510,6 +2733,9 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] Graceful Drain 대기 중인 특정 미매도 포지션을 수동 시장가 청산하고 회수 원화를 후임 봇으로 즉시 복원한다.
+   */
   const handleForceDrainClose = async (pos) => {
     if (!pos) return;
     const confirmText =
@@ -2550,6 +2776,9 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] 가상 Arena 체결 일지(`paper_trades`) 최근 80건을 모델 필터에 맞춰 `/api/arena/trades`에서 조회한다.
+   */
   const fetchAlgoLabTrades = useCallback(async (modelId = null) => {
     try {
       const targetId = modelId !== undefined && modelId !== null ? modelId : selectedAlgoModelId;
@@ -2566,6 +2795,9 @@ export default function App() {
     } catch {}
   }, [selectedAlgoModelId]);
 
+  /**
+   * [Antigravity-Doc] 가상 Arena 전용 원장 및 10대 봇 가상 시드(100만 원)를 `/api/arena/reset`으로 초기화한다.
+   */
   const handleResetAlgoLab = async () => {
     if (!window.confirm("가상거래 전용 원장(paper_trades)과 10대 알고리즘 가상 경쟁을 초기화하시겠습니까?\n(각 봇의 초기 투자자금이 100만 원으로 재설정되고 모든 가상 거래 내역이 삭제된 후 처음부터 다시 경쟁합니다)")) {
       return;
@@ -2588,6 +2820,9 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] 10대 알고리즘 가상 시뮬레이션 1사이클을 `/api/arena/run-cycle`로 수동 즉시 실행한다.
+   */
   const handleRunAlgoLabCycle = async () => {
     setAlgoLabCycleRunning(true);
     try {
@@ -2605,7 +2840,10 @@ export default function App() {
     }
   };
 
-  // 실전 담당 봇 선택 토글 (최소 1개 ~ 최대 3개 제한 및 비율 자동 재배분)
+  /**
+   * [Antigravity-Doc] 설정 화면에서 실전 담당 봇 선택을 토글한다 (최소 1개 ~ 최대 3개 제한).
+   * - 구성 변경 시 합계가 정확히 100%가 되도록 비율을 자동 균등 재배분하고 `isLiveConfigDirty`를 활성화한다.
+   */
   const handleToggleLiveBotSelection = (botId) => {
     setSelectedLiveBotIds((prev) => {
       const validBotList = (algoModels.length > 0 ? algoModels : bots).map((b) => b.bot_id);
@@ -2645,7 +2883,9 @@ export default function App() {
     });
   };
 
-  // 실전 봇 투자금 비율 실시간 연동 (어느 한쪽을 수정하면 나머지가 자동 조정되어 항상 정확히 100% 유지)
+  /**
+   * [Antigravity-Doc] 실전 봇 투자 비중 슬라이더/입력 변경 시 나머지 봇 비율을 비례 재조정해 총합 100%를 항상 유지한다.
+   */
   const handleLiveRatioChange = (changedBotId, newRawVal) => {
     const val = Math.max(0, Math.min(100, Math.round(Number(newRawVal) || 0)));
     setIsLiveConfigDirty(true);
@@ -2697,7 +2937,9 @@ export default function App() {
     });
   };
 
-  // 선택된 실전 봇 균등 배분 (100% N등분)
+  /**
+   * [Antigravity-Doc] 선택된 실전 봇(1~3개)에 투자 비중 100%를 정수 N등분(나머지는 첫 번째 봇에 가산)한다.
+   */
   const handleDistributeEvenly = () => {
     const count = selectedLiveBotIds.length;
     if (count === 0) return;
@@ -2711,7 +2953,10 @@ export default function App() {
     setIsLiveConfigDirty(true);
   };
 
-  // 실전 봇 선택 및 동적 투자금 배분 저장 (PUT /api/settings/live-bots)
+  /**
+   * [Antigravity-Doc] 선택된 실전 봇(1~3개)과 배분 비율을 `PUT /api/settings/live-bots`로 저장한다.
+   * - 총 운용 원금은 업비트 실계좌 총자산의 90%를 자동 산출하며, 교체 제외된 봇의 미매도 포지션은 Graceful Drain 안내로 표시한다.
+   */
   const handleSaveLiveBotsAllocation = async (e) => {
     if (e) e.preventDefault();
     if (selectedLiveBotIds.length < 1 || selectedLiveBotIds.length > 3) {
@@ -2775,6 +3020,10 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] 30분 단기 뉴스·시황 AI 분석 엔진(로컬 Ollama / Gemini Flash Fallback / 기계적 안전모드)의
+   * 현재 활성 상태 배지 메타정보(색상, 라벨, 툴팁)를 우선순위에 따라 판별한다.
+   */
   const getShortTermAiEngineMeta = useCallback((latestRecord = null, streamMetaObj = null, regimeObj = null) => {
     const defaultOllamaModel = ollamaStatus?.model || "qwen3-news";
     const isEnabled = Boolean(ollamaStatus?.enabled);
@@ -2869,6 +3118,9 @@ export default function App() {
     };
   }, [ollamaStatus]);
 
+  /**
+   * [Antigravity-Doc] 로컬 Ollama 연동 설정 및 헬스체크 결과를 `/api/settings/ollama`에서 조회한다.
+   */
   const fetchOllamaSettings = useCallback(async (forceRefresh = false) => {
     try {
       const resp = await fetch(`${API_BASE}/api/settings/ollama${forceRefresh ? "?refresh=1" : ""}`);
@@ -2889,6 +3141,9 @@ export default function App() {
     }
   }, []);
 
+  /**
+   * [Antigravity-Doc] 로컬 Ollama 활성화 여부, 서버 URL, 모델명, 타임아웃 설정을 `PUT /api/settings/ollama`에 저장한다.
+   */
   const handleSaveOllamaSettings = async (e) => {
     if (e) e.preventDefault();
     setOllamaSaving(true);
@@ -2953,6 +3208,7 @@ export default function App() {
   const [backtestHistory, setBacktestHistory] = useState([]);
   const [backtestApplying, setBacktestApplying] = useState(false);
 
+  // [Antigravity-Doc] 백테스트 모달 실행 폼, 결과, 최근 이력 조회 및 최적 파라미터 원클릭 적용 핸들러 그룹
   const fetchBacktestHistory = useCallback(async () => {
     try {
       const resp = await fetch(`${API_BASE}/api/backtest/history?limit=15`);
@@ -3044,6 +3300,9 @@ export default function App() {
   });
   const [hoveredCandleIdx, setHoveredCandleIdx] = useState(null);
 
+  /**
+   * [Antigravity-Doc] 캔들스틱(OHLCV) + 기술지표(VWAP/LRC/20MA) + BUY/SELL 체결 타점 마커 데이터를 `/api/chart/trade-markers`에서 조회한다.
+   */
   const fetchTradeMarkerChart = useCallback(async (override = {}) => {
     setChartData((prev) => ({ ...prev, loading: true }));
     try {
@@ -3075,6 +3334,9 @@ export default function App() {
     }
   }, [chartQuery.market, chartQuery.bot_id, chartQuery.mode, chartQuery.unit, chartQuery.count]);
 
+  /**
+   * [Antigravity-Doc] 특정 마켓/봇/모드/타임프레임 조건으로 인터랙티브 타점 차트 모달을 열고 즉시 데이터를 로드한다.
+   */
   const openTradeMarkerChart = useCallback(
     ({ market = "KRW-BTC", bot_id = "all", mode = "live", unit = 15 } = {}) => {
       const next = {
@@ -3112,6 +3374,9 @@ export default function App() {
   const [notifTesting, setNotifTesting] = useState(false);
   const [notifMsg, setNotifMsg] = useState(null);
 
+  /**
+   * [Antigravity-Doc] 멀티채널 알림 허브(Telegram · Discord · WebPush) 설정 및 마스킹 키를 `/api/settings/notifications`에서 조회한다.
+   */
   const fetchNotificationSettings = useCallback(async () => {
     try {
       const resp = await fetch(`${API_BASE}/api/settings/notifications`);
@@ -3129,6 +3394,9 @@ export default function App() {
     } catch {}
   }, []);
 
+  /**
+   * [Antigravity-Doc] 멀티채널 알림 허브 설정을 `PUT /api/settings/notifications`로 저장한다 (토큰/웹훅은 백엔드 AES-256-GCM 암호화).
+   */
   const handleSaveNotificationSettings = async (e) => {
     if (e) e.preventDefault();
     setNotifSaving(true);
@@ -3184,6 +3452,9 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] 설정된 모든 활성 채널(Telegram · Discord · WebPush)로 연동 테스트 알림을 즉시 발송한다.
+   */
   const handleTestMultiChannelNotification = async () => {
     setNotifTesting(true);
     setNotifMsg(null);
@@ -3226,6 +3497,10 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] 최신 듀얼 AI 마켓 브리핑, 장세 레짐 필터, Gemini 쿼터 및 Ollama 상태를 `/api/ai/briefing`에서 조회한다.
+   * - 스트리밍 진행 중(`isAiBusyRef.current === true`)일 때 백그라운드 silent 폴링 덮어쓰기를 방지한다.
+   */
   const fetchAiBriefing = async (silent = false) => {
     if (silent && isAiBusyRef.current) return;
     try {
@@ -3250,6 +3525,9 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] 최신 뉴스 기반 AI 브리핑을 `/api/ai/news-briefing`에서 조회하고, 신규 자동 분석 ID 감지 시 웹푸시 알림을 발송한다.
+   */
   const fetchNewsAiBriefing = async (silent = false) => {
     if (silent && isNewsAiBusyRef.current) return;
     try {
@@ -3279,6 +3557,9 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] AI 주간 최적 봇 편성 현황 및 다음 자동 실행 일정을 `/api/ai/weekly-bot-selection`에서 조회한다.
+   */
   const fetchWeeklyBotSelection = async () => {
     try {
       const resp = await fetch(`${API_BASE}/api/ai/weekly-bot-selection`);
@@ -3291,6 +3572,9 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] AI 주간 최적 봇 평가 및 실전 자동 편성(`/api/ai/weekly-bot-selection/run`)을 수동 트리거한다.
+   */
   const triggerWeeklyBotSelection = async () => {
     setWeeklyBotLoading(true);
     try {
@@ -3323,6 +3607,11 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] 실시간 AI 시황 분석 SSE 스트리밍(`/api/ai/stream-analyze`) 요청 핸들러
+   * - 로컬 Ollama 미연결 시 Gemini 무료 일일 잔여 쿼터를 사전 점검하고, 기존 진행 중 스트림은 `AbortController`로 취소한다.
+   * - SSE 블록(`meta`, `chunk`, `done`, `error`)을 파싱해 `typewriterQueueRef`로 흘려보내며 장세 레짐 필터와 쿼터를 실시간 갱신한다.
+   */
   const triggerAiAnalysis = async () => {
     const canUseLocalOllama = Boolean(ollamaStatus?.enabled && ollamaStatus?.reachable);
     if (!canUseLocalOllama && geminiQuota && Number(geminiQuota.remaining_calls) <= 0) {
@@ -3493,6 +3782,9 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] 사용자가 입력한 Gemini API 키를 `/api/ai/save-key`로 저장하고 마스킹 상태와 쿼터를 갱신한다.
+   */
   const handleSaveAiKey = async () => {
     if (!aiKeyInput.trim()) {
       setAiError("Gemini API 키를 입력해주세요.");
@@ -3533,7 +3825,9 @@ export default function App() {
     }
   };
 
-  // 입장 코드 검증 (백엔드 HttpOnly 서명 쿠키 발급, 날짜 변경 시 재인증 요구)
+  /**
+   * [Antigravity-Doc] 입장 코드 검증(`/api/auth/verify`) 핸들러: 성공 시 HttpOnly 세션 쿠키가 발급되며 당일 KST 인증 날짜를 저장한다.
+   */
   const handleVerifyEntryCode = async (e) => {
     e.preventDefault();
     setGateError("");
@@ -3566,6 +3860,9 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] 로그아웃 핸들러: 백엔드 세션을 폐기(`/api/auth/logout`)하고 클라이언트 인증 스토리지를 정리한다.
+   */
   const handleLogout = async () => {
     try {
       await fetch(`${API_BASE}/api/auth/logout`, { method: "POST" });
@@ -3579,11 +3876,13 @@ export default function App() {
     setAuthenticated(false);
   };
 
+  // [Antigravity-Doc] 현재 유효한 AI 장세 레짐 필터 (실시간 스트리밍 메타 → 최신 브리핑 → 전역 상태 순 우선 적용)
   const effectiveRegimeFilter = useMemo(
     () => streamingMeta?.regime_filter || aiBriefing?.regime_filter || regimeFilter || null,
     [streamingMeta, aiBriefing, regimeFilter]
   );
 
+  // [Antigravity-Doc] 실전 선택에서 해제되었으나 잔여 미매도 포지션/투자금이 남아 Graceful Drain 감시 중인 봇 목록
   const drainingBotsList = useMemo(
     () =>
       (bots || []).filter(
@@ -3595,8 +3894,10 @@ export default function App() {
     [bots]
   );
 
-  // 날짜 변경(자정 경과) 실시간 감지: 하루가 지나 날짜가 바뀌면 즉시 인증 화면으로 전환
-  // 브라우저 웹 알림 및 서비스 워커 초기화
+  /**
+   * [Antigravity-Doc] 인증 완료 시 브라우저 Notification 권한 확인·VAPID 구독 갱신 및 Service Worker 클릭 네비게이션 메시지를 수신한다.
+   * - 언마운트 시 `message` 이벤트 리스너를 제거한다.
+   */
   useEffect(() => {
     if (typeof window !== "undefined" && "Notification" in window) {
       setNotificationPermission(Notification.permission);
@@ -3617,6 +3918,10 @@ export default function App() {
     }
   }, [authenticated, registerAndSubscribePush]);
 
+  /**
+   * [Antigravity-Doc] KST 자정 경과(날짜 변경) 실시간 감지 훅: 5초 주기 + 창 포커스/가시성 전환 시 당일 인증 유효성을 검증한다.
+   * - 만료 시 즉시 로그아웃 상태로 전환하며 클린업에서 타이머 및 윈도우/도큐먼트 리스너를 해제한다.
+   */
   useEffect(() => {
     if (!authenticated) return;
     const checkDateExpiration = () => {
@@ -3637,7 +3942,9 @@ export default function App() {
     };
   }, [authenticated]);
 
-  // 업비트 통신 상태 주기적 조회
+  /**
+   * [Antigravity-Doc] 업비트 Open API·WebSocket 통신 상태 및 로컬 Ollama 헬스 정보를 `/api/upbit/status`에서 조회한다.
+   */
   const fetchUpbitStatus = async () => {
     try {
       const resp = await fetch(`${API_BASE}/api/upbit/status`);
@@ -3677,7 +3984,9 @@ export default function App() {
     }
   };
 
-  // 5중 실전 중복 주문 가드레일 상태 반영 및 비상 정지 Modal Popup 표시 (useEffect 상단 선언으로 TDZ 원천 차단)
+  /**
+   * [Antigravity-Doc] 5중 실전 중복 주문 가드레일 상태 반영 및 비상 정지 모달 표출 (TDZ 방지를 위해 useEffect 상단에 선언)
+   */
   const applyGuardrailPayload = useCallback((payload) => {
     if (!payload || typeof payload !== "object") return;
     setGuardrailStatus(payload);
@@ -3700,6 +4009,9 @@ export default function App() {
     }
   }, []);
 
+  /**
+   * [Antigravity-Doc] 가드레일 상태를 `/api/guardrail/status`에서 단건 조회해 `applyGuardrailPayload`로 반영한다.
+   */
   const fetchGuardrailStatus = useCallback(async () => {
     try {
       const resp = await fetch("/api/guardrail/status");
@@ -3711,6 +4023,9 @@ export default function App() {
     } catch {}
   }, [applyGuardrailPayload]);
 
+  /**
+   * [Antigravity-Doc] 가드레일 비상 정지 플래그를 `/api/guardrail/reset-emergency`로 초기화해 수동 재가동이 가능하도록 해제한다.
+   */
   const handleResetGuardrailEmergency = useCallback(async () => {
     setGuardrailResetLoading(true);
     try {
@@ -3739,7 +4054,11 @@ export default function App() {
     }
   }, [applyGuardrailPayload, fetchGuardrailStatus]);
 
-  // 시스템 개요 및 봇 정보 조회
+  /**
+   * [Antigravity-Doc] 시스템 전체 개요(`/api/system/overview`)를 조회해 10대 봇 상태, 자금 배분, 장세 필터, 가드레일을 동기화한다.
+   * - 사용자가 설정 화면에서 실전 봇 구성을 편집 중(`isLiveConfigDirtyRef.current`)이면 편집 중인 입력값을 덮어쓰지 않는다.
+   * - 잔고 0원 이하 자동 정지(`zero_balance_halted`) 감지 시 경고 모달을 표시한다.
+   */
   const fetchOverviewAndBots = async (triggerZeroModalOnTrades = false, targetMode = null) => {
     try {
       const mode = targetMode || tradeMode.mode;
@@ -3817,6 +4136,9 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] 선택된 봇의 거래 체결 원장을 `/api/trades`에서 20건 단위 페이징으로 조회한다.
+   */
   const fetchTrades = async (botId, targetMode = null, page = null, silent = false) => {
     if (!silent) setTradeLoading(true);
     try {
@@ -3856,6 +4178,9 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] 일간/주간/월간 차익 추이, 코인별 손익 순위, 월별 자산 증감 통계를 `/api/statistics`에서 조회한다.
+   */
   const fetchStatistics = async (targetMode = null) => {
     try {
       const mode = targetMode || tradeMode.mode;
@@ -3868,7 +4193,9 @@ export default function App() {
     }
   };
 
-  // 통계 메뉴 최하단 거래내역 조회 (페이지당 50건, 실거래/가상거래 모드 연동)
+  /**
+   * [Antigravity-Doc] 통계 화면 하단 전체 체결 원장(50건 페이징, 봇/모드 필터 연동)을 `/api/trades`에서 조회한다.
+   */
   const fetchStatsTrades = useCallback(
     async (page = 1, botId = null, targetMode = null) => {
       setStatsTradeLoading(true);
@@ -3899,6 +4226,9 @@ export default function App() {
     [statsTradeFilterBot, statsModeTab]
   );
 
+  /**
+   * [Antigravity-Doc] 실제 업비트 계좌의 원화 잔고·주문 가능 금액·코인 총 매수/평가액·총 보유자산을 `/api/upbit/account`에서 조회한다.
+   */
   const fetchUpbitAccount = async (silent = false) => {
     if (!silent) {
       setUpbitAccount((prev) => ({ ...prev, loading: true }));
@@ -3963,6 +4293,9 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] 6초 폴링용 경량 봇 상태 갱신(`/api/bots`): 설정 폼 입력값을 건드리지 않고 실시간 봇·레짐·가드레일 상태만 갱신한다.
+   */
   const refreshBotsStatusOnly = async (targetMode = null) => {
     try {
       const mode = targetMode || tradeMode.mode;
@@ -3984,6 +4317,11 @@ export default function App() {
     } catch {}
   };
 
+  /**
+   * [Antigravity-Doc] 메인 실시간 데이터 초기 로드 및 6초 주기 백그라운드 폴링 훅
+   * - 인증 완료 시 모든 대시보드 데이터를 1회 일괄 로드한 뒤 6초마다 업비트 상태·계좌·봇·가드레일·로테이션·거래내역·AI 브리핑을 갱신한다.
+   * - 의존성 변경 또는 언마운트 시 `clearInterval`로 타이머를 정리한다.
+   */
   useEffect(() => {
     if (!authenticated) return;
     fetchUpbitStatus();
@@ -4017,7 +4355,9 @@ export default function App() {
     return () => clearInterval(timer);
   }, [authenticated, selectedBotId, tradeMode.mode, statsModeTab, fetchTradeMode, fetchAlgoLabModels, fetchRotationStatus, fetchEntryCode, fetchOllamaSettings, fetchGuardrailStatus]);
 
-  // 가상거래 경쟁(Arena) 활성화 시 5초 주기 실시간 리더보드 및 체결 일지 자동 갱신
+  /**
+   * [Antigravity-Doc] 가상거래 경쟁(Arena) 탭 활성화 시 5초 주기로 10대 봇 리더보드, 체결 일지, 로테이션 현황을 실시간 폴링한다.
+   */
   useEffect(() => {
     if (!authenticated || (activeMenu !== "arena" && activeMenu !== "algo-lab")) return;
     fetchAlgoLabModels();
@@ -4032,6 +4372,10 @@ export default function App() {
     return () => clearInterval(timer);
   }, [authenticated, activeMenu, selectedAlgoModelId, fetchAlgoLabModels, fetchAlgoLabTrades, fetchRotationStatus]);
 
+  /**
+   * [Antigravity-Doc] 활성 메뉴 변경 시 스토리지에 현재 탭을 영속화하고, 이탈한 탭의 진행 중 SSE 스트림을 `AbortController`로 안전 중단한다.
+   * - 설정(`settings`) 탭 진입 시 입장코드·로테이션·Ollama·알림 설정을 최신 상태로 재조회한다.
+   */
   useEffect(() => {
     sessionStorage.setItem("autoCoinTrade_menu", activeMenu);
     localStorage.setItem("autoCoinTrade_menu", activeMenu);
@@ -4059,6 +4403,7 @@ export default function App() {
     }
   }, [activeMenu, fetchEntryCode, fetchRotationStatus, fetchOllamaSettings, fetchNotificationSettings]);
 
+  // [Antigravity-Doc] 선택된 봇 ID 및 통계 기간 탭(daily/weekly/monthly)을 세션/로컬 스토리지에 동기화한다.
   useEffect(() => {
     sessionStorage.setItem("autoCoinTrade_bot", selectedBotId);
     localStorage.setItem("autoCoinTrade_bot", selectedBotId);
@@ -4069,7 +4414,10 @@ export default function App() {
     localStorage.setItem("autoCoinTrade_statsTab", statsPeriodTab);
   }, [statsPeriodTab]);
 
-  // 뉴스 목록 조회 (한 페이지 50건, 날짜/키워드 검색 — 입력 시 불필요한 자동 호출 방지를 위해 ref 참조)
+  /**
+   * [Antigravity-Doc] 뉴스 피드 목록을 `/api/news`에서 50건 페이징 및 날짜·키워드 필터로 조회한다.
+   * - 입력 타이핑마다 재호출되지 않도록 `newsFilterRef.current`에서 최신 필터 조건을 참조한다.
+   */
   const fetchNews = useCallback(async (page = 1, options = {}) => {
     setNewsLoading(true);
     try {
@@ -4100,6 +4448,10 @@ export default function App() {
     }
   }, []);
 
+  /**
+   * [Antigravity-Doc] 뉴스 기반 실시간 AI 종합 분석 SSE 스트리밍(`/api/ai/stream-news-analyze`) 핸들러
+   * - 스트림 완료(`done`) 시 웹푸시 알림("ai 분석이 완료되었습니다")을 발송하고 `newsAiBriefing` 상태를 업데이트한다.
+   */
   const triggerNewsAiAnalysis = async () => {
     const canUseLocalOllama = Boolean(ollamaStatus?.enabled && ollamaStatus?.reachable);
     if (!canUseLocalOllama && geminiQuota && Number(geminiQuota.remaining_calls) <= 0) {
@@ -4275,6 +4627,9 @@ export default function App() {
     }
   };
 
+  /**
+   * [Antigravity-Doc] 뉴스 탭 진입 시 1페이지 뉴스 피드와 최신 뉴스 AI 브리핑을 자동 로드한다.
+   */
   useEffect(() => {
     if (activeMenu === "news") {
       fetchNews(1);
@@ -4282,6 +4637,7 @@ export default function App() {
     }
   }, [activeMenu, fetchNews]);
 
+  // [Antigravity-Doc] 뉴스 검색, 필터 초기화, 추천 해시태그 클릭 및 수동 RSS 수집(`/api/news/refresh`) 핸들러 그룹
   const handleSearchNews = (e) => {
     if (e) e.preventDefault();
     fetchNews(1);
@@ -4324,7 +4680,9 @@ export default function App() {
     }
   };
 
-  // 메뉴 전환 시 처리 (거래현황 진입 시 잔고 0 이하 여부 즉시 체크하여 모달 표기)
+  /**
+   * [Antigravity-Doc] 좌측 사이드바 메뉴 전환 핸들러: 탭 상태를 갱신하고 각 탭에 필요한 최신 데이터를 즉시 프리페치한다.
+   */
   const handleMenuChange = (menuKey) => {
     const targetKey = menuKey === "algo-lab" ? "arena" : menuKey;
     setActiveMenu(targetKey);
@@ -4349,7 +4707,10 @@ export default function App() {
     }
   };
 
-  // 요구사항 20: 거래 시작 / 중단 수동 제어 및 정상 동작 확인 Modal Popup 표기
+  /**
+   * [Antigravity-Doc] 개별 실전 봇 자동매매 시작/중지 제어(`/api/bots/{botId}/start|stop`) 핸들러
+   * - 미저장 설정 변경(`isLiveConfigDirty`) 상태에서 시작 요청 시 저장을 먼저 요구하는 가드를 적용한다.
+   */
   const handleBotStartStop = async (botId, start) => {
     if (start && isLiveConfigDirty) {
       showModal(
@@ -4385,7 +4746,9 @@ export default function App() {
     }
   };
 
-  // 수동 매수 / 보유 지분 분할 매도 테스트 (한 줄 업데이트 및 포지션 격리 확인용)
+  /**
+   * [Antigravity-Doc] 특정 봇의 수동 즉시 매수/보유 지분 분할 매도 테스트(`/api/bots/{botId}/manual-trade`) 실행 핸들러
+   */
   const handleManualTradeTest = async (botId, action) => {
     try {
       const resp = await fetch(`${API_BASE}/api/bots/${botId}/manual-trade`, {
@@ -4407,7 +4770,9 @@ export default function App() {
     }
   };
 
-  // 요구사항 22: 자금 분배 비율 저장 (실계좌 잔고 90% 자동 적용)
+  /**
+   * [Antigravity-Doc] 전체 운용 원금(실계좌 90% 자동 적용) 및 봇별 자금 분배 비율을 검증 후 `PUT /api/settings/allocation`에 저장한다.
+   */
   const handleSaveAllocation = async (e) => {
     e.preventDefault();
     const liveAsset = Number(upbitAccount?.total_asset_krw ?? upbitAccount?.krw_total ?? upbitAccount?.krw_balance ?? 0);
@@ -4497,7 +4862,9 @@ export default function App() {
     }
   };
 
-  // 요구사항 15: 봇 수정 및 별명(Nickname) 저장
+  /**
+   * [Antigravity-Doc] 개별 봇의 별명(Nickname), 최소 거래대금, 손절/익절 파라미터를 `PUT /api/bots/{botId}`로 저장한다.
+   */
   const handleSaveBotConfig = async (botId) => {
     const form = botEditForms[botId];
     if (!form) return;
@@ -4519,7 +4886,9 @@ export default function App() {
     }
   };
 
-  // 요구사항 13: JSON 파일 마이그레이션 (내보내기)
+  /**
+   * [Antigravity-Doc] DB 전체 봇 설정·거래내역·포지션을 JSON 파일로 내보내기(`/api/settings/export`)한다.
+   */
   const handleExportJson = async () => {
     try {
       const resp = await fetch(`${API_BASE}/api/settings/export`);
@@ -4544,7 +4913,9 @@ export default function App() {
     }
   };
 
-  // 요구사항 13: JSON 파일 읽어서 DB 복원
+  /**
+   * [Antigravity-Doc] 업로드한 마이그레이션 JSON 파일을 파싱해 `/api/settings/import-json`으로 DB를 복원하고 전체 상태를 재동기화한다.
+   */
   const handleImportJsonFile = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -4579,7 +4950,9 @@ export default function App() {
     }
   };
 
-  // 보안 및 입장 코드 변경 저장
+  /**
+   * [Antigravity-Doc] 새 보안 입장 코드(최소 4자)를 검증 후 `/api/settings/entry-code`로 변경 저장한다 (기존 타 기기 세션 즉시 무효화).
+   */
   const handleSaveEntryCode = async (e) => {
     if (e) e.preventDefault();
     setEntryCodeMsg(null);
@@ -4627,6 +5000,7 @@ export default function App() {
     }
   };
 
+  // [Antigravity-Doc] 현재 거래현황 탭에서 선택된 봇 객체 (목록에 없으면 첫 번째 실전 선택 봇으로 폴백)
   const currentBot = useMemo(() => {
     const matched = bots.find((b) => b.bot_id === selectedBotId);
     if (matched) return matched;
@@ -4634,7 +5008,10 @@ export default function App() {
     return firstLive || bots[0] || null;
   }, [bots, selectedBotId]);
 
-  // 실전 담당 봇(또는 보유 포지션이 남아있는 Drain 봇)과 selectedBotId 자동 동기화
+  /**
+   * [Antigravity-Doc] 실전 봇 구성이나 Drain 봇 목록이 변경되어 현재 `selectedBotId`가 유효 풀에서 사라지면
+   * 자동으로 첫 번째 활성 봇으로 전환하고 1페이지 거래내역을 재조회한다.
+   */
   useEffect(() => {
     if (!Array.isArray(bots) || bots.length === 0) return;
     const selectablePool = bots.filter(
@@ -4655,11 +5032,12 @@ export default function App() {
   }, [bots, selectedLiveBotIds, selectedBotId]);
 
   // ------------------------------------------------------------------
-  // 초기 설정 마법사 화면 (Step-by-Step Onboarding Setup Wizard)
+  // [Antigravity-Doc] 초기 설정 마법사 화면 분기 (Step 1 기본/보안 → Step 2 DB → Step 3 API 키 → Step 4 자동 설치)
   // ------------------------------------------------------------------
   if (showSetupWizard) {
     return (
       <div className="wizard-wrapper">
+        {/* [Antigravity-Doc] 초기 설정 마법사(Setup Wizard) 메인 카드 컨테이너 */}
         <div className="wizard-card">
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "10px" }}>
             <div>
@@ -5218,11 +5596,12 @@ export default function App() {
   }
 
   // ------------------------------------------------------------------
-  // 입장 코드 화면 (기본: stock)
+  // [Antigravity-Doc] 일일 보안 입장 코드 게이트 화면 분기 (HttpOnly 세션 쿠키 인증 통과 전 노출)
   // ------------------------------------------------------------------
   if (!authenticated) {
     return (
       <div className="gate-wrapper">
+        {/* [Antigravity-Doc] 입장 코드 인증 게이트 카드 (버전 배지, 코드 입력 폼, 변경 이력 모달 포함) */}
         <div className="gate-card">
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
             <span className="gate-badge" style={{ margin: 0 }}>UPBIT QUANT AUTO TRADER</span>
@@ -5276,6 +5655,7 @@ export default function App() {
     );
   }
 
+  // [Antigravity-Doc] 통계 기간 탭(daily/weekly/monthly)에 대응하는 차트 시계열 데이터 및 기간 라벨 계산
   const chartSeries =
     statsPeriodTab === "daily"
       ? stats.daily
@@ -5291,7 +5671,7 @@ export default function App() {
   // ------------------------------------------------------------------
   return (
     <div className="app-layout">
-      {/* 좌측 메뉴 영역 (20%) */}
+      {/* [Antigravity-Doc] 좌측 사이드바 영역 (20%): 업비트 API/WS 통신 상태 배지, 실전/가상 모드 전환, 5대 메뉴 네비게이션, 버전/로그아웃 */}
       <aside className="left-sidebar">
         <div className="sidebar-top-section">
           <div
@@ -5452,6 +5832,7 @@ export default function App() {
         {/* ============================================================
             [메뉴 1] 거래현황 (요구사항 9, 20, 21)
            ============================================================ */}
+        {/* [Antigravity-Doc] 탭 1: 실제거래 현황 대시보드 (가드레일 배너, 실계좌 요약, 주간 AI 봇 편성, 듀얼 AI 브리핑, 1~3대 실전 봇 제어, Graceful Drain, 보유 현황, 20건 페이징 거래내역) */}
         {activeMenu === "trades" && (
           <div>
             {isLiveConfigDirty && (
@@ -5549,7 +5930,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* 5중 실전 중복 주문 가드레일 비상 정지 / 타임아웃 경고 배너 */}
+            {/* [Antigravity-Doc] 5중 실전 중복 주문 가드레일 비상 정지 / 타임아웃 경고 배너 및 수동 경고 해제 버튼 */}
             {guardrailStatus &&
               (guardrailStatus.emergency_halted ||
                 (guardrailStatus.counters?.unresolved_timeout_count || 0) > 0 ||
@@ -5789,7 +6170,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* AI 주간 최적 봇 자동 편성 카드 (1주일 주기) */}
+            {/* [Antigravity-Doc] AI 주간 최적 봇 자동 편성 카드 (1주일 주기 TOP 3 봇 추천 및 즉시 재평가 트리거) */}
             <div
               className="card"
               style={{
@@ -5900,7 +6281,7 @@ export default function App() {
               )}
             </div>
 
-            {/* AI 실시간 시장 분석 및 봇 진단 카드 (Gemini 3.5 Flash) */}
+            {/* [Antigravity-Doc] 듀얼 AI 실시간 시장 분석 & 봇 진단 카드 (로컬 Ollama/Gemini Flash 30분 + Pro 1시간 교차 검증, SSE 스트리밍, 10대 봇 스위치 요약) */}
             <div
               className="card"
               style={{
@@ -6799,7 +7180,7 @@ export default function App() {
               )}
             </div>
 
-            {/* 실전 담당 봇 탭 구분 (선택된 1~3개 실전 봇만 동적 노출) */}
+            {/* [Antigravity-Doc] 실전 담당 봇(1~3개) 선택 탭, AI 게이트웨이 ALLOW/BLOCK 배지 및 봇 시작/중단 제어 패널 */}
             {(() => {
               const matched = bots.filter((b) => Number(b.is_selected_for_live) === 1 || selectedLiveBotIds.includes(b.bot_id));
               const liveBots = matched.length > 0 ? matched : bots.slice(0, 3);
@@ -7065,7 +7446,7 @@ export default function App() {
                     })}
                   </div>
 
-                  {/* 실전 교체 후 잔여 포지션이 남은 봇 포지션 보호(Graceful Drain) 감시 카드 */}
+                  {/* [Antigravity-Doc] 실전 교체 후 잔여 포지션 보호(Graceful Drain) 감시 카드 및 수동 즉시 청산 버튼 */}
                   {(drainingBotsList.length > 0 || (rotationStatus?.draining_positions?.length || 0) > 0) && (() => {
                     const liveDrainPositions = rotationStatus?.draining_positions || [];
                     const totalDrainTransferred = Math.floor(Number(rotationStatus?.total_drain_transferred_krw || 0));
@@ -7379,7 +7760,7 @@ export default function App() {
               );
             })()}
 
-            {/* 봇별 보유 현황 목록 (선택한 봇이 소유한 미매도 보유 코인/포지션만 단독 표시) */}
+            {/* [Antigravity-Doc] 선택된 봇 전용 미매도 보유 코인/포지션 격리 현황 테이블 및 타점 차트 바로가기 */}
             {currentBot && (() => {
               const selectableHoldingBots = (() => {
                 const matched = bots.filter(
@@ -7788,7 +8169,7 @@ export default function App() {
               );
             })()}
 
-            {/* 요구사항 9: 게시판 형식 거래정보 (매수, 매도, 매수일, 매도일, 차익 한 줄 표기 / 미매도 시 빈칸, 매도 시 업데이트 / 한 페이지 20건 페이징) */}
+            {/* [Antigravity-Doc] 실전 봇 거래 체결 내역 게시판 (매수·매도 한 줄 표기, 미매도 빈칸, 한 페이지 20건 페이징) */}
             <div className="card">
               <div
                 style={{
@@ -8087,6 +8468,7 @@ export default function App() {
         {/* ============================================================
             [메뉴 2] 통계 (요구사항 10, 11, 12)
            ============================================================ */}
+        {/* [Antigravity-Doc] 탭 2: 수익 통계 대시보드 (실거래/가상거래 모드 전환, 월간 자산 지표, 월별 자산 막대 차트, 일/주/월 차익 선 그래프, 코인/봇 순위, 50건 페이징 전체 원장) */}
         {activeMenu === "stats" && (
           <div>
             <div className="page-header">
@@ -8244,7 +8626,7 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 3대 핵심 자산 지표 카드 그리드 */}
+              {/* [Antigravity-Doc] 통계 상단 3대 핵심 자산 지표 카드 (월초 1일 자산 / 현재 자산 / 월간 순증감) */}
               <div
                 style={{
                   display: "grid",
@@ -8385,7 +8767,7 @@ export default function App() {
                 })()}
               </div>
 
-              {/* 월별 보유 자산 증감 그래프 섹션 */}
+              {/* [Antigravity-Doc] 월별 보유 자산 증감 비교 막대 차트 및 변동 원장 섹션 */}
               <div style={{ borderTop: "1px solid rgba(255, 255, 255, 0.08)", paddingTop: "20px", marginTop: "4px" }}>
                 <div
                   style={{
@@ -8678,7 +9060,7 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 실제 거래내역 테이블 */}
+              {/* [Antigravity-Doc] 통계 하단 전체 거래 체결 원장 테이블 (봇 필터 + 50건 단위 페이지네이션) */}
               <div className="table-container">
                 <table className="board-table">
                   <thead>
@@ -8926,6 +9308,7 @@ export default function App() {
           </div>
         )}
 
+        {/* [Antigravity-Doc] 탭 3: 10대 알고리즘 상시 가상 경쟁(Arena) (TOP 3 포디움, 전략군 필터 리더보드, 백테스트/타점 차트 진입, 봇별 가상 포지션, 가상 체결 일지) */}
         {(activeMenu === "arena" || activeMenu === "algo-lab") && (
           <div>
             {/* 페이지 상단 헤더 */}
@@ -9096,7 +9479,7 @@ export default function App() {
               </button>
             </div>
 
-            {/* TOP 3 랭킹 포디움 (Gold 🥇 1위, Silver 🥈 2위, Bronze 🥉 3위) */}
+            {/* [Antigravity-Doc] 가상 Arena 상위 1~3위 봇 포디움 카드 (Gold/Silver/Bronze) */}
             <div className="podium-container">
               {algoModels.slice(0, 3).map((m, idx) => {
                 const rankNum = idx + 1;
@@ -9187,7 +9570,7 @@ export default function App() {
               })}
             </div>
 
-            {/* 10대 알고리즘 실시간 수익률 랭킹 보드 (1위 ~ 10위 전체 리더보드) */}
+            {/* [Antigravity-Doc] 10대 알고리즘 실시간 수익률·승률·MDD·AI 게이트웨이 통합 리더보드 테이블 */}
             <div className="card" style={{ marginBottom: "20px" }}>
               <div
                 style={{
@@ -9447,7 +9830,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* 아레나 봇별 보유 현황 목록 (각 봇 클릭 시 해당 봇이 소유한 포지션만 단독 표시) */}
+            {/* [Antigravity-Doc] 아레나 10대 봇별 가상 보유 포지션 격리 뷰어 */}
             {algoModels.length > 0 && (() => {
               const targetArenaBot =
                 algoModels.find((m) => m.bot_id === selectedAlgoModelId) || algoModels[0];
@@ -9706,7 +10089,7 @@ export default function App() {
               );
             })()}
 
-            {/* 하단: 가상 매매 체결 일지 (paper_trades) */}
+            {/* [Antigravity-Doc] 아레나 하단 가상 매매 체결 일지(`paper_trades`) 테이블 */}
             <div className="card">
               <div
                 style={{
@@ -9832,6 +10215,7 @@ export default function App() {
         {/* ============================================================
             [메뉴] 실시간 뉴스 피드 & LLM 감성 분석 (50건 페이지네이션, 날짜/키워드 검색, AI 뉴스 판단)
            ============================================================ */}
+        {/* [Antigravity-Doc] 탭 4: 실시간 암호화폐 뉴스 피드 & 뉴스 기반 AI 종합 판단 (SSE 스트리밍, 날짜/키워드/해시태그 검색, 50건 페이징) */}
         {activeMenu === "news" && (
           <div>
             <div className="page-header">
@@ -10188,7 +10572,7 @@ export default function App() {
               )}
             </div>
 
-            {/* 검색 및 필터 카드 (날짜 범위, 키워드 검색, 태그 필터) */}
+            {/* [Antigravity-Doc] 뉴스 기간·키워드 검색 및 추천 해시태그 빠른 필터 카드 */}
             <div className="card" style={{ marginBottom: "16px" }}>
               <form onSubmit={handleSearchNews}>
                 <div className="news-filter-grid">
@@ -10301,7 +10685,7 @@ export default function App() {
               </form>
             </div>
 
-            {/* 뉴스 목록 테이블 카드 (한 화면 50건, row 높이 동일화) */}
+            {/* [Antigravity-Doc] 수집 뉴스 감성 분석 목록 테이블 및 50건 단위 페이지네이션 */}
             <div className="card">
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
                 <span style={{ fontSize: "14px", color: "var(--text-secondary)" }}>
@@ -10515,6 +10899,7 @@ export default function App() {
         {/* ============================================================
             [메뉴 3] 설정 (요구사항 13, 15, 22)
            ============================================================ */}
+        {/* [Antigravity-Doc] 탭 5: 시스템 통합 설정 (모드 전환, 업비트 실계좌 조회, 주간 자동 로테이션, 1~3대 실전 봇 & 90% 동적 자금 배분, 봇 파라미터/별명, 보안 입장코드, 로컬 Ollama, JSON 백업/복원, 멀티채널 알림 허브, 버전 정보) */}
         {activeMenu === "settings" && (
           <div>
             <div className="page-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "12px" }}>
@@ -10738,7 +11123,7 @@ export default function App() {
               )}
             </div>
 
-            {/* 🤖 주간 전략별 1위 봇 자동 선출 (Auto-Rotation) 설정 */}
+            {/* [Antigravity-Doc] 주간 전략별 1위 봇 자동 선출(Auto-Rotation) 스케줄·90% 상한 게이지·챔피언 프리뷰·교체 이력 카드 */}
             <div
               className="card"
               style={{
@@ -11221,7 +11606,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* 1. 실제 거래 담당 봇(1~3개) 선택 및 동적 투자금 배분 설정 */}
+            {/* [Antigravity-Doc] 실전 거래 담당 봇(1~3개) 선택(전략군별/순위별 보기) 및 실계좌 90% 동적 투자금 비율 배분 패널 */}
             <div className="card" style={{ marginBottom: "20px" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "10px", marginBottom: "16px" }}>
                 <div>
@@ -12148,7 +12533,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* 요구사항 15: 봇 수정 및 각 봇별 별명(Nickname) 설정 */}
+            {/* [Antigravity-Doc] 개별 봇 상세 설정 카드 (별명, 최소 거래대금, 손절/익절 파라미터 수정) */}
             <div className="card">
               <h3 style={{ fontSize: "16px", fontWeight: 700, marginBottom: "14px" }}>
                 2. 봇별 별명(Nickname) 및 전략 파라미터 수정 (10대 알고리즘 엔진 연동)
@@ -12411,7 +12796,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* 3. 보안 및 입장 코드(Gate Code) 설정 */}
+            {/* [Antigravity-Doc] 보안 및 일일 입장 코드(Gate Code) 변경 설정 카드 */}
             <div className="card" style={{ marginBottom: "20px" }}>
               <div
                 style={{
@@ -12552,7 +12937,7 @@ export default function App() {
               </form>
             </div>
 
-            {/* 3-1. 로컬 Ollama (30분 단기 뉴스·시황 AI) 연동 설정 */}
+            {/* [Antigravity-Doc] 로컬 Ollama(30분 단기 뉴스·시황 AI) 연동 URL·모델·타임아웃 설정 카드 */}
             <div className="card" style={{ marginBottom: "20px" }}>
               <div
                 style={{
@@ -12833,7 +13218,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* 5-1. 실시간 멀티채널 알림 허브 설정 (Telegram · Discord · WebPush · AES-256-GCM 암호화 저장) */}
+            {/* [Antigravity-Doc] 실시간 멀티채널 알림 허브 설정 카드 (Telegram · Discord · WebPush · AES-256-GCM 암호화) */}
             <div className="card" style={{ marginTop: "20px" }}>
               <div
                 style={{
@@ -13138,7 +13523,7 @@ export default function App() {
             </div>
           </div>
         )}
-        {/* 법적 면책 조항 (Legal Disclaimer Footer) */}
+        {/* [Antigravity-Doc] 하단 법적 면책 조항(Legal Disclaimer) 푸터 */}
         <footer
           style={{
             marginTop: "40px",
@@ -13167,7 +13552,7 @@ export default function App() {
         </footer>
       </main>
 
-      {/* 인앱 웹푸시 토스트 팝업 */}
+      {/* [Antigravity-Doc] 우측 하단 인앱 웹푸시 토스트 팝업 (5초 자동 닫힘) */}
       {pushToast.show && (
         <div
           style={{
@@ -13222,7 +13607,7 @@ export default function App() {
         </div>
       )}
 
-      {/* 요구사항 20, 21: 거래 시작/중지 동작 알림 및 잔고 0 이하 거래 중지 알림 Modal Popup */}
+      {/* [Antigravity-Doc] 공용 시스템 알림 모달 (봇 시작/중지, 잔고 0원 경고, 가드레일 비상정지, 설정 저장 결과) */}
       {modalInfo.open && (
         <div className="modal-backdrop" onClick={closeModal}>
           <div className="modal-box" onClick={(e) => e.stopPropagation()}>
@@ -13253,7 +13638,7 @@ export default function App() {
         </div>
       )}
 
-      {/* [고도화 2] 히스토리컬 캔들 백테스팅 & Walk-Forward 검증 모달 */}
+      {/* [Antigravity-Doc] 모달 1: 히스토리컬 캔들 백테스팅 & Walk-Forward(70%/30%) 검증 + SVG 자산곡선 모달 */}
       {backtestModalOpen && (
         <div className="modal-backdrop" onClick={() => setBacktestModalOpen(false)}>
           <div className="quant-modal-box" onClick={(e) => e.stopPropagation()}>
@@ -13585,7 +13970,7 @@ export default function App() {
         </div>
       )}
 
-      {/* [고도화 4-A] 캔들스틱 + VWAP/LRC/20MA + BUY/SELL 타점 마커 차트 모달 */}
+      {/* [Antigravity-Doc] 모달 2: 인터랙티브 캔들스틱 + VWAP/LRC/20MA 지표 + BUY/SELL 체결 타점 마커 SVG 차트 모달 */}
       {chartModalOpen && (
         <div className="modal-backdrop" onClick={() => setChartModalOpen(false)}>
           <div className="quant-modal-box" onClick={(e) => e.stopPropagation()}>
@@ -13868,7 +14253,7 @@ export default function App() {
         </div>
       )}
 
-      {/* 버전별 변경 이력 (history.md) Modal Popup */}
+      {/* [Antigravity-Doc] 모달 3: 프로젝트 버전별 변경 이력(history.md) 뷰어 모달 */}
       {renderHistoryModal()}
     </div>
   );
