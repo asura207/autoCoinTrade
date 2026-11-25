@@ -648,8 +648,8 @@ export function evaluateSmartExit({
   const curPeak = Math.max(Number(peakPrice || avgBuy), curPrice);
   const peakPnlPct = pctChange(curPeak, avgBuy);
 
-  // 1. 본절 스탑 (Breakeven Stop — 수익 반납 방지)
-  if (peakPnlPct >= 1.2 && pnlPct <= 0.25) {
+  // 1. 본절 스탑 (Breakeven Stop — 수익 반납 방지, 왕복 수수료 0.1% 감안 +0.30% 이상 보호)
+  if (peakPnlPct >= 1.2 && pnlPct <= 0.3) {
     return {
       signal: "SELL",
       exitType: "BREAKEVEN_STOP",
@@ -700,24 +700,25 @@ export function evaluateSmartExit({
     const isBot10SetupB =
       normId === "bot_10" && (buyReasonStr.includes("반등") || buyReasonStr.includes("Setup B") || inferredBot10Dip);
     if (normId !== "bot_06" && !isBot10SetupB) {
-      const hardStopPrice = avgBuy - 2.2 * atr;
-      if (curPrice <= hardStopPrice) {
+      // [Antigravity-Doc] 손익비 개선: 하드 손절을 -1.6×ATR로 타이트화하되 노이즈 휩소 방지를 위해 -1.0% 이하일 때만 발동
+      const hardStopPrice = avgBuy - 1.6 * atr;
+      if (curPrice <= hardStopPrice && pnlPct <= -1.0) {
         return {
           signal: "SELL",
           exitType: "ATR_HARD_STOP",
-          reason: `동적 ATR 손절(Hard Stop): 진입가 대비 -2.2×ATR(${ko(2.2 * atr)}원) 이탈 (수익률 ${fmt(pnlPct)}%)`,
+          reason: `동적 ATR 손절(Hard Stop): 진입가 대비 -1.6×ATR(${ko(1.6 * atr)}원) 이탈 (수익률 ${fmt(pnlPct)}%)`,
         };
       }
     }
 
-    // 3-2. 최고가 +1.0% 이상 수익 도달 후 수익 확보선(avgBuy 초과) 위에서 -1.8 * ATR 하락 시 트레일링 익절
-    if (peakPnlPct >= 1.0) {
-      const trailingStopPrice = curPeak - 1.8 * atr;
-      if (trailingStopPrice > avgBuy && curPrice <= trailingStopPrice) {
+    // 3-2. 최고가 +1.4% 이상 수익 도달 후 최소 순수익 확보선(+0.35% 이상) 위에서 -1.2 * ATR 하락 시 트레일링 익절
+    if (peakPnlPct >= 1.4) {
+      const trailingStopPrice = curPeak - 1.2 * atr;
+      if (trailingStopPrice >= avgBuy * 1.0035 && curPrice <= trailingStopPrice) {
         return {
           signal: "SELL",
           exitType: "ATR_TRAILING_STOP",
-          reason: `동적 ATR 트레일링 스탑: 최고가(${ko(curPeak)}) 대비 -1.8×ATR(${ko(1.8 * atr)}원) 이탈 (수익률 ${fmt(pnlPct)}%)`,
+          reason: `동적 ATR 트레일링 스탑: 최고가(${ko(curPeak)}) 대비 -1.2×ATR(${ko(1.2 * atr)}원) 이탈 (수익률 ${fmt(pnlPct)}%)`,
         };
       }
     }
@@ -1433,7 +1434,7 @@ export const ARENA_BOT_DEFS = [
     min_volume_krw: 8000000000,
     stop_loss_pct: 2.0,
     take_profit_pct: 3.5,
-    config: { bb_period: 20, bb_std: 2.0, bb_stddev: 2.0, rsi_threshold: 35, candle_unit: "minutes/15", order_krw: 15000, order_ratio: 0.45, max_positions: 2 },
+    config: { bb_period: 20, bb_std: 2.0, bb_stddev: 2.0, rsi_threshold: 32, candle_unit: "minutes/15", order_krw: 15000, order_ratio: 0.45, max_positions: 2 },
   },
   {
     bot_id: "bot_06",
@@ -1445,11 +1446,11 @@ export const ARENA_BOT_DEFS = [
     strategy_group: "역추세·그리드",
     strategy_sub_label: "분할 매수 그리드",
     strategy_rule: "SIDEWAYS 박스권 ALLOW, 급락 쇼크 BLOCK",
-    description: "단기 과매도(RSI≤40) 진입 후 -2.5%/-5.0% 추가 하락 시 최대 3분할 매수(order_uuid 개별 관리) | 개별 포지션 +1.8% 도달 시 개별 익절",
+    description: "단기 과매도(RSI≤32, 1h 급락장 차단) 진입 후 -3.0%/-6.0% 추가 하락 시 최대 3분할 매수(order_uuid 개별 관리) | 개별 포지션 +2.0% 도달 시 개별 익절",
     min_volume_krw: 5000000000,
     stop_loss_pct: 9.0,
-    take_profit_pct: 1.8,
-    config: { rsi_entry: 40, grid_step_1_pct: 2.5, grid_step_2_pct: 5.0, max_splits: 3, order_ratio: 0.45, max_positions: 2 },
+    take_profit_pct: 2.0,
+    config: { rsi_entry: 32, grid_step_1_pct: 3.0, grid_step_2_pct: 6.0, max_splits: 3, order_ratio: 0.45, max_positions: 2 },
   },
   {
     bot_id: "bot_07",
@@ -1511,7 +1512,7 @@ export const ARENA_BOT_DEFS = [
     strategy_rule: "VWAP/회귀 채널 멀티 레짐 ALLOW, 패닉 쇼크 BLOCK",
     description: "4대 핵심 지표(VWAP, 20봉 선형회귀 채널 LRC ±2σ, 거래량 폭발 RVOL, 당일시가/전일고저) 기반 돌파 및 과매도 2분할 반등 매매",
     min_volume_krw: 5000000000,
-    stop_loss_pct: 2.5,
+    stop_loss_pct: 1.8,
     take_profit_pct: 5.0,
     config: {
       rvol_breakout_arena: 1.4,
@@ -1519,6 +1520,8 @@ export const ARENA_BOT_DEFS = [
       rvol_dip: 1.3,
       vwap_gap_arena: 2.0,
       vwap_gap_live: 2.0,
+      min_lrc_tp_pct: 1.1,
+      trailing_stop_pct: 1.0,
       order_ratio: 0.3,
       max_positions: 3,
     },
@@ -1666,13 +1669,26 @@ const STRATEGIES = {
     return hold(`스퀴즈 ${squeezed ? "형성" : "미형성"} / 상단 ${ko(m.bb.upper)}`);
   },
 
-  // [Antigravity-Doc] bot_05 (볼린저 역추세 반등): 15m 직전 2봉 저가가 BB 하단 터치 + 현재가 양봉 복귀 + 최근 3봉 RSI ≤ 38 과매도 시 진입
+  // [Antigravity-Doc] bot_05 (볼린저 역추세 반등): 1h 급락 패닉 차단 + 15m 직전 2봉 저가 BB 하단 터치 + 양봉 복귀 + 최근 3봉 RSI ≤ 32 진입, 보유 중 BB 중심선 도달(+1.2% 이상) 시 회귀 익절
   // bot_05: 볼린저 역추세 반등
   bot_05({ price, ind, held, params }) {
     const m = ind.m15;
     if (!m || !m.bb) return hold("15분봉 데이터 부족");
-    if (held.length > 0) return hold("보유 중 (+3.5% 익절 / -2.0% 손절 감시)");
-    const rsiTh = Number(params.rsi_threshold ?? 38);
+    if (held.length > 0) {
+      const totalCost = held.reduce((acc, p) => acc + Number(p.buy_amount || Number(p.volume || 0) * Number(p.avg_buy_price || 0)), 0);
+      const totalVol = held.reduce((acc, p) => acc + Number(p.volume || 0), 0);
+      const avgBuyPrice = totalVol > 0 ? totalCost / totalVol : Number(held[0].avg_buy_price || 0);
+      const pnlPct = avgBuyPrice > 0 ? pctChange(price, avgBuyPrice) : 0;
+      if (price >= m.bb.mid && pnlPct >= 1.2) {
+        return sell(`볼린저 중심선 회귀 익절 (+${fmt(pnlPct)}%)`);
+      }
+      return hold("보유 중 (BB 중심선/+3.5% 익절 · ATR 손절 감시)");
+    }
+    const h = ind.m60;
+    if (h && ((Number.isFinite(h.rsi) && h.rsi < 25) || (h.ema20 > 0 && pctChange(price, h.ema20) < -4.0))) {
+      return hold(`1시간봉 급락 패닉 차단 (1h RSI ${fmt(h.rsi ?? 0, 1)}, EMA20 이격 ${fmt(h.ema20 > 0 ? pctChange(price, h.ema20) : 0)}%)`);
+    }
+    const rsiTh = Number(params.rsi_threshold ?? 32);
     const touched = m.minLow2 <= m.bb.lower;
     if (touched && m.curBullish && price > m.bb.lower && m.rsiMin3 <= rsiTh) {
       return buy(`BB 하단 터치 후 양봉 복귀 · RSI ${fmt(m.rsiMin3, 1)} ≤ ${rsiTh} 과매도 반등`);
@@ -1680,11 +1696,11 @@ const STRATEGIES = {
     return hold(`BB 하단 ${ko(m.bb.lower)} / RSI ${fmt(m.rsi, 1)} (기준 ≤ ${rsiTh})`);
   },
 
-  // [Antigravity-Doc] bot_06 (다단계 분할 그리드): RSI ≤ 38 & BB 하단 부근 1차 진입 후 -2.5%/-5.0% 하락 시 최대 3차 분할 매수, 개별 포지션 +1.8% 개별 익절
+  // [Antigravity-Doc] bot_06 (다단계 분할 그리드): 1h 급락 패닉 차단 + RSI ≤ 32 & BB 하단 부근 1차 진입 후 -3.0%/-6.0% 하락 시 최대 3차 분할 매수, 개별 포지션 +2.0% 개별 익절
   // bot_06: 다단계 분할 매수 그리드
   bot_06({ price, ind, held, params }) {
     const m = ind.m15;
-    const tp = Number(params.take_profit_pct ?? 1.8);
+    const tp = Number(params.take_profit_pct ?? 2.0);
     const maxSplits = Math.max(1, Number(params.max_splits ?? 3));
     const rawRatio = Number(params.order_ratio ?? 0.45);
     const normRatio = Math.min(1, rawRatio > 1 ? rawRatio / 100 : (rawRatio > 0 ? rawRatio : 0.45));
@@ -1697,8 +1713,8 @@ const STRATEGIES = {
       if (held.length < maxSplits) {
         const ref = Number(held.slice().sort((a, b) => a.id - b.id)[0].avg_buy_price);
         const drop = -pctChange(price, ref);
-        const step1 = Number(params.grid_step_1_pct ?? 2.5);
-        const step2 = Number(params.grid_step_2_pct ?? 5.0);
+        const step1 = Number(params.grid_step_1_pct ?? 3.0);
+        const step2 = Number(params.grid_step_2_pct ?? 6.0);
         if (held.length === 1 && drop >= step1) {
           return buy(`그리드 2차 분할 매수 (최초 대비 -${fmt(drop)}%)`, { splitIndex: 2, order_ratio: splitOrderRatio });
         }
@@ -1709,7 +1725,11 @@ const STRATEGIES = {
       return hold(`그리드 보유 ${held.length}분할`);
     }
     if (!m || !m.bb) return hold("15분봉 데이터 부족");
-    const rsiEntry = Number(params.rsi_entry ?? 38);
+    const h = ind.m60;
+    if (h && ((Number.isFinite(h.rsi) && h.rsi < 25) || (h.ema20 > 0 && pctChange(price, h.ema20) < -4.5))) {
+      return hold(`1시간봉 급락 패닉 그리드 진입 차단 (1h RSI ${fmt(h.rsi ?? 0, 1)})`);
+    }
+    const rsiEntry = Number(params.rsi_entry ?? 32);
     if (m.rsi <= rsiEntry && price <= m.bb.lower * 1.005) {
       return buy(`단기 과매도 그리드 1차 진입 (RSI ${fmt(m.rsi, 1)} ≤ ${rsiEntry}, BB 하단 부근)`, {
         splitIndex: 1,
@@ -1719,9 +1739,9 @@ const STRATEGIES = {
     return hold(`과매도 대기 (RSI ${fmt(m.rsi, 1)} / 기준 ≤ ${rsiEntry})`);
   },
 
-  // [Antigravity-Doc] bot_07 (MACD + RSI 골든크로스): 15m·60m EMA(20>60) 정배열 + MACD 골든크로스 + RSI 45~65 진입, 데드크로스 또는 EMA 붕괴 청산
+  // [Antigravity-Doc] bot_07 (MACD + RSI 골든크로스): 15m·60m EMA(20>60) 정배열 + 1h EMA20 상회 + MACD 골든크로스·히스토그램 확대 + 거래량 1.05배 + RSI 45~65 진입, 데드크로스 또는 EMA 붕괴 청산
   // bot_07: MACD + RSI 골든크로스
-  bot_07({ ind, held, params }) {
+  bot_07({ price, ind, held, params }) {
     const m = ind.m15;
     const h = ind.m60;
     if (!m || !m.macdSeries || !h) return hold("15분/60분봉 데이터 부족");
@@ -1735,25 +1755,32 @@ const STRATEGIES = {
       return hold("보유 중 (MACD/EMA 감시)");
     }
     const aligned = m.ema20 > m.ema60 && h.ema20 > h.ema60;
+    const aboveHtfEma20 = !(h.ema20 > 0) || price >= h.ema20;
     const macdStillAbove = Number.isFinite(macd[n - 1]) && Number.isFinite(signal[n - 1]) && macd[n - 1] > signal[n - 1];
+    const histExpanding =
+      Number.isFinite(macd[n - 2]) &&
+      Number.isFinite(signal[n - 2]) &&
+      macd[n - 1] - signal[n - 1] > macd[n - 2] - signal[n - 2];
     const crossUp =
       macdStillAbove &&
+      histExpanding &&
       [1, 2].some((back) => macd[n - back - 1] <= signal[n - back - 1] && macd[n - back] > signal[n - back]);
+    const volOk = Math.max(Number(m.curVolRatio || 0), Number(m.closedVolRatio || 0)) >= 1.05;
     const rsiMin = Number(params.rsi_min ?? 45);
     const rsiMax = Number(params.rsi_max ?? 65);
-    if (aligned && crossUp && m.rsi >= rsiMin && m.rsi <= rsiMax) {
-      return buy(`EMA(20>60) 정배열 · MACD 골든크로스 · RSI ${fmt(m.rsi, 1)}`);
+    if (aligned && aboveHtfEma20 && crossUp && volOk && m.rsi >= rsiMin && m.rsi <= rsiMax) {
+      return buy(`EMA(20>60) 정배열 · 1h지지 · MACD 골든크로스(확대) · RSI ${fmt(m.rsi, 1)}`);
     }
-    return hold(`정배열 ${aligned ? "O" : "X"} / 골든크로스 ${crossUp ? "O" : "X"} / RSI ${fmt(m.rsi, 1)}`);
+    return hold(`정배열 ${aligned ? "O" : "X"} / 골든크로스 ${crossUp ? "O" : "X"} / 거래량 ${volOk ? "O" : "X"} / RSI ${fmt(m.rsi, 1)}`);
   },
 
-  // [Antigravity-Doc] bot_08 (20일선 눌림목 스윙): 일봉/4h 정배열(5>20>60) + 20일선 ±band% 지지 + 거래량 감소 + 직전고점 상승여력 확인 시 진입, 직전고점 부근 익절
+  // [Antigravity-Doc] bot_08 (20일선 눌림목 스윙): 일봉 상승추세(20>60) 또는 4h 정배열(5>20>60) + 일봉/4h 20선 눌림목(-1.5%~+2.5%) 지지 + 거래량 진정/양봉 반등 + 직전고점 상승여력(≥1.2%) 확인 시 진입
   // bot_08: 정배열 20일선 눌림목
   bot_08({ price, ind, held, params }) {
     const d = ind.day;
     const h4 = ind.m240;
     if (!d || !h4 || d.ma60 === null || h4.ma60 === null) return hold("일봉/4시간봉 데이터 부족");
-    const minTpPct = Number(params.min_tp_pct ?? 0.6);
+    const minTpPct = Number(params.min_tp_pct ?? 1.2);
     const targetHighPrice = d.recentHigh20 ? d.recentHigh20 * 0.995 : 0;
     if (held.length > 0) {
       const totalCost = held.reduce((acc, p) => acc + Number(p.buy_amount || Number(p.volume || 0) * Number(p.avg_buy_price || 0)), 0);
@@ -1765,17 +1792,24 @@ const STRATEGIES = {
       }
       return hold("보유 중 (직전 고점 익절 대기)");
     }
-    const dayAligned = d.ma5 > d.ma20 && d.ma20 > d.ma60;
+    const dayUpTrend = d.ma20 > d.ma60;
     const h4Aligned = h4.ma5 > h4.ma20 && h4.ma20 > h4.ma60;
-    const band = Number(params.pullback_band_pct ?? 2.2);
-    const gap = pctChange(price, d.ma20);
-    const volDecline = h4.lastClosedVolRatio < 1.0;
+    const h4NotBearish = h4.ma20 >= h4.ma60 * 0.985;
+    const trendOk = (dayUpTrend || h4Aligned) && h4NotBearish;
+    const band = Number(params.pullback_band_pct ?? 2.5);
+    const gapDay = pctChange(price, d.ma20);
+    const gapH4 = h4.ma20 > 0 ? pctChange(price, h4.ma20) : 999;
+    const nearDayMa20 = gapDay >= -1.5 && gapDay <= band;
+    const nearH4Ma20 = gapH4 >= -1.5 && gapH4 <= band;
+    const nearSupport = nearDayMa20 || nearH4Ma20;
+    const volOrBounceOk = h4.lastClosedVolRatio < 1.25 || Boolean(ind.m15?.curBullish);
     const roomToTargetPct = targetHighPrice > 0 && price > 0 ? ((targetHighPrice - price) / price) * 100 : Infinity;
     const hasUpsideRoom = targetHighPrice <= 0 || (price < targetHighPrice && roomToTargetPct >= minTpPct);
-    if (dayAligned && h4Aligned && Math.abs(gap) <= band && volDecline && hasUpsideRoom) {
-      return buy(`정배열(5>20>60) 20일선 눌림목 지지 (이격 ${fmt(gap)}%, 거래량 감소)`);
+    if (trendOk && nearSupport && volOrBounceOk && hasUpsideRoom) {
+      const refLabel = nearDayMa20 ? `일봉20선(${fmt(gapDay)}%)` : `4h20선(${fmt(gapH4)}%)`;
+      return buy(`상승추세 20선 눌림목 지지 (${refLabel}, 거래량 진정/반등)`);
     }
-    return hold(`정배열 ${dayAligned && h4Aligned ? "O" : "X"} / 20선 이격 ${fmt(gap)}%`);
+    return hold(`추세 ${trendOk ? "O" : "X"} / 20선 이격 일봉 ${fmt(gapDay)}% · 4h ${fmt(gapH4)}%`);
   },
 
   // [Antigravity-Doc] bot_09 (거래량 폭발 스캘퍼): 15m 마감봉 거래량 ≥ 1.4배 양봉 + 추격 상한(+1.5%) & 윗꼬리 필터 통과 시 진입, 최고가 대비 -1.5% 트레일링 청산
@@ -1821,8 +1855,8 @@ const STRATEGIES = {
     const dipGapTh = Number.isFinite(Number(rawDipGap))
       ? -Math.abs(Number(rawDipGap))
       : -2.0;
-    const trailingPct = Number.isFinite(Number(params.trailing_stop_pct)) ? Number(params.trailing_stop_pct) : 1.5;
-    const minLrcTpPct = Number.isFinite(Number(params.min_lrc_tp_pct)) ? Number(params.min_lrc_tp_pct) : 0.6;
+    const trailingPct = Number.isFinite(Number(params.trailing_stop_pct)) ? Number(params.trailing_stop_pct) : 1.0;
+    const minLrcTpPct = Number.isFinite(Number(params.min_lrc_tp_pct)) ? Number(params.min_lrc_tp_pct) : 1.1;
 
     // ==========================================
     // 1. 보유 포지션 매도 / 익절 / 손절 평가
@@ -1839,7 +1873,7 @@ const STRATEGIES = {
       const isBreakout = hasExplicitBreakout || (!hasExplicitDip && !inferredDip);
       const isDip = hasExplicitDip || inferredDip;
 
-      // (1) 기계적 기준선 손절 (Key Level Hard Stop)
+      // (1) 기계적 기준선 손절 (Key Level Hard Stop — 손익비 개선: Setup A -1.4%, Setup B -1.8%)
       if (isBreakout) {
         const brokeBelowKeyLevels =
           k.today_open > 0 &&
@@ -1848,8 +1882,8 @@ const STRATEGIES = {
           price < k.today_open * 0.995 &&
           price < k.vwap * 0.995 &&
           totalPnlPct <= -0.8;
-        if (brokeBelowKeyLevels || totalPnlPct <= -2.0) {
-          return sell(`[Setup A 손절] 당일시가(${ko(k.today_open)}) 및 VWAP(${ko(k.vwap)}) 동시 이탈 / 손절(-2.0%) 청산 (수익률 ${fmt(totalPnlPct)}%)`);
+        if (brokeBelowKeyLevels || totalPnlPct <= -1.4) {
+          return sell(`[Setup A 손절] 당일시가(${ko(k.today_open)}) 및 VWAP(${ko(k.vwap)}) 동시 이탈 / 손절(-1.4%) 청산 (수익률 ${fmt(totalPnlPct)}%)`);
         }
       }
 
@@ -1862,18 +1896,18 @@ const STRATEGIES = {
         if (brokePrevLow) {
           return sell(`[Setup B 손절] 전일 저가(${ko(k.prev_low)}) 하향 이탈 손절 (수익률 ${fmt(totalPnlPct)}%)`);
         }
-        if (totalPnlPct <= -2.5) {
-          return sell(`[Setup B 손절] 평단가 대비 -2.5% 손절 (수익률 ${fmt(totalPnlPct)}%)`);
+        if (totalPnlPct <= -1.8) {
+          return sell(`[Setup B 손절] 평단가 대비 -1.8% 손절 (수익률 ${fmt(totalPnlPct)}%)`);
         }
       }
 
       if (!isBreakout && !isDip) {
-        if (totalPnlPct <= -2.5) {
-          return sell(`[기계적 기준선 손절] 평단가 대비 -2.5% 손절 (수익률 ${fmt(totalPnlPct)}%)`);
+        if (totalPnlPct <= -1.8) {
+          return sell(`[기계적 기준선 손절] 평단가 대비 -1.8% 손절 (수익률 ${fmt(totalPnlPct)}%)`);
         }
       }
 
-      // (2) 선형 회귀 채널 익절 (Take Profit) — 업비트 왕복 수수료(0.1%)·호가 스프레드를 충분히 상회할 때만 익절
+      // (2) 선형 회귀 채널 익절 (Take Profit) — 업비트 왕복 수수료(0.1%)·슬리피지를 상회하는 최소 +1.1% 이상 순수익 구간에서만 익절
       if (price >= k.lrc.upper && totalPnlPct >= minLrcTpPct) {
         return sell(`[LRC 상단 익절] +2σ 채널 상단(${ko(k.lrc.upper)}) 도달 전량 익절 (수익률 +${fmt(totalPnlPct)}%)`);
       }
@@ -1889,19 +1923,19 @@ const STRATEGIES = {
         return sell(`[거래량 클라이맥스 엑시트] RVOL ${fmt(k.rvol, 1)}배 윗꼬리 음봉 출현 익절 (수익률 +${fmt(totalPnlPct)}%)`);
       }
 
-      // (4) 최고가 대비 -1.5% 트레일링 스탑
+      // (4) 최고가 대비 -1.0% 트레일링 스탑 (최고 +1.5% 도달 후 수익 반납 방지)
       const peak = Math.max(Number(options.peakPrice || 0), price);
       const peakPnl = pctChange(peak, avgBuyPrice);
       if (peakPnl >= 1.5 && price <= peak * (1 - trailingPct / 100)) {
         return sell(`[트레일링 스탑] 고점 대비 -${trailingPct}% 반락 익절 (수익률 ${totalPnlPct >= 0 ? "+" : ""}${fmt(totalPnlPct)}%)`);
       }
 
-      // (5) Setup B 2차 분할 매수 (Scaling-In): -2.5% 손절 이전(-1.5%~-2.4%) 전일 저가 지지 반등 시 추가 분할 매수
+      // (5) Setup B 2차 분할 매수 (Scaling-In): -1.8% 손절 이전(-1.2%~-1.8%) 전일 저가 지지 반등 시 추가 분할 매수
       if (isDip && held.length === 1) {
         const firstBuyPrice = Number(held[0].avg_buy_price);
         const dropPct = pctChange(price, firstBuyPrice);
         const hasRebound = k.curBullish || price > Number(k.closed.trade_price);
-        if (dropPct <= -1.5 && totalPnlPct > -2.5 && hasRebound && (k.prev_low === 0 || price >= k.prev_low)) {
+        if (dropPct <= -1.2 && totalPnlPct > -1.8 && hasRebound && (k.prev_low === 0 || price >= k.prev_low)) {
           return buy(`[Setup B 2차 분할 매수] 1차 진입가 대비 ${fmt(dropPct)}% 추가 하락 지지 반등 분할 매수 (Scaling-In)`, {
             setup: "B",
             splitIndex: 2,

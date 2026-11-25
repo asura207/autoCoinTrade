@@ -219,7 +219,7 @@ function buildScenarioPack() {
       if (i < 45) c = 1000 + i * 2.0 + (i % 2 === 0 ? 0.5 : -0.5);
       else if (i < 63) c = 1088 - (i - 44) * 1.9 + (i % 2 === 0 ? 1.0 : -1.0);
       else c = 1054 + (i - 62) * 2.0 + (i === 65 ? -1.5 : 0);
-      return { open: c - 1, high: c + 2, low: c - 2, close: c, vol: 1100 };
+      return { open: c - 1, high: c + 2, low: c - 2, close: c, vol: i >= 68 ? 1300 : 1100 };
     });
     const price = Number(m15[m15.length - 1].trade_price);
     const md = { market: "KRW-SHIB", price, ticker: { trade_price: price, acc_trade_price_24h: 20000000000 }, candles: { day: makeSteadyDayCandles(65, price), m240: [], m60, m15 } };
@@ -279,10 +279,10 @@ function buildScenarioPack() {
       }
       if (i === 57) return { open: 968, high: 969, low: 960, close: 964, vol: 1100 };
       if (i === 58) return { open: 964, high: 965, low: 930, close: 934, vol: 1800 };
-      // 현재봉: LRC 하단(937.66) 터치 후 반등 초입 (중심선 951.20 대비 +0.87% 여유)
-      return { open: 935, high: 944, low: 933, close: 943, vol: 2000 };
+      // 현재봉: LRC 하단 터치 후 반등 초입 (중심선 대비 >= 1.1% 여유)
+      return { open: 933, high: 941, low: 931, close: 939, vol: 2000 };
     });
-    const price = 943;
+    const price = 939;
     const md = { market: "KRW-SUI", price, ticker: { trade_price: price, acc_trade_price_24h: 30000000000 }, candles: { day, m240: [], m60: [], m15 } };
     md.indicators = buildIndicators(md);
     return md;
@@ -434,24 +434,24 @@ async function runTests() {
       "HOLD",
       "bot_06 must HOLD right after Split 1"
     );
-    // Drop -2.6% -> Split 2
-    const b6Split2 = evaluateStrategy("bot_06", { ...packs.mdBot06, price: 915 }, packs.mdBot06.indicators, [{ id: 10, avg_buy_price: 940 }], {
+    // Drop -3.19% -> Split 2 (>= 3.0% step)
+    const b6Split2 = evaluateStrategy("bot_06", { ...packs.mdBot06, price: 910 }, packs.mdBot06.indicators, [{ id: 10, avg_buy_price: 940 }], {
       isLive: true,
-      params: { order_ratio: 0.45, max_splits: 3, take_profit_pct: 1.8 },
+      params: { order_ratio: 0.45, max_splits: 3, take_profit_pct: 2.0 },
     });
     assert.equal(b6Split2.signal, "BUY");
     assert.equal(b6Split2.splitIndex, 2);
     assert.ok(Math.abs(b6Split2.order_ratio - 0.15) < 1e-6);
-    // Rebound +2% on split 2 (934) while split 1 (940) is flat -> sell ONLY split 2 id!
+    // Rebound +2.2% on split 2 (930) while split 1 (940) is flat -> sell ONLY split 2 id!
     const b6PartialSell = evaluateStrategy(
       "bot_06",
-      { ...packs.mdBot06, price: 934 },
+      { ...packs.mdBot06, price: 930 },
       packs.mdBot06.indicators,
       [
         { id: 10, avg_buy_price: 940 },
-        { id: 11, avg_buy_price: 915 },
+        { id: 11, avg_buy_price: 910 },
       ],
-      { isLive: true, params: { take_profit_pct: 1.8 } }
+      { isLive: true, params: { take_profit_pct: 2.0 } }
     );
     assert.equal(b6PartialSell.signal, "SELL");
     assert.deepEqual(b6PartialSell.sellPositionIds, [11], "bot_06 must exit only profitable split #11");
@@ -544,11 +544,11 @@ async function runTests() {
     assert.equal(b10Buy1.setup, "B");
     assert.equal(b10Buy1.splitIndex, 1);
     assert.equal(
-      evaluateStrategy("bot_10", packs.mdBot10, packs.mdBot10.indicators, [{ id: 1, avg_buy_price: 943, buy_reason: b10Buy1.reason }], { isLive: true }).signal,
+      evaluateStrategy("bot_10", packs.mdBot10, packs.mdBot10.indicators, [{ id: 1, avg_buy_price: 939, buy_reason: b10Buy1.reason }], { isLive: true }).signal,
       "HOLD",
       "bot_10 must HOLD immediately after Setup B 1차 BUY"
     );
-    // Setup B 2차 scaling-in (-1.7% drop with bounce above prev_low) MUST now be reachable!
+    // Setup B 2차 scaling-in (-1.38% drop with bounce above prev_low) MUST now be reachable!
     const b10ScaleInd = structuredClone(packs.mdBot10.indicators);
     b10ScaleInd.kellogg.prev_low = 920;
     b10ScaleInd.kellogg.curBullish = true;
@@ -556,10 +556,10 @@ async function runTests() {
       "bot_10",
       { market: "KRW-SUI", price: 926 },
       b10ScaleInd,
-      [{ id: 1, avg_buy_price: 943, buy_amount: 10000, volume: "10.604453", buy_reason: b10Buy1.reason }],
+      [{ id: 1, avg_buy_price: 939, buy_amount: 10000, volume: "10.649627", buy_reason: b10Buy1.reason }],
       { isLive: true }
     );
-    assert.equal(b10ScaleBuy.signal, "BUY", `bot_10 Setup B 2차 scaling-in at -1.7% should BUY, got: ${b10ScaleBuy.reason}`);
+    assert.equal(b10ScaleBuy.signal, "BUY", `bot_10 Setup B 2차 scaling-in at -1.38% should BUY, got: ${b10ScaleBuy.reason}`);
     assert.equal(b10ScaleBuy.splitIndex, 2);
 
     // Setup A 돌파: LRC 상단 여지 >= 0.6% 시 매수, < 0.6% 차단, 익절 시 +0.6% 마진 확인
@@ -610,13 +610,13 @@ async function runTests() {
     assert.equal(
       evaluateStrategy(
         "bot_10",
-        { market: "KRW-SUI", price: 1015 },
-        mkSetupAInd({ price: 1015, lrcUpper: 1014 }),
+        { market: "KRW-SUI", price: 1017 },
+        mkSetupAInd({ price: 1017, lrcUpper: 1016 }),
         [{ id: 1, avg_buy_price: 1005, buy_amount: 10000, volume: "9.950248", buy_reason: b10SetupABuy.reason }],
         { isLive: true }
       ).signal,
       "SELL",
-      "bot_10 Setup A must take LRC upper profit when gain (+1.0%) >= 0.6%"
+      "bot_10 Setup A must take LRC upper profit when gain (+1.19%) >= 1.1%"
     );
     reportRows.push({ suite: "Strategy", bot: "bot_10", check: "Kellogg Setup A + Setup B 1차/2차 + Churn Guard", status: "PASS" });
 

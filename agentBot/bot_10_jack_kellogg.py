@@ -266,7 +266,8 @@ def evaluate_jack_kellogg_strategy(
     if raw_dip_gap is None:
         raw_dip_gap = params.get("vwap_gap", 2.0)
     dip_gap_th = -abs(float(raw_dip_gap))
-    trailing_pct = float(params.get("trailing_stop_pct", 1.5))
+    trailing_pct = float(params.get("trailing_stop_pct", 1.0))
+    min_lrc_tp_pct = float(params.get("min_lrc_tp_pct", 1.1))
 
     held = open_positions or []
 
@@ -292,13 +293,13 @@ def evaluate_jack_kellogg_strategy(
             if inferred_dip:
                 is_dip = True
 
-        # [Antigravity-Doc] 청산 규칙 (1) 기계적 기준선 손절: Setup A는 당일시가&VWAP 동시 이탈/-2.0%, Setup B는 전일저가 이탈 또는 2차 분할 후 -2.5%
+        # [Antigravity-Doc] 청산 규칙 (1) 기계적 기준선 손절: Setup A는 당일시가&VWAP 동시 이탈/-1.4%, Setup B는 전일저가 이탈 또는 평단가 -1.8%
         # (1) 기계적 기준선 손절 (Key Level Hard Stop)
         if is_breakout:
-            if (k["today_open"] > 0 and price < k["today_open"] and price < k["vwap"]) or total_pnl_pct <= -2.0:
+            if (k["today_open"] > 0 and price < k["today_open"] and price < k["vwap"]) or total_pnl_pct <= -1.4:
                 return {
                     "signal": "SELL",
-                    "reason": f"[Setup A 손절] 시가({k['today_open']:,.0f}) & VWAP({k['vwap']:,.0f}) 동시 이탈 / -2.0% 도달 (수익률 {total_pnl_pct:.2f}%)",
+                    "reason": f"[Setup A 손절] 시가({k['today_open']:,.0f}) & VWAP({k['vwap']:,.0f}) 동시 이탈 / -1.4% 도달 (수익률 {total_pnl_pct:.2f}%)",
                 }
 
         if is_dip:
@@ -307,28 +308,28 @@ def evaluate_jack_kellogg_strategy(
                     "signal": "SELL",
                     "reason": f"[Setup B 손절] 전일 저가({k['prev_low']:,.0f}) 하향 이탈 손절 (수익률 {total_pnl_pct:.2f}%)",
                 }
-            if len(held) >= 2 and total_pnl_pct <= -2.5:
+            if total_pnl_pct <= -1.8:
                 return {
                     "signal": "SELL",
-                    "reason": f"[Setup B 손절] 2차 분할 후 평단가 대비 -2.5% 손절 (수익률 {total_pnl_pct:.2f}%)",
+                    "reason": f"[Setup B 손절] 평단가 대비 -1.8% 손절 (수익률 {total_pnl_pct:.2f}%)",
                 }
 
         if not is_breakout and not is_dip:
-            if (k["today_open"] > 0 and price < k["today_open"] and price < k["vwap"]) or total_pnl_pct <= -2.5:
+            if (k["today_open"] > 0 and price < k["today_open"] and price < k["vwap"]) or total_pnl_pct <= -1.8:
                 return {
                     "signal": "SELL",
-                    "reason": f"[기계적 기준선 손절] 시가/VWAP 동시 이탈 또는 -2.5% 손절 (수익률 {total_pnl_pct:.2f}%)",
+                    "reason": f"[기계적 기준선 손절] 시가/VWAP 동시 이탈 또는 -1.8% 손절 (수익률 {total_pnl_pct:.2f}%)",
                 }
 
-        # [Antigravity-Doc] 청산 규칙 (2) 선형 회귀 채널 익절: 수익률 >= +1.5%이면서 LRC 상단(+2σ) 도달 시 전량 익절 (Setup B는 중심선 회귀 시에도 익절)
+        # [Antigravity-Doc] 청산 규칙 (2) 선형 회귀 채널 익절: 수익률 >= min_lrc_tp_pct(기본 +1.1%)이면서 LRC 상단(+2σ) 도달 시 전량 익절 (Setup B는 중심선 회귀 시에도 익절)
         # (2) 선형 회귀 채널 익절 (Take Profit)
         lrc = k["lrc"]
-        if total_pnl_pct >= 1.5 and price >= lrc["upper"]:
+        if total_pnl_pct >= min_lrc_tp_pct and price >= lrc["upper"]:
             return {
                 "signal": "SELL",
                 "reason": f"[LRC 상단 익절] +2σ 채널 상단({lrc['upper']:,.0f}) 도달 전량 익절 (+{total_pnl_pct:.2f}%)",
             }
-        if is_dip and total_pnl_pct >= 1.5 and price >= lrc["mid"]:
+        if is_dip and total_pnl_pct >= min_lrc_tp_pct and price >= lrc["mid"]:
             return {
                 "signal": "SELL",
                 "reason": f"[LRC 중심선 회귀 익절] LRC 중심선({lrc['mid']:,.0f}) 회귀 익절 (+{total_pnl_pct:.2f}%)",
@@ -356,13 +357,13 @@ def evaluate_jack_kellogg_strategy(
                 "reason": f"[트레일링 스탑] 고점 대비 -{trailing_pct}% 반락 익절 (수익률 {total_pnl_pct:+.2f}%)",
             }
 
-        # [Antigravity-Doc] 추가 매수 규칙 (5) Setup B 2차 분할 매수(Scaling-In): 1차 진입 대비 -2.5% 이하 하락 & 전일 저가 지지 시 15% 비중 추가 진입
+        # [Antigravity-Doc] 추가 매수 규칙 (5) Setup B 2차 분할 매수(Scaling-In): 1차 진입 대비 -1.2%~-1.8% 하락 & 전일 저가 지지 시 15% 비중 추가 진입
         # (5) Setup B 2차 분할 매수 (Scaling-In) 평가
         if is_dip and len(held) == 1:
             first_buy = float(held[0].get("avg_buy_price") or 0.0)
             if first_buy > 0:
                 drop_pct = ((price - first_buy) / first_buy) * 100.0
-                if drop_pct <= -2.5 and (k["prev_low"] <= 0 or price >= k["prev_low"]):
+                if drop_pct <= -1.2 and total_pnl_pct > -1.8 and (k["prev_low"] <= 0 or price >= k["prev_low"]):
                     return {
                         "signal": "BUY",
                         "reason": f"[Setup B 2차 분할 매수] 1차 진입가 대비 {drop_pct:.2f}% 추가 하락 분할 매수 (Scaling-In)",
